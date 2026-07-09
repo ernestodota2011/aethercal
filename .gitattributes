@@ -18,3 +18,9 @@
 *.gz binary
 *.zip binary
 *.ics -text
+
+# Generated / reproducible artifacts: collapse them in GitHub diffs and keep them out of
+# textual diffs and code review. They are regenerated (`uv lock`, `pnpm build`), not authored.
+uv.lock linguist-generated=true -diff
+pnpm-lock.yaml linguist-generated=true -diff
+packages/aethercal-ui/src/aethercal/ui/assets/aethercal-calendar.js linguist-generated=true -diff
