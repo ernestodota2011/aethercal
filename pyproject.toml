@@ -16,7 +16,10 @@ dependencies = [
     # with `aethercal-ui[reflex]`. See docs/spikes/f0-10-reflex-tsx.md for the full rationale.
     "aethercal-ui[reflex]",
     "aethercal",
-    "aethercal-server",
+    # `google` extra requested here (same reasoning as aethercal-ui[reflex]): the single dev venv
+    # gets the Google SDKs the F0-11 spike + `uv run poe check` need, while a standalone
+    # `pip install aethercal-server` stays lean. See docs/spikes/f0-11-google-calendar.md.
+    "aethercal-server[google]",
     "aethercal-booking",
 ]
 

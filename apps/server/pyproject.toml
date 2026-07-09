@@ -10,9 +10,19 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
 classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
-# NOTE: FastAPI / SQLAlchemy / Alembic / Reflex / integration SDKs are added in F0-11 / F1
-# as those layers are built. Dependency-free stub during F0 scaffolding.
+# NOTE: FastAPI / SQLAlchemy / Alembic / Reflex are added in F1 as those layers are built. The
+# Google Calendar client SDKs land here in F0-11 as the `google` extra (see below), so a bare
+# `pip install aethercal-server` stays lean; the monorepo dev venv opts in via the root
+# pyproject.toml requesting `aethercal-server[google]`. Promote to a hard dependency in F1-07 when
+# the full Google integration (BusyCache, incremental sync) ships.
 dependencies = []
+
+[project.optional-dependencies]
+google = [
+    "google-api-python-client>=2.100",
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]
