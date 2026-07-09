@@ -1,0 +1,20 @@
+# Normalize line endings: the repository stores text as LF on every platform.
+* text=auto eol=lf
+
+# Windows-only tooling that must keep CRLF (none today; placeholder for clarity)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets (never diffed / normalized)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.whl binary
+*.gz binary
+*.zip binary
+*.ics -text

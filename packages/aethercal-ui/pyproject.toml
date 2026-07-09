@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal-ui"
+version = "0.0.0"
+description = "AetherCal calendar component: Reflex wrapper around a custom TSX core"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+# NOTE: reflex (and the packaged JS bundle) are added in F0-10 / F2 (Spike A). Kept dependency-free
+# for now so the F0 core-engine environment stays lean and fast to sync.
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]

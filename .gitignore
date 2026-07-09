@@ -1,0 +1,51 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.mypy_cache/
+.pyright/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Build artifacts
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / instance config (never committed)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node / JS (packages/aethercal-ui/js) — never commit node_modules or built bundles
+node_modules/
+*.tsbuildinfo
+packages/aethercal-ui/js/dist/
+packages/aethercal-ui/src/aethercal/ui/assets/
+
+# Reflex build output
+.web/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal-booking"
+version = "0.0.0"
+description = "AetherCal public booking page (FastHTML + HTMX)"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+# NOTE: python-fasthtml + aethercal-client are added in F1. Dependency-free stub during F0.
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]

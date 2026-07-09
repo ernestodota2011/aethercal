@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal-schemas"
+version = "0.0.0"
+description = "AetherCal API contract: Pydantic request/response schemas"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+dependencies = [
+    "aethercal-core",
+    "pydantic>=2.7",
+]
+
+[tool.uv.sources]
+aethercal-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]

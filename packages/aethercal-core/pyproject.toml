@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal-core"
+version = "0.0.0"
+description = "AetherCal domain engine: recurrence, availability, slots, timezones — pure, zero I/O"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+keywords = ["calendar", "scheduling", "recurrence", "rfc5545", "icalendar", "availability", "timezone"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Scheduling",
+    "Typing :: Typed",
+]
+dependencies = [
+    "python-dateutil>=2.9",
+    "icalendar>=6",
+    "pydantic>=2.7",
+    "tzdata>=2024.1; platform_system == 'Windows'",
+]
+
+[project.urls]
+Homepage = "https://github.com/ernestodota2011/aethercal"
+Repository = "https://github.com/ernestodota2011/aethercal"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]

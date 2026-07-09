@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal"
+version = "0.0.0"
+description = "AetherCal metapackage + CLI (serve / migrate / worker / create-admin)"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+dependencies = [
+    "aethercal-core",
+    "aethercal-schemas",
+    "aethercal-client",
+    "typer>=0.12",
+]
+# NOTE: the console_scripts entry point (`aethercal = ...`) is added when the CLI is built
+# test-first in F1. No untested entry point is wired during F0 scaffolding.
+
+[tool.uv.sources]
+aethercal-core = { workspace = true }
+aethercal-schemas = { workspace = true }
+aethercal-client = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]

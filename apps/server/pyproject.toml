@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aethercal-server"
+version = "0.0.0"
+description = "AetherCal server: FastAPI API v1 + Reflex admin"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "AetherLogik" }]
+classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+# NOTE: FastAPI / SQLAlchemy / Alembic / Reflex / integration SDKs are added in F0-11 / F1
+# as those layers are built. Dependency-free stub during F0 scaffolding.
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aethercal"]
