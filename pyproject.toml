@@ -85,6 +85,12 @@ addopts = "-ra --strict-markers --strict-config"
 testpaths = ["packages", "apps"]
 xfail_strict = true
 filterwarnings = ["error"]
+markers = [
+    # Opt-in tests that need a real PostgreSQL server (autogenerate parity, the boot advisory
+    # lock). They skip unless AETHERCAL_TEST_DATABASE_URL is set, so the default matrix
+    # (ubuntu+windows, no Docker) stays green; a dedicated CI job with a postgres service runs them.
+    "db: requires a real PostgreSQL database (set AETHERCAL_TEST_DATABASE_URL)",
+]
 
 [tool.coverage.run]
 branch = true
@@ -98,6 +104,10 @@ precision = 2
 line-length = 100
 target-version = "py311"
 src = ["packages/aethercal-core/src", "packages/aethercal-schemas/src", "packages/aethercal-client/src", "packages/aethercal-ui/src", "packages/aethercal/src", "apps/server/src", "apps/booking/src"]
+# Alembic version scripts are generated (autogenerate), not hand-authored — the hand-written
+# migration env lives one level up and is linted. Excluding only versions/ keeps CI green without
+# reformatting machine-emitted DDL.
+extend-exclude = ["apps/server/src/aethercal/server/db/migrations/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "PL", "RUF", "TID"]
@@ -120,7 +130,13 @@ include = [
     "apps/server/src",
     "apps/booking/src",
 ]
-exclude = ["**/node_modules", "**/.venv", "**/__pycache__"]
+exclude = [
+    "**/node_modules",
+    "**/.venv",
+    "**/__pycache__",
+    # Generated Alembic version scripts (the hand-written migration env one level up is checked).
+    "apps/server/src/aethercal/server/db/migrations/versions",
+]
 # Untyped third-party libraries (icalendar, recurring-ical-events) produce "unknown type"
 # cascades under strict mode. We silence only that family — our own code stays strictly
 # annotated (missing parameter/return/type-argument annotations still error).
