@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per workflow+ref; newer pushes cancel the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the CI never needs to write to the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Sync workspace (locked)
+        run: uv sync --locked
+      - name: Format check (ruff)
+        run: uv run ruff format --check .
+      - name: Lint (ruff)
+        run: uv run ruff check .
+      - name: Type-check (pyright)
+        run: uv run pyright
+      - name: Import contracts (import-linter)
+        run: uv run lint-imports
+
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          # setup-uv installs this interpreter and exports UV_PYTHON, so the
+          # commands below run against the matrix Python version.
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Sync workspace (locked)
+        run: uv sync --locked
+      - name: Test (pytest)
+        run: uv run pytest

@@ -1,0 +1,11 @@
+# CODEOWNERS — required reviewers by path.
+# Docs: https://docs.github.com/articles/about-code-owners
+# The last matching pattern wins, so keep the default first and the
+# highest-risk paths after it.
+
+# Default owner for everything in the repository.
+*                           @ernestodota2011
+
+# Highest-risk paths — the pure date/recurrence engine and the CI/security config.
+/packages/aethercal-core/   @ernestodota2011
+/.github/                   @ernestodota2011
