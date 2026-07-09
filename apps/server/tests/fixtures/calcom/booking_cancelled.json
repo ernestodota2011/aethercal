@@ -1,0 +1,31 @@
+{
+  "triggerEvent": "BOOKING_CANCELLED",
+  "createdAt": "2026-07-08T09:12:05.000Z",
+  "payload": {
+    "type": "discovery-call",
+    "title": "Discovery Call between AetherLogik and Jane Doe",
+    "startTime": "2026-07-10T16:00:00.000Z",
+    "endTime": "2026-07-10T16:30:00.000Z",
+    "organizer": {
+      "id": 1001,
+      "name": "AetherLogik",
+      "email": "team@aetherlogik.example",
+      "username": "aetherlogik",
+      "timeZone": "America/New_York"
+    },
+    "attendees": [
+      {
+        "name": "Jane Doe",
+        "email": "jane.doe@example.com",
+        "timeZone": "America/New_York",
+        "language": { "locale": "en" }
+      }
+    ],
+    "uid": "spikefixturecreated0001",
+    "bookingId": 900001,
+    "eventTypeId": 12345,
+    "status": "CANCELLED",
+    "cancellationReason": "Something came up, will rebook next week.",
+    "location": "integrations:daily"
+  }
+}

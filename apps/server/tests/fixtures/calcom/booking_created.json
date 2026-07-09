@@ -1,0 +1,36 @@
+{
+  "triggerEvent": "BOOKING_CREATED",
+  "createdAt": "2026-07-01T14:03:22.000Z",
+  "payload": {
+    "type": "discovery-call",
+    "title": "Discovery Call between AetherLogik and Jane Doe",
+    "startTime": "2026-07-10T16:00:00.000Z",
+    "endTime": "2026-07-10T16:30:00.000Z",
+    "organizer": {
+      "id": 1001,
+      "name": "AetherLogik",
+      "email": "team@aetherlogik.example",
+      "username": "aetherlogik",
+      "timeZone": "America/New_York"
+    },
+    "attendees": [
+      {
+        "name": "Jane Doe",
+        "email": "jane.doe@example.com",
+        "timeZone": "America/New_York",
+        "language": { "locale": "en" }
+      }
+    ],
+    "uid": "spikefixturecreated0001",
+    "bookingId": 900001,
+    "eventTypeId": 12345,
+    "status": "ACCEPTED",
+    "location": "integrations:daily",
+    "metadata": { "videoCallUrl": "https://meet.example.com/aaa-bbbb-ccc" },
+    "videoCallData": { "type": "daily_video", "url": "https://meet.example.com/aaa-bbbb-ccc" },
+    "responses": {
+      "name": { "label": "your_name", "value": "Jane Doe" },
+      "email": { "label": "email_address", "value": "jane.doe@example.com" }
+    }
+  }
+}
