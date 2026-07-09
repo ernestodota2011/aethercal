@@ -34,11 +34,13 @@ env/
 *.pem
 *.key
 
-# Node / JS (packages/aethercal-ui/js) — never commit node_modules or built bundles
+# Node / JS (packages/aethercal-ui/js) — never commit node_modules or transient build output
 node_modules/
 *.tsbuildinfo
 packages/aethercal-ui/js/dist/
-packages/aethercal-ui/src/aethercal/ui/assets/
+# The built calendar bundle (src/aethercal/ui/assets/aethercal-calendar.js) IS committed on
+# purpose: ~3 KB, reproducible via `pnpm build`, and it must be present at import time (rx.asset()
+# validates it) for a fresh clone / CI / `pip install` to work with no Node toolchain.
 
 # Reflex build output
 .web/

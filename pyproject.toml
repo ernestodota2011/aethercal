@@ -10,7 +10,11 @@ dependencies = [
     "aethercal-core",
     "aethercal-schemas",
     "aethercal-client",
-    "aethercal-ui",
+    # The `reflex` extra is requested here (not in aethercal-ui's own bare dependency list) so the
+    # single monorepo dev venv always has what `uv run poe check` needs to type-check/test
+    # aethercal-ui, while a standalone `pip install aethercal-ui` stays lean by default and opts in
+    # with `aethercal-ui[reflex]`. See docs/spikes/f0-10-reflex-tsx.md for the full rationale.
+    "aethercal-ui[reflex]",
     "aethercal",
     "aethercal-server",
     "aethercal-booking",

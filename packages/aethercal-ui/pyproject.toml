@@ -10,9 +10,24 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
 classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
-# NOTE: reflex (and the packaged JS bundle) are added in F0-10 / F2 (Spike A). Kept dependency-free
-# for now so the F0 core-engine environment stays lean and fast to sync.
+# `reflex` is an extra (not a hard dependency): a standalone `pip install aethercal-ui` stays
+# lean; the monorepo dev venv opts in via the root pyproject.toml requesting `aethercal-ui[reflex]`
+# instead. See docs/spikes/f0-10-reflex-tsx.md for the full rationale and its trade-offs.
 dependencies = []
+
+[project.optional-dependencies]
+reflex = [
+    "reflex>=0.9.6.post1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]
+# The built JS bundle (packages/aethercal-ui/js -> `pnpm build`) lands at
+# src/aethercal/ui/assets/aethercal-calendar.js and is committed (a small, reproducible build
+# artifact) so a fresh clone / CI / `pip install` works with no Node toolchain -- rx.asset()
+# validates the file at import time. `artifacts` is kept as belt-and-suspenders: it force-includes
+# the bundle into the wheel even if a future change re-gitignores it (hatchling's default "vcs"
+# strategy would otherwise silently drop it). A JS change must be followed by `pnpm build` +
+# committing the regenerated bundle; a CI rebuild-and-diff drift guard is F2 hardening (see
+# docs/spikes/f0-10-reflex-tsx.md).
+artifacts = ["src/aethercal/ui/assets/*.js"]

@@ -1,0 +1,21 @@
+{
+  "name": "@aetherlogik/aethercal-calendar-core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Custom TSX calendar core for aethercal-ui, wrapped as a Reflex component (F0-10 spike).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
