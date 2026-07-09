@@ -4,7 +4,7 @@ Golden instants were verified against dateutil + zoneinfo before being encoded h
 
 from datetime import UTC, datetime, timedelta
 
-from aethercal.core.model import Event, TimeInterval
+from aethercal.core.model import Event, Occurrence, TimeInterval
 from aethercal.core.recurrence import expand
 
 
@@ -16,7 +16,7 @@ def _window(start: datetime, end: datetime) -> TimeInterval:
     return TimeInterval(start=start, end=end)
 
 
-def _starts(occs: list) -> list[datetime]:
+def _starts(occs: list[Occurrence]) -> list[datetime]:
     return [o.start for o in occs]
 
 

@@ -102,8 +102,26 @@ ignore = ["PLR2004"]
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["packages", "apps"]
+# Type-check the shipped library source strictly; test code is validated by execution, not pyright
+# (tests exercise loosely-typed scheduling libraries where strict typing is noise, not safety).
+include = [
+    "packages/aethercal-core/src",
+    "packages/aethercal-schemas/src",
+    "packages/aethercal-client/src",
+    "packages/aethercal-ui/src",
+    "packages/aethercal/src",
+    "apps/server/src",
+    "apps/booking/src",
+]
 exclude = ["**/node_modules", "**/.venv", "**/__pycache__"]
+# Untyped third-party libraries (icalendar, recurring-ical-events) produce "unknown type"
+# cascades under strict mode. We silence only that family — our own code stays strictly
+# annotated (missing parameter/return/type-argument annotations still error).
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownLambdaType = "none"
 
 # --------------------------------------------------------------------------------------
 # import-linter — enforces the dependency rules from AetherCal-02-Plan §3.
