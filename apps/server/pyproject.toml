@@ -10,12 +10,18 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
 classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
-# NOTE: FastAPI / SQLAlchemy / Alembic / Reflex are added in F1 as those layers are built. The
-# Google Calendar client SDKs land here in F0-11 as the `google` extra (see below), so a bare
-# `pip install aethercal-server` stays lean; the monorepo dev venv opts in via the root
-# pyproject.toml requesting `aethercal-server[google]`. Promote to a hard dependency in F1-07 when
-# the full Google integration (BusyCache, incremental sync) ships.
-dependencies = []
+# The persistence layer (F1-01) is the server's foundation, so SQLAlchemy, Alembic and the
+# Postgres driver are hard dependencies: the server cannot run without a database. psycopg 3 is a
+# single driver that serves both the async application engine and the sync Alembic/boot migrator.
+# aethercal-core is imported for the shared domain vocabulary (e.g. BookingStatus). FastAPI /
+# Reflex are added as their layers land later in F1. The Google Calendar SDKs stay an optional
+# extra (see below) so a bare `pip install aethercal-server` skips them until F1-07.
+dependencies = [
+    "aethercal-core",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+]
 
 [project.optional-dependencies]
 google = [
