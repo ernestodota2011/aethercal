@@ -49,6 +49,13 @@ def test_parse_freebusy_raises_on_calendar_errors_instead_of_reporting_all_free(
         parse_freebusy(response, "primary")
 
 
+def test_parse_freebusy_raises_when_the_calendar_is_absent_from_the_response() -> None:
+    # A calendar the response never mentions must NOT be reported as free (double-booking risk).
+    response = {"calendars": {}}
+    with pytest.raises(RuntimeError, match="omitted calendar"):
+        parse_freebusy(response, "primary")
+
+
 def test_build_meet_event_body_requests_hangouts_meet() -> None:
     body = build_meet_event_body(
         MeetEventRequest(

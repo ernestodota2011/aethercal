@@ -19,11 +19,17 @@ from aethercal.core.model import TimeInterval
 def parse_freebusy(response: dict[str, Any], calendar_id: str) -> list[TimeInterval]:
     """Map a calendar's busy blocks from a freebusy response into sorted UTC ``TimeInterval``s.
 
-    Raises if Google reported per-calendar errors (e.g. the calendar is not accessible) rather than
-    silently returning an empty (and dangerously "all-free") result.
+    Raises if the requested calendar is absent from the response or Google reported per-calendar
+    errors, rather than silently returning an empty (and dangerously "all-free") result -- treating
+    an unknown calendar as free is exactly how a double-booking slips through.
     """
     calendars: dict[str, Any] = response.get("calendars", {})
-    entry: dict[str, Any] = calendars.get(calendar_id, {})
+    if calendar_id not in calendars:
+        raise RuntimeError(
+            f"freebusy response omitted calendar {calendar_id!r}; refusing to treat it as free "
+            f"(that would risk a double-booking)"
+        )
+    entry: dict[str, Any] = calendars[calendar_id]
     errors: Any = entry.get("errors")
     if errors:
         raise RuntimeError(f"freebusy reported errors for calendar {calendar_id!r}: {errors}")
