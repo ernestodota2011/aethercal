@@ -12,7 +12,9 @@ The lifespan does the things that must happen against a live process:
 * when ``run_scheduler`` is set (the container turns it on in exactly ONE process — see
   ``deploy/README.md``), start the in-process scheduler: the persistent per-booking reminder runner
   and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh jobs;
-* on shutdown, stop the scheduler(s), close the HTTP client, and dispose the async engine.
+* on shutdown -- or on a failure part-way through startup -- unwind every resource that was
+  acquired (via an ``AsyncExitStack``): stop the scheduler(s), close the HTTP client, and dispose
+  the async engine, so a partial boot never leaks a started scheduler/client/engine.
 
 ``create_app_from_env`` is the uvicorn ``--factory`` entrypoint: it builds ``Settings`` from the
 environment (RF-19, no secrets in source) and returns ``create_app(settings)``.
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 import httpx
@@ -89,40 +91,43 @@ def create_app(settings: Settings) -> FastAPI:
             finally:
                 sync_engine.dispose()
 
-        # Shared runtime effects the booking flow (and the webhook job) read best-effort. Absent
-        # SMTP/Google config → the effect is None and the request path degrades gracefully.
-        http_client = httpx.AsyncClient(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
-        app.state.http_client = http_client
-        app.state.fernet_key = settings.fernet_key()
-        app.state.email_sender = build_email_sender()
+        # An AsyncExitStack registers each resource's teardown the instant it is acquired, so a
+        # failure at ANY later startup step unwinds everything already started (in reverse order)
+        # instead of leaking it — a partial boot no longer skips cleanup. On the normal path the
+        # stack unwinds at shutdown in the same order the old try/finally did: interval scheduler →
+        # reminder runner → HTTP client → engine.
+        async with AsyncExitStack() as stack:
+            stack.push_async_callback(engine.dispose)
 
-        interval_scheduler: Any = None
-        reminder_runner: ApschedulerTaskRunner | None = None
-        if settings.run_scheduler:  # pragma: no cover - live: starts real APScheduler loops
-            # Persistent per-booking reminders (survive a restart via the Postgres jobstore).
-            reminder_runner = ApschedulerTaskRunner.with_postgres_jobstore(
-                settings.database_config().url
-            )
-            reminder_runner.start()
-            # Recurring maintenance jobs (webhook delivery + busy-cache refresh), memory jobstore.
-            interval_scheduler = build_interval_scheduler()
-            start_scheduler(
-                interval_scheduler,
-                webhook_tick=make_webhook_delivery_tick(app),
-                busy_refresh_tick=make_busy_refresh_tick(app),
-            )
-        app.state.reminder_runner = reminder_runner
-        app.state.scheduler = interval_scheduler
+            # Shared runtime effects the booking flow (and the webhook job) read best-effort. Absent
+            # SMTP/Google config → the effect is None and the request path degrades gracefully.
+            http_client = httpx.AsyncClient(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
+            stack.push_async_callback(http_client.aclose)
+            app.state.http_client = http_client
+            app.state.fernet_key = settings.fernet_key()
+            app.state.email_sender = build_email_sender()
 
-        try:
+            interval_scheduler: Any = None
+            reminder_runner: ApschedulerTaskRunner | None = None
+            if settings.run_scheduler:  # pragma: no cover - live: starts real APScheduler loops
+                # Persistent per-booking reminders (survive a restart via the Postgres jobstore).
+                reminder_runner = ApschedulerTaskRunner.with_postgres_jobstore(
+                    settings.database_config().url
+                )
+                reminder_runner.start()
+                stack.callback(reminder_runner.shutdown)
+                # Recurring maintenance jobs (webhook delivery + busy-cache refresh), memory store.
+                interval_scheduler = build_interval_scheduler()
+                start_scheduler(
+                    interval_scheduler,
+                    webhook_tick=make_webhook_delivery_tick(app),
+                    busy_refresh_tick=make_busy_refresh_tick(app),
+                )
+                stack.callback(stop_scheduler, interval_scheduler)
+            app.state.reminder_runner = reminder_runner
+            app.state.scheduler = interval_scheduler
+
             yield
-        finally:
-            if interval_scheduler is not None:  # pragma: no cover - live
-                stop_scheduler(interval_scheduler)
-            if reminder_runner is not None:  # pragma: no cover - live
-                reminder_runner.shutdown()
-            await http_client.aclose()
-            await engine.dispose()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.state.settings = settings

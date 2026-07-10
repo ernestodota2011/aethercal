@@ -7,7 +7,7 @@ proving the eagerly-built engine/sessionmaker on ``app.state`` are what serve re
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 import pytest
@@ -15,6 +15,7 @@ import pytest_asyncio
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from aethercal.server import app as app_module
 from aethercal.server.api.auth import AuthContext, require_api_key
 from aethercal.server.app import build_email_sender, create_app, create_app_from_env
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
@@ -142,3 +143,79 @@ async def test_lifespan_attaches_runtime_effects_without_a_scheduler(
 
     # The HTTP client is closed cleanly on shutdown (no leaked resources under filterwarnings).
     assert app.state.http_client.is_closed is True
+
+
+async def test_lifespan_unwinds_every_started_resource_on_partial_boot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure PART-WAY through startup must still tear down everything already acquired.
+
+    The scheduler wiring is exercised with fakes (the live APScheduler objects stay behind their
+    ``# pragma: no cover - live`` seam). ``start_scheduler`` blows up AFTER the reminder runner has
+    started, so the ``AsyncExitStack`` must unwind every resource registered up to that point — the
+    reminder runner is shut down, the HTTP client closed, and the engine disposed — rather than
+    leaking them (the old normal-shutdown-only path never ran cleanup on a partial boot).
+    """
+    for var in ("AETHERCAL_SMTP_HOST", "AETHERCAL_SMTP_FROM"):
+        monkeypatch.delenv(var, raising=False)
+
+    settings = Settings(
+        database_url="sqlite+aiosqlite://",
+        app_secret="test-secret",
+        auto_migrate=False,
+        run_scheduler=True,
+    )
+
+    class _FakeEngine:
+        """Records disposal so the test can prove the engine's cleanup ran on partial boot."""
+
+        def __init__(self) -> None:
+            self.disposed = False
+
+        async def dispose(self) -> None:
+            self.disposed = True
+
+    class _FakeReminderRunner:
+        """A started-then-shut-down reminder runner (no real Postgres jobstore)."""
+
+        def __init__(self) -> None:
+            self.started = False
+            self.shut_down = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def shutdown(self) -> None:
+            self.shut_down = True
+
+    fake_engine = _FakeEngine()
+    reminder_runner = _FakeReminderRunner()
+
+    class _FakeRunnerFactory:
+        @staticmethod
+        def with_postgres_jobstore(_url: str) -> _FakeReminderRunner:
+            reminder_runner.start()
+            return reminder_runner
+
+    def _boom_start_scheduler(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("scheduler failed to start")
+
+    monkeypatch.setattr(app_module, "build_async_engine", lambda _config: fake_engine)
+    monkeypatch.setattr(app_module, "build_sessionmaker", lambda _engine: object())
+    monkeypatch.setattr(app_module, "ApschedulerTaskRunner", _FakeRunnerFactory)
+    monkeypatch.setattr(app_module, "build_interval_scheduler", object)
+    monkeypatch.setattr(app_module, "start_scheduler", _boom_start_scheduler)
+
+    app = create_app(settings)
+
+    # Startup raises before the lifespan yields; the AsyncExitStack must still unwind on exit.
+    with pytest.raises(RuntimeError, match="scheduler failed to start"):
+        async with app.router.lifespan_context(app):
+            pass  # unreachable — the failure happens during startup
+
+    # The reminder runner had started (the failure is genuinely AFTER it), yet every acquired
+    # resource's cleanup still ran: reminder runner shut down, HTTP client closed, engine disposed.
+    assert reminder_runner.started is True
+    assert reminder_runner.shut_down is True
+    assert app.state.http_client.is_closed is True
+    assert fake_engine.disposed is True
