@@ -788,13 +788,13 @@ async def test_cancel_enqueues_a_cancellation_email_intent(
     assert sender.sent == []  # still nothing sent inline — both intents await the drain
 
 
-async def test_confirmation_and_cancellation_drained_together_carry_snapshotted_sequences(
+async def test_confirmation_and_cancellation_drained_together_only_sends_the_cancellation(
     sqlite_session: AsyncSession, tenant_factory: Any
 ) -> None:
-    """Even when the confirmation and cancellation emails drain in the SAME pass (both pending), the
-    .ics carries the SEQUENCE snapshotted at ITS transition (0 then 1) over the one shared UID — the
-    calendar converges to "cancelled" regardless of which email is sent first (the machine state is
-    order-independent; the sequence, not delivery order, is what a client honors).
+    """When the confirmation and cancellation emails drain in the SAME pass (create then cancel
+    before any drain), the confirmation is already STALE — the booking was cancelled — so it is
+    DISCARDED and only the cancellation is sent (sequence 1). The guest never receives a "confirmed"
+    for a booking already cancelled, regardless of the internal drain order.
     """
     tenant, event_type = await _seed(sqlite_session, tenant_factory)
     sender = _RecordingSender()
@@ -813,13 +813,107 @@ async def test_confirmation_and_cancellation_drained_together_carry_snapshotted_
         effects=_effects(),
     )
 
-    # Drain BOTH email intents in one pass, then inspect by kind (subject), not by send order.
+    # Drain BOTH email intents in one pass.
     execute = make_booking_effect_executor(sender=sender, service_factory=None)
     await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
 
-    by_seq = {seq: uid for seq, uid in (_ics_seq_and_uid(msg) for msg in sender.sent)}
-    assert set(by_seq) == {0, 1}  # confirmation snapshotted 0, cancellation snapshotted 1
-    assert set(by_seq.values()) == {booking.ical_uid}  # both address the same event
+    # Exactly one email — the cancellation (sequence 1); the stale confirmation was dropped.
+    assert len(sender.sent) == 1
+    seq, uid = _ics_seq_and_uid(sender.sent[0])
+    assert seq == 1 and uid == booking.ical_uid
+    assert "cancelada" in str(sender.sent[0]["Subject"]).lower()
+    # Both intents are consumed (delivered) — the discarded one is not left retrying.
+    email_rows = [
+        r
+        for r in await _outbox_rows(sqlite_session, booking_id=booking.id)
+        if r.effect == OutboxEffect.EMAIL.value
+    ]
+    assert {r.status for r in email_rows} == {"delivered"}
+
+
+async def test_a_confirmation_retried_after_cancellation_is_discarded_as_stale(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """The at-least-once hazard the guard closes: a confirmation email that kept FAILING and finally
+    retries AFTER the booking was cancelled must be DISCARDED (no "confirmed" after "cancelled"),
+    while the cancellation is still sent — the notifications keep causal order under retries."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )  # email:confirmation enqueued
+
+    # Pass 1: the confirmation send FAILS (SMTP down) → parked failed for a backoff retry.
+    failing = make_booking_effect_executor(sender=_FailingSender(), service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=failing)
+
+    # The booking is CANCELLED before the confirmation ever succeeds (cancellation email enqueued).
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_BEFORE, effects=_effects()
+    )
+
+    # Pass 2 (past the confirmation's retry): a WORKING sender drains both due intents.
+    sender = _RecordingSender()
+    working = make_booking_effect_executor(sender=sender, service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE + backoff_delay(1), execute=working)
+
+    # The retried confirmation is discarded as stale; only the cancellation reaches the guest.
+    subjects = [str(m["Subject"]).lower() for m in sender.sent]
+    assert not any("confirmada" in s for s in subjects)  # no "confirmed" after "cancelled"
+    assert any("cancelada" in s for s in subjects)  # the cancellation is delivered
+
+
+async def test_a_reschedule_email_retried_after_a_further_reschedule_is_discarded_as_stale(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Same guard for reschedules: a reschedule notice that kept failing and retries AFTER the
+    booking was rescheduled AGAIN is discarded — the guest gets only the LATEST reschedule, never an
+    outdated one for a slot already replaced."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=_effects(),
+    )  # reschedule email for b2 enqueued
+
+    # Pass 1: b2's reschedule send FAILS (b1's now-stale confirmation is silently discarded).
+    failing = make_booking_effect_executor(sender=_FailingSender(), service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=failing)
+
+    # b2 is rescheduled AGAIN to b3 before its own reschedule notice ever succeeds.
+    _SLOT_13 = datetime(2026, 7, 6, 13, 0, tzinfo=UTC)
+    b3 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b2.id,
+        new_start=_SLOT_13,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    # Pass 2 (past the retry): the stale b2 reschedule is discarded; only b3's reschedule is sent.
+    sender = _RecordingSender()
+    working = make_booking_effect_executor(sender=sender, service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE + backoff_delay(1), execute=working)
+
+    assert len(sender.sent) == 1
+    seq, uid = _ics_seq_and_uid(sender.sent[0])
+    assert seq == b3.sequence == 2  # the latest reschedule
+    assert uid == b1.ical_uid  # the whole chain shares one UID
+    assert "reprogramada" in str(sender.sent[0]["Subject"]).lower()
 
 
 async def test_persisted_sequence_strictly_increases_across_reschedules_and_cancel(

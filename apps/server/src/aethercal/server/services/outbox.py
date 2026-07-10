@@ -301,6 +301,13 @@ async def run_email_effect(
     twice. ``cancel_url`` / ``reschedule_url`` / ``locale`` ride in the intent payload (the guest
     tokens were minted in-txn at enqueue time); the persisted booking ``sequence`` drives SEQUENCE.
 
+    DISCARDS a STALE notification: with at-least-once retries a confirmation/reschedule that kept
+    failing could otherwise deliver AFTER a later cancellation or reschedule already went out — the
+    guest must never receive a "confirmed"/"rescheduled" once the chain has moved on. So a
+    confirmation/reschedule whose booking is no longer the chain's live member (superseded → its row
+    is cancelled) is dropped (marked delivered, never sent). A CANCELLATION is the terminal, legit
+    transition and is ALWAYS sent — it is never discarded as stale.
+
     DEFERS (raising :class:`OutboxDeferred`, no attempt consumed) while the booking still has an
     undelivered Google sync that will produce its Meet link — so the notice carries the link even if
     the sync only succeeds on a later retry, not only when it drains first. Once the sync delivers
@@ -309,12 +316,19 @@ async def run_email_effect(
     booking = await session.get(Booking, outbox.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return
+    payload = outbox.payload
+    kind = NotificationKind(payload["kind"])
+    if kind in (NotificationKind.CONFIRMATION, NotificationKind.RESCHEDULE) and not (
+        await _is_chain_current(session, booking)
+    ):
+        # A later transition superseded this booking: drop the stale notice (never mail a
+        # "confirmed" after a "cancelled" / for a replaced slot). Cancellation still sends below.
+        return
     if booking.meeting_url is None and await _awaiting_meeting_sync(session, booking.id):
         raise OutboxDeferred(f"email for booking {booking.id} awaits its Google Meet link")
-    payload = outbox.payload
     await send_booking_notification(
         session,
-        kind=NotificationKind(payload["kind"]),
+        kind=kind,
         booking=booking,
         cancel_url=payload.get("cancel_url"),
         reschedule_url=payload.get("reschedule_url"),
