@@ -175,9 +175,14 @@ async def refresh_all_busy_caches(
 ) -> int:
     """Refresh the busy cache for every active (non-revoked) connection over ``window`` (RF-12).
 
-    Each connection is refreshed independently: one that raises (e.g. an unreachable Google account)
-    is logged and skipped so it never stops the rest. Returns how many refreshed successfully. The
-    write is flushed by :func:`refresh_busy_cache`; the caller owns the commit.
+    Each connection is refreshed inside its OWN ``SAVEPOINT`` (``session.begin_nested()``) so a
+    failure is isolated to that connection: a raised ``service_factory`` (e.g. an unreachable
+    Google account) OR a SQLAlchemy error mid-flush rolls back just that connection and is logged,
+    while the shared session's transaction stays usable for the rest. Without the SAVEPOINT a single
+    flush would deactivate the transaction and abort every remaining connection too, silently
+    half-completing the batch (and leaving those busy caches stale, which the slots engine then has
+    to treat conservatively). Returns how many refreshed successfully. The per-connection writes are
+    flushed by :func:`refresh_busy_cache` into their SAVEPOINTs; the caller owns the outer commit.
     """
     connections = list(
         (
@@ -189,10 +194,13 @@ async def refresh_all_busy_caches(
     refreshed = 0
     for connection in connections:
         try:
-            service = service_factory(connection)
-            await refresh_busy_cache(
-                session, connection=connection, window=window, now=now, service=service
-            )
+            # A SAVEPOINT per connection: on any error inside, the nested transaction rolls back to
+            # the SAVEPOINT (recovering the outer transaction) and re-raises to the handler below.
+            async with session.begin_nested():
+                service = service_factory(connection)
+                await refresh_busy_cache(
+                    session, connection=connection, window=window, now=now, service=service
+                )
             refreshed += 1
         except Exception:
             _logger.exception(
