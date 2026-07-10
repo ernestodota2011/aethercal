@@ -24,7 +24,6 @@ helper is not turned into an event handler by Reflex.
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 from datetime import UTC, datetime
 
@@ -42,18 +41,28 @@ from aethercal.server.admin.format import (
     schedule_row,
     weekly_rules,
 )
+from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
 
 # Internal (prefix-free) routes; the mount prefix is applied by Reflex's ``frontend_path`` basename.
 LOGIN_ROUTE = "/login"
 HOME_ROUTE = "/"
 
-# Per-session login throttle. This is a defense-in-depth layer only — the primary brute-force
-# defense for a mounted admin is at the reverse proxy (rate-limit + fail2ban on /admin), reinforced
-# by the deliberately slow, constant-time PBKDF2. This caps a single scripted session and never
-# blocks the event loop (the KDF runs off-thread).
-_MAX_FAILED_LOGINS = 5
-_LOCKOUT_SECONDS = 60.0
+_LOCKED_OUT_MESSAGE = "Too many attempts. Please wait and try again."
+
+
+def _rate_keys(state: AdminState, username: str) -> list[str]:
+    """The rate-limit keys for a login attempt: the client IP and (if present) the username.
+
+    Keying by BOTH means a brute-force from one IP (many usernames) and one username (many IPs) both
+    trip the limiter, and — crucially — the budget is per-IP/per-username at the PROCESS level, so
+    opening a fresh session does not reset it.
+    """
+    ip = state.router.session.client_ip or "unknown"
+    keys = [f"ip:{ip}"]
+    if username:
+        keys.append(f"user:{username}")
+    return keys
 
 
 def _error_text(exc: Exception) -> str:
@@ -109,10 +118,8 @@ def _schedule_id(schedules: list[dict[str, str]], name: str) -> uuid.UUID:
 class AdminState(rx.State):
     """The whole admin session: the login flag (backend-only) + the three data lists."""
 
-    # Security-critical: backend-only vars — never sent to the frontend, no client setter (RF-18).
+    # Security-critical: backend-only var — never sent to the frontend, no client setter (RF-18).
     _authenticated: bool = False
-    _failed_logins: int = 0
-    _locked_until: float = 0.0
     error: str = ""
     bookings: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     event_types: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
@@ -124,30 +131,46 @@ class AdminState(rx.State):
     async def login(self, form_data: dict[str, str]) -> EventSpec | None:
         """Verify the submitted credentials against the env config; redirect home on success.
 
-        Throttled per session (lockout after repeated failures) and verified off the event loop so
-        the deliberately slow PBKDF2 never blocks it. The rejection message is generic (RF-16).
+        Rate-limited at the PROCESS level by client IP + username (a new session does not reset the
+        budget) and verified off the event loop under a bounded-concurrency semaphore, so the slow
+        PBKDF2 never blocks the loop and a login flood cannot exhaust CPU. Messages are generic
+        (RF-16); the primary brute-force defense remains the reverse proxy (see ``ratelimit``).
         """
-        if time.monotonic() < self._locked_until:
-            self.error = "Too many attempts. Please wait and try again."
+        username = _clean(form_data, "username")
+        keys = _rate_keys(self, username)
+        if LOGIN_LIMITER.any_locked(keys):
+            self.error = _LOCKED_OUT_MESSAGE
             return None
         runtime = current_runtime()
-        username = _clean(form_data, "username")
         password = str(form_data.get("password", ""))
-        authenticated = await asyncio.to_thread(authenticate, runtime.config, username, password)
+        try:
+            async with PBKDF2_LIMITER.slot():
+                # Re-check the lockout INSIDE the acquired slot, just before spending a derivation:
+                # once concurrent failures trip the lock, queued attempts abort here rather than
+                # racing past the pre-check (bounds the overshoot to the concurrency limit, RF-18).
+                if LOGIN_LIMITER.any_locked(keys):
+                    self.error = _LOCKED_OUT_MESSAGE
+                    return None
+                authenticated = await asyncio.to_thread(
+                    authenticate, runtime.config, username, password
+                )
+        except LoginThrottledError:
+            self.error = _LOCKED_OUT_MESSAGE
+            return None
         if authenticated:
             self._authenticated = True
-            self._failed_logins = 0
-            self._locked_until = 0.0
+            for key in keys:
+                LOGIN_LIMITER.record_success(key)
             self.error = ""
             return rx.redirect(HOME_ROUTE)
         self._authenticated = False
-        self._failed_logins += 1
-        if self._failed_logins >= _MAX_FAILED_LOGINS:
-            self._locked_until = time.monotonic() + _LOCKOUT_SECONDS
-            self._failed_logins = 0
-            self.error = "Too many attempts. Please wait and try again."
-        else:
-            self.error = "Invalid username or password."
+        for key in keys:
+            LOGIN_LIMITER.record_failure(key)
+        self.error = (
+            _LOCKED_OUT_MESSAGE
+            if LOGIN_LIMITER.any_locked(keys)
+            else ("Invalid username or password.")
+        )
         return None
 
     @rx.event
@@ -286,13 +309,15 @@ class AdminState(rx.State):
             return
         runtime = current_runtime()
         try:
-            await service.deactivate_event_type_action(
+            existed = await service.deactivate_event_type_action(
                 runtime.sessionmaker,
                 tenant_slug=runtime.config.tenant_slug,
                 event_type_id=uuid.UUID(event_type_id),
             )
             self.event_types = await _fetch_event_types(runtime)
-            self.error = ""
+            # Do not report success for a no-op: an unknown id must surface as an error, not
+            # silently "succeed" (the service returns False rather than raising for an absent row).
+            self.error = "" if existed else "Event type not found"
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
 

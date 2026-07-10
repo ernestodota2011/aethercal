@@ -35,7 +35,13 @@ _MAX_ITERATIONS = 10_000_000
 
 
 def hash_password(plain: str, *, iterations: int = _DEFAULT_ITERATIONS) -> str:
-    """Hash ``plain`` into the self-describing ``pbkdf2_sha256$...`` string (fresh random salt)."""
+    """Hash ``plain`` into the self-describing ``pbkdf2_sha256$...`` string (fresh random salt).
+
+    ``iterations`` is held to the SAME bounds :func:`verify_password` enforces, so this function can
+    never mint a hash its own verifier would reject as out-of-range.
+    """
+    if not _MIN_ITERATIONS <= iterations <= _MAX_ITERATIONS:
+        raise ValueError(f"iterations must be in [{_MIN_ITERATIONS}, {_MAX_ITERATIONS}]")
     salt = secrets.token_bytes(_SALT_BYTES)
     derived = _derive(plain, salt=salt, iterations=iterations)
     return f"{_SCHEME}${iterations}${salt.hex()}${derived.hex()}"
