@@ -63,5 +63,12 @@ integration (BusyCache, incremental sync, safe degradation) on this foundation.
    windows, for efficiency at scale.
 4. **Quotas / backoff** and the fact that `conferenceData` creation is asynchronous and not always
    guaranteed — F1 needs retry/backoff and a no-Meet fallback.
-5. **Multi-host / multiple connected calendars** (RF-30) — the spike targets a single `primary`
-   calendar.
+5. **Multi-host / multiple connected calendars** (RF-30) — the spike targets a single calendar
+   selected by `AETHERCAL_GOOGLE_CALENDAR_ID` (a **dedicated secondary calendar**, not `primary`).
+6. **Dedicated agency account (isolation).** Today the connected account is a personal Google
+   account whose *calendar* is set aside for the agency (a secondary `…@group.calendar.google.com`
+   calendar, isolated from `primary`) — isolated at the calendar level, not the account level. When
+   F1-07's Google path is actually wired (deferred; needs a headless OAuth flow), move the OAuth
+   client + calendar to a **dedicated agency Google account** (a free Gmail is enough — no Workspace
+   required). The default `AETHERCAL_GOOGLE_CALENDAR_ID` is `primary`, so a deploy that turns Google
+   on **must** set the dedicated calendar id explicitly. Email is sent via Resend, never Google.
