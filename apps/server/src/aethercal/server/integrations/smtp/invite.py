@@ -21,7 +21,6 @@ from icalendar import Event as VEvent
 from aethercal.core.ical import PRODID
 
 _VERSION = "2.0"
-_METHOD = "REQUEST"
 
 
 def booking_invite_ics(  # noqa: PLR0913 - the invite's iCalendar properties ARE the interface
@@ -34,12 +33,19 @@ def booking_invite_ics(  # noqa: PLR0913 - the invite's iCalendar properties ARE
     organizer_email: str,
     attendee_name: str,
     attendee_email: str,
+    method: str,
+    status: str,
+    sequence: int,
     description: str | None = None,
 ) -> str:
-    """Serialize a single-VEVENT ``REQUEST`` invite for a booking to an RFC 5545 string.
+    """Serialize a single-VEVENT booking invite to an RFC 5545 string (RF-08).
 
-    ``start`` / ``end`` should be timezone-aware; a UTC instant is emitted in the ``Z`` form. The
-    organizer is the host and the single attendee is the guest (RF-08).
+    The iTIP ``method`` (``REQUEST`` to add/update, ``CANCEL`` to withdraw), the VEVENT ``status``
+    (``CONFIRMED`` / ``CANCELLED``) and the ``sequence`` are chosen by the caller so the invite
+    matches the notification kind: a cancellation *cancels* rather than re-adds the event, and a
+    reschedule bumps ``sequence`` (keeping the same stable ``uid``) so clients treat it as an update
+    of the original confirmation. ``start`` / ``end`` should be timezone-aware; a UTC instant is
+    emitted in the ``Z`` form. The organizer is the host and the single attendee is the guest.
     """
     vevent: Any = VEvent()
     vevent.add("uid", uid)
@@ -47,6 +53,8 @@ def booking_invite_ics(  # noqa: PLR0913 - the invite's iCalendar properties ARE
     vevent.add("dtstart", start)
     vevent.add("dtend", end)
     vevent.add("summary", summary)
+    vevent.add("status", status)
+    vevent.add("sequence", sequence)
     if description:
         vevent.add("description", description)
     vevent.add("organizer", _address(organizer_name, organizer_email, role=None))
@@ -55,7 +63,7 @@ def booking_invite_ics(  # noqa: PLR0913 - the invite's iCalendar properties ARE
     calendar: Any = Calendar()
     calendar.add("prodid", PRODID)
     calendar.add("version", _VERSION)
-    calendar.add("method", _METHOD)
+    calendar.add("method", method)
     calendar.add_component(vevent)
     ics: str = calendar.to_ical().decode("utf-8")
     return ics

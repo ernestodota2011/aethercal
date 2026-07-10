@@ -38,6 +38,23 @@ class RecordingEmailSender:
         self.sent.append(message)
 
 
+class LedgerProbingSender:
+    """A fake sender that records whether the ledger row already exists at the moment of sending.
+
+    Reserve-first (RF-08) must INSERT the ``(tenant, booking, kind)`` row *before* the send, so the
+    row is already visible here; the previous SELECT-then-send-then-INSERT order left it absent
+    until after the send.
+    """
+
+    def __init__(self, session: AsyncSession, booking: Booking) -> None:
+        self._session = session
+        self._booking = booking
+        self.reserved_at_send_time: list[bool] = []
+
+    async def send(self, message: EmailMessage) -> None:
+        self.reserved_at_send_time.append(await _ledger_count(self._session, self._booking) > 0)
+
+
 async def _seed_booking(
     session: AsyncSession,
     tenant_factory: TenantFactory,
@@ -208,3 +225,79 @@ async def test_locale_english_subject(
         locale="en",
     )
     assert "Booking confirmed" in sender.sent[0]["Subject"]
+
+
+async def test_reservation_is_recorded_before_the_send(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    """Reserve-first (RF-08): the ledger row exists before the sender fires, exactly once."""
+    booking = await _seed_booking(sqlite_session, tenant_factory)
+    sender = LedgerProbingSender(sqlite_session, booking)
+
+    sent = await send_booking_notification(
+        sqlite_session,
+        kind=NotificationKind.CONFIRMATION,
+        booking=booking,
+        cancel_url=None,
+        reschedule_url=None,
+        sender=sender,
+        now=NOW,
+    )
+
+    assert sent is True
+    assert sender.reserved_at_send_time == [True]  # reserved BEFORE (and only once across) the send
+
+
+async def test_skips_send_when_the_row_was_already_reserved(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    """Reserve-first (RF-08): a concurrent winner's row makes our INSERT fail, so we skip."""
+    booking = await _seed_booking(sqlite_session, tenant_factory)
+    sender = RecordingEmailSender()
+    # Simulate a concurrent caller that already reserved (and committed) the (booking, kind) row.
+    sqlite_session.add(
+        SentNotification(
+            tenant_id=booking.tenant_id,
+            booking_id=booking.id,
+            kind=NotificationKind.CONFIRMATION.value,
+            sent_at=NOW,
+        )
+    )
+    await sqlite_session.flush()
+
+    sent = await send_booking_notification(
+        sqlite_session,
+        kind=NotificationKind.CONFIRMATION,
+        booking=booking,
+        cancel_url=None,
+        reschedule_url=None,
+        sender=sender,
+        now=NOW,
+    )
+
+    assert sent is False  # the unique constraint arbitrated: someone else already reserved it
+    assert sender.sent == []  # so the guest is not mailed twice
+    assert await _ledger_count(sqlite_session, booking, "confirmation") == 1  # no duplicate row
+
+
+async def test_cancellation_notification_carries_a_cancel_method_ics(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    """RF-08: the kind threads through to the invite — a cancellation ships METHOD:CANCEL."""
+    booking = await _seed_booking(sqlite_session, tenant_factory)
+    sender = RecordingEmailSender()
+
+    await send_booking_notification(
+        sqlite_session,
+        kind=NotificationKind.CANCELLATION,
+        booking=booking,
+        cancel_url=None,
+        reschedule_url=None,
+        sender=sender,
+        now=NOW,
+    )
+
+    ics_part = next(p for p in sender.sent[0].walk() if p.get_content_type() == "text/calendar")
+    cal: Any = Calendar.from_ical(ics_part.get_content())
+    assert str(cal["METHOD"]) == "CANCEL"
+    assert str(cal.walk("VEVENT")[0]["STATUS"]) == "CANCELLED"
