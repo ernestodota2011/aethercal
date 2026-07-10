@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aethercal.server.db.models import Booking, Tenant
+from aethercal.server.db.models import Booking, GuestToken, Tenant
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
@@ -274,3 +274,38 @@ async def test_consume_rejects_wrong_purpose(
     )
     assert still_valid is not None
     assert still_valid.used_at is None
+
+
+async def test_verify_rejects_booking_id_mismatch(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    """The signed booking must equal the row's booking: the two layers bind the SAME booking.
+
+    We craft the discrepancy directly — a row whose ``token_hash`` matches a token signed for a
+    *different* booking — to prove the crypto layer's ``booking_id`` is enforced, not decorative.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    booking_a = await _make_booking(sqlite_session, tenant.id)
+    booking_b = await _make_booking(sqlite_session, tenant.id)
+    signer = GuestTokenSigner(_SECRET)
+
+    # A validly-signed token for booking B...
+    token = signer.sign(booking_id=booking_b.id, purpose=GuestTokenPurpose.CANCEL, nonce="mismatch")
+    # ...but the persisted row (found by token_hash) points at booking A.
+    sqlite_session.add(
+        GuestToken(
+            tenant_id=tenant.id,
+            booking_id=booking_a.id,
+            purpose=GuestTokenPurpose.CANCEL.value,
+            token_hash=hash_token(token),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    await sqlite_session.flush()
+
+    assert (
+        await verify_guest_token(
+            sqlite_session, signer, token, expected_purpose=GuestTokenPurpose.CANCEL
+        )
+        is None
+    )

@@ -168,7 +168,8 @@ async def verify_guest_token(
     """Return the backing :class:`GuestToken` row iff the token is valid, else ``None``.
 
     Valid means: the signature verifies and is not older than :data:`MAX_SIGNATURE_AGE`, its purpose
-    equals ``expected_purpose``, a matching row exists, that row's purpose also matches, it has not
+    equals ``expected_purpose``, a matching row exists whose ``booking_id`` and purpose agree with
+    the signed payload (so the two layers genuinely bind the token to the same booking), it has not
     been used, and it has not expired. Any failure returns ``None`` uniformly — no exception carries
     booking data (RF-09: no information leak). This is read-only; it does not mark the token used.
     """
@@ -183,7 +184,8 @@ async def verify_guest_token(
         return None
 
     row_is_valid = (
-        row.purpose == expected_purpose.value
+        row.booking_id == payload.booking_id
+        and row.purpose == expected_purpose.value
         and row.used_at is None
         and _as_aware_utc(row.expires_at) > _now()
     )
