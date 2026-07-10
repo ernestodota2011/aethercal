@@ -105,6 +105,15 @@ def format_day_heading(day: date, locale: Locale) -> str:
     return f"{weekday} {day.day} de {month}"
 
 
+def slot_aria_label(time_label: str, day_heading: str) -> str:
+    """A screen-reader label combining a slot's ``time_label`` and localized ``day_heading``.
+
+    A bare time ("09:00") doesn't tell an assistive-tech user which day the slot falls on (I2) —
+    every rendered slot control pairs its visible time with this fuller label.
+    """
+    return f"{time_label}, {day_heading}"
+
+
 def group_slots(slots: Sequence[SlotRead], tz: str, locale: Locale) -> list[DayGroup]:
     """Group slots (in chronological order) under the local day they fall on in ``tz``."""
     zone = _zone(tz)
@@ -133,5 +142,6 @@ __all__ = [
     "format_day_heading",
     "format_time",
     "group_slots",
+    "slot_aria_label",
     "today_in_zone",
 ]

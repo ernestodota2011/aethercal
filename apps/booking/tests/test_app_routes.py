@@ -116,6 +116,7 @@ class FakeAPI:
         # internal message (LEAK_MARKER) the guest must never see.
         self.fail_event_types = False
         self.fail_slots = False
+        self.fail_create_booking = False
 
     def _event_types(self) -> httpx.Response:
         return httpx.Response(
@@ -161,6 +162,8 @@ class FakeAPI:
         )
 
     def _create_booking(self, request: httpx.Request) -> httpx.Response:
+        if self.fail_create_booking:
+            return self._boom()
         body = json.loads(request.content.decode())
         self.created_bookings.append(body)
         if body.get("guest_email") == "taken@example.com":
@@ -204,7 +207,9 @@ class FakeAPI:
         return httpx.Response(404, json={"error": "not_found", "message": "Unknown"})
 
 
-def _make_client() -> tuple[TestClient, FakeAPI]:
+def _make_client(
+    *, rate_limiter: booking_app._RateLimiter | None = None
+) -> tuple[TestClient, FakeAPI]:
     fake = FakeAPI()
     settings = BookingSettings(api_url="http://api.test", api_key=API_KEY, default_locale="es")
     transport = httpx.MockTransport(fake.handler)
@@ -212,7 +217,7 @@ def _make_client() -> tuple[TestClient, FakeAPI]:
     def client_factory() -> AetherCalClient:
         return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
 
-    app = create_app(settings=settings, client_factory=client_factory)
+    app = create_app(settings=settings, client_factory=client_factory, rate_limiter=rate_limiter)
     return TestClient(app), fake
 
 
@@ -249,12 +254,39 @@ def test_event_page_shows_times_and_is_accessible() -> None:
     assert "Saltar al contenido" in response.text
 
 
+def test_event_page_pager_prev_disabled_at_the_floor() -> None:
+    # No `from=` query means the window defaults to "today" — already at the floor, so "previous
+    # week" must render disabled, not as a dead link.
+    client, _ = _make_client()
+    response = client.get("/e/intro?tz=UTC")
+    assert response.status_code == 200
+    assert 'aria-disabled="true"' in response.text
+
+
+def test_event_page_pager_prev_enabled_when_a_later_window() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/intro?tz=UTC&from=2026-08-01")
+    assert response.status_code == 200
+    assert 'aria-disabled="true"' not in response.text
+
+
 def test_unknown_event_returns_404_without_stack_trace() -> None:
     client, _ = _make_client()
     response = client.get("/e/does-not-exist")
     assert response.status_code == 404
     assert "Traceback" not in response.text
     assert "no encontr" in response.text.lower()
+
+
+def test_unknown_top_level_path_returns_branded_404() -> None:
+    # A truly unmatched route (no registered handler at all) must still get the branded 404 page
+    # with the app's security headers — never Starlette's bare default response.
+    client, _ = _make_client()
+    response = client.get("/this-route-does-not-exist")
+    assert response.status_code == 404
+    assert "Traceback" not in response.text
+    assert "no encontr" in response.text.lower()
+    assert response.headers.get("content-security-policy") is not None
 
 
 def test_slots_partial_is_a_fragment_for_htmx() -> None:
@@ -327,7 +359,9 @@ def test_invalid_email_rerenders_form_with_error_and_no_booking() -> None:
     assert not fake.created_bookings  # nothing was booked
 
 
-def test_taken_slot_shows_friendly_message() -> None:
+def test_taken_slot_redirects_prg_to_picker_with_err_query() -> None:
+    # I4: a 409 slot conflict is a Post/Redirect/Get — never an inline re-render of the POST
+    # response — so a guest refresh of the picker can't re-submit the booking.
     client, _ = _make_client()
     response = client.post(
         "/e/intro/book",
@@ -338,11 +372,81 @@ def test_taken_slot_shows_friendly_message() -> None:
             "name": "Ada",
             "email": "taken@example.com",
         },
+        follow_redirects=False,
     )
-    # A slot conflict is a real 409 (not a masked 200); the guest still gets the friendly copy.
-    assert response.status_code == 409
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("/e/intro?")
+    assert "err=slot_unavailable" in location
+    assert "tz=UTC" in location
+    assert "lang=es" in location
+
+
+def test_taken_slot_followed_redirect_shows_friendly_notice_on_picker() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "es",
+            "name": "Ada",
+            "email": "taken@example.com",
+        },
+    )  # default TestClient behavior follows the 303 with a GET.
+    assert response.status_code == 200
     assert "ya no está disponible" in response.text
     assert "Traceback" not in response.text
+
+
+def test_picker_refresh_after_conflict_does_not_repost() -> None:
+    # A plain GET of the picker carrying the same err query must never create a booking.
+    client, fake = _make_client()
+    response = client.get("/e/intro?tz=UTC&lang=es&err=slot_unavailable")
+    assert response.status_code == 200
+    assert "ya no está disponible" in response.text
+    assert not fake.created_bookings
+    # Refreshing again is idempotent — still no booking, still the same notice.
+    again = client.get("/e/intro?tz=UTC&lang=es&err=slot_unavailable")
+    assert again.status_code == 200
+    assert not fake.created_bookings
+
+
+def test_honeypot_filled_returns_plausible_success_without_booking() -> None:
+    # Anti-spam hardening: a bot that fills the hidden `company_website` field must never reach
+    # create_booking, and it must see a plausible 200 (so it doesn't retry) — never an error.
+    client, fake = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "es",
+            "name": "Bot",
+            "email": "bot@example.com",
+            "company_website": "http://spam.example",
+        },
+    )
+    assert response.status_code == 200
+    assert not fake.created_bookings
+    assert "Traceback" not in response.text
+
+
+def test_honeypot_empty_flows_through_to_a_real_booking() -> None:
+    client, fake = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "en",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+            "company_website": "",
+        },
+    )
+    assert response.status_code == 200
+    assert fake.created_bookings
 
 
 def test_cancel_page_then_cancel_succeeds() -> None:
@@ -362,6 +466,83 @@ def test_cancel_with_expired_token_is_friendly() -> None:
     assert done.status_code == 403
     assert "expiró" in done.text.lower() or "no es válido" in done.text.lower()
     assert "Traceback" not in done.text
+
+
+# ---------------------------------------------------------------------------------------
+# (f) Per-IP rate limiting on the public POST handlers — an app-level replacement for the
+# Cloudflare rate-limit rule the free plan doesn't allow.
+# ---------------------------------------------------------------------------------------
+
+
+def test_rate_limit_blocks_the_request_over_threshold_same_ip() -> None:
+    limiter = booking_app._RateLimiter(max_requests=3, window_seconds=60)
+    client, fake = _make_client(rate_limiter=limiter)
+    headers = {"CF-Connecting-IP": "203.0.113.5"}
+    data = {"booking": BOOKING_ID, "token": "good", "lang": "es"}
+    for _ in range(3):
+        response = client.post("/cancel", data=data, headers=headers)
+        assert response.status_code != 429
+    blocked = client.post("/cancel", data=data, headers=headers)
+    assert blocked.status_code == 429
+    assert "Traceback" not in blocked.text
+    del fake  # unused: this test only cares about the limiter, not backend side effects
+
+
+def test_rate_limit_is_scoped_per_ip() -> None:
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter)
+    data = {"booking": BOOKING_ID, "token": "good", "lang": "es"}
+    first_ip = client.post("/cancel", data=data, headers={"CF-Connecting-IP": "203.0.113.5"})
+    assert first_ip.status_code != 429
+    other_ip = client.post("/cancel", data=data, headers={"CF-Connecting-IP": "203.0.113.9"})
+    assert other_ip.status_code != 429  # a different IP is unaffected by the first IP's usage
+    same_ip_again = client.post("/cancel", data=data, headers={"CF-Connecting-IP": "203.0.113.5"})
+    assert same_ip_again.status_code == 429  # the first IP is now over its own limit
+
+
+def test_rate_limit_applies_to_reschedule_submit_too() -> None:
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter)
+    headers = {"CF-Connecting-IP": "203.0.113.5"}
+    data = {
+        "booking": BOOKING_ID,
+        "token": "good",
+        "new_start": "2026-07-21T15:00:00+00:00",
+        "lang": "es",
+    }
+    first = client.post("/reschedule", data=data, headers=headers)
+    assert first.status_code != 429
+    second = client.post("/reschedule", data=data, headers=headers)
+    assert second.status_code == 429
+
+
+def test_rate_limit_applies_to_book_submit_too() -> None:
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter)
+    headers = {"CF-Connecting-IP": "203.0.113.5"}
+    data = {
+        "start": "2026-07-14T13:00:00+00:00",
+        "tz": "UTC",
+        "lang": "es",
+        "name": "Ada",
+        "email": "ada@example.com",
+    }
+    first = client.post("/e/intro/book", data=data, headers=headers)
+    assert first.status_code != 429
+    second = client.post("/e/intro/book", data=data, headers=headers)
+    assert second.status_code == 429
+
+
+def test_rate_limit_falls_back_to_the_transport_client_ip_without_the_header() -> None:
+    # Without a CF-Connecting-IP header, the limiter must still key on *some* stable per-client
+    # identity (the ASGI transport's client address) rather than silently not limiting at all.
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter)
+    data = {"booking": BOOKING_ID, "token": "good", "lang": "es"}
+    first = client.post("/cancel", data=data)
+    assert first.status_code != 429
+    second = client.post("/cancel", data=data)
+    assert second.status_code == 429
 
 
 def test_reschedule_page_lists_new_times() -> None:
@@ -395,6 +576,18 @@ def test_reschedule_submit_succeeds() -> None:
     )
     assert response.status_code == 200
     assert "reprogramada" in response.text.lower()
+
+
+def test_robots_txt_disallows_everything_except_the_root() -> None:
+    # A booking tool, not content SEO — noindex everything but the root (RNF audit minor).
+    client, fake = _make_client()
+    response = client.get("/robots.txt")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    assert "User-agent: *" in response.text
+    assert "Allow: /$" in response.text
+    assert "Disallow: /" in response.text
+    assert fake.last_auth is None  # never calls the backend
 
 
 def test_healthz_is_ok_without_calling_the_api() -> None:
@@ -467,7 +660,11 @@ def test_backend_failure_is_logged_for_observability(caplog: Any) -> None:
 
 
 def test_booking_submit_backend_failure_is_friendly_and_no_leak() -> None:
-    client, _ = _make_client()
+    # A genuine backend 5xx on create_booking (distinct from a 409 slot conflict, which is now a
+    # PRG redirect — see test_taken_slot_redirects_prg_to_picker_with_err_query) still degrades to
+    # a friendly, non-leaking page.
+    client, fake = _make_client()
+    fake.fail_create_booking = True
     response = client.post(
         "/e/intro/book",
         data={
@@ -475,11 +672,10 @@ def test_booking_submit_backend_failure_is_friendly_and_no_leak() -> None:
             "tz": "UTC",
             "lang": "es",
             "name": "Ada",
-            "email": "taken@example.com",
+            "email": "ada@example.com",
         },
     )
-    # Covered by test_taken_slot_shows_friendly_message too; this pins the no-leak contract.
-    assert response.status_code == 409
+    assert response.status_code == 503
     assert "Traceback" not in response.text
     assert LEAK_MARKER not in response.text
 
@@ -519,14 +715,20 @@ def test_shifted_url_clamps_navigation_to_the_given_floor() -> None:
 
 def test_date_navigation_floor_follows_visitor_timezone_not_server(monkeypatch: Any) -> None:
     # 02:00 UTC on the 14th is still 22:00 on the 13th in New York: the navigation floor must be
-    # the VISITOR's local day, so the same instant yields a DIFFERENT floor per timezone.
+    # the VISITOR's local day, so the same instant yields a DIFFERENT floor per timezone. Both
+    # requests land exactly at their own floor (the requested `from` predates it, so `_window_of`
+    # clamps up to it) — read the resolved window off the tz-form's hidden `from` field, which
+    # renders regardless of the pager's prev-disabled state (I2 audit minor).
     monkeypatch.setattr(booking_app, "_now", lambda: datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
     client, _ = _make_client()
     ny = client.get("/e/intro?tz=America/New_York&from=2026-07-01")
     utc = client.get("/e/intro?tz=UTC&from=2026-07-01")
-    assert "from=2026-07-13" in ny.text  # New York floor = the 13th
-    assert "from=2026-07-14" in utc.text  # UTC floor = the 14th
-    assert "from=2026-07-13" not in utc.text
+    assert 'name="from" value="2026-07-13"' in ny.text  # New York floor = the 13th
+    assert 'name="from" value="2026-07-14"' in utc.text  # UTC floor = the 14th
+    assert 'name="from" value="2026-07-13"' not in utc.text
+    # Both requests are exactly at their own floor, so "previous week" must be disabled on both.
+    assert 'aria-disabled="true"' in ny.text
+    assert 'aria-disabled="true"' in utc.text
 
 
 # ---------------------------------------------------------------------------------------
@@ -603,10 +805,14 @@ def test_confirmation_localizes_event_title_with_lang_query() -> None:
     assert ES_TITLE not in response.text
 
 
-def test_booking_submit_conflict_error_localizes_event_title() -> None:
+def test_booking_submit_backend_error_localizes_event_title() -> None:
     # Pins app.py's `_error_response(..., title=...)`, the one crude use outside views.py: the
-    # error page's <title>/H1 must resolve by locale too, not just the surrounding chrome.
-    client, _ = _make_client()
+    # error page's <title>/H1 must resolve by locale too, not just the surrounding chrome. A 409
+    # slot conflict no longer reaches `_error_response` (it's now a PRG redirect — see
+    # test_taken_slot_redirects_prg_to_picker_with_err_query), so this pins a genuine backend
+    # failure (still routed through `_error_response`) instead.
+    client, fake = _make_client()
+    fake.fail_create_booking = True
     response = client.post(
         "/e/espanol/book",
         data={
@@ -614,10 +820,10 @@ def test_booking_submit_conflict_error_localizes_event_title() -> None:
             "tz": "UTC",
             "lang": "en",
             "name": "Ada",
-            "email": "taken@example.com",
+            "email": "ada@example.com",
         },
     )
-    assert response.status_code == 409
+    assert response.status_code == 503
     assert EN_TITLE_OVERRIDE in response.text
     assert ES_TITLE not in response.text
 

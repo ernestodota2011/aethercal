@@ -85,6 +85,16 @@ def test_page_shell_is_accessible_and_localized() -> None:
     assert views._HTMX_SRC in html  # the exact pinned HTMX src is wired
 
 
+def test_page_shell_includes_meta_description_and_hreflang_alternates() -> None:
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p>hi</p>"), lang_urls=LANG_URLS))
+    assert 'name="description"' in html
+    assert 'hreflang="es"' in html
+    assert 'hreflang="en"' in html
+    assert 'href="/e/intro?lang=es"' in html
+    assert 'href="/e/intro?lang=en"' in html
+    assert 'hreflang="x-default"' in html
+
+
 def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
     # A5.1 (I3 fix): htmx must be served by the app itself, never fetched from unpkg/a CDN.
     html = to_xml(views.page("es", "Reserva", views.NotStr("<p>hi</p>"), lang_urls=LANG_URLS))
@@ -144,6 +154,80 @@ def test_slots_section_renders_times_as_links() -> None:
     assert "2026-07-14T13%3A00%3A00" in html
 
 
+def test_slots_section_slot_links_carry_localized_day_aria_label() -> None:
+    # I2: a screen-reader user must hear the day, not just the bare time, for each slot.
+    html_en = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="9:00 AM, Tuesday, July 14"' in html_en
+
+    es_group = DayGroup(
+        day=_group().day,
+        heading="martes 14 de julio",
+        slots=[SlotChoice(label="09:00", iso="2026-07-14T13:00:00+00:00")],
+    )
+    html_es = to_xml(
+        views.slots_section(
+            "es",
+            event=_event(),
+            groups=[es_group],
+            availability="ok",
+            tz="UTC",
+            book_path="/e/intro/book",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="09:00, martes 14 de julio"' in html_es
+
+
+def test_slots_section_pager_prev_disabled_at_the_floor() -> None:
+    # When the guest is already viewing the earliest allowed window, "previous week" is a dead
+    # link (the floor clamps it to the same window) — disable it instead of offering a no-op.
+    html = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="/e/intro?from=2026-07-14",
+            next_url="/e/intro?from=2026-07-28",
+            prev_disabled=True,
+        )
+    )
+    assert 'aria-disabled="true"' in html
+    assert 'href="/e/intro?from=2026-07-14"' not in html
+    assert 'href="/e/intro?from=2026-07-28"' in html  # next is still a live link
+
+
+def test_slots_section_pager_prev_enabled_when_not_at_floor() -> None:
+    html = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="/e/intro?from=2026-07-07",
+            next_url="/e/intro?from=2026-07-28",
+        )
+    )
+    assert 'aria-disabled="true"' not in html
+    assert 'href="/e/intro?from=2026-07-07"' in html
+
+
 def test_slots_section_unavailable_shows_message_and_no_times() -> None:
     html = to_xml(
         views.slots_section(
@@ -200,6 +284,29 @@ def test_booking_form_has_labelled_inputs_and_questions() -> None:
     assert "Tuesday, July 14 at 9:00 AM" in html
 
 
+def test_booking_form_includes_honeypot_field_hidden_from_real_guests() -> None:
+    # Anti-spam honeypot: a decoy field a bot fills but a sighted/AT user never perceives.
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert 'name="company_website"' in html
+    assert 'tabindex="-1"' in html
+    assert 'autocomplete="off"' in html
+    assert 'aria-hidden="true"' in html
+    assert "-9999px" in html  # CSS-hidden off-screen, not display:none (bots ignore that)
+
+
 def test_booking_form_renders_inline_errors_accessibly() -> None:
     html = to_xml(
         views.booking_form_page(
@@ -236,6 +343,41 @@ def test_confirmation_shows_details_and_meeting_link() -> None:
     assert "https://meet.example/xyz" in html
 
 
+def test_reschedule_section_slot_buttons_carry_localized_day_aria_label() -> None:
+    # I2, applies equally to the reschedule flow's POST-button slots.
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="9:00 AM, Tuesday, July 14"' in html
+
+
+def test_reschedule_section_pager_prev_disabled_at_the_floor() -> None:
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="/reschedule?from=2026-07-14",
+            next_url="/reschedule?from=2026-07-28",
+            prev_disabled=True,
+        )
+    )
+    assert 'aria-disabled="true"' in html
+    assert 'href="/reschedule?from=2026-07-14"' not in html
+
+
 def test_message_page_never_leaks_internals() -> None:
     html = to_xml(
         views.message_page(
@@ -264,6 +406,41 @@ def test_cancel_confirm_has_post_form_with_hidden_context() -> None:
     assert str(booking_id) in html
     assert "signed.token" in html
     assert "cancelar" in html.lower()
+    assert 'enctype="application/x-www-form-urlencoded"' in html
+
+
+def test_booking_form_has_explicit_enctype() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert 'enctype="application/x-www-form-urlencoded"' in html
+
+
+def test_reschedule_section_slot_forms_have_explicit_enctype() -> None:
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'enctype="application/x-www-form-urlencoded"' in html
 
 
 # --------------------------------------------------------------------------------------
@@ -350,6 +527,32 @@ def test_event_page_lang_switcher_marks_active_locale() -> None:
     html = _render_event_page("en", _localized_event())
     assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
     assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+def test_event_page_renders_notice_when_given() -> None:
+    # I4: after a 409 slot-conflict PRG redirect, the picker shows an inline notice.
+    html = to_xml(
+        views.event_page(
+            "es",
+            event=_event(),
+            tz="UTC",
+            tz_options=["UTC"],
+            tz_explicit=False,
+            window_from="2026-07-14",
+            slots=views.NotStr(""),
+            self_path="/e/intro",
+            slots_endpoint="/e/intro/slots",
+            lang_urls=LANG_URLS,
+            notice="Ese horario ya no está disponible. Elige otro, por favor.",
+        )
+    )
+    assert "Ese horario ya no está disponible" in html
+    assert 'class="notice error"' in html
+
+
+def test_event_page_has_no_notice_by_default() -> None:
+    html = _render_event_page("es", _event())
+    assert 'class="notice error"' not in html
 
 
 def test_booking_form_page_localizes_title() -> None:

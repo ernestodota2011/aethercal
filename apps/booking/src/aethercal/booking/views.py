@@ -40,6 +40,7 @@ from fasthtml.common import (
     Input,
     Label,
     Li,
+    Link,
     Main,
     Meta,
     Nav,
@@ -58,8 +59,8 @@ from fasthtml.common import (
 )
 
 from aethercal.booking.forms import FieldError, QuestionSpec, question_field_name
-from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, t
-from aethercal.booking.timefmt import DayGroup
+from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
+from aethercal.booking.timefmt import DayGroup, slot_aria_label
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
 from aethercal.schemas.slots import Availability
@@ -194,6 +195,21 @@ def _footer(locale: Locale) -> Any:
     return Footer(P(t(locale, "footer_powered")), cls="site-footer")
 
 
+def _hreflang_links(lang_urls: Mapping[Locale, str]) -> list[Any]:
+    """``<link rel="alternate" hreflang="...">`` for every locale ``page()`` was given a URL for,
+    plus ``x-default`` pointing at the default-locale URL — so a crawler (and any client that
+    parses it) knows the current page's URL in each language (RNF-1: ES primary + EN)."""
+    links = [
+        Link(rel="alternate", hreflang=candidate, href=lang_urls[candidate])
+        for candidate in SUPPORTED_LOCALES
+        if candidate in lang_urls
+    ]
+    default_url = lang_urls.get(DEFAULT_LOCALE)
+    if default_url:
+        links.append(Link(rel="alternate", hreflang="x-default", href=default_url))
+    return links
+
+
 def page(locale: Locale, title: str, *content: Any, lang_urls: Mapping[Locale, str]) -> Any:
     """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``."""
     return Html(
@@ -201,7 +217,9 @@ def page(locale: Locale, title: str, *content: Any, lang_urls: Mapping[Locale, s
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
+            Meta(name="description", content=t(locale, "meta_description")),
             Title(f"{title} · {t(locale, 'app_name')}"),
+            *_hreflang_links(lang_urls),
             Style(_CSS),
             Script(src=_HTMX_SRC, defer=True),
         ),
@@ -339,13 +357,21 @@ def event_page(
     self_path: str,
     slots_endpoint: str,
     lang_urls: Mapping[Locale, str],
+    notice: str | None = None,
 ) -> Any:
-    """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list."""
+    """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
+
+    ``notice`` renders an inline error banner above the picker (I4) — used after the PRG redirect
+    a 409 slot conflict on submit sends the guest back to with ``?err=slot_unavailable``.
+    """
+    intro: list[Any] = [_event_intro(locale, event)]
+    if notice:
+        intro.append(Div(notice, cls="notice error"))
     return page(
         locale,
         resolve_title(event, locale),
         Div(
-            _event_intro(locale, event),
+            *intro,
             H2(t(locale, "choose_time")),
             _tz_form(
                 locale,
@@ -368,14 +394,24 @@ def event_page(
 # --------------------------------------------------------------------------------------
 
 
-def _slot_link(locale: Locale, *, book_path: str, iso: str, tz: str, label: str) -> Any:
+def _slot_link(
+    locale: Locale, *, book_path: str, iso: str, tz: str, label: str, aria_label: str
+) -> Any:
     href = f"{book_path}?{urlencode({'start': iso, 'tz': tz, 'lang': locale})}"
-    return A(label, href=href, cls="slot")
+    return A(label, href=href, cls="slot", aria_label=aria_label)
 
 
-def _pager(locale: Locale, prev_url: str, next_url: str) -> Any:
+def _pager(locale: Locale, prev_url: str, next_url: str, *, prev_disabled: bool = False) -> Any:
+    """Prev/next navigation. ``prev_disabled`` renders "previous week" as a non-link, non-focusable
+    notice instead of a dead link — the guest is already at the floor (the earliest allowed
+    window) and clicking it would just reload the same page (I2/audit minor)."""
+    prev_control: Any = (
+        Span(t(locale, "prev_week"), cls="btn secondary", aria_disabled="true")
+        if prev_disabled
+        else A(t(locale, "prev_week"), href=prev_url, cls="btn secondary")
+    )
     return Nav(
-        A(t(locale, "prev_week"), href=prev_url, cls="btn secondary"),
+        prev_control,
         A(t(locale, "next_week"), href=next_url, cls="btn secondary"),
         cls="pager",
         aria_label=t(locale, "choose_time"),
@@ -406,6 +442,7 @@ def slots_section(
     book_path: str,
     prev_url: str,
     next_url: str,
+    prev_disabled: bool = False,
 ) -> Any:
     """The bookable-times region (``id="slots"``): day-grouped time links, or a friendly notice."""
     if availability == "unavailable":
@@ -416,18 +453,51 @@ def slots_section(
         blocks: list[Any] = []
         for group in groups:
             links = [
-                _slot_link(locale, book_path=book_path, iso=choice.iso, tz=tz, label=choice.label)
+                _slot_link(
+                    locale,
+                    book_path=book_path,
+                    iso=choice.iso,
+                    tz=tz,
+                    label=choice.label,
+                    aria_label=slot_aria_label(choice.label, group.heading),
+                )
                 for choice in group.slots
             ]
             blocks.append(Div(group.heading, cls="day"))
             blocks.append(Div(*links, cls="slots"))
         inner = Div(*blocks)
-    return Section(inner, _pager(locale, prev_url, next_url), id="slots", aria_live="polite")
+    pager = _pager(locale, prev_url, next_url, prev_disabled=prev_disabled)
+    return Section(inner, pager, id="slots", aria_live="polite")
 
 
 # --------------------------------------------------------------------------------------
 # Booking form (step 2) + confirmation (step 3).
 # --------------------------------------------------------------------------------------
+
+
+#: The honeypot field name — plausible enough that a naive spam bot fills it, but no real guest
+#: ever sees or focuses it (CSS-hidden off-screen, `tabindex="-1"`, `aria-hidden`). A non-empty
+#: value on submit means a bot filled the form (see ``book_submit``'s honeypot check).
+HONEYPOT_FIELD_NAME = "company_website"
+
+
+def _honeypot_field() -> Any:
+    """A decoy input real guests never perceive or reach, but a naive bot fills.
+
+    `display:none`/`visibility:hidden` are common honeypot tells bots skip; positioning it
+    off-screen while it stays "visible" to a naive DOM-fill script is the more effective trap.
+    `tabindex="-1"` keeps it out of the keyboard tab order and `aria-hidden="true"` keeps it out
+    of the accessibility tree, so a real guest (sighted or assistive-tech) never encounters it.
+    """
+    return Input(
+        type="text",
+        name=HONEYPOT_FIELD_NAME,
+        id=HONEYPOT_FIELD_NAME,
+        tabindex="-1",
+        autocomplete="off",
+        aria_hidden="true",
+        style="position:absolute;left:-9999px;top:-9999px;",
+    )
 
 
 def _errors_by_field(errors: Sequence[FieldError]) -> dict[str, str]:
@@ -572,10 +642,12 @@ def booking_form_page(
         Input(type="hidden", name="start", value=start_iso),
         Input(type="hidden", name="tz", value=tz),
         Input(type="hidden", name="lang", value=locale),
+        _honeypot_field(),
         *fields,
         Button(t(locale, "confirm_booking"), type="submit", cls="btn"),
         method="post",
         action=action,
+        enctype="application/x-www-form-urlencoded",
     )
     return page(
         locale,
@@ -658,6 +730,7 @@ def cancel_confirm_page(
         Button(t(locale, "cancel_confirm"), type="submit", cls="btn"),
         method="post",
         action=action,
+        enctype="application/x-www-form-urlencoded",
     )
     return page(
         locale,
@@ -682,6 +755,7 @@ def reschedule_section(
     token: str,
     prev_url: str,
     next_url: str,
+    prev_disabled: bool = False,
 ) -> Any:
     """The reschedule slot list: each time is a POST button carrying ``new_start`` + the token."""
     if availability == "unavailable":
@@ -697,16 +771,23 @@ def reschedule_section(
                     Input(type="hidden", name="token", value=token),
                     Input(type="hidden", name="lang", value=locale),
                     Input(type="hidden", name="new_start", value=choice.iso),
-                    Button(choice.label, type="submit", cls="slot"),
+                    Button(
+                        choice.label,
+                        type="submit",
+                        cls="slot",
+                        aria_label=slot_aria_label(choice.label, group.heading),
+                    ),
                     method="post",
                     action=action,
+                    enctype="application/x-www-form-urlencoded",
                 )
                 for choice in group.slots
             ]
             blocks.append(Div(group.heading, cls="day"))
             blocks.append(Div(*buttons, cls="slots"))
         inner = Div(*blocks)
-    return Section(inner, _pager(locale, prev_url, next_url), id="slots", aria_live="polite")
+    pager = _pager(locale, prev_url, next_url, prev_disabled=prev_disabled)
+    return Section(inner, pager, id="slots", aria_live="polite")
 
 
 def reschedule_page(
@@ -737,6 +818,7 @@ def reschedule_page(
 
 
 __all__ = [
+    "HONEYPOT_FIELD_NAME",
     "NotStr",
     "booking_form_page",
     "cancel_confirm_page",
