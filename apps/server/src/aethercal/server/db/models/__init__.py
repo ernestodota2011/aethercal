@@ -9,6 +9,7 @@ from aethercal.server.db.models.integrations import (
     ExternalConnection,
 )
 from aethercal.server.db.models.notifications import SentNotification
+from aethercal.server.db.models.outbox import Outbox
 from aethercal.server.db.models.scheduling import DateOverride, EventType, Schedule
 from aethercal.server.db.models.tenancy import ApiKey, Tenant, User
 from aethercal.server.db.models.webhooks import Webhook, WebhookDelivery
@@ -22,6 +23,7 @@ __all__ = [
     "ExternalCalendarLink",
     "ExternalConnection",
     "GuestToken",
+    "Outbox",
     "Schedule",
     "SentNotification",
     "Tenant",

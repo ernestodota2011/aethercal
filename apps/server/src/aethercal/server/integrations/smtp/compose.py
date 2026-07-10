@@ -37,18 +37,16 @@ _HOST_IS_COPIED = frozenset(
 )
 
 
-# The iTIP method + VEVENT status + SEQUENCE per kind, so the ``.ics`` matches the kind (RF-08).
-# All kinds share the same stable UID (derived per booking), so cancel/reschedule reference the
-# very event the confirmation created: confirmation ADDs it; reschedule UPDATEs it (same UID,
-# bumped sequence); cancellation CANCELs it (bumped again). The reminder re-states the still-
-# confirmed event, so it mirrors the confirmation. Successive reschedules share sequence 1 — a
-# fully monotonic per-booking counter would need to be persisted on the booking (out of scope;
-# documented residual).
-_ICS_LIFECYCLE: Mapping[NotificationKind, tuple[str, str, int]] = {
-    NotificationKind.CONFIRMATION: ("REQUEST", "CONFIRMED", 0),
-    NotificationKind.RESCHEDULE: ("REQUEST", "CONFIRMED", 1),
-    NotificationKind.CANCELLATION: ("CANCEL", "CANCELLED", 2),
-    NotificationKind.REMINDER: ("REQUEST", "CONFIRMED", 0),
+# The iTIP method + VEVENT status per kind, so the ``.ics`` matches the kind (RF-08): confirmation
+# ADDs the event; reschedule UPDATEs it; cancellation CANCELs it; the reminder re-states the still-
+# confirmed event. The SEQUENCE is NOT fixed by kind — it comes from the booking's persisted
+# ``sequence`` counter (RFC 5545, F1-08), so successive updates to a UID strictly increase and a
+# client never ignores a stale update (the old by-kind constant made every reschedule emit 1).
+_ICS_LIFECYCLE: Mapping[NotificationKind, tuple[str, str]] = {
+    NotificationKind.CONFIRMATION: ("REQUEST", "CONFIRMED"),
+    NotificationKind.RESCHEDULE: ("REQUEST", "CONFIRMED"),
+    NotificationKind.CANCELLATION: ("CANCEL", "CANCELLED"),
+    NotificationKind.REMINDER: ("REQUEST", "CONFIRMED"),
 }
 
 
@@ -57,7 +55,9 @@ class BookingEmailContext:
     """Everything the composer needs about one booking, resolved from the ORM by the service.
 
     ``start_at`` / ``end_at`` are timezone-aware UTC instants; ``guest_timezone`` is the IANA zone
-    the guest booked in (used to render the local time). The three URLs are optional — the reminder
+    the guest booked in (used to render the local time). ``sequence`` is the booking's persisted
+    iCal SEQUENCE (RFC 5545), used verbatim for the ``.ics``. The three URLs are optional — the
+    reminder
     job, for instance, has no signed guest links to pass.
     """
 
@@ -70,6 +70,7 @@ class BookingEmailContext:
     start_at: datetime
     end_at: datetime
     guest_timezone: str
+    sequence: int
     meeting_url: str | None = None
     cancel_url: str | None = None
     reschedule_url: str | None = None
@@ -182,9 +183,10 @@ def build_notification_email(
     """Compose the :class:`EmailMessage` for ``kind`` in ``locale`` (default Spanish, RNF-1).
 
     The guest is the recipient; the host is copied on confirmation/cancellation/reschedule. The
-    ``.ics`` invite is attached as ``text/calendar`` with the iTIP method/status/sequence matching
-    ``kind`` (see :data:`_ICS_LIFECYCLE`), so a cancellation cancels the event instead of re-adding
-    it. ``From`` is intentionally left unset — the
+    ``.ics`` invite is attached as ``text/calendar`` with the iTIP method/status matching ``kind``
+    (see :data:`_ICS_LIFECYCLE`) — so a cancellation cancels the event instead of re-adding it — and
+    the SEQUENCE taken from the booking's persisted ``context.sequence`` (RFC 5545). ``From`` is
+    intentionally left unset — the
     :class:`~aethercal.server.integrations.smtp.sender.SmtpEmailSender` stamps it from its config so
     the composer stays free of any environment/secret.
     """
@@ -197,7 +199,7 @@ def build_notification_email(
         message["Cc"] = formataddr((context.host_name, context.host_email))
     message.set_content(_build_body(copy, context, kind))
 
-    method, status, sequence = _ICS_LIFECYCLE[kind]
+    method, status = _ICS_LIFECYCLE[kind]
     ics = booking_invite_ics(
         uid=context.uid,
         summary=context.event_title,
@@ -209,7 +211,7 @@ def build_notification_email(
         attendee_email=context.guest_email,
         method=method,
         status=status,
-        sequence=sequence,
+        sequence=context.sequence,
     )
     # A str routes to the text content manager (maintype is implicitly "text"); ``subtype`` gives
     # the text/calendar part. ``add_attachment`` marks it Content-Disposition: attachment.

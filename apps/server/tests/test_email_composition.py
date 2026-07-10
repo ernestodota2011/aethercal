@@ -38,6 +38,7 @@ def _context(**overrides: Any) -> BookingEmailContext:
         "start_at": _START,
         "end_at": _END,
         "guest_timezone": "America/New_York",
+        "sequence": 0,
         "meeting_url": "https://meet.example.com/abc",
         "cancel_url": _CANCEL_URL,
         "reschedule_url": _RESCHEDULE_URL,
@@ -62,9 +63,10 @@ def _ics_text(msg: EmailMessage) -> str:
     raise AssertionError("no text/calendar part found in the message")
 
 
-def _calendar(kind: NotificationKind) -> Any:
-    """Parse the ``.ics`` attached to the ``kind`` email for the default booking context."""
-    return Calendar.from_ical(_ics_text(build_notification_email(_context(), kind=kind)))
+def _calendar(kind: NotificationKind, *, sequence: int = 0) -> Any:
+    """Parse the ``.ics`` attached to the ``kind`` email for a booking context at ``sequence``."""
+    context = _context(sequence=sequence)
+    return Calendar.from_ical(_ics_text(build_notification_email(context, kind=kind)))
 
 
 @pytest.mark.parametrize(
@@ -150,8 +152,8 @@ def test_ics_attachment_has_ics_filename() -> None:
 
 
 def test_confirmation_ics_is_a_request_to_add() -> None:
-    """RF-08: a confirmation tells the calendar to ADD the event (METHOD:REQUEST, SEQUENCE:0)."""
-    cal = _calendar(NotificationKind.CONFIRMATION)
+    """RF-08: a confirmation tells the calendar to ADD the event (METHOD:REQUEST, sequence 0)."""
+    cal = _calendar(NotificationKind.CONFIRMATION, sequence=0)
     vevent = cal.walk("VEVENT")[0]
     assert str(cal["METHOD"]) == "REQUEST"
     assert str(vevent["STATUS"]) == "CONFIRMED"
@@ -160,21 +162,33 @@ def test_confirmation_ics_is_a_request_to_add() -> None:
 
 def test_cancellation_ics_is_a_cancel() -> None:
     """RF-08: a cancellation must CANCEL the event, not re-add it (METHOD:CANCEL)."""
-    cal = _calendar(NotificationKind.CANCELLATION)
+    cal = _calendar(NotificationKind.CANCELLATION, sequence=3)
     vevent = cal.walk("VEVENT")[0]
     assert str(cal["METHOD"]) == "CANCEL"
     assert str(vevent["STATUS"]) == "CANCELLED"
-    assert int(vevent["SEQUENCE"]) >= 1  # bumped so clients supersede the original
 
 
-def test_reschedule_ics_bumps_sequence_above_confirmation() -> None:
-    """RF-08: a reschedule is an UPDATE — same UID, METHOD:REQUEST, SEQUENCE above the original."""
-    confirmation = _calendar(NotificationKind.CONFIRMATION).walk("VEVENT")[0]
-    cal = _calendar(NotificationKind.RESCHEDULE)
+def test_reschedule_ics_is_a_request_to_update() -> None:
+    """RF-08: a reschedule is an UPDATE — same UID, METHOD:REQUEST, still CONFIRMED."""
+    cal = _calendar(NotificationKind.RESCHEDULE, sequence=1)
     vevent = cal.walk("VEVENT")[0]
     assert str(cal["METHOD"]) == "REQUEST"
     assert str(vevent["STATUS"]) == "CONFIRMED"
-    assert int(vevent["SEQUENCE"]) > int(confirmation["SEQUENCE"])
+
+
+def test_ics_sequence_is_the_persisted_context_sequence() -> None:
+    """F1-08: SEQUENCE is the booking's persisted counter, not a by-kind constant — so successive
+    updates to the same UID strictly increase (RFC 5545) instead of every reschedule emitting 1.
+    """
+    for kind in (
+        NotificationKind.CONFIRMATION,
+        NotificationKind.RESCHEDULE,
+        NotificationKind.CANCELLATION,
+        NotificationKind.REMINDER,
+    ):
+        for expected in (0, 1, 2, 7):
+            vevent = _calendar(kind, sequence=expected).walk("VEVENT")[0]
+            assert int(vevent["SEQUENCE"]) == expected
 
 
 def test_all_lifecycle_kinds_share_the_same_uid() -> None:

@@ -19,16 +19,19 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.server.api import bookings
-from aethercal.server.db.models import EventType, Schedule, Tenant, User
+from aethercal.server.db.models import EventType, Outbox, Schedule, Tenant, User
+from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.api_keys import issue_api_key
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
     issue_guest_token,
 )
+from aethercal.server.services.outbox import OutboxEffect, email_dedupe_key
 from aethercal.server.services.slots import compute_slots
 
 pytestmark = pytest.mark.db
@@ -134,6 +137,30 @@ async def test_create_returns_201_and_confirms(
     assert body["status"] == "confirmed"
     assert body["event_type_id"] == seeded["event_type_id"]
     assert "external_event_id" not in body  # internal field never leaks (RF-16)
+
+
+async def test_http_create_enqueues_email_intent_but_not_google(
+    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """R6 deferral is clean + safe: the real HTTP booking path ALWAYS enqueues the confirmation
+    email intent (durable, drained post-commit), but with no host ``ExternalConnection`` resolved it
+    enqueues NO Google intent — Google stays cleanly deferred (the outbox never queues a Google
+    effect in a half-wired state). Wiring the host connection is the documented remaining step (live
+    OAuth, out of this scope)."""
+    resp = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert resp.status_code == 201
+    booking_id = uuid.UUID(resp.json()["id"])
+
+    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    async with sessionmaker() as session:
+        rows = list(
+            (await session.scalars(select(Outbox).where(Outbox.booking_id == booking_id))).all()
+        )
+    keys = {(r.effect, r.dedupe_key) for r in rows}
+    assert (OutboxEffect.EMAIL.value, email_dedupe_key(NotificationKind.CONFIRMATION)) in keys
+    assert all(r.effect != OutboxEffect.GOOGLE.value for r in rows)  # Google deferred → not queued
 
 
 async def test_duplicate_slot_returns_409(

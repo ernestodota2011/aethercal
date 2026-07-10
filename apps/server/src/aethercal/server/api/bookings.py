@@ -114,19 +114,18 @@ def _booking_base_url(request: Request, settings: Settings) -> str:
 
 
 def _build_effects(request: Request) -> BookingEffects:
-    """Assemble the side-effects bundle from ``app.state`` (all effects degrade gracefully).
+    """Assemble the request-time side-effects bundle from ``app.state``.
 
-    The guest-token signer + booking base URL are always present. The SMTP sender and reminder
-    runner are read from ``app.state`` when the integrator has wired them (F1-08/F1-10); until then
-    they are ``None`` and those effects are skipped. Request-path Google sync (F1-07) is not wired
-    here (it needs a per-host live client), so ``connection``/``google_service`` stay ``None`` — a
-    booking never attempts Google in this path and never 500s on its absence.
+    The guest-token signer + booking base URL are always present. The email notice is enqueued to
+    the durable outbox unconditionally (the drain worker owns the live SMTP sender), so no sender is
+    passed here. The 24 h reminder runner is read from ``app.state`` when wired (F1-10). Google
+    sync (F1-07) is not wired yet (resolving the host's ``ExternalConnection`` is the last step), so
+    ``connection`` stays ``None`` — a booking never attempts Google in this path.
     """
     settings = _settings(request)
     return BookingEffects(
         signer=GuestTokenSigner(settings.app_secret),
         booking_base_url=_booking_base_url(request, settings),
-        sender=getattr(request.app.state, "email_sender", None),
         reminder_runner=getattr(request.app.state, "reminder_runner", None),
     )
 

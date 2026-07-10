@@ -13,9 +13,10 @@ import sqlalchemy as sa
 from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db import Base
 
-# The MVP entity set (F1). Everything in the first migration; nothing from F2+ (no Workflow,
-# Payment, Membership/RBAC, multi-host). This set is asserted exactly, so an accidental omission
-# or a stray extra table fails loudly.
+# The MVP entity set (F1); nothing from F2+ (no Workflow, Payment, Membership/RBAC, multi-host).
+# ``outbox`` (the transactional-outbox queue for booking post-commit effects) landed with the F1-05
+# residual fix in migration 0003. This set is asserted exactly, so an accidental omission or a stray
+# extra table fails loudly.
 EXPECTED_TABLES = {
     "tenants",
     "users",
@@ -31,6 +32,7 @@ EXPECTED_TABLES = {
     "webhooks",
     "webhook_deliveries",
     "sent_notifications",
+    "outbox",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.
