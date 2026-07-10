@@ -74,3 +74,16 @@ def test_verify_rejects_wrong_salt_or_digest_widths() -> None:
     assert verify_password("pbkdf2_sha256$600000$00$0011", "x") is False  # too short
     good_salt = "00" * 16
     assert verify_password(f"pbkdf2_sha256$600000${good_salt}$00", "x") is False  # short digest
+
+
+@pytest.mark.parametrize("iterations", [1, 999, 10_000_001, 99_999_999_999])
+def test_hash_password_refuses_out_of_range_iterations(iterations: int) -> None:
+    # A hash must never be minted with a work factor its own verifier would reject as out-of-range.
+    with pytest.raises(ValueError, match="iterations"):
+        hash_password("s3cret", iterations=iterations)
+
+
+def test_hash_password_accepts_and_verifies_the_bound_edge() -> None:
+    # The exact minimum still round-trips (kept small so the test stays fast).
+    stored = hash_password("s3cret", iterations=1_000)
+    assert verify_password(stored, "s3cret") is True
