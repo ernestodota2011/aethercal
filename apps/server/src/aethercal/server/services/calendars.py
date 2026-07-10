@@ -21,12 +21,16 @@ Design notes:
   (``GoogleCredential``, ``BusyQuery``, and the existing ``MeetEventRequest``) so signatures stay
   small and self-documenting -- the house convention for this codebase.
 
-RF-13 degradation contract (``read_busy``): the result is one of FRESH / STALE / UNAVAILABLE.
-``FRESH`` = data straight from a fresh cache or a successful refresh (or "no connection" -> empty).
-``STALE`` = a refresh failed and we are serving the last-known copy (``is_degraded``); slots may
-still be offered. ``UNAVAILABLE`` = we have a connection but no data and cannot reach Google
-(``not is_available``) -- the slots engine MUST refuse to offer this host's slots rather than risk a
-double-booking.
+RF-12/13 freshness + degradation contract (``read_busy``): freshness is WINDOW-AWARE. The cache is
+usable for a query only if it is both time-fresh AND its synced coverage window fully contains the
+queried window -- a cache filled for one window never answers a query about another (that is how a
+double-booking slips through). The result is one of FRESH / STALE / UNAVAILABLE. ``FRESH`` = data
+from a covered + time-fresh cache or a successful refresh (or "no connection" -> empty; an
+empty-but-covered window is FRESH with no busy). ``STALE`` = a refresh failed and the prior coverage
+fully contained the window, so we serve the last-known (complete-for-this-window) copy
+(``is_degraded``); slots may still be offered. ``UNAVAILABLE`` = a refresh failed with partial or
+absent coverage and we cannot reach Google (``not is_available``) -- the slots engine MUST refuse to
+offer this host's slots rather than serve incomplete data as complete and risk a double-booking.
 
 CalendarSyncError contract (event lifecycle): a Google mutation that fails raises
 ``CalendarSyncError``. Booking success must NOT hard-depend on Google being reachable, so the caller
@@ -209,8 +213,12 @@ async def refresh_busy_cache(
 
     ``service`` is an injected live Google client (built from ``build_service``); tests pass a fake.
     All existing ``BusyCache`` rows for the connection are dropped and the freshly-fetched busy
-    blocks are written stamped ``fetched_at=now``. Returns the busy intervals that were cached. The
-    write is flushed, not committed -- the caller owns the transaction.
+    blocks are written stamped ``fetched_at=now``. The connection's coverage stamp
+    (``busy_synced_from/to`` = the fetched ``window``, ``busy_synced_at=now``) is set in the same
+    flush so :func:`read_busy` can judge freshness by window coverage rather than a per-row age --
+    and so a fetched window with ZERO busy blocks is representable as covered-and-fresh (not
+    indistinguishable from "never synced"). Returns the busy intervals that were cached. The write
+    is flushed, not committed -- the caller owns the transaction.
     """
     busy = query_busy(service, _DEFAULT_CALENDAR_ID, window)
     await session.execute(
@@ -229,6 +237,9 @@ async def refresh_busy_cache(
                 fetched_at=now,
             )
         )
+    connection.busy_synced_from = window.start
+    connection.busy_synced_to = window.end
+    connection.busy_synced_at = now
     await session.flush()
     return busy
 
@@ -246,16 +257,28 @@ async def read_busy(
     query: BusyQuery,
     service_factory: ServiceFactory | None = None,
 ) -> BusyReadResult:
-    """Return the host's external busy set over the window (TTL refresh, RF-13 safe degradation).
+    """Return the host's external busy set over the window (window-aware TTL, RF-13 degradation).
+
+    Freshness is judged by WINDOW COVERAGE, not by a per-connection ``fetched_at``: a cache filled
+    for one window must never read as fresh for a different window (a cache of last week does not
+    answer a query about next week -- reusing it is how a double-booking slips through). Let
+
+    * ``covered``   = the connection's synced window fully contains ``query.window``
+      (``busy_synced_from <= query.window.start`` and ``busy_synced_to >= query.window.end``); and
+    * ``time_fresh`` = ``busy_synced_at`` is set and ``query.now - busy_synced_at <= query.ttl``.
 
     RF-13 decision table (see the module docstring for the full contract):
 
     * no connection for the host -> ``FRESH`` with empty busy (no external calendar = no busy).
-    * cache fresh (``now - fetched_at <= ttl``) -> ``FRESH`` from cache, Google is NOT contacted.
-    * cache stale/absent -> refresh via ``service_factory``:
+    * ``covered and time_fresh`` -> ``FRESH`` from cache (rows intersecting the window), Google is
+      NOT contacted -- an empty-but-covered window correctly returns ``busy=()``.
+    * otherwise refresh via ``service_factory`` for ``query.window``:
         * refresh succeeds -> ``FRESH`` with the new data.
-        * refresh fails but a last-known copy exists -> ``STALE`` with that copy (degraded).
-        * refresh fails and there is NO copy -> ``UNAVAILABLE`` (refuse to offer slots).
+        * refresh fails and the PRIOR coverage fully contains the window (``covered``) -> ``STALE``
+          with the last-known copy (degraded): it is complete for this window, so slots may still
+          be offered.
+        * refresh fails and coverage is partial/absent -> ``UNAVAILABLE`` (refuse to offer slots):
+          partial coverage is never served as if complete, and "unknown" is never treated as free.
 
     ``query.now`` and ``query.ttl`` are injected so the TTL is deterministic in tests.
     ``service_factory`` builds the live client for a connection; when ``None`` (or Google is
@@ -266,14 +289,26 @@ async def read_busy(
     if connection is None:
         return BusyReadResult(status=BusyStatus.FRESH, busy=())
 
+    covered = _coverage_contains(connection, query.window)
+    synced_at = (
+        _as_utc(connection.busy_synced_at) if connection.busy_synced_at is not None else None
+    )
+    time_fresh = synced_at is not None and (query.now - synced_at) <= query.ttl
+
     cached = await _read_cache(session, connection=connection)
     last_known = tuple(_to_intervals(cached))
-    fetched_at = max((_as_utc(row.fetched_at) for row in cached), default=None)
-    if fetched_at is not None and (query.now - fetched_at) <= query.ttl:
-        return BusyReadResult(status=BusyStatus.FRESH, busy=last_known)
+
+    if covered and time_fresh:
+        return BusyReadResult(status=BusyStatus.FRESH, busy=_intersecting(last_known, query.window))
 
     if service_factory is None:
-        return _degrade(connection, last_known, reason="no refresh factory available")
+        return _degrade(
+            connection,
+            last_known,
+            covered=covered,
+            window=query.window,
+            reason="no refresh factory",
+        )
 
     try:
         service = service_factory(connection)
@@ -286,24 +321,59 @@ async def read_busy(
             connection.id,
             connection.tenant_id,
         )
-        return _degrade(connection, last_known, reason="refresh failed")
+        return _degrade(
+            connection, last_known, covered=covered, window=query.window, reason="refresh failed"
+        )
 
     return BusyReadResult(status=BusyStatus.FRESH, busy=tuple(busy))
 
 
 def _degrade(
-    connection: ExternalConnection, last_known: tuple[TimeInterval, ...], *, reason: str
+    connection: ExternalConnection,
+    last_known: tuple[TimeInterval, ...],
+    *,
+    covered: bool,
+    window: TimeInterval,
+    reason: str,
 ) -> BusyReadResult:
-    """Serve the last-known copy if we have one, else declare the host UNAVAILABLE (RF-13)."""
-    if last_known:
+    """Degrade a failed refresh: STALE only if the prior cache COVERS the window, else UNAVAILABLE.
+
+    Serving the last-known copy is safe only when the prior coverage fully contains ``window`` --
+    then the cache is complete for that window and can be offered as degraded (RF-13). Partial or
+    absent coverage is refused (``UNAVAILABLE``): an uncovered stretch could hide a conflict, and
+    treating it as free is exactly the double-booking this system must prevent.
+    """
+    if covered:
         _logger.warning(
             "serving degraded (last-known) busy for connection %s: %s", connection.id, reason
         )
-        return BusyReadResult(status=BusyStatus.STALE, busy=last_known)
+        return BusyReadResult(status=BusyStatus.STALE, busy=_intersecting(last_known, window))
     _logger.error(
-        "no busy data for connection %s and %s; marking host UNAVAILABLE", connection.id, reason
+        "no complete coverage for connection %s and %s; marking host UNAVAILABLE",
+        connection.id,
+        reason,
     )
     return BusyReadResult(status=BusyStatus.UNAVAILABLE, busy=())
+
+
+def _coverage_contains(connection: ExternalConnection, window: TimeInterval) -> bool:
+    """True if the connection's last-synced busy window fully contains ``window`` (RF-12/13).
+
+    ``NULL`` bounds (never synced) are not coverage. The stored bounds are normalized to UTC because
+    SQLite drops tzinfo on round-trip and comparing a naive bound to the tz-aware ``window`` raises.
+    """
+    synced_from = connection.busy_synced_from
+    synced_to = connection.busy_synced_to
+    if synced_from is None or synced_to is None:
+        return False
+    return _as_utc(synced_from) <= window.start and _as_utc(synced_to) >= window.end
+
+
+def _intersecting(
+    intervals: tuple[TimeInterval, ...], window: TimeInterval
+) -> tuple[TimeInterval, ...]:
+    """The busy intervals that overlap ``window`` (half-open; touching endpoints do not overlap)."""
+    return tuple(interval for interval in intervals if interval.overlaps(window))
 
 
 async def _load_active_connection(

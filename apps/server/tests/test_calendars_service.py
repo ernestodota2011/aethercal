@@ -190,6 +190,25 @@ async def _seed_busy(
     await session.flush()
 
 
+async def _set_coverage(
+    session: AsyncSession,
+    connection: ExternalConnection,
+    *,
+    synced_from: datetime,
+    synced_to: datetime,
+    synced_at: datetime,
+) -> None:
+    """Stamp the connection's busy-sync coverage window -- what refresh_busy_cache records (RF-12).
+
+    read_busy judges freshness by this window, not by a per-row fetched_at, so a query outside the
+    synced window can never read as covered (the F1-07 double-booking bug this fix closes).
+    """
+    connection.busy_synced_from = synced_from
+    connection.busy_synced_to = synced_to
+    connection.busy_synced_at = synced_at
+    await session.flush()
+
+
 def _window(now: datetime) -> TimeInterval:
     return TimeInterval(start=now, end=now + timedelta(days=7))
 
@@ -263,6 +282,39 @@ async def test_refresh_busy_cache_writes_rows_for_the_window(
     for row in rows:
         assert _as_utc(row.fetched_at) == now
 
+    # RF-12: the connection records the window it synced and when, so read_busy can judge coverage.
+    assert _as_utc(connection.busy_synced_from) == now
+    assert _as_utc(connection.busy_synced_to) == now + timedelta(days=7)
+    assert _as_utc(connection.busy_synced_at) == now
+
+
+async def test_refresh_busy_cache_stamps_coverage_when_calendar_is_empty(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    service = FakeGoogleService(
+        freebusy_response=_freebusy([])
+    )  # an empty (but reachable) calendar
+
+    written = await refresh_busy_cache(
+        sqlite_session, connection=connection, window=_window(now), now=now, service=service
+    )
+
+    # Zero busy blocks, yet the window is recorded as synced -> an empty calendar is now
+    # representable as "covered and fresh", not indistinguishable from "never synced" (RF-12/13).
+    assert written == []
+    rows = (
+        await sqlite_session.scalars(
+            select(BusyCache).where(BusyCache.connection_id == connection.id)
+        )
+    ).all()
+    assert len(rows) == 0
+    assert _as_utc(connection.busy_synced_from) == now
+    assert _as_utc(connection.busy_synced_to) == now + timedelta(days=7)
+    assert _as_utc(connection.busy_synced_at) == now
+
 
 async def test_refresh_busy_cache_replaces_previous_rows(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
@@ -300,14 +352,26 @@ async def test_refresh_busy_cache_replaces_previous_rows(
 
 
 def _boom_factory(_: ExternalConnection) -> Any:
-    raise AssertionError("Google must NOT be contacted when the cache is fresh")
+    raise AssertionError("Google must NOT be contacted when the cache covers the query window")
 
 
 def _failing_factory(_: ExternalConnection) -> Any:
     return FakeGoogleService(freebusy_error=RuntimeError("google unreachable"))
 
 
-async def test_read_busy_returns_fresh_cache_without_calling_google(
+class _RecordingFactory:
+    """A service_factory that records whether it was invoked and returns a canned fake service."""
+
+    def __init__(self, service: FakeGoogleService) -> None:
+        self._service = service
+        self.calls = 0
+
+    def __call__(self, _: ExternalConnection) -> Any:
+        self.calls += 1
+        return self._service
+
+
+async def test_read_busy_inside_covered_fresh_window_returns_cache_without_calling_google(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
@@ -316,6 +380,14 @@ async def test_read_busy_returns_fresh_cache_without_calling_google(
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     busy_start, busy_end = now + timedelta(hours=1), now + timedelta(hours=2)
     await _seed_busy(sqlite_session, connection, fetched_at=now, blocks=[(busy_start, busy_end)])
+    # The synced window fully contains the query window and was stamped just now -> covered + fresh.
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now,
+        synced_to=now + timedelta(days=7),
+        synced_at=now,
+    )
 
     result = await read_busy(
         sqlite_session,
@@ -331,18 +403,72 @@ async def test_read_busy_returns_fresh_cache_without_calling_google(
     assert result.busy == (TimeInterval(start=busy_start, end=busy_end),)
 
 
-async def test_read_busy_stale_then_refresh_success_returns_fresh(
+async def test_read_busy_outside_covered_window_refreshes_even_when_time_fresh(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
     user = await _first_user(sqlite_session, tenant)
     connection = await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    # The cache was synced JUST NOW (time-fresh) but for LAST week's window. A query for the coming
+    # week is NOT covered by it, so the stale-window cache must never be reused -- doing so is the
+    # F1-07 double-booking bug. read_busy must contact Google to refresh for the queried window.
+    await _seed_busy(
+        sqlite_session,
+        connection,
+        fetched_at=now,
+        blocks=[(now - timedelta(days=8), now - timedelta(days=8) + timedelta(hours=1))],
+    )
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now - timedelta(days=14),
+        synced_to=now - timedelta(days=7),
+        synced_at=now,  # recently fetched -- but for the wrong window
+    )
+    fresh = FakeGoogleService(
+        freebusy_response=_freebusy([("2026-07-13T15:00:00Z", "2026-07-13T15:45:00Z")])
+    )
+    factory = _RecordingFactory(fresh)
+
+    result = await read_busy(
+        sqlite_session,
+        tenant_id=tenant.id,
+        host_user_id=user.id,
+        query=_query(now),
+        service_factory=factory,
+    )
+
+    assert factory.calls == 1  # the stale-window cache did NOT satisfy a next-week query
+    assert result.status is BusyStatus.FRESH
+    assert result.busy == (
+        TimeInterval(
+            start=datetime(2026, 7, 13, 15, 0, tzinfo=UTC),
+            end=datetime(2026, 7, 13, 15, 45, tzinfo=UTC),
+        ),
+    )
+
+
+async def test_read_busy_time_stale_then_refresh_success_returns_fresh(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    user = await _first_user(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    # Covered window, but the sync is older than the TTL -> time-stale, so a refresh is attempted.
     await _seed_busy(
         sqlite_session,
         connection,
         fetched_at=now - timedelta(hours=1),
         blocks=[(now + timedelta(hours=1), now + timedelta(hours=2))],
+    )
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now,
+        synced_to=now + timedelta(days=7),
+        synced_at=now - timedelta(hours=1),
     )
     fresh = FakeGoogleService(
         freebusy_response=_freebusy([("2026-07-13T15:00:00Z", "2026-07-13T15:45:00Z")])
@@ -366,7 +492,7 @@ async def test_read_busy_stale_then_refresh_success_returns_fresh(
     )
 
 
-async def test_read_busy_stale_then_refresh_failure_serves_last_known_degraded(
+async def test_read_busy_time_stale_refresh_failure_with_full_coverage_serves_last_known_degraded(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
@@ -374,11 +500,20 @@ async def test_read_busy_stale_then_refresh_failure_serves_last_known_degraded(
     connection = await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     last_start, last_end = now + timedelta(hours=1), now + timedelta(hours=2)
+    # Prior coverage FULLY contains the query window -> the last-known copy is complete for it, so a
+    # failed refresh may be served as STALE/degraded rather than refused.
     await _seed_busy(
         sqlite_session,
         connection,
         fetched_at=now - timedelta(hours=1),
         blocks=[(last_start, last_end)],
+    )
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now,
+        synced_to=now + timedelta(days=7),
+        synced_at=now - timedelta(hours=1),
     )
 
     result = await read_busy(
@@ -395,7 +530,44 @@ async def test_read_busy_stale_then_refresh_failure_serves_last_known_degraded(
     assert result.busy == (TimeInterval(start=last_start, end=last_end),)
 
 
-async def test_read_busy_no_cache_and_refresh_failure_is_unavailable(
+async def test_read_busy_refresh_failure_with_partial_coverage_is_unavailable(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    user = await _first_user(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    # Coverage spans only the first 3 days of the 7-day query window -> the cache is INCOMPLETE for
+    # the query. A failed refresh must NOT serve partial data as if complete: refuse (UNAVAILABLE),
+    # because the uncovered tail could hide a conflict and become a double-booking (RF-13).
+    await _seed_busy(
+        sqlite_session,
+        connection,
+        fetched_at=now,
+        blocks=[(now + timedelta(hours=1), now + timedelta(hours=2))],
+    )
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now,
+        synced_to=now + timedelta(days=3),
+        synced_at=now,
+    )
+
+    result = await read_busy(
+        sqlite_session,
+        tenant_id=tenant.id,
+        host_user_id=user.id,
+        query=_query(now),
+        service_factory=_failing_factory,
+    )
+
+    assert result.status is BusyStatus.UNAVAILABLE
+    assert not result.is_available
+    assert result.busy == ()
+
+
+async def test_read_busy_no_coverage_and_refresh_failure_is_unavailable(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
@@ -411,9 +583,40 @@ async def test_read_busy_no_cache_and_refresh_failure_is_unavailable(
         service_factory=_failing_factory,
     )
 
-    # No cached copy AND Google unreachable -> refuse slots (never treat unknown as free).
+    # Never synced (no coverage) AND Google unreachable -> refuse slots (unknown is never free).
     assert result.status is BusyStatus.UNAVAILABLE
     assert not result.is_available
+    assert result.busy == ()
+
+
+async def test_read_busy_empty_but_covered_fresh_window_returns_fresh_without_refresh(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    user = await _first_user(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    # A completed sync of an EMPTY calendar: coverage stamped, zero cached busy rows. This must read
+    # as covered + fresh (busy=()) WITHOUT a re-refresh -- empty is not "unknown".
+    await _set_coverage(
+        sqlite_session,
+        connection,
+        synced_from=now,
+        synced_to=now + timedelta(days=7),
+        synced_at=now,
+    )
+
+    result = await read_busy(
+        sqlite_session,
+        tenant_id=tenant.id,
+        host_user_id=user.id,
+        query=_query(now),
+        service_factory=_boom_factory,  # would raise if read_busy tried to refresh
+    )
+
+    assert result.status is BusyStatus.FRESH
+    assert result.is_available
+    assert not result.is_degraded
     assert result.busy == ()
 
 
@@ -447,13 +650,20 @@ async def test_read_busy_is_tenant_isolated(
     user_a = await _first_user(sqlite_session, tenant_a)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 
-    # Tenant B has a connection with fresh busy; tenant A has none.
+    # Tenant B has a connection with a fresh, covered busy sync; tenant A has none.
     conn_b = await _connect(sqlite_session, tenant_b, fernet=fernet, account_email="b@gmail.com")
     await _seed_busy(
         sqlite_session,
         conn_b,
         fetched_at=now,
         blocks=[(now + timedelta(hours=1), now + timedelta(hours=2))],
+    )
+    await _set_coverage(
+        sqlite_session,
+        conn_b,
+        synced_from=now,
+        synced_to=now + timedelta(days=7),
+        synced_at=now,
     )
 
     result = await read_busy(
