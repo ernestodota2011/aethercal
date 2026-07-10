@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.server.db.models import Webhook, WebhookDelivery
 from aethercal.server.services.webhooks import decrypt_webhook_secret
 from aethercal.server.webhooks.signing import SIGNATURE_HEADER, canonical_body, signature_header
+from aethercal.server.webhooks.ssrf import BlockedUrlError, Resolver, assert_public_url
 
 BACKOFF_BASE_SECONDS = 30
 """First-retry delay; each subsequent failure doubles it (30s, 60s, 120s, ...)."""
@@ -69,18 +70,24 @@ class DeliveryReport:
         return len(self.delivered) + len(self.failed) + len(self.dead)
 
 
-async def deliver_due(
+async def deliver_due(  # noqa: PLR0913 — fully dependency-injected worker: every arg is a seam.
     session: AsyncSession,
     http_client: httpx.AsyncClient,
     *,
     now: datetime,
     fernet_key: bytes,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    resolver: Resolver | None = None,
 ) -> DeliveryReport:
     """Send every due delivery once and record the outcome. Returns a :class:`DeliveryReport`.
 
     "Due" = status ``pending`` or ``failed`` with ``next_retry_at`` unset or ``<= now``. Flushes the
     updated rows; the caller owns the commit.
+
+    Every URL is passed through the SSRF egress guard (:func:`assert_public_url`) right before the
+    send: a subscriber pointing at a private/loopback/link-local/metadata address is parked ``dead``
+    and never POSTed to (RF-17 / RNF-5). ``resolver`` is injected only for tests; ``None`` uses real
+    DNS in production, and resolving at send time is what defeats DNS rebinding.
     """
     due = (
         await session.scalars(
@@ -106,6 +113,17 @@ async def deliver_due(
             # The subscriber is gone (the FK cascade should prevent this); nothing to send.
             delivery.status = _DEAD
             delivery.next_retry_at = None
+            report.dead.append(delivery.id)
+            continue
+
+        try:
+            await assert_public_url(webhook.url, resolver=resolver)
+        except BlockedUrlError:
+            # SSRF egress guard: the target resolves to a non-public address — never POST to it.
+            # Park it dead (a blocked URL can never succeed, so no retry) (RF-17 / RNF-5).
+            delivery.status = _DEAD
+            delivery.next_retry_at = None
+            delivery.response_code = None
             report.dead.append(delivery.id)
             continue
 

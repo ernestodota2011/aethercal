@@ -103,6 +103,20 @@ async def test_create_rejects_an_unknown_event(
 
 
 @pytest.mark.db
+async def test_create_rejects_a_non_http_scheme(
+    wired_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    # The scheme validator fast-fails a non-http(s) URL at registration (RF-17 / RNF-5); the
+    # authoritative private-IP block still happens send-time in the delivery worker.
+    resp = await wired_client.post(
+        COLLECTION,
+        headers=auth_headers,
+        json={"url": "ftp://consumer.test/hook", "events": ["booking.created"]},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.db
 async def test_get_unknown_is_404(wired_client: AsyncClient, auth_headers: dict[str, str]) -> None:
     missing = "00000000-0000-0000-0000-000000000000"
     resp = await wired_client.get(f"{COLLECTION}/{missing}", headers=auth_headers)

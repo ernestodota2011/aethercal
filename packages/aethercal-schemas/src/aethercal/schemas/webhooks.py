@@ -15,8 +15,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal, get_args
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 WebhookEventName = Literal["booking.created", "booking.cancelled", "booking.rescheduled"]
 """The events an AetherCal webhook can fan out. Kept in lockstep with the booking lifecycle."""
@@ -30,6 +31,19 @@ WEBHOOK_API_VERSION = "1"
 _EventList = Annotated[list[WebhookEventName], Field(min_length=1)]
 _Url = Annotated[str, Field(min_length=1, max_length=2048)]
 
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _require_http_scheme(url: str) -> str:
+    """Reject any non ``http``/``https`` webhook URL at registration (RF-17 / RNF-5).
+
+    Scheme-only fast fail — the authoritative egress/IP check runs at send time in the delivery
+    worker (:func:`aethercal.server.webhooks.ssrf.assert_public_url`).
+    """
+    if urlsplit(url).scheme not in _ALLOWED_URL_SCHEMES:
+        raise ValueError("webhook url scheme must be http or https")
+    return url
+
 
 class WebhookCreate(BaseModel):
     """Request body to subscribe a new webhook.
@@ -42,6 +56,12 @@ class WebhookCreate(BaseModel):
     events: _EventList
     secret: str | None = None
 
+    @field_validator("url")
+    @classmethod
+    def _validate_url_scheme(cls, value: str) -> str:
+        """Enforce the ``http``/``https`` scheme on the subscription URL (RF-17 / RNF-5)."""
+        return _require_http_scheme(value)
+
 
 class WebhookUpdate(BaseModel):
     """Partial update of a subscription: toggle ``active``, or change ``url`` / ``events``.
@@ -52,6 +72,12 @@ class WebhookUpdate(BaseModel):
     url: _Url | None = None
     events: _EventList | None = None
     active: bool | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url_scheme(cls, value: str | None) -> str | None:
+        """Enforce the ``http``/``https`` scheme when a new URL is supplied (RF-17 / RNF-5)."""
+        return value if value is None else _require_http_scheme(value)
 
 
 class WebhookRead(BaseModel):
