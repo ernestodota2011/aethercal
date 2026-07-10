@@ -62,6 +62,8 @@ with per-line comments. The essentials:
 | `AETHERCAL_RUN_SCHEDULER` | — | Run the background scheduler in **this** process (see below) |
 | `AETHERCAL_AUTO_MIGRATE` | — | Run migrations on boot (default on) |
 | `AETHERCAL_BOOKING_BASE_URL` | — | Public base for guest cancel/reschedule links |
+| `AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS` | — | Origins allowed to iframe `/embed/*` (the [embeddable widget](../docs/embedding.md)). Blank → `*` (any origin) |
+| `AETHERCAL_BOOKING_TRUSTED_PROXIES` | — | CIDRs of reverse proxies trusted to set `CF-Connecting-IP` for the rate limiter. Blank → use the transport peer address |
 | `AETHERCAL_SMTP_*` | — | Transactional email (absent → email skipped, app still boots) |
 | `AETHERCAL_GOOGLE_*` | — | Google Calendar busy-check + Meet (absent → skipped) |
 

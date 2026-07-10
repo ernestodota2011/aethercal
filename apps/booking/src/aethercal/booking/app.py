@@ -39,7 +39,13 @@ from starlette.datastructures import FormData
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.staticfiles import StaticFiles
 
 from aethercal.booking import views
@@ -86,6 +92,11 @@ COMMON_TIMEZONES: tuple[str, ...] = (
 #: The ``static/`` directory next to this module — the vendored htmx bundle and the tz-detect
 #: script (A5.1/A5.2), served by the app itself so it has no third-party CDN dependency.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+#: ``Cache-Control`` for ``GET /embed.js`` (B2.2) — a year, ``immutable``: the loader changes
+#: rarely and integrators paste the ``<script src>`` once. ``docs/embedding.md`` documents the
+#: cache-busting escape hatch (append ``?v=<n>`` to the URL) for the rare breaking update.
+EMBED_JS_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
 # --------------------------------------------------------------------------------------
@@ -1114,6 +1125,24 @@ class _BookingApp:
         body = "User-agent: *\nAllow: /$\nDisallow: /\n"
         return PlainTextResponse(body)
 
+    def embed_js(self, request: Request) -> Response:
+        """Serve the embed loader (B2) at a clean, memorable URL — ``/embed.js``, not just
+        ``/static/embed.js`` — the way any third-party widget script is conventionally referenced.
+
+        Never touches the backend (like ``healthz``/``robots_txt``): it's a static asset, so a
+        guest embedding a widget on their own site never depends on this app's SDK/API round-trip
+        just to fetch the loader. ``Cache-Control`` is deliberately LONG
+        (``EMBED_JS_CACHE_CONTROL``) since the file changes rarely; ``docs/embedding.md`` tells
+        integrators to cache-bust a real update with a ``?v=`` query string on the
+        ``<script src>`` rather than relying on this expiring on its own.
+        """
+        del request
+        return FileResponse(
+            STATIC_DIR / "embed.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": EMBED_JS_CACHE_CONTROL},
+        )
+
     def healthz(self, request: Request) -> Response:
         """Liveness only — never calls the API, so it stays up even if the backend is down."""
         del request  # Starlette passes the request; liveness ignores it.
@@ -1155,6 +1184,9 @@ def create_app(
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])
     _register(app, "/robots.txt", booking.robots_txt, ["GET"])
+    # B2.2: a clean-URL alias for the embed widget loader (also reachable, unversioned, at
+    # /static/embed.js — kept for both since some integrators reference /static/* directly).
+    _register(app, "/embed.js", booking.embed_js, ["GET"])
     _register(app, "/cancel", booking.cancel_form, ["GET"])
     _register(app, "/cancel", booking.cancel_submit, ["POST"])
     _register(app, "/reschedule", booking.reschedule_form, ["GET"])
@@ -1176,4 +1208,10 @@ def create_app(
     return app
 
 
-__all__ = ["COMMON_TIMEZONES", "STATIC_DIR", "create_app", "security_headers"]
+__all__ = [
+    "COMMON_TIMEZONES",
+    "EMBED_JS_CACHE_CONTROL",
+    "STATIC_DIR",
+    "create_app",
+    "security_headers",
+]
