@@ -1,0 +1,219 @@
+"""End-to-end booking endpoints through the real app over PostgreSQL (F1-05, RF-07/RF-09/RF-16).
+
+``db``-marked (whole module): they need ``AETHERCAL_TEST_DATABASE_URL``, skip in the offline
+matrix, and run in CI's ``test-db`` job. They are the executable HTTP spec for the booking flow:
+auth, the create happy path (201), the duplicate-slot conflict (409), guest-token-gated cancel
+(RF-09), and reschedule. ``wired_client`` mounts the feature router directly (the orchestrator wires
+it under ``/api/v1`` in production; here the path is ``/bookings/``); ``seeded`` provisions a tenant
+with a host, an always-open UTC schedule, a 30-minute event type, its API key, and two genuinely
+offered slots (fetched from the slots engine so they are valid against the real clock).
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from aethercal.server.api import bookings
+from aethercal.server.db.models import EventType, Schedule, Tenant, User
+from aethercal.server.services.api_keys import issue_api_key
+from aethercal.server.services.guest_tokens import (
+    GuestTokenPurpose,
+    GuestTokenSigner,
+    issue_guest_token,
+)
+from aethercal.server.services.slots import compute_slots
+
+pytestmark = pytest.mark.db
+
+BOOKINGS = "/bookings/"
+_APP_SECRET = "test-app-secret"
+# Open every weekday, all day, in UTC → a near-future slot is always on offer.
+_ALWAYS_OPEN = {str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)}
+
+
+@pytest_asyncio.fixture
+async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
+    app.include_router(bookings.router)
+    return client
+
+
+@pytest_asyncio.fixture
+async def seeded(app: FastAPI) -> dict[str, Any]:
+    """Seed a tenant + host + open schedule + event type + API key; return ids, headers, slots."""
+    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    async with sessionmaker() as session, session.begin():
+        tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Seeded Tenant")
+        session.add(tenant)
+        await session.flush()
+        host = User(tenant_id=tenant.id, email="host@example.com", name="Host", timezone="UTC")
+        schedule = Schedule(tenant_id=tenant.id, name="Weekly", timezone="UTC", rules=_ALWAYS_OPEN)
+        session.add_all([host, schedule])
+        await session.flush()
+        event_type = EventType(
+            tenant_id=tenant.id,
+            host_id=host.id,
+            schedule_id=schedule.id,
+            slug="intro",
+            title="Intro Call",
+            duration_seconds=1800,
+            max_advance_seconds=60 * 60 * 24 * 30,
+        )
+        session.add(event_type)
+        await session.flush()
+        _, full_key = await issue_api_key(session, tenant_id=tenant.id, name="test-key")
+
+        now = datetime.now(UTC)
+        tomorrow = (now + timedelta(days=1)).date()
+        result = await compute_slots(
+            session,
+            tenant_id=tenant.id,
+            event_type_id=event_type.id,
+            window_from=tomorrow,
+            window_to=tomorrow,
+            now=now,
+        )
+        assert result is not None and len(result.slots) >= 2
+        tenant_id, event_type_id = tenant.id, event_type.id
+        slot1 = result.slots[0].start
+        slot2 = result.slots[1].start
+    return {
+        "headers": {"Authorization": f"Bearer {full_key}"},
+        "tenant_id": tenant_id,
+        "event_type_id": str(event_type_id),
+        "slot1": slot1.isoformat(),
+        "slot2": slot2.isoformat(),
+    }
+
+
+def _payload(seeded: dict[str, Any], start: str) -> dict[str, Any]:
+    return {
+        "event_type_id": seeded["event_type_id"],
+        "start": start,
+        "guest_name": "Ada Lovelace",
+        "guest_email": "ada@example.com",
+        "guest_timezone": "UTC",
+    }
+
+
+async def _mint_token(
+    app: FastAPI, *, booking_id: uuid.UUID, tenant_id: uuid.UUID, purpose: GuestTokenPurpose
+) -> str:
+    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    async with sessionmaker() as session, session.begin():
+        return await issue_guest_token(
+            session,
+            GuestTokenSigner(_APP_SECRET),
+            booking_id=booking_id,
+            tenant_id=tenant_id,
+            purpose=purpose,
+            ttl=timedelta(days=1),
+        )
+
+
+async def test_requires_auth(wired_client: AsyncClient, seeded: dict[str, Any]) -> None:
+    resp = await wired_client.post(BOOKINGS, json=_payload(seeded, seeded["slot1"]))
+    assert resp.status_code == 401
+
+
+async def test_create_returns_201_and_confirms(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    resp = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "confirmed"
+    assert body["event_type_id"] == seeded["event_type_id"]
+    assert "external_event_id" not in body  # internal field never leaks (RF-16)
+
+
+async def test_duplicate_slot_returns_409(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    first = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert first.status_code == 201
+    second = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"]["error"] == "slot_unavailable"
+
+
+async def test_bad_payload_returns_422(wired_client: AsyncClient, seeded: dict[str, Any]) -> None:
+    bad = {**_payload(seeded, seeded["slot1"]), "guest_email": "not-an-email"}
+    resp = await wired_client.post(BOOKINGS, json=bad, headers=seeded["headers"])
+    assert resp.status_code == 422
+
+
+async def test_get_and_list(wired_client: AsyncClient, seeded: dict[str, Any]) -> None:
+    created = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    booking_id = created.json()["id"]
+
+    one = await wired_client.get(f"{BOOKINGS}{booking_id}", headers=seeded["headers"])
+    assert one.status_code == 200 and one.json()["id"] == booking_id
+
+    listed = await wired_client.get(BOOKINGS, headers=seeded["headers"])
+    assert listed.status_code == 200
+    assert booking_id in [b["id"] for b in listed.json()]
+
+    missing = await wired_client.get(f"{BOOKINGS}{uuid.uuid4()}", headers=seeded["headers"])
+    assert missing.status_code == 404
+
+
+async def test_cancel_via_guest_token(
+    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    created = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    booking_id = created.json()["id"]
+    token = await _mint_token(
+        app,
+        booking_id=uuid.UUID(booking_id),
+        tenant_id=seeded["tenant_id"],
+        purpose=GuestTokenPurpose.CANCEL,
+    )
+
+    # A guest link (no API key) cancels the booking.
+    ok = await wired_client.post(f"{BOOKINGS}{booking_id}/cancel", params={"token": token})
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "cancelled"
+
+    # A bogus token is refused generically (RF-09: no booking data leaked).
+    bad = await wired_client.post(f"{BOOKINGS}{booking_id}/cancel", params={"token": "garbage"})
+    assert bad.status_code == 403
+
+
+async def test_reschedule_via_api_key(wired_client: AsyncClient, seeded: dict[str, Any]) -> None:
+    created = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    original_id = created.json()["id"]
+
+    moved = await wired_client.post(
+        f"{BOOKINGS}{original_id}/reschedule",
+        json={"new_start": seeded["slot2"]},
+        headers=seeded["headers"],
+    )
+    assert moved.status_code == 200
+    body = moved.json()
+    assert body["id"] != original_id
+    assert body["status"] == "confirmed"
+    assert body["rescheduled_from_id"] == original_id
+
+    # The original is now cancelled, freeing its slot.
+    old = await wired_client.get(f"{BOOKINGS}{original_id}", headers=seeded["headers"])
+    assert old.json()["status"] == "cancelled"

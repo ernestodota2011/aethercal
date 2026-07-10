@@ -56,7 +56,13 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
             "event_type_id",
             "start_at",
             unique=True,
+            # The partial predicate (cancelled bookings free their slot, RF-04) is declared for
+            # BOTH PostgreSQL (production) and SQLite (the offline test backend) so ``create_all``
+            # builds a genuinely partial index everywhere. Without ``sqlite_where`` SQLite emits a
+            # FULL unique index and a cancelled row keeps occupying its slot, so the offline suite
+            # could not prove the freed-slot semantics. The initial migration stays PostgreSQL-only.
             postgresql_where=sa.text("status <> 'cancelled'"),
+            sqlite_where=sa.text("status <> 'cancelled'"),
         ),
     )
 
