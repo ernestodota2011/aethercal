@@ -82,7 +82,7 @@ def test_page_shell_is_accessible_and_localized() -> None:
     assert "Saltar al contenido" in html  # skip link
     assert 'name="viewport"' in html
     assert "/e/intro?lang=en" in html  # language switcher exposes the other locale
-    assert "htmx.org" in html  # HTMX is wired for progressive enhancement
+    assert views._HTMX_SRC in html  # the exact pinned HTMX CDN src is wired
 
 
 def test_index_lists_event_types_with_links() -> None:
