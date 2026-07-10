@@ -27,6 +27,14 @@ class ExternalConnection(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     encrypted_credentials: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
     revoked_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
+    # The busy-cache coverage window this connection last synced, and when (RF-12/13). read_busy
+    # judges freshness by whether this window CONTAINS the queried window (not by a per-row age), so
+    # a cache filled for one window is never reused for another -- the fix for the F1-07 double-book
+    # risk. All three are set together by refresh_busy_cache; NULL means "never synced".
+    busy_synced_from: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    busy_synced_to: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    busy_synced_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+
     __table_args__ = (
         sa.UniqueConstraint(
             "tenant_id",

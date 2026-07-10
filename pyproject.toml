@@ -43,6 +43,11 @@ dev = [
     "pytest>=8",
     "pytest-cov>=5",
     "pytest-benchmark>=4",
+    # Async test support for the FastAPI server layer (F1-17+). `asyncio_mode = "auto"` (below)
+    # lets async tests/fixtures run without a per-test marker; aiosqlite gives the offline,
+    # in-memory AsyncSession the service-layer TDD runs against (no Postgres needed).
+    "pytest-asyncio>=0.24",
+    "aiosqlite>=0.20",
     "hypothesis>=6.100",
     # Independent oracle for cross-checking our recurrence expansion (test-only, never runtime —
     # using it both to expand and to verify would make the cross-check circular).
@@ -85,6 +90,11 @@ addopts = "-ra --strict-markers --strict-config"
 testpaths = ["packages", "apps"]
 xfail_strict = true
 filterwarnings = ["error"]
+# Async tests/fixtures (the server layer) run without a per-test marker. The explicit
+# fixture-loop-scope silences pytest-asyncio's "unset" PytestDeprecationWarning, which
+# `filterwarnings = ["error"]` would otherwise promote to a hard failure.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     # Opt-in tests that need a real PostgreSQL server (autogenerate parity, the boot advisory
     # lock). They skip unless AETHERCAL_TEST_DATABASE_URL is set, so the default matrix
@@ -113,8 +123,24 @@ extend-exclude = ["apps/server/src/aethercal/server/db/migrations/versions"]
 select = ["E", "F", "I", "UP", "B", "SIM", "PL", "RUF", "TID"]
 ignore = ["PLR2004"]
 
+# FastAPI dependency injection (`Depends(...)`) and Typer parameter declarations
+# (`Option(...)`/`Argument(...)`) intentionally call these in argument positions; they are the
+# framework's declaration API, not the mutable-default footgun B008 targets.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Header",
+    "fastapi.Path",
+    "typer.Option",
+    "typer.Argument",
+]
+
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["PLR2004", "S101"]
+# The booking page's view builders are presentational functions: each takes the data it renders
+# (event, slots, tz, labels, urls, errors), so a higher argument count is inherent, not a smell.
+"apps/booking/src/aethercal/booking/views.py" = ["PLR0913"]
 
 [tool.pyright]
 pythonVersion = "3.11"

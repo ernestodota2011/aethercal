@@ -1,0 +1,30 @@
+# Keep the Docker build context small and host-agnostic. The build re-creates the venv from
+# uv.lock inside the image, so the host virtualenv (with Windows/host paths) must never be copied.
+.venv/
+**/.venv/
+venv/
+env/
+
+# Local secrets never enter an image layer.
+.env
+.env.*
+!.env.example
+
+# VCS + caches + editor cruft.
+.git/
+.github/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+**/.mypy_cache/
+**/.pyright/
+
+# Node / JS build output for the UI package (the server image doesn't build JS).
+**/node_modules/
+packages/aethercal-ui/js/dist/
+
+# Python build artifacts.
+dist/
+build/
+*.egg-info/
