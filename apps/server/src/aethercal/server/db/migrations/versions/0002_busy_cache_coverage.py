@@ -5,8 +5,8 @@ cache actually COVERS the queried window (not merely by a recent per-row ``fetch
 the double-booking risk where a cache filled for one window read as fresh for a different window.
 
 Forward-only expand migration (RF-19): the three columns are nullable and additive, so the change is
-safe to apply online with the app running (NULL = "never synced"). There is no destructive downgrade
-of these columns (see ``downgrade``); they are removed only when 0001 drops the table.
+safe to apply online with the app running (NULL = "never synced"). The ``downgrade`` symmetrically
+drops them (via batch mode, so it works on SQLite too), though production only ever migrates forward.
 
 Revision ID: 0002_busy_cache_coverage
 Revises: 0001_initial
@@ -43,6 +43,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Forward-only expand: no stand-alone column drop (SQLite has no DROP COLUMN outside batch mode,
-    # and the columns are harmless nullable additions). Downgrade-to-base drops the table via 0001.
-    pass
+    # Symmetric with the expand above; batch mode makes DROP COLUMN work on SQLite too (it has no
+    # bare DROP COLUMN). Production migrates forward-only at boot, but a real downgrade keeps this
+    # revision honest and consistent with 0001.
+    with op.batch_alter_table('external_connections') as batch_op:
+        batch_op.drop_column('busy_synced_at')
+        batch_op.drop_column('busy_synced_to')
+        batch_op.drop_column('busy_synced_from')
