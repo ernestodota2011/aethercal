@@ -170,6 +170,21 @@ class _FailingSender:
         raise RuntimeError("smtp down")
 
 
+class _FailingRunner:
+    """A :class:`TaskRunner` whose ``schedule`` always raises — drives the best-effort reminder
+    contract (RF-10): a failing reminder scheduling must never roll the committed booking back."""
+
+    def schedule(
+        self,
+        func: Any,
+        *,
+        run_at: datetime,
+        job_id: str,
+        kwargs: Any = None,
+    ) -> None:
+        raise RuntimeError("scheduler down")
+
+
 class _RecordingRunner:
     """An in-memory :class:`TaskRunner` recording scheduled reminder jobs."""
 
@@ -563,6 +578,30 @@ async def test_a_failing_confirmation_email_never_rolls_back_the_booking(
     )
 
     # The email raised, but the booking stands (best-effort side-effect, RF-08).
+    assert booking.status == BookingStatus.CONFIRMED
+    persisted = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
+    assert persisted is not None
+
+
+async def test_a_failing_reminder_runner_never_rolls_back_the_booking(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    effects = BookingEffects(
+        signer=GuestTokenSigner("test-app-secret"),
+        booking_base_url="https://book.example.com",
+        reminder_runner=_FailingRunner(),
+    )
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )
+
+    # Reminder scheduling raised, but the booking stands (best-effort side-effect, RF-10).
     assert booking.status == BookingStatus.CONFIRMED
     persisted = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
     assert persisted is not None
