@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -22,7 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.models import ApiKey, Tenant, User
 from aethercal.server.integrations.google.oauth import get_credentials
-from aethercal.server.services.api_keys import issue_api_key, list_api_keys, revoke_api_key
+from aethercal.server.services.api_keys import (
+    RevokeKeyOutcome,
+    issue_api_key,
+    list_api_keys,
+    revoke_api_key,
+)
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.settings import Settings
 
@@ -88,15 +92,6 @@ async def run_list_keys(
         return await list_api_keys(session, tenant_id=tenant.id)
 
 
-class RevokeKeyOutcome(StrEnum):
-    """The three possible results of a revoke, so the Typer command can print a clean message
-    instead of letting an unhandled lookup failure surface as a traceback."""
-
-    REVOKED = "revoked"
-    ALREADY_REVOKED = "already_revoked"
-    NOT_FOUND = "not_found"
-
-
 async def run_revoke_key(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
@@ -104,14 +99,14 @@ async def run_revoke_key(
     api_key_id: uuid.UUID,
 ) -> tuple[RevokeKeyOutcome, str | None]:
     """Revoke the API key ``api_key_id`` iff it belongs to ``tenant_slug``. Returns ``(outcome,
-    prefix)`` — ``prefix`` identifies the key (never the secret) and is ``None`` on
-    :attr:`RevokeKeyOutcome.NOT_FOUND`.
+    prefix)`` from the service's atomic revoke — ``prefix`` identifies the key (never the secret)
+    and is ``None`` on :attr:`RevokeKeyOutcome.NOT_FOUND`.
 
-    Idempotent by design: revoking an already-revoked key reports
-    :attr:`RevokeKeyOutcome.ALREADY_REVOKED` rather than re-stamping ``revoked_at`` or raising. An
-    unknown id — or one that belongs to a different tenant — reports
-    :attr:`RevokeKeyOutcome.NOT_FOUND` (the two cases are indistinguishable on purpose: a
-    cross-tenant probe must not be able to tell "wrong tenant" from "no such key").
+    This coroutine only resolves the slug → tenant; the idempotency and the outcome are owned by
+    :func:`revoke_api_key` (a single atomic conditional UPDATE decided by rowcount), so revoking a
+    key twice — or concurrently — never re-stamps ``revoked_at`` nor double-reports ``REVOKED``. An
+    unknown slug raises ``LookupError``; an unknown/cross-tenant id reports
+    :attr:`RevokeKeyOutcome.NOT_FOUND` (the two id cases are indistinguishable on purpose).
     """
     async with sessionmaker() as session, session.begin():
         tenant = (
@@ -119,17 +114,7 @@ async def run_revoke_key(
         ).one_or_none()
         if tenant is None:
             raise LookupError(f"no tenant with slug {tenant_slug!r}")
-        api_key = (
-            await session.scalars(
-                select(ApiKey).where(ApiKey.id == api_key_id, ApiKey.tenant_id == tenant.id)
-            )
-        ).one_or_none()
-        if api_key is None:
-            return RevokeKeyOutcome.NOT_FOUND, None
-        if api_key.revoked_at is not None:
-            return RevokeKeyOutcome.ALREADY_REVOKED, api_key.prefix
-        await revoke_api_key(session, api_key_id=api_key.id, tenant_id=tenant.id)
-        return RevokeKeyOutcome.REVOKED, api_key.prefix
+        return await revoke_api_key(session, api_key_id=api_key_id, tenant_id=tenant.id)
 
 
 async def run_connect_google(

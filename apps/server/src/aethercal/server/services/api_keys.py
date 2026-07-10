@@ -20,8 +20,9 @@ import secrets
 import string
 import uuid
 from datetime import UTC, datetime
+from enum import StrEnum
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.db.models import ApiKey
@@ -123,21 +124,61 @@ async def list_api_keys(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[
     return list(rows.all())
 
 
+class RevokeKeyOutcome(StrEnum):
+    """The three mutually exclusive results of a revoke, decided authoritatively by the conditional
+    UPDATE's rowcount so two concurrent revokes can never both report a fresh ``REVOKED``."""
+
+    REVOKED = "revoked"
+    ALREADY_REVOKED = "already_revoked"
+    NOT_FOUND = "not_found"
+
+
 async def revoke_api_key(
     session: AsyncSession, *, api_key_id: uuid.UUID, tenant_id: uuid.UUID
-) -> bool:
-    """Revoke the key ``api_key_id`` iff it belongs to ``tenant_id``.
+) -> tuple[RevokeKeyOutcome, str | None]:
+    """Revoke the key ``api_key_id`` iff it belongs to ``tenant_id``. Returns ``(outcome, prefix)``.
 
-    Returns ``True`` when a key owned by the tenant was found (revoking is idempotent), ``False``
-    when no such key exists for that tenant (cross-tenant revoke is refused).
+    The revoke is a single **atomic conditional UPDATE** (``SET revoked_at = now WHERE id = … AND
+    tenant_id = … AND revoked_at IS NULL``); the outcome is decided by the statement's **rowcount**,
+    not a read-then-write, so two concurrent revokes of the same active key can never *both* report
+    :attr:`RevokeKeyOutcome.REVOKED` — exactly one UPDATE matches the ``revoked_at IS NULL`` row.
+
+    * rowcount 1 → the caller's UPDATE won the race → :attr:`RevokeKeyOutcome.REVOKED`.
+    * rowcount 0 → nothing matched; a same-transaction re-query distinguishes
+      :attr:`RevokeKeyOutcome.ALREADY_REVOKED` (the key exists but was already revoked — its
+      ``revoked_at`` is left untouched) from :attr:`RevokeKeyOutcome.NOT_FOUND` (no such key, or it
+      belongs to another tenant; the two are indistinguishable on purpose, RF-16).
+
+    ``prefix`` identifies the key for a safe operator message (never the secret) and is ``None`` on
+    :attr:`RevokeKeyOutcome.NOT_FOUND`.
     """
+    claimed = await session.execute(
+        update(ApiKey)
+        .where(
+            ApiKey.id == api_key_id,
+            ApiKey.tenant_id == tenant_id,
+            ApiKey.revoked_at.is_(None),
+        )
+        .values(revoked_at=datetime.now(UTC))
+        .returning(ApiKey.id)
+        .execution_options(synchronize_session=False)
+    )
+    # RETURNING makes the atomic UPDATE self-report whether it matched the active row: exactly one
+    # of two concurrent revokes gets the row back, so ``matched`` (never a re-read of the stamp)
+    # separates REVOKED from ALREADY_REVOKED — a concurrent revoke can't flip our verdict.
+    matched = claimed.scalar_one_or_none() is not None
+    # Re-read with ``populate_existing`` so any identity-map instance the caller holds is refreshed
+    # to the committed state (``synchronize_session=False`` skips the ORM's in-memory sync); the
+    # row's existence separates NOT_FOUND from the two found cases and yields the reporting prefix.
     api_key = (
         await session.scalars(
-            select(ApiKey).where(ApiKey.id == api_key_id, ApiKey.tenant_id == tenant_id)
+            select(ApiKey)
+            .where(ApiKey.id == api_key_id, ApiKey.tenant_id == tenant_id)
+            .execution_options(populate_existing=True)
         )
     ).one_or_none()
     if api_key is None:
-        return False
-    if api_key.revoked_at is None:
-        api_key.revoked_at = datetime.now(UTC)
-    return True
+        return RevokeKeyOutcome.NOT_FOUND, None
+    if matched:
+        return RevokeKeyOutcome.REVOKED, api_key.prefix
+    return RevokeKeyOutcome.ALREADY_REVOKED, api_key.prefix
