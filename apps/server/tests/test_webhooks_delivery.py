@@ -310,4 +310,5 @@ async def test_sni_and_host_stay_bound_to_the_hostname_not_the_ip(
     assert delivery.status == "delivered"
     assert captured["url_host"] == PUBLIC_IP  # connects to the IP...
     assert captured["host_header"] == "consumer.test"  # ...but Host header is the real hostname...
-    assert captured["sni"] == "consumer.test"  # ...and so is SNI + cert verification
+    # ...and so is SNI + cert verification. httpcore consumes this extension as bytes.
+    assert captured["sni"] == b"consumer.test"

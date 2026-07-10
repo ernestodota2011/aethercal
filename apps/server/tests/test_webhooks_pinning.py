@@ -86,7 +86,8 @@ async def test_build_pinned_request_dials_the_ip_but_keeps_host_and_sni() -> Non
         )
     assert request.url.host == PUBLIC_IP  # the TCP connection targets the validated IP literal
     assert request.headers["Host"] == "consumer.test"  # vhost routing keeps the real hostname
-    assert request.extensions["sni_hostname"] == "consumer.test"  # SNI + cert host = real hostname
+    # SNI + cert host = real hostname, as BYTES (httpcore .decode("ascii")s this extension).
+    assert request.extensions["sni_hostname"] == b"consumer.test"
     assert request.content == b"payload"
 
 
@@ -102,7 +103,27 @@ async def test_build_pinned_request_preserves_a_non_default_port() -> None:
     assert request.url.host == PUBLIC_IP
     assert request.url.port == 8443
     assert request.headers["Host"] == "consumer.test:8443"
-    assert request.extensions["sni_hostname"] == "consumer.test"
+    assert request.extensions["sni_hostname"] == b"consumer.test"
+
+
+async def test_sni_extension_is_bytes_httpcore_can_decode() -> None:
+    """The sni_hostname extension must be the exact type httpcore consumes.
+
+    httpcore derives the TLS ``server_hostname`` by calling ``.decode("ascii")`` on this extension,
+    so a ``str`` would blow up mid-handshake with ``AttributeError``. Assert the value is ``bytes``
+    and round-trips through httpcore's decode back to the real hostname (never the dialed IP).
+    """
+    async with httpx.AsyncClient() as client:
+        request = await build_pinned_request(
+            client,
+            "https://consumer.test/hook",
+            content=b"x",
+            headers={},
+            resolver=_resolves_to(PUBLIC_IP),
+        )
+    sni = request.extensions["sni_hostname"]
+    assert isinstance(sni, bytes)
+    assert sni.decode("ascii") == "consumer.test"
 
 
 async def test_build_pinned_request_blocks_a_rebound_private_ip() -> None:

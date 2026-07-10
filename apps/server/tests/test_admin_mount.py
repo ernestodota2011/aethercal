@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.applications import Starlette
 
+from aethercal.server.admin import app as admin_app_module
 from aethercal.server.admin import mount as mount_module
 from aethercal.server.admin.app import build_admin_app
 from aethercal.server.admin.config import AdminConfig
@@ -82,3 +84,41 @@ def test_build_admin_app_registers_the_four_pages() -> None:
     )
     app = build_admin_app(runtime)
     assert set(app._unevaluated_pages) == {"index", "login", "event-types", "schedules"}
+
+
+async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling the admin must not fail during ``create_app``.
+
+    The live mount builds ``AdminRuntime(sessionmaker=app.state.sessionmaker)``. ``create_app`` sets
+    ``app.state.sessionmaker`` **eagerly** (not in the lifespan) and *before* it calls
+    ``mount_admin``, so the sessionmaker is present when the admin mounts. We stub only the Reflex
+    ASGI build (which needs a compiled frontend); the real ``AdminRuntime`` + the real
+    ``app.state.sessionmaker`` access run, exercising the previously-uncovered live mount path.
+    """
+    for key, value in _ENABLED_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_admin_asgi(runtime: AdminRuntime) -> Starlette:
+        captured["runtime"] = runtime  # the real runtime, built from app.state.sessionmaker
+        return Starlette()
+
+    monkeypatch.setattr(admin_app_module, "build_admin_asgi", _fake_build_admin_asgi)
+
+    settings = Settings(
+        database_url="sqlite+aiosqlite://",
+        app_secret="test-secret",
+        auto_migrate=False,
+    )
+    app = create_app(settings)  # must NOT raise: sessionmaker exists when the admin mounts
+    try:
+        runtime = captured["runtime"]
+        assert isinstance(runtime, AdminRuntime)
+        assert runtime.sessionmaker is app.state.sessionmaker
+        mounted = [r for r in app.routes if getattr(r, "path", "") == ADMIN_MOUNT_PATH]
+        assert mounted, "the admin should be mounted at /admin when enabled"
+    finally:
+        await app.state.engine.dispose()

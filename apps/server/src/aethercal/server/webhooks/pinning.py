@@ -101,8 +101,11 @@ async def build_pinned_request(
     request = client.build_request("POST", url, content=content, headers=headers)
     # Repoint the socket to the validated IP literal; the already-materialized Host header is kept.
     request.url = request.url.copy_with(host=pinned_ip)
-    # SNI + cert-hostname verification stay bound to the real hostname, not the dialed IP.
-    request.extensions[_SNI_EXTENSION] = host
+    # Keep SNI + cert-hostname verification bound to the real hostname, not the dialed IP. httpcore
+    # reads this extension as BYTES (it ``.decode("ascii")``s it into the TLS ``server_hostname``);
+    # a str would raise ``AttributeError`` mid-handshake. Webhook hosts are ASCII/punycode, so
+    # ascii-encoding is the exact round-trip httpcore expects.
+    request.extensions[_SNI_EXTENSION] = host.encode("ascii")
     return request
 
 
