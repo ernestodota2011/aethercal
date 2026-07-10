@@ -9,6 +9,7 @@ google-auth libraries are untyped, so their objects stay behind an ``Any`` seam 
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
 ]
+
+
+def credentials_from_token_json(token_json: str) -> Any:  # pragma: no cover - live wiring
+    """Rebuild Google ``Credentials`` from stored authorized-user token JSON (F1-07).
+
+    The JSON is exactly what ``get_credentials`` cached (``creds.to_json()``) and what
+    ``services.calendars.store_google_connection`` persists encrypted. Constructing the object does
+    no network I/O, but google-auth is untyped so it stays behind the ``Any`` seam. Used by the
+    live ``service_factory`` that ``read_busy`` refreshes through.
+    """
+    info: dict[str, Any] = json.loads(token_json)
+    return Credentials.from_authorized_user_info(info, SCOPES)
 
 
 def _client_config() -> dict[str, Any]:
