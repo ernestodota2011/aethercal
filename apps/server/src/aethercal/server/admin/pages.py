@@ -227,8 +227,14 @@ def event_types_page() -> rx.Component:
                 rx.input(name="id", placeholder="Event type id", required=True),
                 rx.input(name="title", placeholder="New title (optional)"),
                 rx.input(name="duration_min", type="number", placeholder="New minutes (optional)"),
-                rx.input(name="title_en", placeholder="New title EN (optional)"),
-                rx.input(name="description_en", placeholder="New description EN (optional)"),
+                # EN translations: a blank field PRESERVES the saved override (no silent data loss);
+                # tick the matching clear checkbox to REMOVE it explicitly.
+                rx.input(name="title_en", placeholder="New title EN (blank keeps current)"),
+                rx.checkbox("Clear title EN translation", name="clear_title_en"),
+                rx.input(
+                    name="description_en", placeholder="New description EN (blank keeps current)"
+                ),
+                rx.checkbox("Clear description EN translation", name="clear_description_en"),
                 rx.button("Update", type="submit"),
                 spacing="3",
                 align="end",

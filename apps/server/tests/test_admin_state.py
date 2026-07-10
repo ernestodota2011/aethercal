@@ -365,11 +365,8 @@ async def test_update_event_type_absent_en_field_leaves_the_existing_translation
     assert state.event_types[0]["title_en"] == "Discovery call"
 
 
-async def test_update_event_type_blank_en_field_clears_the_stored_translation(
-    seeded_maker: Sessionmaker,
-) -> None:
-    # A present-but-BLANK EN field means "remove this translation": the admin must be able to undo a
-    # saved EN override, so a blank EN field sends title_translations={} (not omit-if-blank).
+async def _event_with_en_translations(seeded_maker: Sessionmaker) -> tuple[AdminState, str]:
+    """A seeded, authed state + one event type that already has EN title/description overrides."""
     state = await _authenticated_state(seeded_maker)
     await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
     await AdminState.create_event_type.fn(
@@ -384,19 +381,81 @@ async def test_update_event_type_blank_en_field_clears_the_stored_translation(
             "description_en": "A quick intro.",
         },
     )
-    event_type_id = state.event_types[0]["id"]
+    assert state.event_types[0]["title_en"] == "Discovery call"
+    return state, state.event_types[0]["id"]
+
+
+async def test_update_event_type_editing_only_duration_preserves_existing_en_translations(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # THE regression Crisol caught: the real edit form always submits the EN inputs (blank when the
+    # operator only changed duration). A blank EN field must NOT silently drop a saved translation.
+    state, event_type_id = await _event_with_en_translations(seeded_maker)
+
+    await AdminState.update_event_type.fn(
+        state,
+        {"id": event_type_id, "duration_min": "45", "title_en": "", "description_en": ""},
+    )
+
+    assert state.error == ""
+    assert state.event_types[0]["duration_min"] == "45"
+    assert state.event_types[0]["title_en"] == "Discovery call"  # PRESERVED, not silently cleared
+    assert state.event_types[0]["description_en"] == "A quick intro."
+
+
+async def test_update_event_type_blank_en_without_clear_checkbox_preserves_translation(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # A blank EN field with the clear checkbox UNCHECKED (absent) preserves the existing override.
+    state, event_type_id = await _event_with_en_translations(seeded_maker)
+
+    await AdminState.update_event_type.fn(state, {"id": event_type_id, "title_en": ""})
+
+    assert state.error == ""
     assert state.event_types[0]["title_en"] == "Discovery call"
 
-    # The admin re-submits the form with the EN fields cleared → both translations are removed.
+
+async def test_update_event_type_clear_checkbox_removes_the_translation(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # Removal is EXPLICIT: only the per-field clear checkbox empties a stored translation ({}).
+    state, event_type_id = await _event_with_en_translations(seeded_maker)
+
     await AdminState.update_event_type.fn(
-        state, {"id": event_type_id, "title_en": "", "description_en": "   "}
+        state,
+        {"id": event_type_id, "clear_title_en": "on", "clear_description_en": "true"},
     )
 
     assert state.error == ""
     assert state.event_types[0]["title_en"] == ""
     assert state.event_types[0]["description_en"] == ""
-    # The canonical title, never in this payload, is untouched.
-    assert state.event_types[0]["title"] == "Introducción"
+    assert state.event_types[0]["title"] == "Introducción"  # canonical untouched
+
+
+async def test_update_event_type_clear_checkbox_wins_over_a_typed_value(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # If the clear checkbox is checked, the (ignored) input value must not resurrect the override.
+    state, event_type_id = await _event_with_en_translations(seeded_maker)
+
+    await AdminState.update_event_type.fn(
+        state,
+        {"id": event_type_id, "title_en": "Ignored", "clear_title_en": "on"},
+    )
+
+    assert state.error == ""
+    assert state.event_types[0]["title_en"] == ""
+
+
+async def test_update_event_type_new_en_value_sets_the_translation_when_not_cleared(
+    seeded_maker: Sessionmaker,
+) -> None:
+    state, event_type_id = await _event_with_en_translations(seeded_maker)
+
+    await AdminState.update_event_type.fn(state, {"id": event_type_id, "title_en": "Intro call"})
+
+    assert state.error == ""
+    assert state.event_types[0]["title_en"] == "Intro call"  # updated to the new value
 
 
 async def test_update_event_type_blank_canonical_title_is_omitted_not_cleared(
