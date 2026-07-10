@@ -42,6 +42,16 @@ class AetherCalAPIError(AetherCalError):
         super().__init__(f"{status_code} {error}: {message}")
 
 
+class AetherCalTransportError(AetherCalError):
+    """The request never produced an HTTP response.
+
+    Raised when the underlying connection fails before any status line arrives — DNS failure,
+    connection refused, TLS error, or a read/connect/pool timeout. Callers that only catch
+    :class:`AetherCalError` (or this subclass) no longer have raw ``httpx.RequestError`` leaking
+    through the SDK boundary. The originating httpx exception is chained as ``__cause__``.
+    """
+
+
 def _auth_headers(api_key: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
@@ -111,9 +121,22 @@ class AetherCalClient:
     def close(self) -> None:
         self._client.close()
 
+    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Issue a request, translating transport failures into :class:`AetherCalTransportError`.
+
+        Every request the client makes goes through here so a connection/timeout error (which
+        ``httpx`` raises as ``httpx.RequestError`` before any response) surfaces as a documented
+        SDK error instead of a leaking httpx exception.
+        """
+        try:
+            return self._client.request(method, path, **kwargs)
+        except httpx.RequestError as exc:
+            msg = f"{method} {path} failed before a response: {exc!r}"
+            raise AetherCalTransportError(msg) from exc
+
     def health(self) -> dict[str, Any]:
         """Return the ``/api/v1/health`` payload, or raise :class:`AetherCalAPIError`."""
-        response = self._client.get(_HEALTH_PATH)
+        response = self._send("GET", _HEALTH_PATH)
         _raise_for_status(response)
         return response.json()
 
@@ -129,7 +152,7 @@ class AetherCalClient:
 
     def list_event_types(self) -> list[EventTypeRead]:
         """List the authenticated tenant's bookable event types (``GET /api/v1/event-types``)."""
-        response = self._client.get(_EVENT_TYPES_PATH)
+        response = self._send("GET", _EVENT_TYPES_PATH)
         _raise_for_status(response)
         return [EventTypeRead.model_validate(item) for item in response.json()]
 
@@ -145,7 +168,8 @@ class AetherCalClient:
 
         ``tz`` is the IANA display zone echoed back on the response; the slot bounds are UTC.
         """
-        response = self._client.get(
+        response = self._send(
+            "GET",
             _SLOTS_PATH,
             params={
                 "event_type": str(event_type),
@@ -159,14 +183,14 @@ class AetherCalClient:
 
     def create_booking(self, booking: BookingCreate) -> BookingRead:
         """Book a slot (``POST /api/v1/bookings``); raises 409 if the time is no longer free."""
-        response = self._client.post(_BOOKINGS_PATH, json=booking.model_dump(mode="json"))
+        response = self._send("POST", _BOOKINGS_PATH, json=booking.model_dump(mode="json"))
         _raise_for_status(response)
         return _booking_from_api(response.json())
 
     def cancel_booking(self, booking_id: uuid.UUID, *, token: str) -> BookingRead:
         """Cancel a booking with a signed guest token (``POST /api/v1/bookings/{id}/cancel``)."""
-        response = self._client.post(
-            f"{_BOOKINGS_PATH}{booking_id}/cancel", params={"token": token}
+        response = self._send(
+            "POST", f"{_BOOKINGS_PATH}{booking_id}/cancel", params={"token": token}
         )
         _raise_for_status(response)
         return _booking_from_api(response.json())
@@ -175,7 +199,8 @@ class AetherCalClient:
         self, booking_id: uuid.UUID, *, new_start: datetime, token: str
     ) -> BookingRead:
         """Reschedule a booking to ``new_start`` with a guest token (409 if the slot is taken)."""
-        response = self._client.post(
+        response = self._send(
+            "POST",
             f"{_BOOKINGS_PATH}{booking_id}/reschedule",
             params={"token": token},
             json=BookingReschedule(new_start=new_start).model_dump(mode="json"),
@@ -216,9 +241,17 @@ class AsyncAetherCalClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _asend(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Async counterpart of :meth:`AetherCalClient._send` — wraps transport failures."""
+        try:
+            return await self._client.request(method, path, **kwargs)
+        except httpx.RequestError as exc:
+            msg = f"{method} {path} failed before a response: {exc!r}"
+            raise AetherCalTransportError(msg) from exc
+
     async def health(self) -> dict[str, Any]:
         """Return the ``/api/v1/health`` payload, or raise :class:`AetherCalAPIError`."""
-        response = await self._client.get(_HEALTH_PATH)
+        response = await self._asend("GET", _HEALTH_PATH)
         _raise_for_status(response)
         return response.json()
 
@@ -235,5 +268,6 @@ __all__ = [
     "AetherCalAPIError",
     "AetherCalClient",
     "AetherCalError",
+    "AetherCalTransportError",
     "AsyncAetherCalClient",
 ]

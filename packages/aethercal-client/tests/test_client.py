@@ -5,11 +5,22 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from aethercal.client import AetherCalAPIError, AetherCalClient, AsyncAetherCalClient
+from aethercal.client import (
+    AetherCalAPIError,
+    AetherCalClient,
+    AetherCalError,
+    AetherCalTransportError,
+    AsyncAetherCalClient,
+)
 
 
 def _ok_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"status": "ok"})
+
+
+def _boom_handler(request: httpx.Request) -> httpx.Response:
+    """Simulate a transport-level failure (no HTTP response ever arrives)."""
+    raise httpx.ConnectError("connection refused")
 
 
 def _unauthorized_handler(request: httpx.Request) -> httpx.Response:
@@ -74,3 +85,42 @@ async def test_async_ping_false_on_error() -> None:
         "http://testserver", transport=httpx.MockTransport(_unauthorized_handler)
     ) as client:
         assert await client.ping() is False
+
+
+def test_transport_error_is_wrapped_sync() -> None:
+    """A connect/timeout error (no HTTP response) surfaces as AetherCalTransportError."""
+    with (
+        AetherCalClient(
+            "http://testserver", transport=httpx.MockTransport(_boom_handler)
+        ) as client,
+        pytest.raises(AetherCalTransportError) as exc_info,
+    ):
+        client.health()
+    # It is part of the documented error hierarchy, and chains the underlying httpx cause.
+    assert isinstance(exc_info.value, AetherCalError)
+    assert isinstance(exc_info.value.__cause__, httpx.RequestError)
+
+
+def test_transport_error_wrapped_on_v1_methods() -> None:
+    with (
+        AetherCalClient(
+            "http://testserver", transport=httpx.MockTransport(_boom_handler)
+        ) as client,
+        pytest.raises(AetherCalTransportError),
+    ):
+        client.list_event_types()
+
+
+def test_ping_false_on_transport_error() -> None:
+    with AetherCalClient(
+        "http://testserver", transport=httpx.MockTransport(_boom_handler)
+    ) as client:
+        assert client.ping() is False
+
+
+async def test_async_transport_error_is_wrapped() -> None:
+    async with AsyncAetherCalClient(
+        "http://testserver", transport=httpx.MockTransport(_boom_handler)
+    ) as client:
+        with pytest.raises(AetherCalTransportError):
+            await client.health()
