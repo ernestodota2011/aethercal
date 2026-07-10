@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any
@@ -670,3 +671,104 @@ def test_reschedule_slot_forms_carry_active_lang() -> None:
     assert response.status_code == 200
     assert response.text.count('name="lang" value="en"') >= 1
     assert '<html lang="en">' in response.text
+
+
+# ---------------------------------------------------------------------------------------
+# (e) A5: self-hosted htmx (no CDN dependency), the externalized tz-detect script, and
+# app-owned security headers (CSP `script-src 'self'` requires (a) + (b) — see A5.3).
+# ---------------------------------------------------------------------------------------
+
+_SCRIPT_TAG_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+
+
+def _assert_no_inline_scripts(html: str) -> None:
+    """Every ``<script>`` on a rendered page must be externally sourced with an empty body — a
+    strict ``script-src 'self'`` CSP (A5.3) would otherwise block an inline script outright."""
+    tags = _SCRIPT_TAG_RE.findall(html)
+    assert tags, "expected at least one <script> tag (htmx) on this page"
+    for attrs, body in tags:
+        assert "src=" in attrs, f"inline script with no src: <script{attrs}>{body}</script>"
+        assert body.strip() == "", f"script tag carries an inline JS body: {body!r}"
+
+
+def test_static_htmx_bundle_is_served() -> None:
+    client, _ = _make_client()
+    response = client.get("/static/htmx-2.0.4.min.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"].lower()
+    assert len(response.content) > 50_000  # the real vendored bundle, not a stub
+    assert b"htmx" in response.content
+
+
+def test_static_tz_detect_script_is_served() -> None:
+    client, _ = _make_client()
+    response = client.get("/static/tz-detect.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"].lower()
+    assert b"currentScript" in response.content
+
+
+def test_no_rendered_page_carries_an_inline_script_body() -> None:
+    client, _ = _make_client()
+    _assert_no_inline_scripts(client.get("/e/intro?tz=UTC").text)
+    _assert_no_inline_scripts(
+        client.get(f"/reschedule?booking={BOOKING_ID}&token=good&event_type={INTRO_ID}&tz=UTC").text
+    )
+
+
+def _assert_security_headers(response: Any) -> None:
+    csp = response.headers.get("content-security-policy")
+    assert csp is not None
+    assert response.headers.get("x-frame-options") == "SAMEORIGIN"
+    assert response.headers.get("x-content-type-options") == "nosniff"
+    assert response.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
+    assert response.headers.get("cross-origin-opener-policy") == "same-origin-allow-popups"
+    assert response.headers.get("permissions-policy") is not None
+    assert response.headers.get("strict-transport-security") is not None
+    assert "script-src 'self'" in csp
+    script_src_segment = csp.split("script-src", 1)[1].split(";", 1)[0]
+    assert "unsafe-inline" not in script_src_segment
+    assert "img-src 'self' data:" in csp
+
+
+def test_security_headers_present_on_index() -> None:
+    client, _ = _make_client()
+    _assert_security_headers(client.get("/"))
+
+
+def test_security_headers_present_on_event_page() -> None:
+    client, _ = _make_client()
+    _assert_security_headers(client.get("/e/intro?tz=UTC"))
+
+
+def test_security_headers_present_on_booking_form() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/intro/book?start=2026-07-14T13:00:00%2B00:00&tz=UTC")
+    _assert_security_headers(response)
+
+
+def test_security_headers_present_on_confirmation() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "es",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+        },
+    )
+    _assert_security_headers(response)
+
+
+def test_security_headers_present_on_static_response() -> None:
+    client, _ = _make_client()
+    _assert_security_headers(client.get("/static/htmx-2.0.4.min.js"))
+
+
+def test_security_headers_present_on_404() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/does-not-exist")
+    assert response.status_code == 404
+    _assert_security_headers(response)

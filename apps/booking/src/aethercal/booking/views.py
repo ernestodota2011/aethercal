@@ -9,7 +9,10 @@ attribute, semantic landmarks, labelled inputs, and ``aria-describedby`` wiring 
 FastHTML ships no type stubs, so the tag constructors are untyped upstream; builders are annotated
 ``-> Any`` (the strict-mode unknown-type family is silenced in ``pyright`` config) while every
 parameter this module owns is fully typed. Text passed to tag constructors is auto-escaped by
-FastHTML; the only raw string we inject is the timezone-detection script (via ``NotStr``).
+FastHTML. Every ``<script>`` this module emits (htmx, the timezone-detection script) is
+externally sourced (``src=``) with no inline body — required for the app's ``script-src 'self'``
+CSP (see ``app.py``'s security-headers middleware). ``NotStr`` stays exported for callers that
+need to inject pre-rendered markup (e.g. tests composing a page shell around a raw fragment).
 """
 
 from __future__ import annotations
@@ -61,9 +64,11 @@ from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
 from aethercal.schemas.slots import Availability
 
-# Served from the htmx CDN (deferred). Everything works WITHOUT it — the flow is plain forms; htmx
-# only live-swaps the slot list when the guest changes timezone. An integrator may self-host this.
-_HTMX_SRC = "https://unpkg.com/htmx.org@2.0.4"
+# Self-hosted (vendored at `static/htmx-2.0.4.min.js`, served by the app itself via `/static`) —
+# never a third-party CDN, so the page has no external script dependency and can run a strict
+# `script-src 'self'` CSP. Everything works WITHOUT it — the flow is plain forms; htmx only
+# live-swaps the slot list when the guest changes timezone.
+_HTMX_SRC = "/static/htmx-2.0.4.min.js"
 
 # Premium-dark, brand-warm (ember accent) — deliberately NOT the lavender/violet/cyan-glow AI-slop
 # palette. Boxless: hairline separators + air, not stacked cards. Light mode is provided for
@@ -308,19 +313,18 @@ def _tz_form(
 
 
 def _detect_script(tz_explicit: bool) -> Any:
-    explicit = "true" if tz_explicit else "false"
-    js = (
-        "(function(){var s=document.getElementById('tz');if(!s)return;try{"
-        "var tz=Intl.DateTimeFormat().resolvedOptions().timeZone;if(!tz)return;"
-        "var has=Array.prototype.some.call(s.options,function(o){return o.value===tz;});"
-        "if(!has){var o=document.createElement('option');o.value=tz;o.text=tz;s.appendChild(o);}"
-        f"if(!{explicit}&&s.value!==tz){{s.value=tz;"
-        "if(window.htmx){s.dispatchEvent(new Event('change',{bubbles:true}));}"
-        "else if(s.form){s.form.requestSubmit?s.form.requestSubmit():s.form.submit();}}"
-        "}catch(e){}})();"
+    """A deferred, externally-sourced script (``static/tz-detect.js``) that auto-detects the
+    guest's browser timezone and, unless it was explicitly chosen, applies it and triggers the
+    HTMX slot refresh (or a plain form submit without JS/HTMX). ``tz_explicit`` rides a
+    ``data-tz-explicit`` attribute so the script tag itself carries no inline JS body — required
+    for the strict ``script-src 'self'`` CSP (A5.3); the script reads it back via
+    ``document.currentScript.dataset.tzExplicit``.
+    """
+    return Script(
+        src="/static/tz-detect.js",
+        data_tz_explicit="true" if tz_explicit else "false",
+        defer=True,
     )
-    # FastHTML renders Script/Style content raw (unescaped); this JS reads only the Intl API.
-    return Script(js)
 
 
 def event_page(

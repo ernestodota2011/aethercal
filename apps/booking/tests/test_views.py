@@ -82,7 +82,32 @@ def test_page_shell_is_accessible_and_localized() -> None:
     assert "Saltar al contenido" in html  # skip link
     assert 'name="viewport"' in html
     assert "/e/intro?lang=en" in html  # language switcher exposes the other locale
-    assert views._HTMX_SRC in html  # the exact pinned HTMX CDN src is wired
+    assert views._HTMX_SRC in html  # the exact pinned HTMX src is wired
+
+
+def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
+    # A5.1 (I3 fix): htmx must be served by the app itself, never fetched from unpkg/a CDN.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p>hi</p>"), lang_urls=LANG_URLS))
+    assert "/static/htmx-2.0.4.min.js" in html
+    assert "unpkg.com" not in html
+    assert "cdn." not in html
+
+
+def test_detect_script_is_external_with_no_inline_body() -> None:
+    # A5.2: the timezone-detection script must be an external <script src=...>, not inline JS —
+    # a strict `script-src 'self'` CSP (A5.3) would otherwise block it.
+    html = to_xml(views._detect_script(True))
+    assert html == '<script src="/static/tz-detect.js" data-tz-explicit="true" defer></script>'
+
+
+def test_detect_script_carries_the_explicit_flag_as_a_data_attribute() -> None:
+    explicit_html = to_xml(views._detect_script(True))
+    implicit_html = to_xml(views._detect_script(False))
+    assert 'data-tz-explicit="true"' in explicit_html
+    assert 'data-tz-explicit="false"' in implicit_html
+    # Neither carries the old inline JS body.
+    assert "Intl.DateTimeFormat" not in explicit_html
+    assert "Intl.DateTimeFormat" not in implicit_html
 
 
 def test_index_lists_event_types_with_links() -> None:

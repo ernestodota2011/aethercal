@@ -10,6 +10,13 @@ The routes deliver the ≤3-step flow (RF-07): an event landing with a slot pick
 a confirmation, plus token-authorized ``/cancel`` and ``/reschedule`` pages (RF-09). Blocking SDK
 calls run in a threadpool so they never stall the event loop. Every failure degrades to a friendly,
 localized page — a stack trace or internal message never reaches a guest (RF-16).
+
+The app owns its own security headers (A5.3) — set on every response by
+``_SecurityHeadersMiddleware`` via ``security_headers`` — rather than depending on an edge/CDN
+config, so the page is correct and portable behind any reverse proxy. It also serves its own
+static assets (self-hosted htmx + the externalized tz-detect script, A5.1/A5.2) from ``/static``,
+mounted from ``STATIC_DIR``, so the page has no third-party CDN dependency and its
+``script-src`` can be a strict ``'self'``.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlencode
 from uuid import UUID
@@ -25,8 +33,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fasthtml.common import FastHTML
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.staticfiles import StaticFiles
 
 from aethercal.booking import views
 from aethercal.booking.errors import friendly_api_error, friendly_unexpected
@@ -66,6 +77,60 @@ COMMON_TIMEZONES: tuple[str, ...] = (
     "Europe/London",
     "Europe/Paris",
 )
+
+#: The ``static/`` directory next to this module — the vendored htmx bundle and the tz-detect
+#: script (A5.1/A5.2), served by the app itself so it has no third-party CDN dependency.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+# --------------------------------------------------------------------------------------
+# Security headers (A5.3) — the app owns these outright rather than relying on an edge/CDN
+# config (portable, OSS-friendly, and correct even when the app is embedded behind a different
+# reverse proxy). ``script-src 'self'`` is strict — no CDN, no inline script — made possible by
+# self-hosting htmx (A5.1) and externalizing the timezone-detection script (A5.2).
+# --------------------------------------------------------------------------------------
+
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+_BASE_SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": _CONTENT_SECURITY_POLICY,
+    "X-Frame-Options": "SAMEORIGIN",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), usb=(), browsing-topics=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+def security_headers(path: str) -> dict[str, str]:
+    """The security headers for a response to ``path`` — every route gets the same conservative
+    baseline today. This is the single per-route seam a future ``/embed/*`` route (B0) will use to
+    relax ``frame-ancestors``/``X-Frame-Options`` for an allow-listed embedder, without touching
+    the middleware wiring itself.
+    """
+    del path  # no per-route variation yet — the seam future work (B0) will extend.
+    return dict(_BASE_SECURITY_HEADERS)
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Sets the app-owned security headers (``security_headers``) on every response."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        response = await call_next(request)
+        for name, value in security_headers(request.url.path).items():
+            response.headers[name] = value
+        return response
 
 
 # --------------------------------------------------------------------------------------
@@ -608,7 +673,8 @@ def create_app(
 ) -> FastHTML:
     """Build the FastHTML booking app bound to ``settings`` and an SDK ``client_factory``."""
     booking = _BookingApp(settings, client_factory)
-    app = FastHTML()
+    app = FastHTML(middleware=[Middleware(_SecurityHeadersMiddleware)])
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])
     _register(app, "/cancel", booking.cancel_form, ["GET"])
@@ -622,4 +688,4 @@ def create_app(
     return app
 
 
-__all__ = ["COMMON_TIMEZONES", "create_app"]
+__all__ = ["COMMON_TIMEZONES", "STATIC_DIR", "create_app", "security_headers"]
