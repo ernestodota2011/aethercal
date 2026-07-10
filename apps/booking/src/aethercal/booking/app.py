@@ -39,7 +39,13 @@ from starlette.datastructures import FormData
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.staticfiles import StaticFiles
 
 from aethercal.booking import views
@@ -87,25 +93,46 @@ COMMON_TIMEZONES: tuple[str, ...] = (
 #: script (A5.1/A5.2), served by the app itself so it has no third-party CDN dependency.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+#: ``Cache-Control`` for ``GET /embed.js`` (B2.2) — a year, ``immutable``: the loader changes
+#: rarely and integrators paste the ``<script src>`` once. ``docs/embedding.md`` documents the
+#: cache-busting escape hatch (append ``?v=<n>`` to the URL) for the rare breaking update.
+EMBED_JS_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
 
 # --------------------------------------------------------------------------------------
 # Security headers (A5.3) — the app owns these outright rather than relying on an edge/CDN
 # config (portable, OSS-friendly, and correct even when the app is embedded behind a different
 # reverse proxy). ``script-src 'self'`` is strict — no CDN, no inline script — made possible by
 # self-hosting htmx (A5.1) and externalizing the timezone-detection script (A5.2).
+#
+# `/embed/*` (B0) is the one deliberate exception: those routes are MEANT to be framed, so their
+# CSP `frame-ancestors` is relaxed to the operator's allow-list (or `*` when unset) and they carry
+# no `X-Frame-Options` at all (any value there would still block ALL framing, including the
+# allow-listed embedder — `X-Frame-Options` predates and can't express an allow-list, so it must be
+# dropped, not loosened). Everything else about `/embed/*`'s headers — nosniff, referrer policy,
+# HSTS, `script-src` — stays exactly as strict as the baseline, plus one CSP hash source for the
+# page's own static inline auto-resize script (views.EMBED_RESIZE_SCRIPT).
 # --------------------------------------------------------------------------------------
 
-_CONTENT_SECURITY_POLICY = (
-    "default-src 'self'; "
-    "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; "
-    "font-src 'self'; "
-    "connect-src 'self'; "
-    "frame-ancestors 'self'; "
-    "base-uri 'self'; "
-    "form-action 'self'"
-)
+
+def _content_security_policy(*, frame_ancestors: str, script_src_extra: str = "") -> str:
+    """Build the CSP string shared by the baseline and the ``/embed/*`` variant — only
+    ``frame_ancestors`` and (for embed) one extra ``script-src`` source ever differ."""
+    script_src = f"'self' {script_src_extra}" if script_src_extra else "'self'"
+    return (
+        "default-src 'self'; "
+        f"script-src {script_src}; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        f"frame-ancestors {frame_ancestors}; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+
+
+_CONTENT_SECURITY_POLICY = _content_security_policy(frame_ancestors="'self'")
 
 _BASE_SECURITY_HEADERS: dict[str, str] = {
     "Content-Security-Policy": _CONTENT_SECURITY_POLICY,
@@ -117,23 +144,74 @@ _BASE_SECURITY_HEADERS: dict[str, str] = {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 }
 
+#: The path prefix that marks a route as the frameable embed surface (B0/B1) — every path in this
+#: space gets relaxed framing headers and the compact chrome-less view shell.
+_EMBED_PATH_PREFIX = "/embed/"
+#: The equivalent NON-embed routing prefix (the pre-existing booking flow), used to build the
+#: correct base path for links/actions/redirects depending on which space a request is in.
+_NORMAL_PATH_PREFIX = "/e"
 
-def security_headers(path: str) -> dict[str, str]:
-    """The security headers for a response to ``path`` — every route gets the same conservative
-    baseline today. This is the single per-route seam a future ``/embed/*`` route (B0) will use to
-    relax ``frame-ancestors``/``X-Frame-Options`` for an allow-listed embedder, without touching
-    the middleware wiring itself.
+
+def _is_embed_path(path: str) -> bool:
+    """True for any path under the frameable ``/embed/*`` space (B0/B1)."""
+    return path.startswith(_EMBED_PATH_PREFIX)
+
+
+def _is_embed_request(request: Request) -> bool:
+    return _is_embed_path(request.url.path)
+
+
+def _booking_prefix(embed: bool) -> str:
+    """The routing base ("/e" or "/embed") a handler builds this request's links/actions from."""
+    return "/embed" if embed else _NORMAL_PATH_PREFIX
+
+
+def _embed_frame_ancestors(embed_allowed_origins: Sequence[str]) -> str:
+    """The CSP ``frame-ancestors`` value for an ``/embed/*`` response: the configured allow-list
+    (space-separated origins — the CSP source-list syntax) or ``*`` when none is configured. V1
+    trusts the operator to lock this down via ``AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS`` once the
+    real embedder(s) are known."""
+    origins = [origin for origin in embed_allowed_origins if origin]
+    return " ".join(origins) if origins else "*"
+
+
+def _embed_security_headers(embed_allowed_origins: Sequence[str]) -> dict[str, str]:
+    """Headers for a frameable ``/embed/*`` response (B0) — see the module-level note above."""
+    headers = {
+        key: value for key, value in _BASE_SECURITY_HEADERS.items() if key != "X-Frame-Options"
+    }
+    headers["Content-Security-Policy"] = _content_security_policy(
+        frame_ancestors=_embed_frame_ancestors(embed_allowed_origins),
+        script_src_extra=views.EMBED_RESIZE_SCRIPT_CSP_SOURCE,
+    )
+    return headers
+
+
+def security_headers(path: str, *, embed_allowed_origins: Sequence[str] = ()) -> dict[str, str]:
+    """The security headers for a response to ``path``: the strict baseline (``frame-ancestors
+    'self'`` + ``X-Frame-Options: SAMEORIGIN``) for every route EXCEPT ``/embed/*`` (B0), which is
+    deliberately frameable — see ``_embed_security_headers``.
     """
-    del path  # no per-route variation yet — the seam future work (B0) will extend.
+    if _is_embed_path(path):
+        return _embed_security_headers(embed_allowed_origins)
     return dict(_BASE_SECURITY_HEADERS)
 
 
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Sets the app-owned security headers (``security_headers``) on every response."""
 
+    def __init__(
+        self, app: Callable[..., object], *, embed_allowed_origins: Sequence[str] = ()
+    ) -> None:
+        super().__init__(app)  # pyright: ignore[reportArgumentType]
+        self._embed_allowed_origins = tuple(embed_allowed_origins)
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
-        for name, value in security_headers(request.url.path).items():
+        headers = security_headers(
+            request.url.path, embed_allowed_origins=self._embed_allowed_origins
+        )
+        for name, value in headers.items():
             response.headers[name] = value
         return response
 
@@ -291,13 +369,15 @@ def _client_ip(request: Request, trusted_proxies: Sequence[_TrustedNetwork]) -> 
 def _is_rate_limited_post(request: Request) -> bool:
     """Whether this request is one of the public state-changing POSTs the limiter guards.
 
-    The three write endpoints (``/e/{slug}/book``, ``/cancel``, ``/reschedule``); read endpoints
-    and static assets are never limited.
+    The write endpoints — ``/e/{slug}/book`` and its ``/embed/{slug}/book`` twin (B1), ``/cancel``,
+    ``/reschedule`` — read endpoints and static assets are never limited.
     """
     if request.method != "POST":
         return False
     path = request.url.path
-    return path in ("/cancel", "/reschedule") or (path.startswith("/e/") and path.endswith("/book"))
+    return path in ("/cancel", "/reschedule") or (
+        (path.startswith("/e/") or path.startswith(_EMBED_PATH_PREFIX)) and path.endswith("/book")
+    )
 
 
 class _RateLimitMiddleware(BaseHTTPMiddleware):
@@ -445,6 +525,8 @@ def _shifted_url(
 
 
 def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
+    # Derived from `request` (not threaded as a param — keeps this at the PLR0913 budget): an
+    # /embed/* 404 (e.g. an unknown slug inside the iframe) must stay compact, chrome-less (B1).
     body = views.message_page(
         locale,
         title=t(locale, "not_found_title"),
@@ -452,6 +534,7 @@ def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
         lang_urls=_lang_links_here(request),
         base_url=base_url,
         is_error=True,
+        embed=_is_embed_request(request),
     )
     return HTMLResponse(views.render(body), status_code=404)
 
@@ -514,8 +597,16 @@ class _BookingApp:
             default=self._settings.default_locale,
         )
 
-    async def _slots_section(
-        self, event: EventTypeRead, tz: str, window_from: date, today: date, locale: Locale
+    async def _slots_section(  # noqa: PLR0913 - each is a distinct query/render input; `event_path`
+        # is the routing base (B1: "/e/{slug}" or "/embed/{slug}") — not derivable from `event`.
+        self,
+        event: EventTypeRead,
+        tz: str,
+        window_from: date,
+        today: date,
+        locale: Locale,
+        *,
+        event_path: str,
     ) -> object:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
@@ -536,9 +627,9 @@ class _BookingApp:
             groups=groups,
             availability=availability,
             tz=tz,
-            book_path=f"/e/{event.slug}/book",
-            prev_url=_shifted_url(f"/e/{event.slug}", base, window_from, -WINDOW_DAYS, floor=today),
-            next_url=_shifted_url(f"/e/{event.slug}", base, window_from, WINDOW_DAYS, floor=today),
+            book_path=f"{event_path}/book",
+            prev_url=_shifted_url(event_path, base, window_from, -WINDOW_DAYS, floor=today),
+            next_url=_shifted_url(event_path, base, window_from, WINDOW_DAYS, floor=today),
             # `_window_of` already floors the requested date to `>= today` — equality means
             # further "previous week" navigation would be a no-op (the floor clamps it in place).
             prev_disabled=(window_from <= today),
@@ -558,7 +649,12 @@ class _BookingApp:
             return None
 
     def _service_error(
-        self, locale: Locale, *, lang_urls: dict[Locale, str], retry_url: str
+        self,
+        locale: Locale,
+        *,
+        lang_urls: dict[Locale, str],
+        retry_url: str,
+        embed: bool = False,
     ) -> Response:
         """The friendly 'service temporarily unavailable' page (503) with a retry affordance."""
         body = views.message_page(
@@ -570,10 +666,11 @@ class _BookingApp:
             back_url=retry_url,
             back_label=t(locale, "retry"),
             is_error=True,
+            embed=embed,
         )
         return HTMLResponse(views.render(body), status_code=503)
 
-    def _error_response(
+    def _error_response(  # noqa: PLR0913 - each kwarg is a distinct rendering axis (copy/nav/embed)
         self,
         locale: Locale,
         *,
@@ -581,12 +678,14 @@ class _BookingApp:
         exc: Exception | None,
         lang_urls: dict[Locale, str],
         retry: tuple[str, str] | None = None,
+        embed: bool = False,
     ) -> Response:
         """A friendly, localized error page with the correct HTTP status — never leaks internals.
 
         ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to
         times"). A method (not a module function) so it can read ``self._settings.base_url``
-        without growing past the PLR0913 argument budget.
+        without growing past the PLR0913 argument budget. ``embed`` (B1) keeps a backend failure
+        inside an iframe compact instead of suddenly surfacing the full site chrome.
         """
         message = (
             friendly_api_error(exc, locale)
@@ -608,6 +707,7 @@ class _BookingApp:
             back_url=retry_url,
             back_label=retry_label,
             is_error=True,
+            embed=embed,
         )
         return HTMLResponse(views.render(body), status_code=status)
 
@@ -629,20 +729,30 @@ class _BookingApp:
         )
 
     async def event(self, request: Request) -> object:
+        # This SAME handler serves BOTH "/e/{slug}" and "/embed/{slug}" (B1) — reused verbatim, not
+        # duplicated. `embed`/`event_path` are derived from the actual request path, so every link
+        # this response emits stays inside whichever space the guest is already in.
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
+        embed = _is_embed_request(request)
+        event_path = f"{_booking_prefix(embed)}/{slug}"
         tz, tz_explicit = _tz_of(request)
         today = _today_in(tz)
         window_from = _window_of(request, today)
         events = await self._events()
         if events is None:
             return self._service_error(
-                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+                locale,
+                lang_urls=_lang_links_here(request),
+                retry_url=str(request.url),
+                embed=embed,
             )
         found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        section = await self._slots_section(found, tz, window_from, today, locale)
+        section = await self._slots_section(
+            found, tz, window_from, today, locale, event_path=event_path
+        )
         # I4 (PRG): a 409 slot-conflict redirect from book_submit lands back here carrying
         # `?err=slot_unavailable` — render it as an inline notice, never re-post on a refresh.
         notice = (
@@ -658,19 +768,23 @@ class _BookingApp:
             tz_explicit=tz_explicit,
             window_from=window_from.isoformat(),
             slots=section,
-            self_path=f"/e/{slug}",
-            slots_endpoint=f"/e/{slug}/slots",
+            self_path=event_path,
+            slots_endpoint=f"{event_path}/slots",
             lang_urls=_lang_links_here(request),
             notice=notice,
             base_url=self._settings.base_url,
+            embed=embed,
         )
 
     async def slots_partial(self, request: Request) -> object:
+        # Same handler for "/e/{slug}/slots" and "/embed/{slug}/slots" (B1) — see `event()`.
         slug = str(request.path_params["slug"])
+        embed = _is_embed_request(request)
+        event_path = f"{_booking_prefix(embed)}/{slug}"
         if request.headers.get("HX-Request") is None:
             query = request.url.query
             return RedirectResponse(
-                f"/e/{slug}?{query}" if query else f"/e/{slug}", status_code=303
+                f"{event_path}?{query}" if query else event_path, status_code=303
             )
         locale = self._locale(request)
         tz, _ = _tz_of(request)
@@ -683,17 +797,25 @@ class _BookingApp:
         found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        return await self._slots_section(found, tz, window_from, today, locale)
+        return await self._slots_section(
+            found, tz, window_from, today, locale, event_path=event_path
+        )
 
     async def book_form(self, request: Request) -> object:
+        # Same handler for "/e/{slug}/book" (GET) and "/embed/{slug}/book" (GET) — see `event()`.
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
+        embed = _is_embed_request(request)
+        event_path = f"{_booking_prefix(embed)}/{slug}"
         tz, _ = _tz_of(request)
         start = request.query_params.get("start", "")
         events = await self._events()
         if events is None:
             return self._service_error(
-                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+                locale,
+                lang_urls=_lang_links_here(request),
+                retry_url=str(request.url),
+                embed=embed,
             )
         found = _find_event(events, slug)
         if found is None:
@@ -701,7 +823,7 @@ class _BookingApp:
         instant = _parse_instant(start)
         if instant is None:
             return RedirectResponse(
-                f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}", status_code=303
+                f"{event_path}?{urlencode({'tz': tz, 'lang': locale})}", status_code=303
             )
         return views.booking_form_page(
             locale,
@@ -712,9 +834,10 @@ class _BookingApp:
             questions=parse_questions(found.questions),
             values={},
             errors=[],
-            action=f"/e/{slug}/book",
-            lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+            action=f"{event_path}/book",
+            lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
             base_url=self._settings.base_url,
+            embed=embed,
         )
 
     def _honeypot_response(
@@ -722,18 +845,23 @@ class _BookingApp:
     ) -> Response | None:
         """The honeypot post-parse check for ``book_submit`` (the rate-limit check runs BEFORE the
         body is even parsed, so it is not here). Returns a short-circuit response, or ``None``.
+        ``embed``/the routing prefix are derived from ``request`` (not threaded as params — keeps
+        this at the PLR0913 budget).
         """
         if form.get(views.HONEYPOT_FIELD_NAME, "").strip():
             # Anti-spam honeypot: a bot filled a field hidden from real guests. Skip the backend
             # entirely and return a plausible "received" 200 — the bot sees success and doesn't
             # retry — never creating a booking, never leaking that it was caught.
+            embed = _is_embed_request(request)
+            event_path = f"{_booking_prefix(embed)}/{slug}"
             locale = self._locale(request, form.get("lang"))
             return views.message_page(
                 locale,
                 title=t(locale, "app_name"),
                 message=t(locale, "honeypot_received_message"),
-                lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+                lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
                 base_url=self._settings.base_url,
+                embed=embed,
             )
         return None
 
@@ -750,13 +878,16 @@ class _BookingApp:
         inline validation errors, a 409-conflict PRG redirect (I4), a friendly backend-failure
         page, or the confirmation. ``event.slug`` and ``form["start"]`` stand in for the
         ``slug``/``start`` the caller already resolved (kept out of the signature for PLR0913).
+        ``embed``/the routing prefix are derived from ``request`` for the same reason (B1).
         """
         slug = event.slug
+        embed = _is_embed_request(request)
+        event_path = f"{_booking_prefix(embed)}/{slug}"
         start = form.get("start", "")
         questions = parse_questions(event.questions)
         instant = _parse_instant(start)
         label = _when_label(instant, tz, locale) if instant is not None else ""
-        lang_urls = _lang_links(f"/e/{slug}/book", {"start": start, "tz": tz})
+        lang_urls = _lang_links(f"{event_path}/book", {"start": start, "tz": tz})
         booking_request = BookingRequest(
             event_type_id=event.id, start_iso=start, guest_timezone=tz, locale=locale
         )
@@ -772,9 +903,10 @@ class _BookingApp:
                 questions=questions,
                 values=result.values,
                 errors=result.errors,
-                action=f"/e/{slug}/book",
+                action=f"{event_path}/book",
                 lang_urls=lang_urls,
                 base_url=self._settings.base_url,
+                embed=embed,
             )
         try:
             booking = await self._call(lambda c: c.create_booking(booking_create))
@@ -782,17 +914,16 @@ class _BookingApp:
             if isinstance(exc, AetherCalAPIError) and exc.status_code == HTTP_409_CONFLICT:
                 # I4 (PRG): redirect back to the picker instead of re-rendering the POST response
                 # inline — a guest refresh then re-GETs the picker instead of re-submitting.
-                return RedirectResponse(
-                    f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale, 'err': 'slot_unavailable'})}",
-                    status_code=303,
-                )
-            back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
+                conflict_query = urlencode({"tz": tz, "lang": locale, "err": "slot_unavailable"})
+                return RedirectResponse(f"{event_path}?{conflict_query}", status_code=303)
+            back = f"{event_path}?{urlencode({'tz': tz, 'lang': locale})}"
             return self._error_response(
                 locale,
                 title=resolve_title(event, locale),
                 exc=exc,
                 lang_urls=lang_urls,
                 retry=(back, t(locale, "back_to_times")),
+                embed=embed,
             )
         return views.confirmation_page(
             locale,
@@ -801,13 +932,17 @@ class _BookingApp:
             when_label=label,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
+            embed=embed,
         )
 
     async def book_submit(self, request: Request) -> object:
         # Rate limiting runs in _RateLimitMiddleware, BEFORE FastHTML parses the body — so a blocked
         # request never pays the body-parse cost. This handler only sees requests within the limit.
+        # Same handler for "/e/{slug}/book" (POST) and "/embed/{slug}/book" (POST) — see `event()`.
         form = _form_dict(await request.form())
         slug = str(request.path_params["slug"])
+        embed = _is_embed_request(request)
+        event_path = f"{_booking_prefix(embed)}/{slug}"
         tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
         start = form.get("start", "")
         honeypot = self._honeypot_response(request, form=form, slug=slug, start=start, tz=tz)
@@ -818,8 +953,9 @@ class _BookingApp:
         if events is None:
             return self._service_error(
                 locale,
-                lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
-                retry_url=f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}",
+                lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
+                retry_url=f"{event_path}?{urlencode({'tz': tz, 'lang': locale})}",
+                embed=embed,
             )
         found = _find_event(events, slug)
         if found is None:
@@ -989,6 +1125,24 @@ class _BookingApp:
         body = "User-agent: *\nAllow: /$\nDisallow: /\n"
         return PlainTextResponse(body)
 
+    def embed_js(self, request: Request) -> Response:
+        """Serve the embed loader (B2) at a clean, memorable URL — ``/embed.js``, not just
+        ``/static/embed.js`` — the way any third-party widget script is conventionally referenced.
+
+        Never touches the backend (like ``healthz``/``robots_txt``): it's a static asset, so a
+        guest embedding a widget on their own site never depends on this app's SDK/API round-trip
+        just to fetch the loader. ``Cache-Control`` is deliberately LONG
+        (``EMBED_JS_CACHE_CONTROL``) since the file changes rarely; ``docs/embedding.md`` tells
+        integrators to cache-bust a real update with a ``?v=`` query string on the
+        ``<script src>`` rather than relying on this expiring on its own.
+        """
+        del request
+        return FileResponse(
+            STATIC_DIR / "embed.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": EMBED_JS_CACHE_CONTROL},
+        )
+
     def healthz(self, request: Request) -> Response:
         """Liveness only — never calls the API, so it stays up even if the backend is down."""
         del request  # Starlette passes the request; liveness ignores it.
@@ -1020,7 +1174,9 @@ def create_app(
     # body parse — so a blocked POST is rejected before its body is read.
     app = FastHTML(
         middleware=[
-            Middleware(_SecurityHeadersMiddleware),
+            Middleware(
+                _SecurityHeadersMiddleware, embed_allowed_origins=settings.embed_allowed_origins
+            ),
             booking.rate_limit_middleware(),
         ]
     )
@@ -1028,6 +1184,9 @@ def create_app(
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])
     _register(app, "/robots.txt", booking.robots_txt, ["GET"])
+    # B2.2: a clean-URL alias for the embed widget loader (also reachable, unversioned, at
+    # /static/embed.js — kept for both since some integrators reference /static/* directly).
+    _register(app, "/embed.js", booking.embed_js, ["GET"])
     _register(app, "/cancel", booking.cancel_form, ["GET"])
     _register(app, "/cancel", booking.cancel_submit, ["POST"])
     _register(app, "/reschedule", booking.reschedule_form, ["GET"])
@@ -1036,10 +1195,23 @@ def create_app(
     _register(app, "/e/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/e/{slug}/book", booking.book_form, ["GET"])
     _register(app, "/e/{slug}/book", booking.book_submit, ["POST"])
+    # /embed/* (B0/B1): the SAME handlers as above, reused verbatim — each derives `embed`/the
+    # routing prefix from `request.url.path`, so the compact chrome-less flow needs no separate
+    # implementation. Framing is relaxed for this whole prefix by `security_headers` (B0).
+    _register(app, "/embed/{slug}", booking.event, ["GET"])
+    _register(app, "/embed/{slug}/slots", booking.slots_partial, ["GET"])
+    _register(app, "/embed/{slug}/book", booking.book_form, ["GET"])
+    _register(app, "/embed/{slug}/book", booking.book_submit, ["POST"])
     # Catch-all MUST be registered last: Starlette matches routes in registration order, so every
     # specific path above still wins; only a truly unmatched path falls through to here.
     _register(app, "/{path:path}", booking.catch_all, ["GET"])
     return app
 
 
-__all__ = ["COMMON_TIMEZONES", "STATIC_DIR", "create_app", "security_headers"]
+__all__ = [
+    "COMMON_TIMEZONES",
+    "EMBED_JS_CACHE_CONTROL",
+    "STATIC_DIR",
+    "create_app",
+    "security_headers",
+]

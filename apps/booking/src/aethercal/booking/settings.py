@@ -36,11 +36,18 @@ DEFAULT_BASE_URL = "https://book.aetherlogik.com"
 #: :func:`_parse_trusted_proxies`.
 DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ()
 
+#: Origins allowed to frame ``/embed/*`` via CSP ``frame-ancestors`` (B0) — a comma-separated
+#: allow-list from ``AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS``. EMPTY by default: v1 trusts the
+#: operator to lock this down once real embedders are known; ``security_headers`` (app.py) treats
+#: an empty tuple as ``frame-ancestors *`` for `/embed/*` — everywhere ELSE stays `'self'`-only.
+DEFAULT_EMBED_ALLOWED_ORIGINS: tuple[str, ...] = ()
+
 _ENV_API_URL = "AETHERCAL_API_URL"
 _ENV_API_KEY = "AETHERCAL_API_KEY"
 _ENV_DEFAULT_LOCALE = "AETHERCAL_BOOKING_DEFAULT_LOCALE"
 _ENV_BASE_URL = "AETHERCAL_BOOKING_BASE_URL"
 _ENV_TRUSTED_PROXIES = "AETHERCAL_BOOKING_TRUSTED_PROXIES"
+_ENV_EMBED_ALLOWED_ORIGINS = "AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +59,7 @@ class BookingSettings:
     default_locale: Locale
     base_url: str = DEFAULT_BASE_URL
     trusted_proxies: tuple[str, ...] = DEFAULT_TRUSTED_PROXIES
+    embed_allowed_origins: tuple[str, ...] = DEFAULT_EMBED_ALLOWED_ORIGINS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> BookingSettings:
@@ -63,28 +71,34 @@ class BookingSettings:
         base_url = (
             environ.get(_ENV_BASE_URL, DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
         )
-        trusted_proxies = _parse_trusted_proxies(environ.get(_ENV_TRUSTED_PROXIES))
+        trusted_proxies = _parse_csv(environ.get(_ENV_TRUSTED_PROXIES), DEFAULT_TRUSTED_PROXIES)
+        embed_allowed_origins = _parse_csv(
+            environ.get(_ENV_EMBED_ALLOWED_ORIGINS), DEFAULT_EMBED_ALLOWED_ORIGINS
+        )
         return cls(
             api_url=api_url,
             api_key=api_key,
             default_locale=default_locale,
             base_url=base_url,
             trusted_proxies=trusted_proxies,
+            embed_allowed_origins=embed_allowed_origins,
         )
 
 
-def _parse_trusted_proxies(raw: str | None) -> tuple[str, ...]:
-    """Parse the comma-separated ``AETHERCAL_BOOKING_TRUSTED_PROXIES`` env value into CIDR strings,
-    dropping blanks; an unset or all-blank value falls back to :data:`DEFAULT_TRUSTED_PROXIES`."""
+def _parse_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse a comma-separated env value into a tuple, dropping blanks; an unset or all-blank
+    value falls back to ``default`` (shared by ``TRUSTED_PROXIES`` and ``EMBED_ALLOWED_ORIGINS``,
+    which both parse "CSV list of strings, blanks dropped, empty -> a named default")."""
     if not raw:
-        return DEFAULT_TRUSTED_PROXIES
+        return default
     parsed = tuple(item.strip() for item in raw.split(",") if item.strip())
-    return parsed or DEFAULT_TRUSTED_PROXIES
+    return parsed or default
 
 
 __all__ = [
     "DEFAULT_API_URL",
     "DEFAULT_BASE_URL",
+    "DEFAULT_EMBED_ALLOWED_ORIGINS",
     "DEFAULT_TRUSTED_PROXIES",
     "BookingSettings",
 ]
