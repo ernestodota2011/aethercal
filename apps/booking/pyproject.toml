@@ -10,8 +10,14 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
 classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
-# NOTE: python-fasthtml + aethercal-client are added in F1. Dependency-free stub during F0.
-dependencies = []
+# The stateless public booking page: FastHTML (SSR + HTMX) on top of the AetherCal SDK. The app
+# only ever reaches the API through the SDK (the D4 rule), so it depends on the client + the shared
+# schemas (for the typed request/response DTOs), never on the server or core directly.
+dependencies = [
+    "python-fasthtml>=0.12",
+    "aethercal-client",
+    "aethercal-schemas",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]
