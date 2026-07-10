@@ -63,6 +63,16 @@ def test_embed_js_validates_message_origin_before_resizing() -> None:
     assert 'addEventListener("message"' in source
 
 
+def test_embed_js_resize_targets_only_its_own_iframe() -> None:
+    # Crisol finding (medium·correctness): with TWO+ widgets of the same origin on one page,
+    # `event.origin` alone matches every widget's message, so one widget's resize would resize
+    # ALL iframes. The listener must ALSO check the message came from THIS iframe's own window
+    # (`event.source === iframe.contentWindow`) before applying the height.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "event.source" in source
+    assert "contentWindow" in source
+
+
 def test_embed_js_builds_the_embed_url_from_slug_and_base() -> None:
     source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
     assert "/embed/" in source

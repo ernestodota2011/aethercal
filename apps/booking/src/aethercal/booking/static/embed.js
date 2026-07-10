@@ -77,6 +77,15 @@
     if (event.origin !== expectedOrigin) {
       return;
     }
+    // Also require the message to have come from THIS loader's own iframe: with two or more
+    // AetherCal widgets of the SAME origin on one page, `event.origin` alone matches all of them,
+    // so one widget's resize would size EVERY iframe. `event.source` is the posting window, so
+    // this scopes each resize to the iframe that actually sent it. (`contentWindow` is null until
+    // the iframe gains a browsing context; a message can only arrive from a loaded frame, so by
+    // the time we're in here it is populated.)
+    if (event.source !== iframe.contentWindow) {
+      return;
+    }
     var data = event.data;
     if (!data || data.type !== "aethercal:resize") {
       return;
