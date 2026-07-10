@@ -34,6 +34,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from aethercal.schemas import ErrorResponse
+from aethercal.server.admin.mount import mount_admin
 from aethercal.server.api import api_router
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker, build_sync_engine
@@ -136,6 +137,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.include_router(api_router)
     app.add_exception_handler(AuthenticationError, _handle_authentication_error)
+
+    # Additive, off-by-default: mounts the single-user Reflex admin at /admin only when the operator
+    # has configured credentials AND set AETHERCAL_ADMIN_ENABLED (F1-11). A no-op otherwise, so the
+    # plain API server and the offline test path are unchanged.
+    mount_admin(app)
 
     return app
 
