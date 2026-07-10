@@ -24,17 +24,26 @@ TenantFactory = Callable[..., Awaitable[Tenant]]
 KEY = derive_fernet_key("test-app-secret")
 NOW = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 SECRET = "shared-hmac-secret"
+PUBLIC_IP = "93.184.216.34"
 
 
-async def _seed_one(session: AsyncSession, tenant_factory: TenantFactory) -> WebhookDelivery:
+async def _public_resolver(_host: str) -> list[str]:
+    """Resolve any host to a fixed public IP so delivery tests stay hermetic (no real DNS)."""
+    return [PUBLIC_IP]
+
+
+async def _seed_one(
+    session: AsyncSession,
+    tenant_factory: TenantFactory,
+    *,
+    url: str = "https://consumer.test/hook",
+) -> WebhookDelivery:
     """Create one active subscriber + one pending delivery for ``booking.created``."""
     tenant = await tenant_factory(session)
     await create_webhook(
         session,
         tenant_id=tenant.id,
-        params=WebhookCreate(
-            url="https://consumer.test/hook", events=["booking.created"], secret=SECRET
-        ),
+        params=WebhookCreate(url=url, events=["booking.created"], secret=SECRET),
         fernet_key=KEY,
     )
     deliveries = await enqueue_event(
@@ -67,7 +76,9 @@ async def test_2xx_marks_delivered_with_a_valid_signature(
         return httpx.Response(200)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        report = await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY)
+        report = await deliver_due(
+            sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver
+        )
 
     assert delivery.status == "delivered"
     assert delivery.response_code == 200
@@ -92,7 +103,7 @@ async def test_5xx_marks_failed_and_schedules_growing_backoff(
     transport = httpx.MockTransport(lambda _req: httpx.Response(503))
 
     async with httpx.AsyncClient(transport=transport) as http:
-        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY)
+        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver)
     assert delivery.status == "failed"
     assert delivery.attempts == 1
     assert delivery.response_code == 503
@@ -102,7 +113,7 @@ async def test_5xx_marks_failed_and_schedules_growing_backoff(
     due = delivery.next_retry_at
     assert due is not None
     async with httpx.AsyncClient(transport=transport) as http:
-        await deliver_due(sqlite_session, http, now=due, fernet_key=KEY)
+        await deliver_due(sqlite_session, http, now=due, fernet_key=KEY, resolver=_public_resolver)
     assert delivery.attempts == 2
     assert delivery.next_retry_at == due + timedelta(seconds=60)
 
@@ -116,7 +127,7 @@ async def test_network_error_is_treated_as_a_failure(
         raise httpx.ConnectError("connection refused")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as http:
-        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY)
+        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver)
     assert delivery.status == "failed"
     assert delivery.attempts == 1
     assert delivery.response_code is None
@@ -131,15 +142,21 @@ async def test_dead_after_max_attempts(
 
     now = NOW
     async with httpx.AsyncClient(transport=transport) as http:
-        await deliver_due(sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3)
+        await deliver_due(
+            sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3, resolver=_public_resolver
+        )
         assert delivery.attempts == 1 and delivery.status == "failed"
         now = delivery.next_retry_at
         assert now is not None
-        await deliver_due(sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3)
+        await deliver_due(
+            sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3, resolver=_public_resolver
+        )
         assert delivery.attempts == 2 and delivery.status == "failed"
         now = delivery.next_retry_at
         assert now is not None
-        report = await deliver_due(sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3)
+        report = await deliver_due(
+            sqlite_session, http, now=now, fernet_key=KEY, max_attempts=3, resolver=_public_resolver
+        )
 
     assert delivery.attempts == 3
     assert delivery.status == "dead"
@@ -154,12 +171,16 @@ async def test_not_yet_due_failed_delivery_is_skipped(
     transport = httpx.MockTransport(lambda _req: httpx.Response(500))
 
     async with httpx.AsyncClient(transport=transport) as http:
-        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY)  # → failed, retry at +30s
+        await deliver_due(
+            sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver
+        )  # → failed, retry at +30s
         assert delivery.attempts == 1
 
         # Run again BEFORE next_retry_at: the delivery must be skipped, untouched.
         before_due = NOW + timedelta(seconds=10)
-        report = await deliver_due(sqlite_session, http, now=before_due, fernet_key=KEY)
+        report = await deliver_due(
+            sqlite_session, http, now=before_due, fernet_key=KEY, resolver=_public_resolver
+        )
 
     assert delivery.attempts == 1
     assert report.attempted == 0
@@ -172,11 +193,38 @@ async def test_delivered_delivery_is_not_reattempted(
     ok = httpx.MockTransport(lambda _r: httpx.Response(200))
 
     async with httpx.AsyncClient(transport=ok) as http:
-        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY)
+        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver)
         assert delivery.status == "delivered"
         report = await deliver_due(
-            sqlite_session, http, now=NOW + timedelta(hours=1), fernet_key=KEY
+            sqlite_session,
+            http,
+            now=NOW + timedelta(hours=1),
+            fernet_key=KEY,
+            resolver=_public_resolver,
         )
 
     assert report.attempted == 0
     assert delivery.attempts == 1
+
+
+async def test_ssrf_blocked_url_is_marked_dead_and_never_posts(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    # A subscriber pointing at the cloud-metadata IP must be parked ``dead`` with no HTTP call.
+    delivery = await _seed_one(sqlite_session, tenant_factory, url="http://169.254.169.254/meta")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await deliver_due(
+            sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver
+        )
+
+    assert delivery.status == "dead"
+    assert delivery.next_retry_at is None
+    assert delivery.response_code is None
+    assert delivery.id in report.dead
+    assert requests == []  # the SSRF guard fires before any POST is attempted

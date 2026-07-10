@@ -94,3 +94,32 @@ def test_update_is_all_optional() -> None:
     assert update.url is None
     assert update.events is None
     assert update.active is None
+
+
+@pytest.mark.parametrize(
+    "bad_url", ["ftp://consumer.test/hook", "file:///etc/passwd", "ws://consumer.test/hook"]
+)
+def test_create_rejects_non_http_scheme(bad_url: str) -> None:
+    # Scheme is validated at registration (fast fail); the authoritative IP check is send-time.
+    with pytest.raises(ValidationError):
+        WebhookCreate(url=bad_url, events=["booking.created"])
+
+
+def test_create_accepts_http_and_https() -> None:
+    assert (
+        WebhookCreate(url="http://consumer.test/hook", events=["booking.created"]).url
+        == "http://consumer.test/hook"
+    )
+    assert (
+        WebhookCreate(url="https://consumer.test/hook", events=["booking.created"]).url
+        == "https://consumer.test/hook"
+    )
+
+
+def test_update_rejects_non_http_scheme() -> None:
+    with pytest.raises(ValidationError):
+        WebhookUpdate(url="ftp://consumer.test/hook")
+
+
+def test_update_url_none_is_still_allowed() -> None:
+    assert WebhookUpdate(url=None).url is None
