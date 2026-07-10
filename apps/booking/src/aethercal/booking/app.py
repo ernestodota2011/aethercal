@@ -21,9 +21,10 @@ mounted from ``STATIC_DIR``, so the page has no third-party CDN dependency and i
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -148,6 +149,10 @@ class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
 #: to blunt a scripted flood.
 _RATE_LIMIT_MAX_REQUESTS = 15
 _RATE_LIMIT_WINDOW_SECONDS = 60.0
+#: Hard cap on how many distinct client keys are tracked at once. Bounds the limiter's memory so a
+#: flood of clients (already reduced to REAL IPs by the ``_client_ip`` trust gate) can't grow it
+#: without limit — past the cap, the least-recently-used key is evicted (a DoS / memory-leak fix).
+_RATE_LIMIT_MAX_KEYS = 10_000
 
 
 class _RateLimiter:
@@ -156,6 +161,11 @@ class _RateLimiter:
     Exposed as an injectable instance (``create_app(..., rate_limiter=...)``) so tests can use a
     small, fast threshold instead of the production default, and so each app instance owns
     independent state (no cross-test bleed without an explicit shared instance).
+
+    State is BOUNDED (memory-safety): a key whose window has fully drained is dropped, an
+    opportunistic sweep prunes fully-expired least-recently-used keys on every call, and a hard
+    ``max_keys`` cap LRU-evicts beyond it — so the tracked set stays proportional to active clients
+    and can never grow without limit.
     """
 
     def __init__(
@@ -163,44 +173,103 @@ class _RateLimiter:
         *,
         max_requests: int = _RATE_LIMIT_MAX_REQUESTS,
         window_seconds: float = _RATE_LIMIT_WINDOW_SECONDS,
+        max_keys: int = _RATE_LIMIT_MAX_KEYS,
     ) -> None:
         self._max_requests = max_requests
         self._window_seconds = window_seconds
-        self._hits: dict[str, list[float]] = defaultdict(list)
+        self._max_keys = max_keys
+        # LRU-ordered: most-recently-used at the end, so the front holds the stalest keys.
+        self._hits: OrderedDict[str, list[float]] = OrderedDict()
 
     def allow(self, key: str, *, now: float | None = None) -> bool:
         """Record a hit for ``key`` and report whether it's within the window's limit.
 
-        Expired hits are pruned from the front of ``key``'s deque-like list (it's chronological by
-        construction, so a prefix-pop is correct and cheap).
+        Expired hits are pruned from the front of ``key``'s list (chronological by construction, so
+        a prefix-pop is correct and cheap). The key is re-inserted as most-recently-used; if its
+        window is empty it is dropped entirely rather than left as dead state.
         """
         current = now if now is not None else time.monotonic()
         window_start = current - self._window_seconds
-        hits = self._hits[key]
+        hits = self._hits.pop(key, None) or []  # pop so a re-insert lands at the MRU end
         while hits and hits[0] < window_start:
             hits.pop(0)
-        if len(hits) >= self._max_requests:
-            return False
-        hits.append(current)
-        return True
+        allowed = len(hits) < self._max_requests
+        if allowed:
+            hits.append(current)
+        if hits:  # keep only live state; an empty window leaves no key behind
+            self._hits[key] = hits
+        self._sweep_expired(window_start)
+        self._evict_over_cap()
+        return allowed
+
+    def _sweep_expired(self, window_start: float) -> None:
+        """Drop fully-expired keys from the LRU front, stopping at the first still-live key.
+
+        The stalest keys sit at the front (least recently used), so this reclaims the keys that
+        would otherwise leak — the clients that hit once and never returned — in bounded work.
+        """
+        while self._hits:
+            oldest_key = next(iter(self._hits))
+            hits = self._hits[oldest_key]
+            if hits and hits[-1] >= window_start:
+                break
+            del self._hits[oldest_key]
+
+    def _evict_over_cap(self) -> None:
+        """Enforce the hard cardinality cap by evicting least-recently-used keys."""
+        while len(self._hits) > self._max_keys:
+            self._hits.popitem(last=False)
+
+    def key_count(self) -> int:
+        """The number of client keys currently tracked (test/observability seam)."""
+        return len(self._hits)
 
     def reset(self) -> None:
         """Clear all recorded hits (test seam)."""
         self._hits.clear()
 
 
-def _client_ip(request: Request) -> str:
-    """The guest's real IP: the edge-set ``CF-Connecting-IP`` header, else the transport address.
+#: A parsed trusted-proxy network (IPv4 or IPv6 CIDR).
+_TrustedNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
-    Behind Cloudflare, ``request.client.host`` is the proxy's IP, not the guest's — the header is
-    authoritative there. Without an edge (local dev, direct deploys), the transport address is the
-    best available identity.
+
+def _parse_trusted_networks(cidrs: Sequence[str]) -> tuple[_TrustedNetwork, ...]:
+    """Parse CIDR strings (from settings) into networks; a malformed entry is logged and dropped
+    rather than crashing the app at startup (a bad env value must fail safe, not fatal)."""
+    networks: list[_TrustedNetwork] = []
+    for cidr in cidrs:
+        try:
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            logger.warning("booking: ignoring invalid trusted-proxy CIDR %r", cidr)
+    return tuple(networks)
+
+
+def _is_trusted_peer(host: str, trusted: Sequence[_TrustedNetwork]) -> bool:
+    """True if ``host`` parses as an IP inside any trusted network (a non-IP peer is never
+    trusted). ``addr in net`` short-circuits ``False`` across IP versions, so mixing v4/v6 nets is
+    safe."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(addr in net for net in trusted)
+
+
+def _client_ip(request: Request, trusted_proxies: Sequence[_TrustedNetwork]) -> str:
+    """The rate-limit key for this request: the real client IP, resolved SAFELY.
+
+    ``CF-Connecting-IP`` is honored ONLY when the transport peer (``request.client.host``) is a
+    trusted proxy — otherwise a direct client could forge the header to spoof its identity, evading
+    the per-IP limit or inflating the limiter's keyspace (a memory-exhaustion vector). When the peer
+    is not trusted (or no header is present), the transport address is authoritative.
     """
-    header = request.headers.get("CF-Connecting-IP")
-    if header:
-        return header.strip()
     client = request.client
-    return client.host if client is not None else "unknown"
+    peer = client.host if client is not None else "unknown"
+    header = request.headers.get("CF-Connecting-IP")
+    if header and _is_trusted_peer(peer, trusted_proxies):
+        return header.strip()
+    return peer
 
 
 # --------------------------------------------------------------------------------------
@@ -342,10 +411,11 @@ class _BookingApp:
         self._settings = settings
         self._client_factory = client_factory
         self._rate_limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
+        self._trusted_proxies = _parse_trusted_networks(settings.trusted_proxies)
 
     def _rate_limited_response(self, request: Request) -> Response | None:
         """``None`` if this request is within the limit, else the friendly 429 to return."""
-        if self._rate_limiter.allow(_client_ip(request)):
+        if self._rate_limiter.allow(_client_ip(request, self._trusted_proxies)):
             return None
         locale = self._locale(request)
         body = views.message_page(

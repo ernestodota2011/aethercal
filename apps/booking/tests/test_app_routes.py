@@ -17,6 +17,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from aethercal.booking import app as booking_app
@@ -208,17 +209,44 @@ class FakeAPI:
 
 
 def _make_client(
-    *, rate_limiter: booking_app._RateLimiter | None = None
+    *,
+    rate_limiter: booking_app._RateLimiter | None = None,
+    client_host: str = "127.0.0.1",
+    trusted_proxies: tuple[str, ...] | None = None,
 ) -> tuple[TestClient, FakeAPI]:
     fake = FakeAPI()
-    settings = BookingSettings(api_url="http://api.test", api_key=API_KEY, default_locale="es")
+    settings_kwargs: dict[str, Any] = {
+        "api_url": "http://api.test",
+        "api_key": API_KEY,
+        "default_locale": "es",
+    }
+    if trusted_proxies is not None:
+        settings_kwargs["trusted_proxies"] = trusted_proxies
+    settings = BookingSettings(**settings_kwargs)
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
         return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory, rate_limiter=rate_limiter)
-    return TestClient(app), fake
+    # The real deployment sits behind NPM/compose, so the transport peer is a private/loopback
+    # address by default (trusted to have set CF-Connecting-IP). Tests that model a DIRECT public
+    # peer pass client_host explicitly.
+    return TestClient(app, client=(client_host, 50000)), fake
+
+
+def _request_with(*, client_host: str, headers: dict[str, str]) -> Request:
+    """A minimal ASGI ``Request`` with a controlled transport peer and headers — lets us unit-test
+    ``_client_ip``'s peer-trust logic without the TestClient's client-host plumbing."""
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/e/intro/book",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": (client_host, 12345),
+        "query_string": b"",
+    }
+    return Request(scope)
 
 
 def test_index_lists_events_in_spanish_by_default() -> None:
@@ -543,6 +571,99 @@ def test_rate_limit_falls_back_to_the_transport_client_ip_without_the_header() -
     assert first.status_code != 429
     second = client.post("/cancel", data=data)
     assert second.status_code == 429
+
+
+# ---------------------------------------------------------------------------------------
+# (f.1) SECURITY: CF-Connecting-IP is only honored when the transport peer is a trusted proxy —
+# a forged header from a direct/untrusted peer must NOT let a client spoof its identity (evading
+# the rate limit or inflating the limiter keyspace).
+# ---------------------------------------------------------------------------------------
+
+_TRUSTED = booking_app._parse_trusted_networks(("127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16"))
+
+
+def test_client_ip_ignores_forged_header_from_untrusted_public_peer() -> None:
+    # A DIRECT public peer is not our proxy: its CF-Connecting-IP is attacker-controlled and must
+    # be ignored — the limiter keys on the real transport address instead.
+    request = _request_with(client_host="203.0.113.7", headers={"CF-Connecting-IP": "9.9.9.9"})
+    assert booking_app._client_ip(request, _TRUSTED) == "203.0.113.7"
+
+
+def test_client_ip_honors_header_from_trusted_private_peer() -> None:
+    request = _request_with(client_host="10.1.2.3", headers={"CF-Connecting-IP": "9.9.9.9"})
+    assert booking_app._client_ip(request, _TRUSTED) == "9.9.9.9"
+
+
+def test_client_ip_honors_header_from_trusted_loopback_peer() -> None:
+    request = _request_with(client_host="127.0.0.1", headers={"CF-Connecting-IP": "8.8.4.4"})
+    assert booking_app._client_ip(request, _TRUSTED) == "8.8.4.4"
+
+
+def test_client_ip_without_header_uses_transport_peer() -> None:
+    request = _request_with(client_host="10.1.2.3", headers={})
+    assert booking_app._client_ip(request, _TRUSTED) == "10.1.2.3"
+
+
+def test_client_ip_custom_trusted_cidr_is_honored() -> None:
+    trusted = booking_app._parse_trusted_networks(("198.51.100.0/24",))
+    request = _request_with(client_host="198.51.100.9", headers={"CF-Connecting-IP": "1.2.3.4"})
+    assert booking_app._client_ip(request, trusted) == "1.2.3.4"
+
+
+def test_client_ip_non_ip_peer_is_never_trusted() -> None:
+    # A non-IP transport peer (e.g. a unix socket / test sentinel) can't be a trusted CIDR match,
+    # so a header from it is ignored and the raw peer string is used as the key.
+    request = _request_with(client_host="testclient", headers={"CF-Connecting-IP": "9.9.9.9"})
+    assert booking_app._client_ip(request, _TRUSTED) == "testclient"
+
+
+def test_forged_cf_header_from_public_peer_does_not_evade_rate_limit() -> None:
+    # End-to-end: a scripted attacker on a direct public peer rotates a forged CF-Connecting-IP per
+    # request to look like many clients. With peer-trust gating, every request still counts against
+    # the single real transport IP, so the limiter blocks them.
+    limiter = booking_app._RateLimiter(max_requests=2, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter, client_host="203.0.113.7")
+    data = {"booking": BOOKING_ID, "token": "good", "lang": "es"}
+    codes = [
+        client.post("/cancel", data=data, headers={"CF-Connecting-IP": f"9.9.9.{i}"}).status_code
+        for i in range(3)
+    ]
+    assert codes[-1] == 429  # the forged rotation did not buy extra allowance
+    assert 429 not in codes[:2]
+
+
+# ---------------------------------------------------------------------------------------
+# (f.2) SECURITY: the limiter's state is bounded — dead keys are pruned and cardinality is capped
+# with eviction, so it can't be grown without limit (memory-exhaustion / DoS).
+# ---------------------------------------------------------------------------------------
+
+
+def test_rate_limiter_drops_dead_keys_after_window_expires() -> None:
+    limiter = booking_app._RateLimiter(max_requests=5, window_seconds=60)
+    assert limiter.allow("a", now=0.0)
+    assert limiter.key_count() == 1
+    # A request from another IP, after "a"'s window has fully expired, sweeps "a" away — its key
+    # must not linger forever (the memory-leak fix).
+    assert limiter.allow("b", now=200.0)
+    assert limiter.key_count() == 1
+
+
+def test_rate_limiter_key_reappears_and_is_tracked_again_after_expiry() -> None:
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    assert limiter.allow("a", now=0.0)
+    assert not limiter.allow("a", now=30.0)  # still within window → blocked
+    # Well past the window, "a"'s stale hit is pruned, so a fresh request is allowed again.
+    assert limiter.allow("a", now=100.0)
+
+
+def test_rate_limiter_caps_key_cardinality_with_lru_eviction() -> None:
+    limiter = booking_app._RateLimiter(max_requests=5, window_seconds=60, max_keys=2)
+    limiter.allow("a", now=0.0)
+    limiter.allow("b", now=1.0)
+    limiter.allow("c", now=2.0)  # third distinct key within the window → LRU "a" is evicted
+    assert limiter.key_count() == 2
+    # "a" was the least-recently-used → evicted, so it gets a fresh allowance (state was dropped).
+    assert limiter.allow("a", now=3.0)
 
 
 def test_reschedule_page_lists_new_times() -> None:

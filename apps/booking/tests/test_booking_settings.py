@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from aethercal.booking.settings import DEFAULT_API_URL, DEFAULT_BASE_URL, BookingSettings
+from aethercal.booking.settings import (
+    DEFAULT_API_URL,
+    DEFAULT_BASE_URL,
+    DEFAULT_TRUSTED_PROXIES,
+    BookingSettings,
+)
 
 
 def test_from_env_uses_defaults_when_absent() -> None:
@@ -48,3 +53,24 @@ def test_from_env_uses_default_base_url_when_absent() -> None:
 def test_from_env_reads_base_url_and_strips_trailing_slash() -> None:
     settings = BookingSettings.from_env({"AETHERCAL_BOOKING_BASE_URL": "https://book.example.com/"})
     assert settings.base_url == "https://book.example.com"
+
+
+def test_from_env_uses_default_trusted_proxies_when_absent() -> None:
+    # The app always runs behind NPM/compose on a private/loopback peer, so RFC1918 + loopback is
+    # the sensible default trusted set for honoring CF-Connecting-IP.
+    settings = BookingSettings.from_env({})
+    assert settings.trusted_proxies == DEFAULT_TRUSTED_PROXIES
+    assert "10.0.0.0/8" in settings.trusted_proxies
+    assert "127.0.0.0/8" in settings.trusted_proxies
+
+
+def test_from_env_parses_trusted_proxies_csv_and_drops_blanks() -> None:
+    settings = BookingSettings.from_env(
+        {"AETHERCAL_BOOKING_TRUSTED_PROXIES": " 203.0.113.0/24 , ,198.51.100.7 "}
+    )
+    assert settings.trusted_proxies == ("203.0.113.0/24", "198.51.100.7")
+
+
+def test_from_env_blank_trusted_proxies_falls_back_to_default() -> None:
+    settings = BookingSettings.from_env({"AETHERCAL_BOOKING_TRUSTED_PROXIES": "   "})
+    assert settings.trusted_proxies == DEFAULT_TRUSTED_PROXIES

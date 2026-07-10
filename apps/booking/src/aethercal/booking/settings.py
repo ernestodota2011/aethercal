@@ -23,10 +23,26 @@ DEFAULT_API_URL = "http://127.0.0.1:8000"
 #: the API server reads for guest links, so the two only need to agree once per deployment).
 DEFAULT_BASE_URL = "https://book.aetherlogik.com"
 
+#: CIDR ranges whose peer address (``request.client.host``) is trusted to have set the real client
+#: IP in ``CF-Connecting-IP``. The app ALWAYS runs behind NPM/compose, so the real transport peer
+#: is a private (RFC1918) or loopback address; a direct PUBLIC peer is by definition not our proxy
+#: and its ``CF-Connecting-IP`` header must NOT be honored (it would let a client forge its identity
+#: to evade the rate limit or inflate the limiter's keyspace). Override per deployment with
+#: ``AETHERCAL_BOOKING_TRUSTED_PROXIES`` (a comma-separated CIDR list).
+DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = (
+    "127.0.0.0/8",  # IPv4 loopback
+    "10.0.0.0/8",  # RFC1918 private
+    "172.16.0.0/12",  # RFC1918 private
+    "192.168.0.0/16",  # RFC1918 private
+    "::1/128",  # IPv6 loopback
+    "fc00::/7",  # IPv6 unique-local
+)
+
 _ENV_API_URL = "AETHERCAL_API_URL"
 _ENV_API_KEY = "AETHERCAL_API_KEY"
 _ENV_DEFAULT_LOCALE = "AETHERCAL_BOOKING_DEFAULT_LOCALE"
 _ENV_BASE_URL = "AETHERCAL_BOOKING_BASE_URL"
+_ENV_TRUSTED_PROXIES = "AETHERCAL_BOOKING_TRUSTED_PROXIES"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +53,7 @@ class BookingSettings:
     api_key: str | None
     default_locale: Locale
     base_url: str = DEFAULT_BASE_URL
+    trusted_proxies: tuple[str, ...] = DEFAULT_TRUSTED_PROXIES
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> BookingSettings:
@@ -48,9 +65,28 @@ class BookingSettings:
         base_url = (
             environ.get(_ENV_BASE_URL, DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
         )
+        trusted_proxies = _parse_trusted_proxies(environ.get(_ENV_TRUSTED_PROXIES))
         return cls(
-            api_url=api_url, api_key=api_key, default_locale=default_locale, base_url=base_url
+            api_url=api_url,
+            api_key=api_key,
+            default_locale=default_locale,
+            base_url=base_url,
+            trusted_proxies=trusted_proxies,
         )
 
 
-__all__ = ["DEFAULT_API_URL", "DEFAULT_BASE_URL", "BookingSettings"]
+def _parse_trusted_proxies(raw: str | None) -> tuple[str, ...]:
+    """Parse the comma-separated ``AETHERCAL_BOOKING_TRUSTED_PROXIES`` env value into CIDR strings,
+    dropping blanks; an unset or all-blank value falls back to :data:`DEFAULT_TRUSTED_PROXIES`."""
+    if not raw:
+        return DEFAULT_TRUSTED_PROXIES
+    parsed = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return parsed or DEFAULT_TRUSTED_PROXIES
+
+
+__all__ = [
+    "DEFAULT_API_URL",
+    "DEFAULT_BASE_URL",
+    "DEFAULT_TRUSTED_PROXIES",
+    "BookingSettings",
+]
