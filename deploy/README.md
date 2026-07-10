@@ -68,6 +68,19 @@ with per-line comments. The essentials:
 Unconfigured SMTP or Google **never** hard-fails boot: those effects degrade gracefully (a booking
 still succeeds, it just skips the email / calendar sync).
 
+## The admin surface (`/admin`)
+
+The single-user Reflex admin mounts at `/admin` on the API app **only** when both
+`AETHERCAL_ADMIN_ENABLED=1` and admin credentials are configured (it is a no-op otherwise). Keep the
+API container (and therefore `/admin`) on an **internal** interface — do not expose it publicly for a
+shadow/MVP deployment; only the public booking page (`book.<domain>`) needs a route.
+
+> [!IMPORTANT]
+> If you ever expose `/admin` publicly, the in-app login lockout is a *secondary* layer only (it is
+> per-session and can be reset by opening a new session). The **primary** brute-force defense must be
+> per-IP rate-limiting + fail2ban on the reverse proxy in front of `/admin`. The stored password is
+> hashed with a slow PBKDF2, but that is not a substitute for proxy-level rate limiting.
+
 ## The scheduler: exactly one process
 
 > [!IMPORTANT]
