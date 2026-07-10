@@ -43,22 +43,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
 from aethercal.server.db.models import Booking, EventType, ExternalConnection
-from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.smtp.compose import NotificationKind
-from aethercal.server.integrations.smtp.sender import EmailSender
 from aethercal.server.jobs.reminders import TaskRunner, schedule_reminder
-from aethercal.server.services.calendars import (
-    create_event_for_booking,
-    delete_event_for_booking,
-    reschedule_event_for_booking,
-)
 from aethercal.server.services.event_types import get_event_type
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
     issue_guest_token,
 )
-from aethercal.server.services.notifications import send_booking_notification
+from aethercal.server.services.outbox import (
+    GoogleOperation,
+    OutboxEffect,
+    email_dedupe_key,
+    enqueue_effect,
+    google_dedupe_key,
+)
 from aethercal.server.services.slots import SlotsResult, compute_slots
 from aethercal.server.services.webhooks import enqueue_event
 
@@ -118,21 +117,22 @@ class BookingParams:
 
 @dataclass(frozen=True, slots=True)
 class BookingEffects:
-    """The optional runtime dependencies for a booking's non-DB side-effects (F1-06/07/08/10).
+    """The runtime dependencies for a booking's side-effects that are decided at request time.
 
-    Injected so the core create/cancel/reschedule stays unit-testable and the effects are pluggable.
-    ``signer`` + ``booking_base_url`` are always present when a bundle is supplied (guest links are
-    minted and built); everything else degrades gracefully when absent — no ``sender`` skips the
-    email, no ``connection``/``google_service`` skips the calendar sync, no ``reminder_runner``
-    skips the reminder. A booking is NEVER failed on a missing or failing effect (all best-effort).
+    Injected so the core create/cancel/reschedule stays unit-testable. ``signer`` +
+    ``booking_base_url`` are always present (the guest links are minted + built in-txn). The durable
+    effects (email, Google sync) are NOT gated on a live client here — they are ENQUEUED to the
+    outbox and the drain worker supplies the client, so a momentarily-absent SMTP/Google never drops
+    a domain-required effect. ``connection`` names the host's calendar link (its id rides in the
+    Google intent; the live client is built later by the executor's ``service_factory``); ``None``
+    means the host has no external calendar, so nothing to sync. ``reminder_runner`` schedules the
+    24 h reminder inline (self-healing at fire time), skipped when absent.
     """
 
     signer: GuestTokenSigner
     booking_base_url: str
-    sender: EmailSender | None = None
     reminder_runner: TaskRunner | None = None
     connection: ExternalConnection | None = None
-    google_service: Any = None
 
 
 # --------------------------------------------------------------------------------------
@@ -401,6 +401,9 @@ async def cancel_booking(
 
     booking.status = BookingStatus.CANCELLED
     booking.cancelled_at = now
+    # Bump the persisted iCal SEQUENCE so the cancellation .ics strictly supersedes the confirmation
+    # (RFC 5545, F1-08); the drained cancellation email reads this value.
+    booking.sequence += 1
     await session.flush()
     await enqueue_event(
         session,
@@ -410,15 +413,19 @@ async def cancel_booking(
         now=now,
     )
     if effects is not None:
-        await _sync_google_delete(booking=booking, effects=effects)
-        await _send_email(
+        await _enqueue_google(
+            session,
+            booking=booking,
+            effects=effects,
+            operation=GoogleOperation.DELETE,
+            external_event_id=booking.external_event_id,
+        )
+        await _enqueue_email(
             session,
             kind=NotificationKind.CANCELLATION,
             booking=booking,
             cancel_url=None,
             reschedule_url=None,
-            effects=effects,
-            now=now,
         )
     return booking
 
@@ -479,6 +486,13 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         guest_notes=old.guest_notes,
         answers=dict(old.answers),
         rescheduled_from_id=old.id,
+        # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
+        # increase (RFC 5545, F1-08); the drained reschedule email snapshots this value.
+        sequence=old.sequence + 1,
+        # Inherit the predecessor's stable UID so every update addresses the SAME calendar event —
+        # without this the strictly-increasing sequence would be spread across distinct UIDs and a
+        # client would treat each reschedule as a brand-new event instead of an update.
+        ical_uid=old.ical_uid,
     )
     await _swap_booking(session, old=old, new=new, now=now, start=start)
     await enqueue_event(
@@ -553,21 +567,18 @@ async def list_bookings(
 
 
 # --------------------------------------------------------------------------------------
-# Side-effects (F1-06/07/08/10) — every one best-effort; never fails the booking.
+# Side-effects (F1-06/07/08/10) — durable, transactional, post-commit.
 # --------------------------------------------------------------------------------------
 
-# SECURITY/RELIABILITY (tracked): these external effects still run BEFORE the caller commits the
-# booking transaction. After the best-effort wrapping (each effect logs-and-continues) a FAILING
-# effect can no longer corrupt or roll back a booking — but effects can still run against a booking
-# whose transaction is later rolled back by the caller (e.g. a downstream error in the request),
-# sending an email or creating a Google event for a booking that never persisted. The real fix is a
-# TRANSACTIONAL OUTBOX: instead of calling email/Google/reminder inline, persist an intent row (the
-# effect + its payload) in the SAME transaction as the booking, and have a post-commit worker drain
-# the outbox — running each effect idempotently (dedupe key = booking id + effect kind) with retries
-# and a dead-letter. That couples with the scheduler/lifespan wiring a later deploy task owns, and
-# no effect deps are wired live in this path yet (sender/reminder_runner/Google are None here), so
-# it is deferred to that task rather than half-built here. Until then, ordering effects after the
-# row flush + the best-effort guards keep a committed booking safe from a failing side-effect.
+# The external effects (email + Google) are NOT run inline before the caller commits. Instead each
+# is persisted as a TRANSACTIONAL OUTBOX intent row in the SAME transaction as the booking mutation
+# (:func:`enqueue_effect`), so it commits atomically with the booking — or rolls back with it, never
+# firing for a booking that never persisted (the ordering bug the old best-effort inline wrapping
+# could not close). A scheduler-driven poller (``services.outbox.drain_outbox``) executes the intent
+# afterwards, at-least-once with idempotency (retries + dead-letter). The guest
+# tokens are still minted in-txn here (they are DB rows, atomic with the booking, and the email
+# payload needs their URLs); the 24 h reminder stays inline because its job re-checks the booking is
+# still confirmed at fire time (self-healing against a rolled-back booking).
 
 
 def _guest_link(base_url: str, action: str, token: str) -> str:
@@ -616,19 +627,26 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
     now: datetime,
     locale: str,
 ) -> None:
-    """Run create-time side-effects: tokens → Google event → email → reminder (all best-effort)."""
+    """Wire create-time effects: mint tokens in-txn, enqueue Google + email intents, schedule the
+    reminder. The email/Google effects are drained post-commit (durable outbox); a rolled-back
+    booking drops their intents.
+    """
     cancel_url, reschedule_url = await _mint_guest_links(
         session, booking=booking, effects=effects, now=now
     )
-    await _sync_google_upsert(session, booking=booking, event_type=event_type, effects=effects)
-    await _send_email(
+    await _enqueue_google(
+        session,
+        booking=booking,
+        effects=effects,
+        operation=GoogleOperation.UPSERT,
+        event_type=event_type,
+    )
+    await _enqueue_email(
         session,
         kind=NotificationKind.CONFIRMATION,
         booking=booking,
         cancel_url=cancel_url,
         reschedule_url=reschedule_url,
-        effects=effects,
-        now=now,
         locale=locale,
     )
     _schedule_reminder(effects, booking=booking)
@@ -643,19 +661,26 @@ async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is par
     effects: BookingEffects,
     now: datetime,
 ) -> None:
-    """Run reschedule-time side-effects: fresh tokens → Google update → email → reminder."""
+    """Wire reschedule-time effects: fresh tokens in-txn, enqueue the Google-move + reschedule email
+    intents (drained post-commit), and re-schedule the reminder.
+    """
     cancel_url, reschedule_url = await _mint_guest_links(
         session, booking=new, effects=effects, now=now
     )
-    await _sync_google_reschedule(session, old=old, new=new, event_type=event_type, effects=effects)
-    await _send_email(
+    await _enqueue_google(
+        session,
+        booking=new,
+        effects=effects,
+        operation=GoogleOperation.RESCHEDULE,
+        event_type=event_type,
+        external_event_id=old.external_event_id,
+    )
+    await _enqueue_email(
         session,
         kind=NotificationKind.RESCHEDULE,
         booking=new,
         cancel_url=cancel_url,
         reschedule_url=reschedule_url,
-        effects=effects,
-        now=now,
     )
     _schedule_reminder(effects, booking=new)
 
@@ -678,116 +703,85 @@ def _schedule_reminder(effects: BookingEffects, *, booking: Booking) -> None:
         _logger.exception("booking %s: reminder scheduling failed (best-effort, kept)", booking.id)
 
 
-async def _send_email(  # noqa: PLR0913 - the composer needs the full booking + link context
+async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking + link context
     session: AsyncSession,
     *,
     kind: NotificationKind,
     booking: Booking,
     cancel_url: str | None,
     reschedule_url: str | None,
-    effects: BookingEffects,
-    now: datetime,
     locale: str = "es",
 ) -> None:
-    """Best-effort send of a transactional email (F1-08); an SMTP failure never fails a booking."""
-    if effects.sender is None:
-        return
-    try:
-        await send_booking_notification(
-            session,
-            kind=kind,
-            booking=booking,
-            cancel_url=cancel_url,
-            reschedule_url=reschedule_url,
-            sender=effects.sender,
-            now=now,
-            locale=locale,
-        )
-    except Exception:
-        _logger.exception("booking %s: %s email failed (best-effort, kept)", booking.id, kind.value)
+    """Enqueue the transactional-email intent for the booking — ALWAYS, not gated on a live sender.
+
+    A booking's confirmation/cancellation/reschedule notice is domain-required, so the durable
+    intent is persisted regardless of whether SMTP is configured at this instant; the drain worker
+    sends it post-commit via the live sender (idempotent through the notification ledger) and simply
+    retries — then dead-letters, surfacing the misconfiguration — if SMTP is momentarily absent.
+    Gating the enqueue on the live sender would silently drop the notice, defeating durability. The
+    intent carries the kind + guest links + locale + the SEQUENCE snapshot; the guest tokens were
+    minted in-txn, so the links persist atomically with the booking.
+    """
+    await enqueue_effect(
+        session,
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
+        effect=OutboxEffect.EMAIL,
+        dedupe_key=email_dedupe_key(kind),
+        payload={
+            "kind": kind.value,
+            "cancel_url": cancel_url,
+            "reschedule_url": reschedule_url,
+            "locale": locale,
+            # Snapshot the SEQUENCE at the transition (F1-08): if a LATER mutation bumps the booking
+            # before this email drains, the .ics must still carry the sequence of ITS transition, so
+            # the chain's emails stay strictly increasing per UID regardless of drain interleaving.
+            "sequence": booking.sequence,
+        },
+    )
 
 
-async def _sync_google_upsert(
-    session: AsyncSession, *, booking: Booking, event_type: EventType, effects: BookingEffects
-) -> None:
-    """Create the Google event for a booking (F1-07); keep the booking and leave NULL on failure."""
-    if effects.connection is None or effects.google_service is None:
-        return
-    try:
-        external_id, meeting_url = await create_event_for_booking(
-            connection=effects.connection,
-            request=_meet_request(booking, event_type),
-            service=effects.google_service,
-        )
-    except Exception:
-        _logger.exception(
-            "booking %s: Google event create failed; leaving external_event_id NULL for retry",
-            booking.id,
-        )
-        return
-    booking.external_event_id = external_id
-    booking.meeting_url = meeting_url
-    await session.flush()
-
-
-async def _sync_google_reschedule(
+async def _enqueue_google(  # noqa: PLR0913 - the sync operation + its event context are the contract
     session: AsyncSession,
     *,
-    old: Booking,
-    new: Booking,
-    event_type: EventType,
+    booking: Booking,
     effects: BookingEffects,
+    operation: GoogleOperation,
+    event_type: EventType | None = None,
+    external_event_id: str | None = None,
 ) -> None:
-    """Move the Google event to the new booking (F1-07); best-effort, kept on failure."""
-    if effects.connection is None or effects.google_service is None:
-        return
-    request = _meet_request(new, event_type)
-    try:
-        if old.external_event_id is not None:
-            external_id, meeting_url = await reschedule_event_for_booking(
-                connection=effects.connection,
-                external_event_id=old.external_event_id,
-                request=request,
-                service=effects.google_service,
-            )
-        else:
-            external_id, meeting_url = await create_event_for_booking(
-                connection=effects.connection, request=request, service=effects.google_service
-            )
-    except Exception:
-        _logger.exception("booking %s: Google reschedule failed (best-effort, kept)", new.id)
-        return
-    new.external_event_id = external_id
-    new.meeting_url = meeting_url
-    await session.flush()
+    """Enqueue a Google-Calendar sync intent for the booking, when the host has a linked calendar.
 
-
-async def _sync_google_delete(*, booking: Booking, effects: BookingEffects) -> None:
-    """Delete a cancelled booking's Google event (F1-07); best-effort, never fails the cancel."""
-    if (
-        effects.connection is None
-        or effects.google_service is None
-        or booking.external_event_id is None
-    ):
+    Gated only on a persisted ``connection`` (its id rides in the intent) — NOT on a live client:
+    building the Google client is exclusively the executor's job (its ``service_factory``), so the
+    producer stays decoupled from momentary Google availability. ``None`` means the host has no
+    external calendar, so there is genuinely nothing to sync. The intent stores the primitives the
+    drain worker rebuilds the event request from; a DELETE needs only the ``external_event_id``.
+    """
+    if effects.connection is None:
         return
-    try:
-        await delete_event_for_booking(
-            connection=effects.connection,
-            external_event_id=booking.external_event_id,
-            service=effects.google_service,
+    payload: dict[str, object] = {
+        "operation": operation.value,
+        "connection_id": str(effects.connection.id),
+        "external_event_id": external_event_id,
+    }
+    if operation is not GoogleOperation.DELETE and event_type is not None:
+        payload.update(
+            {
+                "summary": event_type.title,
+                "start": _to_utc(booking.start_at).isoformat(),
+                "end": _to_utc(booking.end_at).isoformat(),
+                "timezone": booking.guest_timezone,
+                "guest_email": booking.guest_email,
+            }
         )
-    except Exception:
-        _logger.exception("booking %s: Google event delete failed (best-effort)", booking.id)
-
-
-def _meet_request(booking: Booking, event_type: EventType) -> MeetEventRequest:
-    """Build the Google Meet event request for a booking (F1-07)."""
-    return MeetEventRequest(
-        summary=event_type.title,
-        start=_to_utc(booking.start_at),
-        end=_to_utc(booking.end_at),
-        timezone=booking.guest_timezone,
-        guest_email=booking.guest_email,
+    await enqueue_effect(
+        session,
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
+        effect=OutboxEffect.GOOGLE,
+        dedupe_key=google_dedupe_key(operation),
+        payload=payload,
     )
 
 

@@ -11,7 +11,8 @@ The lifespan does the things that must happen against a live process:
   SMTP/Google config leaves the effect ``None`` and never hard-fails boot (the path degrades);
 * when ``run_scheduler`` is set (the container turns it on in exactly ONE process — see
   ``deploy/README.md``), start the in-process scheduler: the persistent per-booking reminder runner
-  and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh jobs;
+  and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh +
+  transactional-outbox-drain jobs;
 * on shutdown -- or on a failure part-way through startup -- unwind every resource that was
   acquired (via an ``AsyncExitStack``): stop the scheduler(s), close the HTTP client, and dispose
   the async engine, so a partial boot never leaks a started scheduler/client/engine.
@@ -46,6 +47,7 @@ from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
     make_busy_refresh_tick,
+    make_outbox_drain_tick,
     make_webhook_delivery_tick,
     start_scheduler,
     stop_scheduler,
@@ -123,6 +125,7 @@ def create_app(settings: Settings) -> FastAPI:
                     interval_scheduler,
                     webhook_tick=make_webhook_delivery_tick(app),
                     busy_refresh_tick=make_busy_refresh_tick(app),
+                    outbox_tick=make_outbox_drain_tick(app),
                 )
                 stack.callback(stop_scheduler, interval_scheduler)
             app.state.reminder_runner = reminder_runner
