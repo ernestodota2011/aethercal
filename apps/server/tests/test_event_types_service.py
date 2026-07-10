@@ -132,6 +132,35 @@ async def test_update_applies_only_provided_fields(
     assert updated.max_advance_seconds == 60 * 60 * 24 * 30
 
 
+async def test_update_without_translations_preserves_existing_map(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    created = await create_event_type(
+        sqlite_session,
+        tenant_id=tenant.id,
+        data=await _make_payload(
+            sqlite_session, tenant, title_translations={"en": "Discovery call"}
+        ),
+    )
+    assert created.title_translations == {"en": "Discovery call"}
+
+    # A partial update that never mentions translations must not clear the existing map.
+    updated = await update_event_type(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=created.id,
+        data=EventTypeUpdate(duration_seconds=3600),
+    )
+    assert updated is not None
+    assert updated.duration_seconds == 3600
+    assert updated.title_translations == {"en": "Discovery call"}
+
+    reread = await get_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=created.id)
+    assert reread is not None
+    assert reread.title_translations == {"en": "Discovery call"}
+
+
 async def test_update_unknown_returns_none(
     sqlite_session: AsyncSession, tenant_factory: TenantFactory
 ) -> None:
