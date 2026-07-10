@@ -58,6 +58,16 @@ class EventType(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     slug: Mapped[str] = mapped_column(sa.String(63), nullable=False)
     title: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(sa.Text)
+    # ``title``/``description`` above are the canonical fallback (the tenant's base-locale text).
+    # These hold only sparse per-locale overrides, e.g. ``{"en": "Discovery call"}`` — a locale with
+    # no entry here falls back to the canonical text. Empty dict = no translations yet; no backfill
+    # needed for existing rows.
+    title_translations: Mapped[dict[str, str]] = mapped_column(
+        sa.JSON, default=dict, nullable=False
+    )
+    description_translations: Mapped[dict[str, str]] = mapped_column(
+        sa.JSON, default=dict, nullable=False
+    )
     location: Mapped[str | None] = mapped_column(sa.String(255))
     duration_seconds: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     buffer_before_seconds: Mapped[int] = mapped_column(

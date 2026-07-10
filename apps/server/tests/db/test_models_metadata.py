@@ -8,10 +8,13 @@ import time, so these run on every CI cell with no DB.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import sqlalchemy as sa
 
 from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db import Base
+from aethercal.server.db.migrate import run_migrations
 
 # The MVP entity set (F1); nothing from F2+ (no Workflow, Payment, Membership/RBAC, multi-host).
 # ``outbox`` (the transactional-outbox queue for booking post-commit effects) landed with the F1-05
@@ -113,3 +116,32 @@ def test_naming_convention_yields_deterministic_constraint_names() -> None:
     fk = next(iter(Base.metadata.tables["users"].foreign_key_constraints))
     assert fk.name is not None
     assert fk.name.startswith("fk_users_")
+
+
+def test_event_type_translation_columns_are_json_overrides_with_empty_default(
+    tmp_path: Path,
+) -> None:
+    """web-qa-auditor NO-GO fix: the EN booking surface must not fall back to the tenant's
+    base-locale ``title``/``description`` under English chrome. ``title``/``description`` stay the
+    canonical fallback (the tenant's base locale); the ``*_translations`` columns hold only sparse
+    locale overrides (e.g. ``{"en": "Discovery call"}``), defaulting to ``{}`` so no backfill is
+    needed for existing rows.
+    """
+    table = Base.metadata.tables["event_types"]
+    for name in ("title_translations", "description_translations"):
+        column = table.c[name]
+        assert isinstance(column.type, sa.JSON), f"{name} must be a JSON column"
+        assert not column.nullable, f"{name} must be NOT NULL"
+        assert column.default is not None and column.default.is_callable, (
+            f"{name} must have a callable Python-side default"
+        )
+        assert column.default.arg(None) == {}, f"{name} must default to an empty dict"
+
+    # SQLite parity: the migration must create exactly the columns the model declares (no DB
+    # server required — this runs on every CI cell, same discipline as test_migration_parity.py).
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'event_type_translations.sqlite'}")
+    run_migrations(engine)
+    inspector = sa.inspect(engine)
+    actual = {col["name"] for col in inspector.get_columns("event_types")}
+    assert {"title_translations", "description_translations"} <= actual
+    engine.dispose()
