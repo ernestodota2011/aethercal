@@ -5,6 +5,7 @@ from __future__ import annotations
 from aethercal.booking.settings import (
     DEFAULT_API_URL,
     DEFAULT_BASE_URL,
+    DEFAULT_EMBED_ALLOWED_ORIGINS,
     DEFAULT_TRUSTED_PROXIES,
     BookingSettings,
 )
@@ -74,3 +75,30 @@ def test_from_env_parses_trusted_proxies_csv_and_drops_blanks() -> None:
 def test_from_env_blank_trusted_proxies_falls_back_to_empty_default() -> None:
     settings = BookingSettings.from_env({"AETHERCAL_BOOKING_TRUSTED_PROXIES": "   "})
     assert settings.trusted_proxies == ()
+
+
+# ---------------------------------------------------------------------------------------
+# B0: the /embed/* CSP `frame-ancestors` allow-list (empty by default -> `*` in app.py).
+# ---------------------------------------------------------------------------------------
+
+
+def test_from_env_defaults_embed_allowed_origins_to_empty() -> None:
+    settings = BookingSettings.from_env({})
+    assert settings.embed_allowed_origins == ()
+    assert DEFAULT_EMBED_ALLOWED_ORIGINS == ()
+
+
+def test_from_env_parses_embed_allowed_origins_csv_and_drops_blanks() -> None:
+    settings = BookingSettings.from_env(
+        {
+            "AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS": (
+                " https://a.example , ,https://b.example:8443 "
+            )
+        }
+    )
+    assert settings.embed_allowed_origins == ("https://a.example", "https://b.example:8443")
+
+
+def test_from_env_blank_embed_allowed_origins_falls_back_to_empty_default() -> None:
+    settings = BookingSettings.from_env({"AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS": "   "})
+    assert settings.embed_allowed_origins == ()

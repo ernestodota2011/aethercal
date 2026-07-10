@@ -17,6 +17,8 @@ need to inject pre-rendered markup (e.g. tests composing a page shell around a r
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -157,7 +159,49 @@ dl.summary { margin: 0; }
 dl.summary dt { color: var(--muted); font-size: .8rem; text-transform: uppercase;
   letter-spacing: .05em; margin-top: 1rem; }
 dl.summary dd { margin: .2rem 0 0; }
+body.embed main { padding: 1.25rem 1rem 1.75rem; max-width: 100%; }
 """
+
+# --------------------------------------------------------------------------------------
+# Embed auto-resize (B1) — a fixed-content inline script for `/embed/*` pages only. Since the
+# content is a compile-time constant (never templated with request data), it's allow-listed via a
+# CSP `sha256-` HASH source (app.py's `security_headers`) rather than the blanket `'unsafe-inline'`
+# — the strictest form of "allow exactly this one script" CSP supports.
+# --------------------------------------------------------------------------------------
+
+#: Tells the parent frame the guest's current content height so it can size the iframe — a
+#: same-origin-policy-isolated iframe has no other way to learn this. Runs once immediately (an
+#: early estimate from what's parsed so far), then again on `load` (images/fonts settled) and
+#: `resize` (guest viewport change). `htmx:afterSettle` bubbles up to `document`, so this ONE
+#: listener — attached only on the initial full-page load — also covers every later HTMX-swapped
+#: fragment (the timezone slot-list refresh), which never re-emits this script itself.
+EMBED_RESIZE_SCRIPT = (
+    "(function(){"
+    "function post(){"
+    "window.parent.postMessage("
+    "{type:'aethercal:resize',height:document.documentElement.scrollHeight},'*');"
+    "}"
+    "post();"
+    "window.addEventListener('load',post);"
+    "window.addEventListener('resize',post);"
+    "document.addEventListener('htmx:afterSettle',post);"
+    "})();"
+)
+
+#: The CSP `script-src` hash source for `EMBED_RESIZE_SCRIPT`, computed once at import time over
+#: the exact UTF-8 bytes a browser hashes for CSP `sha256-` matching.
+EMBED_RESIZE_SCRIPT_CSP_SOURCE = (
+    "'sha256-"
+    + base64.b64encode(hashlib.sha256(EMBED_RESIZE_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+    + "'"
+)
+
+
+def _embed_resize_script() -> Any:
+    # `Script(...)` (fasthtml.xtend) does NOT html-escape its text child — required here since the
+    # script contains `&&`/`<`/`>`-free but quote-heavy JS; escaping would also change the bytes
+    # the CSP hash was computed over.
+    return Script(EMBED_RESIZE_SCRIPT)
 
 
 def render(component: Any) -> str:
@@ -248,15 +292,31 @@ def page(
     *content: Any,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
 ) -> Any:
     """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
 
     ``base_url`` mints the ABSOLUTE urls Open Graph/Twitter Card tags require (A7); callers that
     don't thread a real ``BookingSettings.base_url`` through still get the production default
     rather than a meaningless bare relative path.
+
+    ``embed`` (B1) renders the COMPACT shell for ``/embed/*``: no site header/footer/language
+    switcher (an iframe embedder provides its own chrome, or none) and a reduced-padding
+    ``<main>``, plus the inline auto-resize script (``EMBED_RESIZE_SCRIPT``) so the embedder can
+    size the iframe to the guest's content. The skip-link is also omitted — with no header there
+    is nothing before ``<main>`` to skip past.
     """
     full_title = f"{title} · {t(locale, 'app_name')}"
     current_url = f"{base_url}{lang_urls.get(locale, '')}"
+    body_children: list[Any] = []
+    if not embed:
+        body_children.append(A(t(locale, "skip_to_content"), href="#main", cls="skip-link"))
+        body_children.append(_header(locale, lang_urls))
+    body_children.append(Main(*content, id="main"))
+    if embed:
+        body_children.append(_embed_resize_script())
+    else:
+        body_children.append(_footer(locale))
     return Html(
         Head(
             Meta(charset="utf-8"),
@@ -272,12 +332,7 @@ def page(
             Style(_CSS),
             Script(src=_HTMX_SRC, defer=True),
         ),
-        Body(
-            A(t(locale, "skip_to_content"), href="#main", cls="skip-link"),
-            _header(locale, lang_urls),
-            Main(*content, id="main"),
-            _footer(locale),
-        ),
+        Body(*body_children, cls="embed" if embed else None),
         lang=locale,
     )
 
@@ -410,11 +465,13 @@ def event_page(
     lang_urls: Mapping[Locale, str],
     notice: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
 ) -> Any:
     """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
 
     ``notice`` renders an inline error banner above the picker (I4) — used after the PRG redirect
     a 409 slot conflict on submit sends the guest back to with ``?err=slot_unavailable``.
+    ``embed`` (B1) renders the compact, chrome-less ``/embed/*`` shell (see ``page()``).
     """
     intro: list[Any] = [_event_intro(locale, event)]
     if notice:
@@ -439,6 +496,7 @@ def event_page(
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
         base_url=base_url,
+        embed=embed,
     )
 
 
@@ -637,8 +695,12 @@ def booking_form_page(
     action: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
 ) -> Any:
-    """Step 2: name, email, notes, and questions — re-renders inline errors on failure."""
+    """Step 2: name, email, notes, and questions — re-renders inline errors on failure.
+
+    ``embed`` (B1) renders the compact, chrome-less ``/embed/*`` shell (see ``page()``).
+    """
     field_errors = _errors_by_field(errors)
     fields: list[Any] = [
         _labelled_field(
@@ -703,6 +765,10 @@ def booking_form_page(
         action=action,
         enctype="application/x-www-form-urlencoded",
     )
+    # Derived from `action` (always "<event_path>/book") rather than hardcoding "/e/{slug}" — an
+    # embed route's `action` is "/embed/{slug}/book", so this must stay "/embed/{slug}" too, or a
+    # guest inside the iframe would be bounced out to the full-chrome site (B1).
+    event_path = action.removesuffix("/book")
     return page(
         locale,
         resolve_title(event, locale),
@@ -711,11 +777,12 @@ def booking_form_page(
             P(f"{t(locale, 'selected_time')}: {when_label}", cls="meta"),
             H2(t(locale, "your_details")),
             form,
-            A(t(locale, "back_to_times"), href=_with_lang(f"/e/{event.slug}", locale), cls="meta"),
+            A(t(locale, "back_to_times"), href=_with_lang(event_path, locale), cls="meta"),
             cls="stack",
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        embed=embed,
     )
 
 
@@ -800,9 +867,10 @@ def confirmation_page(
     when_label: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
 ) -> Any:
     """Step 3: a clear confirmation with the essentials (when, meeting link, email note) plus
-    add-to-calendar links (M-F3)."""
+    add-to-calendar links (M-F3). ``embed`` (B1) renders the compact, chrome-less shell."""
     summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
     if event.location:
         summary.append(Dd(event.location, cls="meta"))
@@ -821,6 +889,7 @@ def confirmation_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        embed=embed,
     )
 
 
@@ -839,12 +908,17 @@ def message_page(
     back_label: str | None = None,
     is_error: bool = False,
     base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
 ) -> Any:
-    """A minimal, friendly single-message page (errors, not-found, done states) — never leaks."""
+    """A minimal, friendly single-message page (errors, not-found, done states) — never leaks.
+    ``embed`` (B1) renders the compact, chrome-less shell so a backend hiccup or a 404 inside an
+    iframe never suddenly surfaces the full site chrome."""
     body: list[Any] = [H1(title), Div(message, cls="notice error" if is_error else "notice")]
     if back_url and back_label:
         body.append(A(back_label, href=back_url, cls="btn secondary"))
-    return page(locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url)
+    return page(
+        locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url, embed=embed
+    )
 
 
 def cancel_confirm_page(
