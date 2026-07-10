@@ -3,8 +3,10 @@
 ``send_booking_notification`` composes the email for a kind, sends it through the injected
 :class:`~aethercal.server.integrations.smtp.sender.EmailSender`, and records a
 :class:`~aethercal.server.db.models.SentNotification`. It is **idempotent** per
-``(tenant_id, booking_id, kind)``: a repeat call finds the ledger row and skips, so a retried job or
-a double-fired event never mails the guest twice. Cancel/reschedule links are *passed in* — F1-05
+``(tenant_id, booking_id, kind)`` and **concurrency-safe**: it *reserves* the ledger row (a guarded
+INSERT) BEFORE sending, so the unique constraint — not a racy read — arbitrates exactly-one send,
+and a retried job or a double-fired (even concurrent) event never mails the guest twice.
+Cancel/reschedule links are *passed in* — F1-05
 mints the signed guest tokens (via the F1-06 service) and builds the URLs; this module never mints a
 token. Like every service here it flushes but does not commit — the caller owns the transaction.
 """
@@ -13,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.db.models import Booking, EventType, SentNotification, User
@@ -38,19 +40,28 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
 ) -> bool:
     """Compose + send the ``kind`` email for ``booking`` and record it; return whether it sent.
 
-    Returns ``False`` (a no-op skip) when a ``(tenant_id, booking_id, kind)`` ledger row already
-    exists; otherwise sends via ``sender``, inserts the ledger row stamped ``sent_at=now``, and
-    returns ``True``. The unique constraint on the ledger is the backstop against a concurrent race.
-    Flushes; the caller owns the commit.
+    Reserve-first idempotency (RF-08/RF-10): before sending, it INSERTs the ``(tenant_id,
+    booking_id, kind)`` :class:`SentNotification` row inside a ``begin_nested`` SAVEPOINT (mirroring
+    the duplicate-slug guard in ``services/event_types.py``). If the unique constraint rejects it
+    (:class:`IntegrityError`) another caller already reserved that notification, so this returns
+    ``False`` and sends nothing — the database, not a racy ``SELECT``, arbitrates exactly-one send
+    under concurrency. Only when the reservation succeeds does it compose and hand the message to
+    ``sender`` and return ``True``. Flushes (inside the savepoint); the caller owns the commit.
+
+    Residual (out of scope here): a send that succeeds but whose transaction the caller later rolls
+    back has mailed the guest yet leaves no ledger row — fully closing that gap needs a
+    transactional outbox + delivery worker. Reserve-first closes the concurrent-duplicate hole (two
+    callers both passing a pre-check and both mailing the guest), which the prior
+    SELECT-then-send-then-INSERT order left open.
     """
-    already_sent = await session.scalar(
-        select(SentNotification.id).where(
-            SentNotification.tenant_id == booking.tenant_id,
-            SentNotification.booking_id == booking.id,
-            SentNotification.kind == kind.value,
-        )
+    reservation = SentNotification(
+        tenant_id=booking.tenant_id, booking_id=booking.id, kind=kind.value, sent_at=now
     )
-    if already_sent is not None:
+    try:
+        async with session.begin_nested():
+            session.add(reservation)
+            await session.flush()
+    except IntegrityError:
         return False
 
     context = await _build_context(
@@ -58,13 +69,6 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
     )
     message = build_notification_email(context, kind=kind, locale=locale)
     await sender.send(message)
-
-    session.add(
-        SentNotification(
-            tenant_id=booking.tenant_id, booking_id=booking.id, kind=kind.value, sent_at=now
-        )
-    )
-    await session.flush()
     return True
 
 
