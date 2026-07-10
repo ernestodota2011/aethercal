@@ -16,7 +16,7 @@ owns only its ``/slots`` prefix.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,7 +36,16 @@ AuthDep = Annotated[AuthContext, Depends(require_api_key)]
 _INVALID_TIMEZONE = "invalid_timezone"
 _INVALID_RANGE = "invalid_range"
 _WINDOW_TOO_LARGE = "window_too_large"
+_OUT_OF_RANGE = "window_out_of_range"
 _NOT_FOUND = "not_found"
+
+# The absolute band, relative to "now", a request may ask about. Availability is inherently a
+# near-future question, so a query about year 1 or year 9999 is meaningless — and rejecting it up
+# front keeps every downstream date computation (the ±1-day busy padding and the wall-time->instant
+# timezone conversion) clear of date.min/date.max, where it would otherwise overflow. Generous
+# enough for any real booking horizon, and nowhere near the representable extremes.
+MAX_PAST_DAYS = 1
+MAX_FUTURE_DAYS = 366 * 5
 
 # The widest ``from``..``to`` a single request may span. A booking calendar rarely needs more than a
 # couple of months of look-ahead at once; bounding it keeps the availability computation O(window)
@@ -78,6 +87,22 @@ def _require_window_within_cap(window_from: date, window_to: date) -> None:
         )
 
 
+def _require_window_in_bounds(window_from: date, window_to: date, today: date) -> None:
+    """Reject a window whose dates fall outside a sane near-future band around ``today`` (422).
+
+    Availability is a near-future question; bounding the absolute dates keeps all downstream date
+    math clear of ``date.min`` / ``date.max``, where the busy padding and the timezone conversion
+    would overflow even for a within-cap window (e.g. ``date.max - 1 .. date.max``).
+    """
+    floor = today - timedelta(days=MAX_PAST_DAYS)
+    ceiling = today + timedelta(days=MAX_FUTURE_DAYS)
+    if window_from < floor or window_to > ceiling:
+        raise _unprocessable(
+            _OUT_OF_RANGE,
+            f"Date window must fall within {floor.isoformat()}..{ceiling.isoformat()}",
+        )
+
+
 @router.get("/", response_model=SlotsResponse)
 async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + dependency as a parameter
     session: SessionDep,
@@ -91,6 +116,8 @@ async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + d
     _require_iana_zone(tz)
     _require_ordered_window(window_from, window_to)
     _require_window_within_cap(window_from, window_to)
+    now = datetime.now(UTC)
+    _require_window_in_bounds(window_from, window_to, now.date())
 
     result = await compute_slots(
         session,
@@ -98,7 +125,7 @@ async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + d
         event_type_id=event_type,
         window_from=window_from,
         window_to=window_to,
-        now=datetime.now(UTC),
+        now=now,
     )
     if result is None:
         raise HTTPException(
