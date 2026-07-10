@@ -112,6 +112,204 @@ def test_values_are_echoed_back_for_rerender() -> None:
     assert result.values["email"] == "bad"
 
 
+def test_email_question_rejects_a_malformed_answer() -> None:
+    questions = parse_questions(
+        [{"key": "work_email", "label": "Work email", "type": "email", "required": True}]
+    )
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("work_email"): "not-an-email"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("work_email") for error in result.errors)
+
+
+def test_email_question_accepts_a_valid_answer() -> None:
+    questions = parse_questions(
+        [{"key": "work_email", "label": "Work email", "type": "email", "required": True}]
+    )
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("work_email"): "cto@corp.com"}),
+    )
+    assert result.booking is not None
+    assert result.booking.answers == {"work_email": "cto@corp.com"}
+
+
+def test_number_question_rejects_non_numeric() -> None:
+    questions = parse_questions([{"key": "team", "label": "Team size", "type": "number"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("team"): "a bunch"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("team") for error in result.errors)
+
+
+def test_number_question_accepts_a_number() -> None:
+    questions = parse_questions([{"key": "team", "label": "Team size", "type": "number"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("team"): "42"}),
+    )
+    assert result.booking is not None
+    assert result.booking.answers == {"team": "42"}
+
+
+def test_url_question_rejects_a_non_url() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "just some text"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("site") for error in result.errors)
+
+
+def test_url_question_accepts_an_https_url() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "https://aetherlogik.com"}),
+    )
+    assert result.booking is not None
+
+
+def test_tel_question_rejects_a_non_phone() -> None:
+    questions = parse_questions([{"key": "phone", "label": "Phone", "type": "tel"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("phone"): "call me maybe"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("phone") for error in result.errors)
+
+
+def test_tel_question_accepts_a_phone() -> None:
+    questions = parse_questions([{"key": "phone", "label": "Phone", "type": "tel"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("phone"): "+1 (305) 413-1728"}),
+    )
+    assert result.booking is not None
+
+
+def test_select_question_rejects_a_value_outside_the_options() -> None:
+    questions = parse_questions(
+        [{"name": "size", "label": "Team size", "type": "select", "options": ["1-10", "11+"]}]
+    )
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("size"): "999"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("size") for error in result.errors)
+
+
+def test_select_question_accepts_a_listed_option() -> None:
+    questions = parse_questions(
+        [{"name": "size", "label": "Team size", "type": "select", "options": ["1-10", "11+"]}]
+    )
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("size"): "11+"}),
+    )
+    assert result.booking is not None
+    assert result.booking.answers == {"size": "11+"}
+
+
+def test_optionless_select_is_treated_as_free_text() -> None:
+    # A select with no options is misconfigured; it degrades to a plain text input (so it is not a
+    # phantom "select" that would accept any crafted value) and still collects a free answer.
+    questions = parse_questions([{"key": "role", "label": "Role", "type": "select", "options": []}])
+    assert questions[0].kind == "text"
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("role"): "anything goes"}),
+    )
+    assert result.booking is not None
+    assert result.booking.answers == {"role": "anything goes"}
+
+
+def test_url_question_rejects_a_url_with_spaces() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "https://exa mple.com"}),
+    )
+    assert result.booking is None
+    assert any(error.field == question_field_name("site") for error in result.errors)
+
+
+def test_url_question_rejects_a_scheme_without_a_dotted_host() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "https://localhostonly"}),
+    )
+    assert result.booking is None
+
+
+def test_url_question_rejects_an_invalid_port() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "https://example.com:notaport/x"}),
+    )
+    assert result.booking is None
+
+
+def test_url_question_rejects_malformed_hostnames() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    malformed = (
+        "https://.example.com",  # leading dot -> empty first label
+        "https://example..com",  # consecutive dots -> empty label
+        "https://example.",  # trailing dot leaves a single label
+        "https://-example.com",  # label may not start with a hyphen
+        "https://exa_mple.com",  # underscore is not a valid hostname character
+    )
+    for bad in malformed:
+        result = build_booking(
+            _request(),
+            questions=questions,
+            form=_base_form(**{question_field_name("site"): bad}),
+        )
+        assert result.booking is None, bad
+
+
+def test_url_question_accepts_a_fqdn_with_a_trailing_dot() -> None:
+    questions = parse_questions([{"key": "site", "label": "Website", "type": "url"}])
+    result = build_booking(
+        _request(),
+        questions=questions,
+        form=_base_form(**{question_field_name("site"): "https://sub.aetherlogik.com."}),
+    )
+    assert result.booking is not None
+
+
+def test_optional_typed_question_left_blank_does_not_trip_type_validation() -> None:
+    questions = parse_questions(
+        [{"key": "site", "label": "Website", "type": "url", "required": False}]
+    )
+    result = build_booking(_request(), questions=questions, form=_base_form())
+    assert result.booking is not None
+    assert result.booking.answers == {}
+
+
 def test_parse_questions_is_defensive_about_shapes() -> None:
     questions = parse_questions(
         [
