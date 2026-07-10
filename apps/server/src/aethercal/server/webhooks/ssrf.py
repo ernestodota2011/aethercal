@@ -2,10 +2,17 @@
 
 A subscriber's ``url`` is caller-supplied, so a naive delivery worker would happily POST to
 ``169.254.169.254`` (cloud metadata), ``127.0.0.1``, or an RFC1918 host and reach into the server's
-own network — a classic Server-Side Request Forgery. This module is the egress allowlist-by-
-exclusion: it resolves the target host right before the send and refuses any address that is not
-globally routable. Resolving at *send* time (not only at registration) is what defeats DNS
-rebinding — the IP that is inspected here is the IP that will be dialed.
+own network — a classic Server-Side Request Forgery. This module is the egress guard: it resolves
+the target host right before the send and refuses any address that is not globally routable
+(:func:`ip_is_public`). Validating at *send* time (not only at registration) catches a URL that
+only turns malicious after it is stored.
+
+SECURITY — known residual (tracked hardening): this validates the resolved IPs but does not *pin*
+them into the HTTP connection, so a resolver that returns a public IP here and a private one to
+httpx's own lookup microseconds later (DNS rebinding) is not fully closed. Fully closing it needs a
+transport that dials only the already-validated address while preserving TLS SNI/cert verification —
+a dedicated pass wired where the delivery ``http_client`` is built (F1-08/deploy). The worker is not
+wired to run yet, so nothing dials these URLs until that hardening lands.
 
 The DNS resolver is injected (:data:`Resolver`) so the whole guard is deterministic and offline
 under test; production passes ``None`` and gets a real ``getaddrinfo`` lookup. The guard fails
@@ -41,18 +48,21 @@ async def _default_resolver(host: str) -> list[str]:
 def ip_is_public(ip: str) -> bool:
     """Return ``True`` iff ``ip`` is a globally routable address (RF-17 / RNF-5).
 
-    Blocks private (RFC1918), loopback, link-local (which covers the ``169.254.169.254`` cloud
-    metadata endpoint), multicast, reserved, and unspecified (``0.0.0.0`` / ``::``) ranges. Pure —
-    it performs no DNS and no I/O.
+    Uses :attr:`ipaddress.IPv4Address.is_global` as the positive criterion — allowed only when IANA
+    marks the address globally reachable, which also rejects shared CGNAT space (``100.64.0.0/10``)
+    and the documentation/benchmark ranges — AND layers explicit denials for special-use ranges
+    ``is_global`` does not itself exclude (notably multicast, ``224.0.0.0/4``), plus belt-and-braces
+    checks for private (RFC1918), loopback, link-local (``169.254.169.254`` cloud metadata),
+    reserved, and unspecified (``0.0.0.0`` / ``::``) addresses. Pure — no DNS, no I/O.
     """
     address = ipaddress.ip_address(ip)
-    return not (
-        address.is_private
+    return address.is_global and not (
+        address.is_multicast
         or address.is_loopback
         or address.is_link_local
-        or address.is_multicast
         or address.is_reserved
         or address.is_unspecified
+        or address.is_private
     )
 
 

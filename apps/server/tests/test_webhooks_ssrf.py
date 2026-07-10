@@ -27,6 +27,9 @@ from aethercal.server.webhooks.ssrf import (
         "::1",  # IPv6 loopback
         "0.0.0.0",  # unspecified
         "224.0.0.1",  # multicast
+        "100.64.0.1",  # RFC6598 CGNAT / shared address space — not globally routable
+        "192.0.2.1",  # RFC5737 documentation (TEST-NET-1)
+        "198.18.0.1",  # RFC2544 benchmarking
     ],
 )
 def test_ip_is_public_blocks_non_routable(ip: str) -> None:
