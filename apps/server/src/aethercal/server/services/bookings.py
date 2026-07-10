@@ -8,12 +8,16 @@ an injected :class:`BookingEffects` bundle so the core stays testable offline. T
 
 Anti-double-booking (RF-04) is enforced in TWO independent layers, both required:
 
-1. **Per-host serialization lock.** At the start of a create/reschedule transaction we take a
-   PostgreSQL transaction-scoped advisory lock keyed by a stable 64-bit hash of ``(tenant, host)``
+1. **Per-host serialization lock.** At the start of a create/cancel/reschedule transaction we take
+   a PostgreSQL transaction-scoped advisory lock keyed by a stable 64-bit hash of ``(tenant, host)``
    (:func:`_serialize_host`). Two concurrent bookings for the same host then run one-after-another:
    the loser, on re-reading availability, sees the winner's committed row and finds the slot no
-   longer on offer. Released automatically at transaction end. A no-op on SQLite (which serializes
-   writes anyway) so the offline suite is unaffected.
+   longer on offer. For a cancel/reschedule the lock is taken FIRST, then the booking is re-loaded
+   under it (:func:`_lock_and_reload_booking`) and re-validated as still active before mutating, so
+   two concurrent cancels/reschedules cannot both act on a stale view (a cancel would emit a second
+   webhook; a reschedule to a different ``start_at`` would open a second active replacement the
+   partial index cannot catch). Released automatically at transaction end. A no-op on SQLite (which
+   serializes writes anyway) so the offline suite is unaffected.
 2. **DB partial unique index backstop.** Even if two transactions race past the availability read,
    the ``uq_bookings_active_slot`` partial unique index (``WHERE status <> 'cancelled'``) admits at
    most one active booking per ``(tenant, event_type, start)``. The losing INSERT raises
@@ -44,7 +48,6 @@ from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.integrations.smtp.sender import EmailSender
 from aethercal.server.jobs.reminders import TaskRunner, schedule_reminder
 from aethercal.server.services.calendars import (
-    CalendarSyncError,
     create_event_for_booking,
     delete_event_for_booking,
     reschedule_event_for_booking,
@@ -253,6 +256,36 @@ async def _load_booking(
     ).one_or_none()
 
 
+async def _lock_and_reload_booking(
+    session: AsyncSession, *, tenant_id: uuid.UUID, booking_id: uuid.UUID
+) -> tuple[Booking, EventType]:
+    """Load a booking, take the per-host lock FIRST, then re-load it under the lock (RF-04).
+
+    The correctness-critical ordering shared by the cancel/reschedule mutation paths: acquire the
+    host's transaction-scoped advisory lock (:func:`_serialize_host`) BEFORE trusting the booking's
+    state, then ``refresh`` it so any concurrent mutation that committed while we waited on the lock
+    is now visible (a READ COMMITTED re-read, exactly as ``create_booking`` re-reads availability).
+    The caller then re-validates the committed-consistent status before mutating, so two racing
+    cancel/reschedule requests cannot both act on a stale "still active" view (the double-booking
+    hole a partial index cannot close, since a reschedule to a new ``start_at`` never collides).
+
+    Returns the reloaded booking and its event type (whose ``host_id`` keys the lock). Raises
+    :class:`BookingNotFoundError` (404) if the tenant has no such booking. On SQLite the lock is a
+    no-op and the refresh is a harmless re-read (writes are already serialized there).
+    """
+    booking = await _load_booking(session, tenant_id=tenant_id, booking_id=booking_id)
+    if booking is None:
+        raise BookingNotFoundError("booking not found")
+    event_type = await get_event_type(
+        session, tenant_id=tenant_id, event_type_id=booking.event_type_id
+    )
+    if event_type is None:  # pragma: no cover - the FK guarantees the row exists
+        raise EventTypeNotFoundError("event type not found")
+    await _serialize_host(session, tenant_id=tenant_id, host_id=event_type.host_id)
+    await session.refresh(booking)
+    return booking, event_type
+
+
 # --------------------------------------------------------------------------------------
 # create_booking
 # --------------------------------------------------------------------------------------
@@ -351,18 +384,20 @@ async def cancel_booking(
     now: datetime,
     effects: BookingEffects | None = None,
 ) -> Booking:
-    """Cancel a booking, freeing its slot (RF-07). Idempotent.
+    """Cancel a booking, freeing its slot (RF-07). Idempotent, even under concurrency (RF-04).
 
-    Sets ``status=cancelled`` + ``cancelled_at`` and queues the ``booking.cancelled`` webhook in the
-    same transaction; best-effort deletes the Google event and sends the cancellation email when
-    ``effects`` is supplied. Cancelling an already-cancelled booking is a no-op (no second webhook).
-    Raises :class:`BookingNotFoundError` (404) if the tenant has no such booking.
+    Takes the per-host advisory lock FIRST and re-loads the booking under it (committed state), so
+    two concurrent cancels serialize instead of racing: the first transitions ``status=cancelled`` +
+    ``cancelled_at`` and queues the ``booking.cancelled`` webhook in the same transaction; the loser
+    sees it already cancelled and is a no-op that queues NO second webhook. Best-effort deletes the
+    Google event and sends the cancellation email when ``effects`` is supplied. Raises
+    :class:`BookingNotFoundError` (404) if the tenant has no such booking.
     """
-    booking = await _load_booking(session, tenant_id=tenant_id, booking_id=booking_id)
-    if booking is None:
-        raise BookingNotFoundError("booking not found")
+    booking, _event_type = await _lock_and_reload_booking(
+        session, tenant_id=tenant_id, booking_id=booking_id
+    )
     if booking.status == BookingStatus.CANCELLED:
-        return booking
+        return booking  # already cancelled under the lock → no-op, no duplicate webhook (RF-04)
 
     booking.status = BookingStatus.CANCELLED
     booking.cancelled_at = now
@@ -409,23 +444,25 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     on the new slot (RF-04 layer 2) rolls BOTH back — the original is never left cancelled without a
     replacement. Queues ``booking.rescheduled`` in the same transaction; best-effort updates the
     Google event, sends the reschedule email and re-schedules the reminder. Raises
-    :class:`BookingNotFoundError` (404), :class:`BookingNotActiveError` (409, already cancelled),
+    :class:`BookingNotFoundError` (404), :class:`BookingNotActiveError` (409, no longer confirmed),
     :class:`SlotUnavailableError` (409) or :class:`AvailabilityUnavailableError` (503).
-    """
-    old = await _load_booking(session, tenant_id=tenant_id, booking_id=booking_id)
-    if old is None:
-        raise BookingNotFoundError("booking not found")
-    if old.status == BookingStatus.CANCELLED:
-        raise BookingNotActiveError("a cancelled booking cannot be rescheduled")
 
-    event_type = await get_event_type(session, tenant_id=tenant_id, event_type_id=old.event_type_id)
-    if event_type is None:  # pragma: no cover - the FK guarantees the row exists
-        raise EventTypeNotFoundError("event type not found")
+    Concurrency correctness (RF-04): the per-host advisory lock is taken FIRST (via
+    :func:`_lock_and_reload_booking`) and the booking is re-loaded + re-validated as still
+    ``confirmed`` under it. Two concurrent reschedules of the same booking to DIFFERENT slots would
+    otherwise each see it active and each open a replacement (different ``start_at`` slips past the
+    partial index) — a double-booking hole. Serializing on the lock and re-checking the committed
+    status closes it: the loser sees it already cancelled/rescheduled and is refused (not active).
+    """
+    old, event_type = await _lock_and_reload_booking(
+        session, tenant_id=tenant_id, booking_id=booking_id
+    )
+    if old.status != BookingStatus.CONFIRMED:
+        raise BookingNotActiveError("only a confirmed booking can be rescheduled")
 
     start = _to_utc(new_start)
     end = start + timedelta(seconds=event_type.duration_seconds)
 
-    await _serialize_host(session, tenant_id=tenant_id, host_id=event_type.host_id)
     await _validate_slot(
         session, tenant_id=tenant_id, event_type=event_type, start=start, end=end, now=now
     )
@@ -519,6 +556,19 @@ async def list_bookings(
 # Side-effects (F1-06/07/08/10) — every one best-effort; never fails the booking.
 # --------------------------------------------------------------------------------------
 
+# SECURITY/RELIABILITY (tracked): these external effects still run BEFORE the caller commits the
+# booking transaction. After the best-effort wrapping (each effect logs-and-continues) a FAILING
+# effect can no longer corrupt or roll back a booking — but effects can still run against a booking
+# whose transaction is later rolled back by the caller (e.g. a downstream error in the request),
+# sending an email or creating a Google event for a booking that never persisted. The real fix is a
+# TRANSACTIONAL OUTBOX: instead of calling email/Google/reminder inline, persist an intent row (the
+# effect + its payload) in the SAME transaction as the booking, and have a post-commit worker drain
+# the outbox — running each effect idempotently (dedupe key = booking id + effect kind) with retries
+# and a dead-letter. That couples with the scheduler/lifespan wiring a later deploy task owns, and
+# no effect deps are wired live in this path yet (sender/reminder_runner/Google are None here), so
+# it is deferred to that task rather than half-built here. Until then, ordering effects after the
+# row flush + the best-effort guards keep a committed booking safe from a failing side-effect.
+
 
 def _guest_link(base_url: str, action: str, token: str) -> str:
     """Build a public self-serve link carrying the signed guest ``token`` (F1-06/10)."""
@@ -611,14 +661,21 @@ async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is par
 
 
 def _schedule_reminder(effects: BookingEffects, *, booking: Booking) -> None:
-    """Schedule the 24 h reminder for ``booking`` if a runner is wired (F1-10); else skip."""
+    """Schedule the 24 h reminder for ``booking`` if a runner is wired (F1-10); else skip.
+
+    Best-effort (RF-10): a scheduler that raises must NEVER roll the committed booking back, so the
+    scheduling call is guarded — on failure it is logged and the booking stands.
+    """
     if effects.reminder_runner is None:
         return
-    schedule_reminder(
-        effects.reminder_runner,
-        booking=booking,
-        send_at=_to_utc(booking.start_at) - _REMINDER_LEAD,
-    )
+    try:
+        schedule_reminder(
+            effects.reminder_runner,
+            booking=booking,
+            send_at=_to_utc(booking.start_at) - _REMINDER_LEAD,
+        )
+    except Exception:
+        _logger.exception("booking %s: reminder scheduling failed (best-effort, kept)", booking.id)
 
 
 async def _send_email(  # noqa: PLR0913 - the composer needs the full booking + link context
@@ -662,7 +719,7 @@ async def _sync_google_upsert(
             request=_meet_request(booking, event_type),
             service=effects.google_service,
         )
-    except CalendarSyncError:
+    except Exception:
         _logger.exception(
             "booking %s: Google event create failed; leaving external_event_id NULL for retry",
             booking.id,
@@ -697,7 +754,7 @@ async def _sync_google_reschedule(
             external_id, meeting_url = await create_event_for_booking(
                 connection=effects.connection, request=request, service=effects.google_service
             )
-    except CalendarSyncError:
+    except Exception:
         _logger.exception("booking %s: Google reschedule failed (best-effort, kept)", new.id)
         return
     new.external_event_id = external_id
@@ -719,7 +776,7 @@ async def _sync_google_delete(*, booking: Booking, effects: BookingEffects) -> N
             external_event_id=booking.external_event_id,
             service=effects.google_service,
         )
-    except CalendarSyncError:
+    except Exception:
         _logger.exception("booking %s: Google event delete failed (best-effort)", booking.id)
 
 
