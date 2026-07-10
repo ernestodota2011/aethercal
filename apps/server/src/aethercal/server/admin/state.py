@@ -81,6 +81,16 @@ def _clean(form_data: dict[str, str], key: str) -> str:
     return str(form_data.get(key, "")).strip()
 
 
+def _en_translation(form_data: dict[str, str], key: str) -> dict[str, str]:
+    """A sparse ``{"en": value}`` translation map from a form field; blank → ``{}`` (A4).
+
+    Blank never persists an ``"en"`` key at all — an empty override is not a meaningful override
+    (mirrors :func:`aethercal.schemas.event_types.resolve_title`'s own "blank falls back" rule).
+    """
+    value = _clean(form_data, key)
+    return {"en": value} if value else {}
+
+
 # --------------------------------------------------------------------------------------
 # Fetch helpers (free functions the handlers await).
 # --------------------------------------------------------------------------------------
@@ -271,6 +281,8 @@ class AdminState(rx.State):
                 schedule_id=_schedule_id(self.schedules, _clean(form_data, "schedule")),
                 duration_seconds=int(_clean(form_data, "duration_min")) * 60,
                 max_advance_seconds=int(_clean(form_data, "max_advance_days")) * 86_400,
+                title_translations=_en_translation(form_data, "title_en"),
+                description_translations=_en_translation(form_data, "description_en"),
             )
             await service.create_event_type_action(
                 runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
@@ -282,15 +294,33 @@ class AdminState(rx.State):
 
     @rx.event
     async def update_event_type(self, form_data: dict[str, str]) -> None:
-        """Update an event type's title and/or duration (blank fields are left unchanged)."""
+        """Update an event type's title/duration/EN translations (blank fields left unchanged).
+
+        Each optional field is OMITTED from the payload when blank, never sent as an explicit
+        ``None`` — ``title`` is NOT NULL in the DB, so a blank-means-``None`` payload would flush
+        as a constraint violation instead of a no-op (the bug this fixed while wiring the EN
+        translations through, A4). ``EventTypeUpdate.model_validate`` marks only the keys present
+        in ``update_fields`` as "set", matching the same ``exclude_unset`` contract every other
+        field in this handler already relies on.
+        """
         if not self._authenticated:
             return
         runtime = current_runtime()
         try:
-            title = _clean(form_data, "title") or None
+            update_fields: dict[str, str | int | dict[str, str]] = {}
+            title = _clean(form_data, "title")
+            if title:
+                update_fields["title"] = title
             duration_raw = _clean(form_data, "duration_min")
-            duration = int(duration_raw) * 60 if duration_raw else None
-            data = EventTypeUpdate(title=title, duration_seconds=duration)
+            if duration_raw:
+                update_fields["duration_seconds"] = int(duration_raw) * 60
+            title_en = _en_translation(form_data, "title_en")
+            if title_en:
+                update_fields["title_translations"] = title_en
+            description_en = _en_translation(form_data, "description_en")
+            if description_en:
+                update_fields["description_translations"] = description_en
+            data = EventTypeUpdate.model_validate(update_fields)
             await service.update_event_type_action(
                 runtime.sessionmaker,
                 tenant_slug=runtime.config.tenant_slug,

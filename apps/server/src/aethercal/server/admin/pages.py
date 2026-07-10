@@ -153,6 +153,7 @@ def _event_type_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
     return rx.table.row(
         rx.table.cell(row["slug"]),
         rx.table.cell(row["title"]),
+        rx.table.cell(row["title_en"]),
         rx.table.cell(row["duration_min"]),
         rx.table.cell(row["active"]),
         rx.table.cell(
@@ -168,7 +169,13 @@ def _event_type_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
 
 
 def event_types_page() -> rx.Component:
-    """Event-type CRUD: a table, a create form, and a rename/re-duration form."""
+    """Event-type CRUD: a table, a create form, and a rename/re-duration form.
+
+    ``title_en``/``description_en`` (below the canonical Spanish ``title``) are the sole EN
+    override the platform supports today (A4) — blank leaves no translation on create, and leaves
+    the stored one untouched on update; the table's "Title (EN)" column is how a saved/edited
+    override is surfaced back to the operator.
+    """
     return _shell(
         "Event types",
         _error(AdminState.error),
@@ -177,6 +184,7 @@ def event_types_page() -> rx.Component:
                 rx.table.row(
                     rx.table.column_header_cell("Slug"),
                     rx.table.column_header_cell("Title"),
+                    rx.table.column_header_cell("Title (EN)"),
                     rx.table.column_header_cell("Minutes"),
                     rx.table.column_header_cell("Active"),
                     rx.table.column_header_cell("Actions"),
@@ -190,6 +198,8 @@ def event_types_page() -> rx.Component:
             rx.vstack(
                 rx.input(name="slug", placeholder="slug (e.g. intro-call)", required=True),
                 rx.input(name="title", placeholder="Title", required=True),
+                rx.input(name="title_en", placeholder="Title (English, optional)"),
+                rx.input(name="description_en", placeholder="Description (English, optional)"),
                 rx.input(name="schedule", placeholder="Schedule name", required=True),
                 rx.input(
                     name="duration_min",
@@ -213,10 +223,12 @@ def event_types_page() -> rx.Component:
         ),
         rx.heading("Update an event type", size="4"),
         rx.form(
-            rx.hstack(
+            rx.vstack(
                 rx.input(name="id", placeholder="Event type id", required=True),
                 rx.input(name="title", placeholder="New title (optional)"),
                 rx.input(name="duration_min", type="number", placeholder="New minutes (optional)"),
+                rx.input(name="title_en", placeholder="New title EN (optional)"),
+                rx.input(name="description_en", placeholder="New description EN (optional)"),
                 rx.button("Update", type="submit"),
                 spacing="3",
                 align="end",
