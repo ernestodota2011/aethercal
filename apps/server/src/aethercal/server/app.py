@@ -143,8 +143,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     # Additive, off-by-default: mounts the single-user Reflex admin at /admin only when the operator
     # has configured credentials AND set AETHERCAL_ADMIN_ENABLED (F1-11). A no-op otherwise, so the
-    # plain API server and the offline test path are unchanged.
-    mount_admin(app)
+    # plain API server and the offline test path are unchanged. The eager sessionmaker (built above)
+    # is handed in explicitly — the mount never reaches into app.state for it.
+    mount_admin(app, sessionmaker=sessionmaker)
 
     return app
 

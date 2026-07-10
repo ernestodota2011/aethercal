@@ -46,18 +46,20 @@ def test_mount_invokes_the_live_mount_when_configured_and_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Stub the live mount (it would need the built Reflex frontend) and prove the gate opens.
-    recorded: list[tuple[FastAPI, AdminConfig]] = []
+    recorded: list[tuple[FastAPI, AdminConfig, object]] = []
 
-    def _record(app: FastAPI, config: AdminConfig) -> None:
-        recorded.append((app, config))
+    def _record(app: FastAPI, config: AdminConfig, sessionmaker: object) -> None:
+        recorded.append((app, config, sessionmaker))
 
     monkeypatch.setattr(mount_module, "_mount_admin_app", _record)
 
+    session_factory = async_sessionmaker(create_async_engine("sqlite+aiosqlite://"))
     app = FastAPI()
-    assert mount_admin(app, environ=_ENABLED_ENV) is True
+    assert mount_admin(app, environ=_ENABLED_ENV, sessionmaker=session_factory) is True
     assert len(recorded) == 1
-    _, config = recorded[0]
+    _, config, passed_factory = recorded[0]
     assert config.username == "admin"
+    assert passed_factory is session_factory  # the explicit factory is threaded straight through
 
 
 async def test_create_app_does_not_mount_admin_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

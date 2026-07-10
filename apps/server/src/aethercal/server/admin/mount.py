@@ -21,33 +21,48 @@ from aethercal.server.admin.config import AdminConfig, admin_mount_enabled
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 ADMIN_MOUNT_PATH = "/admin"
 
 
-def mount_admin(app: FastAPI, environ: Mapping[str, str] | None = None) -> bool:
+def mount_admin(
+    app: FastAPI,
+    environ: Mapping[str, str] | None = None,
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+) -> bool:
     """Mount the Reflex admin under ``/admin`` when configured + enabled; return whether it mounted.
 
     A no-op (returns ``False``) unless both ``AETHERCAL_ADMIN_USERNAME`` / ``_PASSWORD_HASH`` are
     set and ``AETHERCAL_ADMIN_ENABLED`` is truthy — the default server is unchanged.
+
+    ``sessionmaker`` is the same-process DB session factory the admin's Reflex backend uses. The
+    caller passes it explicitly (``create_app`` builds engine + sessionmaker eagerly and hands the
+    factory straight in), so the mount never reaches into ``app.state`` for a dependency whose
+    lifecycle is the app's — it is an explicit input. Falls back to ``app.state.sessionmaker`` only
+    when a caller omits it.
     """
     env = os.environ if environ is None else environ
     config = AdminConfig.from_env(env)
     if config is None or not admin_mount_enabled(env):
         return False
-    _mount_admin_app(app, config)
+    session_factory = sessionmaker if sessionmaker is not None else app.state.sessionmaker
+    _mount_admin_app(app, config, session_factory)
     return True
 
 
 def _mount_admin_app(
-    app: FastAPI, config: AdminConfig
+    app: FastAPI,
+    config: AdminConfig,
+    sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:  # pragma: no cover - live (needs the built frontend + a running server)
-    """Build the Reflex ASGI admin over the server's sessionmaker and mount it at ``/admin``."""
+    """Build the Reflex ASGI admin over the given sessionmaker and mount it at ``/admin``."""
     # Imported lazily on purpose: keeps reflex out of the import graph when the admin is disabled.
     from aethercal.server.admin.app import build_admin_asgi  # noqa: PLC0415
     from aethercal.server.admin.runtime import AdminRuntime  # noqa: PLC0415
 
-    runtime = AdminRuntime(sessionmaker=app.state.sessionmaker, config=config)
+    runtime = AdminRuntime(sessionmaker=sessionmaker, config=config)
     app.mount(ADMIN_MOUNT_PATH, build_admin_asgi(runtime))
 
 
