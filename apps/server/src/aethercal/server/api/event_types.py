@@ -49,7 +49,7 @@ def _duplicate_slug(exc: DuplicateSlugError) -> HTTPException:
 
 def _invalid_reference(exc: InvalidReferenceError) -> HTTPException:
     return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail={"error": _INVALID_REFERENCE, "message": str(exc)},
     )
 
