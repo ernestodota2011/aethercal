@@ -138,6 +138,9 @@ extend-immutable-calls = [
 
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["PLR2004", "S101"]
+# The booking page's view builders are presentational functions: each takes the data it renders
+# (event, slots, tz, labels, urls, errors), so a higher argument count is inherent, not a smell.
+"apps/booking/src/aethercal/booking/views.py" = ["PLR0913"]
 
 [tool.pyright]
 pythonVersion = "3.11"
