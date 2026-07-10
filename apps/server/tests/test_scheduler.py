@@ -34,7 +34,7 @@ from aethercal.core.model import TimeInterval
 from aethercal.server import scheduler as sched
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
-from aethercal.server.db.models import ExternalConnection, Tenant, User
+from aethercal.server.db.models import BusyCache, ExternalConnection, Tenant, User
 from aethercal.server.scheduler import (
     BUSY_REFRESH_JOB_ID,
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
@@ -314,6 +314,64 @@ async def test_refresh_all_busy_caches_skips_a_failing_connection(
     await sqlite_session.refresh(bad)
     assert good.busy_synced_at is not None
     assert bad.busy_synced_at is None
+
+
+async def test_refresh_all_busy_caches_isolates_a_flush_error_from_the_rest(
+    sqlite_session: AsyncSession,
+    tenant_factory: TenantFactory,
+    fernet: Fernet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SQLAlchemy error mid-flush on ONE connection must not poison the whole batch.
+
+    Unlike a ``service_factory`` exception (which never touches the DB), a failing flush deactivates
+    the shared session's transaction: without per-connection SAVEPOINT isolation every remaining
+    connection would then abort too and the batch would silently half-complete. Each connection is
+    wrapped in ``session.begin_nested()`` so the poisoned flush rolls back just that connection.
+    """
+    await _connect(sqlite_session, tenant_factory, fernet=fernet, email="a@host.com")
+    await _connect(sqlite_session, tenant_factory, fernet=fernet, email="b@host.com")
+    window = TimeInterval(start=NOW, end=NOW + timedelta(days=30))
+
+    real_refresh = sched.refresh_busy_cache
+    calls = {"count": 0}
+
+    async def _refresh(
+        session: AsyncSession,
+        *,
+        connection: ExternalConnection,
+        window: TimeInterval,
+        now: datetime,
+        service: Any,
+    ) -> list[TimeInterval]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # A genuine SQLAlchemy error DURING FLUSH: a BusyCache row missing its NOT NULL columns.
+            # This deactivates the outer transaction; only a SAVEPOINT rollback recovers it so the
+            # next connection still refreshes.
+            session.add(BusyCache(tenant_id=connection.tenant_id, connection_id=connection.id))
+            await session.flush()
+        return await real_refresh(
+            session, connection=connection, window=window, now=now, service=service
+        )
+
+    monkeypatch.setattr(sched, "refresh_busy_cache", _refresh)
+
+    refreshed = await refresh_all_busy_caches(
+        sqlite_session,
+        now=NOW,
+        window=window,
+        service_factory=lambda _conn: _FakeGoogleService(),
+    )
+
+    # The first connection's flush blew up; the OTHER still refreshed (SAVEPOINT isolation — one
+    # poisoned flush no longer aborts the whole batch).
+    assert refreshed == 1
+    stamped = [
+        connection.busy_synced_at
+        for connection in (await sqlite_session.scalars(select(ExternalConnection))).all()
+    ]
+    assert sum(stamp is not None for stamp in stamped) == 1
 
 
 async def test_run_busy_refresh_once_swallows_a_failing_tick(
