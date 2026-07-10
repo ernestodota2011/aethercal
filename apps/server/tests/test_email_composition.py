@@ -62,6 +62,11 @@ def _ics_text(msg: EmailMessage) -> str:
     raise AssertionError("no text/calendar part found in the message")
 
 
+def _calendar(kind: NotificationKind) -> Any:
+    """Parse the ``.ics`` attached to the ``kind`` email for the default booking context."""
+    return Calendar.from_ical(_ics_text(build_notification_email(_context(), kind=kind)))
+
+
 @pytest.mark.parametrize(
     ("kind", "locale", "expected"),
     [
@@ -142,3 +147,44 @@ def test_ics_attachment_has_ics_filename() -> None:
     calendar_parts = [p for p in msg.walk() if p.get_content_type() == "text/calendar"]
     assert len(calendar_parts) == 1
     assert calendar_parts[0].get_filename() == "invite.ics"
+
+
+def test_confirmation_ics_is_a_request_to_add() -> None:
+    """RF-08: a confirmation tells the calendar to ADD the event (METHOD:REQUEST, SEQUENCE:0)."""
+    cal = _calendar(NotificationKind.CONFIRMATION)
+    vevent = cal.walk("VEVENT")[0]
+    assert str(cal["METHOD"]) == "REQUEST"
+    assert str(vevent["STATUS"]) == "CONFIRMED"
+    assert int(vevent["SEQUENCE"]) == 0
+
+
+def test_cancellation_ics_is_a_cancel() -> None:
+    """RF-08: a cancellation must CANCEL the event, not re-add it (METHOD:CANCEL)."""
+    cal = _calendar(NotificationKind.CANCELLATION)
+    vevent = cal.walk("VEVENT")[0]
+    assert str(cal["METHOD"]) == "CANCEL"
+    assert str(vevent["STATUS"]) == "CANCELLED"
+    assert int(vevent["SEQUENCE"]) >= 1  # bumped so clients supersede the original
+
+
+def test_reschedule_ics_bumps_sequence_above_confirmation() -> None:
+    """RF-08: a reschedule is an UPDATE — same UID, METHOD:REQUEST, SEQUENCE above the original."""
+    confirmation = _calendar(NotificationKind.CONFIRMATION).walk("VEVENT")[0]
+    cal = _calendar(NotificationKind.RESCHEDULE)
+    vevent = cal.walk("VEVENT")[0]
+    assert str(cal["METHOD"]) == "REQUEST"
+    assert str(vevent["STATUS"]) == "CONFIRMED"
+    assert int(vevent["SEQUENCE"]) > int(confirmation["SEQUENCE"])
+
+
+def test_all_lifecycle_kinds_share_the_same_uid() -> None:
+    """RF-08: cancel/reschedule reference the SAME calendar event as the original confirmation."""
+    uids = {
+        str(_calendar(kind).walk("VEVENT")[0]["UID"])
+        for kind in (
+            NotificationKind.CONFIRMATION,
+            NotificationKind.RESCHEDULE,
+            NotificationKind.CANCELLATION,
+        )
+    }
+    assert uids == {"booking-123@aethercal"}
