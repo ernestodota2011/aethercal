@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.db.models import Webhook, WebhookDelivery
 from aethercal.server.services.webhooks import decrypt_webhook_secret
+from aethercal.server.webhooks.pinning import build_pinned_request
 from aethercal.server.webhooks.signing import SIGNATURE_HEADER, canonical_body, signature_header
 from aethercal.server.webhooks.ssrf import BlockedUrlError, Resolver, assert_public_url
 
@@ -86,8 +87,11 @@ async def deliver_due(  # noqa: PLR0913 — fully dependency-injected worker: ev
 
     Every URL is passed through the SSRF egress guard (:func:`assert_public_url`) right before the
     send: a subscriber pointing at a private/loopback/link-local/metadata address is parked ``dead``
-    and never POSTed to (RF-17 / RNF-5). ``resolver`` is injected only for tests; ``None`` uses real
-    DNS in production, and resolving at send time is what defeats DNS rebinding.
+    and never POSTed to (RF-17 / RNF-5). The actual POST is then IP-pinned
+    (:func:`build_pinned_request`): the host is re-resolved and the exact address dialed is
+    re-validated at connect time, so a name that passes the guard but rebinds to a private IP before
+    the socket opens is still refused — DNS rebinding is closed at the root, not just narrowed.
+    ``resolver`` is injected only for tests; ``None`` uses real DNS for both the guard and the pin.
     """
     due = (
         await session.scalars(
@@ -111,29 +115,27 @@ async def deliver_due(  # noqa: PLR0913 — fully dependency-injected worker: ev
 
         if webhook is None:
             # The subscriber is gone (the FK cascade should prevent this); nothing to send.
-            delivery.status = _DEAD
-            delivery.next_retry_at = None
-            report.dead.append(delivery.id)
+            _park_dead(delivery, report)
             continue
 
         try:
+            # Pre-flight egress guard (all resolved IPs must be public), then sign and POST with a
+            # connect-time IP pin (dial only the re-validated address). Either the guard or the pin
+            # can veto a non-public target (RF-17 / RNF-5); a blocked URL skips signing entirely.
             await assert_public_url(webhook.url, resolver=resolver)
+            body = canonical_body(delivery.payload)
+            secret = decrypt_webhook_secret(webhook, fernet_key)
+            headers = {
+                SIGNATURE_HEADER: signature_header(body, secret),
+                "Content-Type": "application/json",
+            }
+            response_code = await _post(http_client, webhook.url, body, headers, resolver=resolver)
         except BlockedUrlError:
-            # SSRF egress guard: the target resolves to a non-public address — never POST to it.
-            # Park it dead (a blocked URL can never succeed, so no retry) (RF-17 / RNF-5).
-            delivery.status = _DEAD
-            delivery.next_retry_at = None
-            delivery.response_code = None
-            report.dead.append(delivery.id)
+            # The target resolves to a non-public address, at the guard or at the connect-time pin
+            # (DNS rebinding). A blocked URL can never succeed, so park it dead with no retry.
+            _park_dead(delivery, report)
             continue
 
-        body = canonical_body(delivery.payload)
-        secret = decrypt_webhook_secret(webhook, fernet_key)
-        headers = {
-            SIGNATURE_HEADER: signature_header(body, secret),
-            "Content-Type": "application/json",
-        }
-        response_code = await _post(http_client, webhook.url, body, headers)
         delivery.response_code = response_code
 
         if response_code is not None and 200 <= response_code < 300:
@@ -153,12 +155,34 @@ async def deliver_due(  # noqa: PLR0913 — fully dependency-injected worker: ev
     return report
 
 
+def _park_dead(delivery: WebhookDelivery, report: DeliveryReport) -> None:
+    """Park a delivery as ``dead`` — terminal, never retried — and record it in ``report``."""
+    delivery.status = _DEAD
+    delivery.next_retry_at = None
+    delivery.response_code = None
+    report.dead.append(delivery.id)
+
+
 async def _post(
-    http_client: httpx.AsyncClient, url: str, body: bytes, headers: dict[str, str]
+    http_client: httpx.AsyncClient,
+    url: str,
+    body: bytes,
+    headers: dict[str, str],
+    *,
+    resolver: Resolver | None,
 ) -> int | None:
-    """POST ``body`` to ``url``; return the status code, or ``None`` on a transport error."""
+    """POST ``body`` to ``url``, dialing only the connect-time-validated public IP (anti-rebinding).
+
+    Builds an IP-pinned request (:func:`build_pinned_request`) — the socket targets the re-validated
+    address while SNI/Host/cert stay bound to the original hostname — then sends it. Propagates
+    :class:`BlockedUrlError` when the pinned address is non-public (the caller parks the delivery
+    dead); returns the status code, or ``None`` on a transport error.
+    """
+    request = await build_pinned_request(
+        http_client, url, content=body, headers=headers, resolver=resolver
+    )
     try:
-        response = await http_client.post(url, content=body, headers=headers)
+        response = await http_client.send(request)
     except httpx.HTTPError:
         return None
     return response.status_code

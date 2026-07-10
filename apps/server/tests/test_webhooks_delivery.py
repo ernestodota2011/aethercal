@@ -18,6 +18,7 @@ from aethercal.server.db.models import Tenant, WebhookDelivery
 from aethercal.server.services.webhooks import create_webhook, enqueue_event
 from aethercal.server.webhooks.delivery import backoff_delay, deliver_due
 from aethercal.server.webhooks.signing import SIGNATURE_HEADER, canonical_body, verify_signature
+from aethercal.server.webhooks.ssrf import Resolver
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -30,6 +31,20 @@ PUBLIC_IP = "93.184.216.34"
 async def _public_resolver(_host: str) -> list[str]:
     """Resolve any host to a fixed public IP so delivery tests stay hermetic (no real DNS)."""
     return [PUBLIC_IP]
+
+
+def _rebinding_resolver(guard_answer: list[str], connect_answer: list[str]) -> Resolver:
+    """Model a DNS rebind: the first call (the pre-flight guard) sees ``guard_answer``; every call
+    after (the connect-time pin) sees ``connect_answer``. The pin re-validates what it actually
+    dials, so a name that passes the guard but rebinds by connect time is still refused.
+    """
+    calls = {"n": 0}
+
+    async def _resolver(_host: str) -> list[str]:
+        calls["n"] += 1
+        return guard_answer if calls["n"] == 1 else connect_answer
+
+    return _resolver
 
 
 async def _seed_one(
@@ -228,3 +243,71 @@ async def test_ssrf_blocked_url_is_marked_dead_and_never_posts(
     assert delivery.response_code is None
     assert delivery.id in report.dead
     assert requests == []  # the SSRF guard fires before any POST is attempted
+
+
+async def test_dns_rebinding_between_guard_and_connect_is_blocked_and_marked_dead(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    # The host passes the pre-flight guard (first resolve → public) but rebinds to a private IP by
+    # connect time (second resolve → loopback). The pin re-validates the exact IP it will dial, so
+    # the send is refused and the delivery is parked dead — nothing is ever POSTed (RF-17 / RNF-5).
+    delivery = await _seed_one(sqlite_session, tenant_factory, url="https://rebind.test/hook")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    resolver = _rebinding_resolver(guard_answer=[PUBLIC_IP], connect_answer=["127.0.0.1"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        report = await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=resolver)
+
+    assert delivery.status == "dead"
+    assert delivery.next_retry_at is None
+    assert delivery.response_code is None
+    assert delivery.id in report.dead
+    assert requests == []  # the rebind is caught at connect time, before any POST leaves the worker
+
+
+async def test_public_target_is_dialed_on_the_validated_pinned_ip(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    # A legitimate public subscriber is delivered — and the socket targets the validated IP literal,
+    # not the hostname, so httpx cannot re-resolve to a different address behind our back.
+    delivery = await _seed_one(sqlite_session, tenant_factory, url="https://consumer.test/hook")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url_host"] = request.url.host
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver)
+
+    assert delivery.status == "delivered"
+    assert delivery.response_code == 200
+    assert captured["url_host"] == PUBLIC_IP  # dialed the validated IP literal, never the hostname
+
+
+async def test_sni_and_host_stay_bound_to_the_hostname_not_the_ip(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    # Pinning the IP must not weaken TLS: SNI + certificate verification stay bound to the real
+    # hostname (via the ``sni_hostname`` extension, which httpcore uses as ``server_hostname``), and
+    # the Host header keeps the consumer's virtual-host routing intact.
+    delivery = await _seed_one(sqlite_session, tenant_factory, url="https://consumer.test/hook")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url_host"] = request.url.host
+        captured["host_header"] = request.headers.get("Host")
+        captured["sni"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await deliver_due(sqlite_session, http, now=NOW, fernet_key=KEY, resolver=_public_resolver)
+
+    assert delivery.status == "delivered"
+    assert captured["url_host"] == PUBLIC_IP  # connects to the IP...
+    assert captured["host_header"] == "consumer.test"  # ...but Host header is the real hostname...
+    assert captured["sni"] == "consumer.test"  # ...and so is SNI + cert verification
