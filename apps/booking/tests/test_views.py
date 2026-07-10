@@ -239,3 +239,171 @@ def test_cancel_confirm_has_post_form_with_hidden_context() -> None:
     assert str(booking_id) in html
     assert "signed.token" in html
     assert "cancelar" in html.lower()
+
+
+# --------------------------------------------------------------------------------------
+# Event-type content localization (C1): the resolved title/description must follow the
+# active locale, not the tenant's canonical-language text, in every view that renders them.
+# --------------------------------------------------------------------------------------
+
+_CANONICAL_TITLE = "Llamada de descubrimiento"
+_CANONICAL_DESC = "Una charla rápida de 30 minutos."
+_EN_TITLE = "Discovery call"
+_EN_DESC = "A quick 30-minute chat."
+
+
+def _localized_event(**overrides: Any) -> EventTypeRead:
+    base: dict[str, Any] = {
+        "title": _CANONICAL_TITLE,
+        "description": _CANONICAL_DESC,
+        "title_translations": {"en": _EN_TITLE},
+        "description_translations": {"en": _EN_DESC},
+    }
+    base.update(overrides)
+    return _event(**base)
+
+
+def test_index_page_uses_locale_title_override_when_present() -> None:
+    html = to_xml(views.index_page("en", event_types=[_localized_event()], lang_urls=LANG_URLS))
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+
+
+def test_index_page_falls_back_to_canonical_title_without_override() -> None:
+    event = _event(title=_CANONICAL_TITLE)
+    html = to_xml(views.index_page("en", event_types=[event], lang_urls=LANG_URLS))
+    assert _CANONICAL_TITLE in html
+
+
+def _render_event_page(locale: str, event: EventTypeRead) -> str:
+    return to_xml(
+        views.event_page(
+            locale,
+            event=event,
+            tz="UTC",
+            tz_options=["UTC"],
+            tz_explicit=False,
+            window_from="2026-07-14",
+            slots=views.NotStr(""),
+            self_path="/e/intro",
+            slots_endpoint="/e/intro/slots",
+            lang_urls=LANG_URLS,
+        )
+    )
+
+
+def test_event_page_localizes_title_and_description() -> None:
+    html = _render_event_page("en", _localized_event())
+    assert _EN_TITLE in html
+    assert _EN_DESC in html
+    assert _CANONICAL_TITLE not in html
+    assert _CANONICAL_DESC not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_event_page_falls_back_to_canonical_without_override() -> None:
+    html = _render_event_page("en", _event(title=_CANONICAL_TITLE, description=_CANONICAL_DESC))
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+
+
+def test_event_page_empty_string_override_falls_back_to_canonical() -> None:
+    event = _localized_event(title_translations={"en": ""}, description_translations={"en": ""})
+    html = _render_event_page("en", event)
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+
+
+def test_event_page_spanish_locale_always_shows_canonical() -> None:
+    html = _render_event_page("es", _localized_event())
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+    assert _EN_TITLE not in html
+
+
+def test_event_page_lang_switcher_marks_active_locale() -> None:
+    html = _render_event_page("en", _localized_event())
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+def test_booking_form_page_localizes_title() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_localized_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_booking_form_page_lang_switcher_marks_active_locale() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_localized_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+def test_confirmation_page_localizes_heading_title() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_confirmation_page_falls_back_to_canonical_without_override() -> None:
+    event = _event(title=_CANONICAL_TITLE)
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=event,
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _CANONICAL_TITLE in html
+
+
+def test_confirmation_page_lang_switcher_marks_active_locale() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html

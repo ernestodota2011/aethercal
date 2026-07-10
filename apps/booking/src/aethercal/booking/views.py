@@ -58,7 +58,7 @@ from aethercal.booking.forms import FieldError, QuestionSpec, question_field_nam
 from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.timefmt import DayGroup
 from aethercal.schemas.bookings import BookingRead
-from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
 from aethercal.schemas.slots import Availability
 
 # Served from the htmx CDN (deferred). Everything works WITHOUT it — the flow is plain forms; htmx
@@ -231,7 +231,11 @@ def index_page(
     else:
         items = [
             Li(
-                A(event.title, href=_with_lang(f"/e/{event.slug}", locale), cls="brand"),
+                A(
+                    resolve_title(event, locale),
+                    href=_with_lang(f"/e/{event.slug}", locale),
+                    cls="brand",
+                ),
                 Div(_duration_label(locale, event), cls="meta"),
             )
             for event in event_types
@@ -251,9 +255,10 @@ def _event_intro(locale: Locale, event: EventTypeRead) -> Any:
     meta_parts = [_duration_label(locale, event)]
     if event.location:
         meta_parts.append(event.location)
-    bits: list[Any] = [H1(event.title), P(" · ".join(meta_parts), cls="meta")]
-    if event.description:
-        bits.append(P(event.description, cls="lead"))
+    bits: list[Any] = [H1(resolve_title(event, locale)), P(" · ".join(meta_parts), cls="meta")]
+    description = resolve_description(event, locale)
+    if description:
+        bits.append(P(description, cls="lead"))
     return Div(*bits)
 
 
@@ -334,7 +339,7 @@ def event_page(
     """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list."""
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
             _event_intro(locale, event),
             H2(t(locale, "choose_time")),
@@ -570,9 +575,9 @@ def booking_form_page(
     )
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
-            H1(event.title),
+            H1(resolve_title(event, locale)),
             P(f"{t(locale, 'selected_time')}: {when_label}", cls="meta"),
             H2(t(locale, "your_details")),
             form,
@@ -600,9 +605,9 @@ def confirmation_page(
         summary.append(Dd(A(booking.meeting_url, href=booking.meeting_url)))
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
-            H1(t(locale, "confirmed_heading", title=event.title)),
+            H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
             Dl(*summary, cls="summary"),
             P(t(locale, "confirmed_email_note", email=booking.guest_email), cls="lead"),
             cls="stack",

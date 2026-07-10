@@ -35,7 +35,7 @@ from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
 from aethercal.client import AetherCalAPIError, AetherCalClient
-from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.event_types import EventTypeRead, resolve_title
 
 T = TypeVar("T")
 
@@ -443,7 +443,7 @@ class _BookingApp:
             back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
             return _error_response(
                 locale,
-                title=found.title,
+                title=resolve_title(found, locale),
                 exc=exc,
                 lang_urls=lang_urls,
                 retry=(back, t(locale, "back_to_times")),

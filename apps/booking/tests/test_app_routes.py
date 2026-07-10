@@ -26,13 +26,31 @@ from aethercal.client import AetherCalClient
 INTRO_ID = str(uuid.uuid4())
 DEEP_ID = str(uuid.uuid4())
 TYPED_ID = str(uuid.uuid4())
+ES_ID = str(uuid.uuid4())
 BOOKING_ID = str(uuid.uuid4())
 API_KEY = "ack_server_side_secret"
 # A value the fake backend echoes in its internal error message; the guest must never see it.
 LEAK_MARKER = "internal stack secret"
 
+# C1 fixtures: a Spanish-canonical event with an English override, to prove the booking app
+# resolves event-type content by the ACTIVE locale (not just the chrome copy) end-to-end.
+ES_TITLE = "Llamada de descubrimiento"
+ES_DESC = "Una consulta inicial de 30 minutos."
+EN_TITLE_OVERRIDE = "Discovery call"
+EN_DESC_OVERRIDE = "A 30-minute intro call."
 
-def _event_json(*, event_id: str, slug: str, title: str, questions: list[Any], active: bool = True):
+
+def _event_json(  # noqa: PLR0913 - each field is a distinct fixture knob callers opt into
+    *,
+    event_id: str,
+    slug: str,
+    title: str,
+    questions: list[Any],
+    active: bool = True,
+    description: str = "Let's talk.",
+    title_translations: dict[str, str] | None = None,
+    description_translations: dict[str, str] | None = None,
+):
     return {
         "id": event_id,
         "tenant_id": str(uuid.uuid4()),
@@ -40,7 +58,9 @@ def _event_json(*, event_id: str, slug: str, title: str, questions: list[Any], a
         "schedule_id": str(uuid.uuid4()),
         "slug": slug,
         "title": title,
-        "description": "Let's talk.",
+        "description": description,
+        "title_translations": title_translations or {},
+        "description_translations": description_translations or {},
         "location": "Google Meet",
         "duration_seconds": 1800,
         "buffer_before_seconds": 0,
@@ -126,6 +146,15 @@ class FakeAPI:
                             "required": True,
                         },
                     ],
+                ),
+                _event_json(
+                    event_id=ES_ID,
+                    slug="espanol",
+                    title=ES_TITLE,
+                    description=ES_DESC,
+                    title_translations={"en": EN_TITLE_OVERRIDE},
+                    description_translations={"en": EN_DESC_OVERRIDE},
+                    questions=[],
                 ),
             ],
         )
@@ -497,3 +526,147 @@ def test_date_navigation_floor_follows_visitor_timezone_not_server(monkeypatch: 
     assert "from=2026-07-13" in ny.text  # New York floor = the 13th
     assert "from=2026-07-14" in utc.text  # UTC floor = the 14th
     assert "from=2026-07-13" not in utc.text
+
+
+# ---------------------------------------------------------------------------------------
+# (c) C1: event-type content (title/description) resolves by the ACTIVE locale end-to-end —
+# not just the chrome copy — in every view, and the language selector stays persistent.
+# ---------------------------------------------------------------------------------------
+
+
+def test_index_page_localizes_event_title_with_lang_query() -> None:
+    client, _ = _make_client()
+    response = client.get("/?lang=en")
+    assert response.status_code == 200
+    assert EN_TITLE_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+
+
+def test_index_page_shows_canonical_title_by_default() -> None:
+    client, _ = _make_client()
+    response = client.get("/")
+    assert ES_TITLE in response.text
+    assert EN_TITLE_OVERRIDE not in response.text
+
+
+def test_event_page_localizes_title_and_description_with_lang_query() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/espanol?tz=UTC&lang=en")
+    assert response.status_code == 200
+    assert EN_TITLE_OVERRIDE in response.text
+    assert EN_DESC_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+    assert ES_DESC not in response.text
+    assert f"<title>{EN_TITLE_OVERRIDE} · AetherCal</title>" in response.text
+
+
+def test_event_page_falls_back_to_canonical_spanish_by_default() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/espanol?tz=UTC")
+    assert ES_TITLE in response.text
+    assert ES_DESC in response.text
+
+
+def test_event_page_localizes_via_accept_language_header_without_lang_query() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/espanol?tz=UTC", headers={"Accept-Language": "en-US,en;q=0.9"})
+    assert response.status_code == 200
+    assert '<html lang="en">' in response.text
+    assert EN_TITLE_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+
+
+def test_booking_form_localizes_event_title_with_lang_query() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/espanol/book?start=2026-07-14T13:00:00%2B00:00&tz=UTC&lang=en")
+    assert response.status_code == 200
+    assert EN_TITLE_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+    assert f"<title>{EN_TITLE_OVERRIDE} · AetherCal</title>" in response.text
+
+
+def test_confirmation_localizes_event_title_with_lang_query() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/espanol/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "en",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+        },
+    )
+    assert response.status_code == 200
+    assert EN_TITLE_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+
+
+def test_booking_submit_conflict_error_localizes_event_title() -> None:
+    # Pins app.py's `_error_response(..., title=...)`, the one crude use outside views.py: the
+    # error page's <title>/H1 must resolve by locale too, not just the surrounding chrome.
+    client, _ = _make_client()
+    response = client.post(
+        "/e/espanol/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "en",
+            "name": "Ada",
+            "email": "taken@example.com",
+        },
+    )
+    assert response.status_code == 409
+    assert EN_TITLE_OVERRIDE in response.text
+    assert ES_TITLE not in response.text
+
+
+# ---------------------------------------------------------------------------------------
+# (d) Persistence regression guards: the active `lang` survives navigation, forms, and the
+# language selector across every step of the flow (mostly already correct — pinned here).
+# ---------------------------------------------------------------------------------------
+
+
+def test_event_page_prev_next_links_carry_active_lang() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/intro?tz=UTC&lang=en&from=2026-07-14")
+    assert response.status_code == 200
+    assert response.text.count("lang=en") >= 3  # switcher + prev-week + next-week
+
+
+def test_booking_form_hidden_lang_matches_active_locale() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/intro/book?start=2026-07-14T13:00:00%2B00:00&tz=UTC&lang=en")
+    assert '<input type="hidden" name="lang" value="en">' in response.text
+
+
+def test_confirmation_lang_switcher_present_and_active() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "en",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+        },
+    )
+    assert '<html lang="en">' in response.text
+    assert 'aria-current="true"' in response.text
+
+
+def test_cancel_form_hidden_lang_matches_active_locale() -> None:
+    client, _ = _make_client()
+    response = client.get(f"/cancel?booking={BOOKING_ID}&token=good&lang=en")
+    assert '<input type="hidden" name="lang" value="en">' in response.text
+
+
+def test_reschedule_slot_forms_carry_active_lang() -> None:
+    client, _ = _make_client()
+    response = client.get(
+        f"/reschedule?booking={BOOKING_ID}&token=good&event_type={INTRO_ID}&tz=UTC&lang=en"
+    )
+    assert response.status_code == 200
+    assert response.text.count('name="lang" value="en"') >= 1
+    assert '<html lang="en">' in response.text
