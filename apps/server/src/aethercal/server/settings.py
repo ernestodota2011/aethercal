@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     # Operational toggles.
     auto_migrate: bool = True
     echo_sql: bool = False
+    # Run the in-process background scheduler (reminder firing + webhook delivery + busy-cache
+    # refresh) in THIS process. Off by default so the offline test/API path starts no loop; the
+    # container sets AETHERCAL_RUN_SCHEDULER=1 in exactly ONE process (see deploy/README).
+    run_scheduler: bool = False
+
+    # Public base URL of the booking page, used to mint guest cancel/reschedule links. When unset,
+    # the request path falls back to the incoming request's base URL.
+    booking_base_url: str | None = None
 
     # Descriptive.
     app_name: str = "AetherCal"

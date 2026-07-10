@@ -22,6 +22,27 @@ def test_defaults_are_sensible() -> None:
     settings = _settings()
     assert settings.auto_migrate is True
     assert settings.echo_sql is False
+    # The scheduler is OFF by default so the offline test/API path never starts a background loop;
+    # the container turns it on with AETHERCAL_RUN_SCHEDULER=1 in exactly one process (RF-19).
+    assert settings.run_scheduler is False
+    # No public booking base by default → the request path falls back to the request's base URL.
+    assert settings.booking_base_url is None
+
+
+def test_run_scheduler_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "postgres://u:p@h/db")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "from-env")
+    monkeypatch.setenv("AETHERCAL_RUN_SCHEDULER", "true")
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.run_scheduler is True
+
+
+def test_booking_base_url_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "postgres://u:p@h/db")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "from-env")
+    monkeypatch.setenv("AETHERCAL_BOOKING_BASE_URL", "https://book.example.com")
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.booking_base_url == "https://book.example.com"
 
 
 def test_database_config_normalizes_the_url_to_psycopg() -> None:
