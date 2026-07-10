@@ -38,11 +38,14 @@ from aethercal.server.db.models import BusyCache, ExternalConnection, Tenant, Us
 from aethercal.server.scheduler import (
     BUSY_REFRESH_JOB_ID,
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
     DEFAULT_WEBHOOK_INTERVAL_SECONDS,
+    OUTBOX_DRAIN_JOB_ID,
     WEBHOOK_DELIVERY_JOB_ID,
     refresh_all_busy_caches,
     register_scheduler_jobs,
     run_busy_refresh_once,
+    run_outbox_drain_once,
     run_webhook_delivery_once,
     start_scheduler,
     stop_scheduler,
@@ -175,21 +178,28 @@ async def _connect(
 # --------------------------------------------------------------------------------------
 
 
-def test_register_scheduler_jobs_registers_both_interval_jobs() -> None:
+def test_register_scheduler_jobs_registers_all_interval_jobs() -> None:
     scheduler = FakeScheduler()
 
-    register_scheduler_jobs(scheduler, webhook_tick=_noop, busy_refresh_tick=_noop)
+    register_scheduler_jobs(
+        scheduler, webhook_tick=_noop, busy_refresh_tick=_noop, outbox_tick=_noop
+    )
 
     by_id = {job.job_id: job for job in scheduler.jobs}
-    assert set(by_id) == {WEBHOOK_DELIVERY_JOB_ID, BUSY_REFRESH_JOB_ID}
+    assert set(by_id) == {WEBHOOK_DELIVERY_JOB_ID, BUSY_REFRESH_JOB_ID, OUTBOX_DRAIN_JOB_ID}
     webhook = by_id[WEBHOOK_DELIVERY_JOB_ID]
     busy = by_id[BUSY_REFRESH_JOB_ID]
+    outbox = by_id[OUTBOX_DRAIN_JOB_ID]
     assert webhook.trigger == "interval"
     assert webhook.seconds == DEFAULT_WEBHOOK_INTERVAL_SECONDS == 60
     assert busy.trigger == "interval"
     assert busy.seconds == DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS
+    assert outbox.trigger == "interval"
+    assert outbox.seconds == DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS == 60
     # Idempotent replace so a restart never double-registers.
-    assert webhook.replace_existing is True and busy.replace_existing is True
+    assert webhook.replace_existing is True
+    assert busy.replace_existing is True
+    assert outbox.replace_existing is True
 
 
 def test_register_scheduler_jobs_honors_custom_intervals() -> None:
@@ -199,21 +209,24 @@ def test_register_scheduler_jobs_honors_custom_intervals() -> None:
         scheduler,
         webhook_tick=_noop,
         busy_refresh_tick=_noop,
+        outbox_tick=_noop,
         webhook_interval_seconds=15,
         busy_refresh_interval_seconds=120,
+        outbox_drain_interval_seconds=30,
     )
 
     by_id = {job.job_id: job.seconds for job in scheduler.jobs}
     assert by_id[WEBHOOK_DELIVERY_JOB_ID] == 15
     assert by_id[BUSY_REFRESH_JOB_ID] == 120
+    assert by_id[OUTBOX_DRAIN_JOB_ID] == 30
 
 
 def test_start_scheduler_registers_then_starts() -> None:
     scheduler = FakeScheduler()
 
-    start_scheduler(scheduler, webhook_tick=_noop, busy_refresh_tick=_noop)
+    start_scheduler(scheduler, webhook_tick=_noop, busy_refresh_tick=_noop, outbox_tick=_noop)
 
-    assert len(scheduler.jobs) == 2
+    assert len(scheduler.jobs) == 3
     assert scheduler.started is True
 
 
@@ -261,6 +274,43 @@ async def test_run_webhook_delivery_once_swallows_a_failing_tick(
             fernet_key=derive_fernet_key("test-app-secret"),
             now=NOW,
         )
+
+    # One bad tick must never propagate — it returns None so the scheduler keeps ticking.
+    assert report is None
+
+
+# --------------------------------------------------------------------------------------
+# 2b. Outbox-drain tick — a clean pass, and a guarded failing pass.
+# --------------------------------------------------------------------------------------
+
+
+async def _noop_execute(_session: AsyncSession, _outbox: Any, _now: datetime) -> None:
+    return None
+
+
+async def test_run_outbox_drain_once_reports_a_clean_empty_pass(
+    sqlite_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    report = await run_outbox_drain_once(
+        sessionmaker=sqlite_sessionmaker, execute=_noop_execute, now=NOW
+    )
+
+    assert report is not None
+    assert report.attempted == 0
+
+
+async def test_run_outbox_drain_once_swallows_a_failing_tick(
+    sqlite_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("drain blew up")
+
+    monkeypatch.setattr(sched, "drain_outbox", _boom)
+
+    report = await run_outbox_drain_once(
+        sessionmaker=sqlite_sessionmaker, execute=_noop_execute, now=NOW
+    )
 
     # One bad tick must never propagate — it returns None so the scheduler keeps ticking.
     assert report is None

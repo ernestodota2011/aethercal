@@ -7,12 +7,13 @@ the target host right before the send and refuses any address that is not global
 (:func:`ip_is_public`). Validating at *send* time (not only at registration) catches a URL that
 only turns malicious after it is stored.
 
-SECURITY — known residual (tracked hardening): this validates the resolved IPs but does not *pin*
-them into the HTTP connection, so a resolver that returns a public IP here and a private one to
-httpx's own lookup microseconds later (DNS rebinding) is not fully closed. Fully closing it needs a
-transport that dials only the already-validated address while preserving TLS SNI/cert verification —
-a dedicated pass wired where the delivery ``http_client`` is built (F1-08/deploy). The worker is not
-wired to run yet, so nothing dials these URLs until that hardening lands.
+SECURITY — this is the *pre-flight* guard (resolve every A/AAAA record, require all public). On its
+own it validates the resolved IPs but does not *pin* them into the HTTP connection, so a resolver
+that returns a public IP here and a private one to httpx's own lookup microseconds later (DNS
+rebinding) would slip through. That hole is closed by the connect-time pin in
+:mod:`aethercal.server.webhooks.pinning`, which the delivery worker uses to dial only the exact,
+re-validated address while preserving TLS SNI/cert verification against the original hostname — so
+httpx never re-resolves. This guard remains as the cheap first line of defence (defence in depth).
 
 The DNS resolver is injected (:data:`Resolver`) so the whole guard is deterministic and offline
 under test; production passes ``None`` and gets a real ``getaddrinfo`` lookup. The guard fails
@@ -38,8 +39,12 @@ class BlockedUrlError(ValueError):
     """Raised when a webhook URL is refused by the SSRF egress guard (RF-17 / RNF-5)."""
 
 
-async def _default_resolver(host: str) -> list[str]:
-    """Resolve ``host`` to its IP strings via the running loop's ``getaddrinfo`` (RF-17 / RNF-5)."""
+async def default_resolver(host: str) -> list[str]:
+    """Resolve ``host`` to its IP strings via the running loop's ``getaddrinfo`` (RF-17 / RNF-5).
+
+    The production DNS default shared by both the pre-flight guard (:func:`assert_public_url`) and
+    the connect-time pin (``webhooks.pinning``); tests inject a fake resolver instead.
+    """
     loop = asyncio.get_running_loop()
     infos = await loop.getaddrinfo(host, None, type=SOCK_STREAM)
     return [str(info[4][0]) for info in infos]
@@ -90,7 +95,7 @@ async def assert_public_url(url: str, *, resolver: Resolver | None = None) -> No
             raise BlockedUrlError(f"URL host {host!r} is not a public address")
         return
 
-    resolve = resolver if resolver is not None else _default_resolver
+    resolve = resolver if resolver is not None else default_resolver
     try:
         addresses = await resolve(host)
     except BlockedUrlError:
@@ -108,5 +113,6 @@ __all__ = [
     "BlockedUrlError",
     "Resolver",
     "assert_public_url",
+    "default_resolver",
     "ip_is_public",
 ]

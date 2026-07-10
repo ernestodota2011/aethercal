@@ -14,6 +14,7 @@ localized page — a stack trace or internal message never reaches a guest (RF-1
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import TypeVar
@@ -33,10 +34,15 @@ from aethercal.booking.forms import BookingRequest, build_booking, parse_questio
 from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
-from aethercal.client import AetherCalAPIError, AetherCalClient, AetherCalError
+from aethercal.client import AetherCalAPIError, AetherCalClient
 from aethercal.schemas.event_types import EventTypeRead
 
 T = TypeVar("T")
+
+#: Server-side logger for backend-failure observability. The RF-16 trust boundaries degrade the
+#: guest experience to a friendly page, but every swallowed failure is logged here (with its
+#: traceback) so operators can see a failing backend — the log never reaches the guest.
+logger = logging.getLogger(__name__)
 
 #: The default display zone when a guest hasn't chosen one yet (the browser then auto-detects).
 DEFAULT_TZ = "UTC"
@@ -96,13 +102,26 @@ def _form_dict(form: FormData) -> dict[str, str]:
     return {key: value for key, value in form.multi_items() if isinstance(value, str)}
 
 
+def _now() -> datetime:
+    """The current instant in UTC — the single clock seam so date logic is testable and correct."""
+    return datetime.now(UTC)
+
+
 def _tz_of(request: Request) -> tuple[str, bool]:
     chosen = _valid_tz(request.query_params.get("tz"))
     return (chosen, True) if chosen else (DEFAULT_TZ, False)
 
 
-def _window_of(request: Request, tz: str) -> date:
-    today = today_in_zone(datetime.now(UTC), tz)
+def _today_in(tz: str) -> date:
+    """The calendar day it currently is in the VISITOR's ``tz`` — anchors all date navigation.
+
+    Deriving 'today' from the guest's timezone (not the server clock) keeps prev/next/window
+    navigation correct for a guest sitting near a date boundary (RF-06).
+    """
+    return today_in_zone(_now(), tz)
+
+
+def _window_of(request: Request, today: date) -> date:
     raw = request.query_params.get("from")
     if not raw:
         return today
@@ -137,8 +156,12 @@ def _find_event(events: Sequence[EventTypeRead], slug: str) -> EventTypeRead | N
     return next((e for e in events if e.slug == slug and e.active), None)
 
 
-def _shifted_url(path: str, base: Mapping[str, str], anchor: date, delta_days: int) -> str:
-    new_from = max(anchor + timedelta(days=delta_days), date.today())
+def _shifted_url(
+    path: str, base: Mapping[str, str], anchor: date, delta_days: int, *, floor: date
+) -> str:
+    # ``floor`` is the visitor's local "today" — the window never navigates before it. It must be
+    # derived from the booking timezone (via ``_today_in``), never the server clock.
+    new_from = max(anchor + timedelta(days=delta_days), floor)
     return f"{path}?{urlencode({**base, 'from': new_from.isoformat()})}"
 
 
@@ -153,18 +176,51 @@ def _not_found(request: Request, locale: Locale) -> Response:
     return HTMLResponse(views.render(body), status_code=404)
 
 
-def _error_page(
-    locale: Locale, *, title: str, exc: AetherCalError, lang_urls: dict[Locale, str], **extra: str
-) -> object:
-    """A friendly, localized page for any SDK failure (API error or otherwise) — never leaks."""
+def _http_status_for(exc: Exception | None) -> int:
+    """The status a guest-facing error page should carry: a clean upstream 4xx, else 503.
+
+    A backend 5xx (or a transport drop / malformed response) surfaces to the guest as a 503
+    "temporarily unavailable" — never the raw 500 — while a clean client signal (409 conflict,
+    403 bad token, 404) is passed through so caches/monitors read the outcome correctly.
+    """
+    if isinstance(exc, AetherCalAPIError) and 400 <= exc.status_code < 500:
+        return exc.status_code
+    return 503
+
+
+def _error_response(
+    locale: Locale,
+    *,
+    title: str,
+    exc: Exception | None,
+    lang_urls: dict[Locale, str],
+    retry: tuple[str, str] | None = None,
+) -> Response:
+    """A friendly, localized error page with the correct HTTP status — never leaks internals.
+
+    ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to times").
+    """
     message = (
         friendly_api_error(exc, locale)
         if isinstance(exc, AetherCalAPIError)
         else friendly_unexpected(locale)
     )
-    return views.message_page(
-        locale, title=title, message=message, lang_urls=lang_urls, is_error=True, **extra
+    status = _http_status_for(exc)
+    if status >= 500 and exc is not None:
+        # A backend 5xx, transport drop, or unexpected error — observable to ops, hidden from the
+        # guest. A clean client signal (409/403/404) is expected flow, not an error to log.
+        logger.error("booking page: backend failure rendering %r", title, exc_info=exc)
+    retry_url, retry_label = retry if retry is not None else (None, None)
+    body = views.message_page(
+        locale,
+        title=title,
+        message=message,
+        lang_urls=lang_urls,
+        back_url=retry_url,
+        back_label=retry_label,
+        is_error=True,
     )
+    return HTMLResponse(views.render(body), status_code=status)
 
 
 def _register(app: FastHTML, path: str, handler: Callable[..., object], methods: list[str]) -> None:
@@ -198,7 +254,7 @@ class _BookingApp:
         )
 
     async def _slots_section(
-        self, event: EventTypeRead, tz: str, window_from: date, locale: Locale
+        self, event: EventTypeRead, tz: str, window_from: date, today: date, locale: Locale
     ) -> object:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
@@ -207,7 +263,10 @@ class _BookingApp:
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability
-        except AetherCalAPIError:
+        except Exception:
+            # RF-16 trust boundary: an API error, a dropped connection, or a malformed slots
+            # response degrades to a friendly "unavailable" notice — never a 500/stack to a guest.
+            logger.exception("booking page: failed to load slots for %s", event.slug)
             groups, availability = [], "unavailable"
         base = {"tz": tz, "lang": locale}
         return views.slots_section(
@@ -217,15 +276,47 @@ class _BookingApp:
             availability=availability,
             tz=tz,
             book_path=f"/e/{event.slug}/book",
-            prev_url=_shifted_url(f"/e/{event.slug}", base, window_from, -WINDOW_DAYS),
-            next_url=_shifted_url(f"/e/{event.slug}", base, window_from, WINDOW_DAYS),
+            prev_url=_shifted_url(f"/e/{event.slug}", base, window_from, -WINDOW_DAYS, floor=today),
+            next_url=_shifted_url(f"/e/{event.slug}", base, window_from, WINDOW_DAYS, floor=today),
         )
+
+    async def _events(self) -> list[EventTypeRead] | None:
+        """Load the tenant's event types, or ``None`` if the backend can't be reached (RF-16).
+
+        A public-page trust boundary: an API error, a dropped connection, or a malformed response
+        must degrade to a friendly page — never a 500/stack. Every SDK failure collapses to
+        ``None`` here, and the caller renders the service-unavailable page.
+        """
+        try:
+            return await self._call(lambda c: c.list_event_types())
+        except Exception:
+            logger.exception("booking page: failed to load event types")
+            return None
+
+    def _service_error(
+        self, locale: Locale, *, lang_urls: dict[Locale, str], retry_url: str
+    ) -> Response:
+        """The friendly 'service temporarily unavailable' page (503) with a retry affordance."""
+        body = views.message_page(
+            locale,
+            title=t(locale, "app_name"),
+            message=t(locale, "error_generic"),
+            lang_urls=lang_urls,
+            back_url=retry_url,
+            back_label=t(locale, "retry"),
+            is_error=True,
+        )
+        return HTMLResponse(views.render(body), status_code=503)
 
     # -- routes -------------------------------------------------------------------------
 
     async def index(self, request: Request) -> object:
         locale = self._locale(request)
-        events = await self._call(lambda c: c.list_event_types())
+        events = await self._events()
+        if events is None:
+            return self._service_error(
+                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+            )
         active = [event for event in events if event.active]
         return views.index_page(locale, event_types=active, lang_urls=_lang_links_here(request))
 
@@ -233,11 +324,17 @@ class _BookingApp:
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
         tz, tz_explicit = _tz_of(request)
-        window_from = _window_of(request, tz)
-        found = _find_event(await self._call(lambda c: c.list_event_types()), slug)
+        today = _today_in(tz)
+        window_from = _window_of(request, today)
+        events = await self._events()
+        if events is None:
+            return self._service_error(
+                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+            )
+        found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale)
-        section = await self._slots_section(found, tz, window_from, locale)
+        section = await self._slots_section(found, tz, window_from, today, locale)
         return views.event_page(
             locale,
             event=found,
@@ -260,18 +357,28 @@ class _BookingApp:
             )
         locale = self._locale(request)
         tz, _ = _tz_of(request)
-        window_from = _window_of(request, tz)
-        found = _find_event(await self._call(lambda c: c.list_event_types()), slug)
+        today = _today_in(tz)
+        window_from = _window_of(request, today)
+        events = await self._events()
+        if events is None:
+            # HTMX swaps only on 2xx: degrade the fragment in place, not with a non-swapping 5xx.
+            return views.slots_unavailable_fragment(locale)
+        found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale)
-        return await self._slots_section(found, tz, window_from, locale)
+        return await self._slots_section(found, tz, window_from, today, locale)
 
     async def book_form(self, request: Request) -> object:
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
         tz, _ = _tz_of(request)
         start = request.query_params.get("start", "")
-        found = _find_event(await self._call(lambda c: c.list_event_types()), slug)
+        events = await self._events()
+        if events is None:
+            return self._service_error(
+                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+            )
+        found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale)
         instant = _parse_instant(start)
@@ -298,7 +405,14 @@ class _BookingApp:
         slug = str(request.path_params["slug"])
         tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
         start = form.get("start", "")
-        found = _find_event(await self._call(lambda c: c.list_event_types()), slug)
+        events = await self._events()
+        if events is None:
+            return self._service_error(
+                locale,
+                lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+                retry_url=f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}",
+            )
+        found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale)
         questions = parse_questions(found.questions)
@@ -325,15 +439,14 @@ class _BookingApp:
             )
         try:
             booking = await self._call(lambda c: c.create_booking(booking_create))
-        except AetherCalError as exc:
+        except Exception as exc:
             back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
-            return _error_page(
+            return _error_response(
                 locale,
                 title=found.title,
                 exc=exc,
                 lang_urls=lang_urls,
-                back_url=back,
-                back_label=t(locale, "back_to_times"),
+                retry=(back, t(locale, "back_to_times")),
             )
         return views.confirmation_page(
             locale,
@@ -379,8 +492,8 @@ class _BookingApp:
             )
         try:
             await self._call(lambda c: c.cancel_booking(booking_id, token=token))
-        except AetherCalError as exc:
-            return _error_page(
+        except Exception as exc:
+            return _error_response(
                 locale, title=t(locale, "cancel_title"), exc=exc, lang_urls=lang_urls
             )
         return views.message_page(
@@ -404,7 +517,8 @@ class _BookingApp:
                 is_error=True,
             )
         tz, tz_explicit = _tz_of(request)
-        window_from = _window_of(request, tz)
+        today = _today_in(tz)
+        window_from = _window_of(request, today)
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
             result = await self._call(
@@ -412,7 +526,9 @@ class _BookingApp:
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability
-        except AetherCalAPIError:
+        except Exception:
+            # RF-16 trust boundary (see _slots_section): degrade instead of leaking a 500.
+            logger.exception("booking page: failed to load reschedule slots for %s", event_id)
             groups, availability = [], "unavailable"
         base = {
             "booking": str(booking_id),
@@ -428,8 +544,8 @@ class _BookingApp:
             action="/reschedule",
             booking_id=booking_id,
             token=token,
-            prev_url=_shifted_url("/reschedule", base, window_from, -WINDOW_DAYS),
-            next_url=_shifted_url("/reschedule", base, window_from, WINDOW_DAYS),
+            prev_url=_shifted_url("/reschedule", base, window_from, -WINDOW_DAYS, floor=today),
+            next_url=_shifted_url("/reschedule", base, window_from, WINDOW_DAYS, floor=today),
         )
         hidden = [
             ("lang", str(locale)),
@@ -468,8 +584,8 @@ class _BookingApp:
             await self._call(
                 lambda c: c.reschedule_booking(booking_id, new_start=new_start, token=token)
             )
-        except AetherCalError as exc:
-            return _error_page(
+        except Exception as exc:
+            return _error_response(
                 locale, title=t(locale, "reschedule_title"), exc=exc, lang_urls=lang_urls
             )
         return views.message_page(

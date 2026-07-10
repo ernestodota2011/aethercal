@@ -23,6 +23,11 @@ _BOOKING_STATUS = sa.Enum(
 )
 
 
+def _new_ical_uid() -> str:
+    """A fresh, stable RFC 5545 UID for a new booking (inherited by its reschedule successors)."""
+    return f"{uuid.uuid4()}@aethercal"
+
+
 class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     """A reserved slot for one guest (RF-07). The single guest is denormalized onto the row; the
     partial unique index enforces one active booking per slot at the database level (RF-04)."""
@@ -42,12 +47,26 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     guest_timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     guest_notes: Mapped[str | None] = mapped_column(sa.Text)
     answers: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)
+    # The RFC 5545 UID for this booking's calendar event (F1-08). A reschedule successor INHERITS
+    # its predecessor's ``ical_uid`` so the confirmation, every reschedule, and the cancellation all
+    # address the SAME event — which is what makes the strictly-increasing ``sequence`` above let a
+    # client honor each update (a per-booking UID would make the sequence bumps meaningless).
+    ical_uid: Mapped[str] = mapped_column(
+        sa.String(255), server_default=sa.text("''"), default=_new_ical_uid, nullable=False
+    )
     external_event_id: Mapped[str | None] = mapped_column(sa.String(255))
     meeting_url: Mapped[str | None] = mapped_column(sa.String(1024))
     rescheduled_from_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("bookings.id", ondelete="SET NULL")
     )
     cancelled_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # The persisted iCal SEQUENCE for this booking's UID (RFC 5545, F1-08). Starts at 0 (the
+    # confirmation), and every mutation that emits an updated ``.ics`` bumps it — a cancellation
+    # bumps it, a reschedule carries the predecessor + 1 — so successive updates strictly increase
+    # and calendar clients never ignore a stale update (the by-kind constant could not).
+    sequence: Mapped[int] = mapped_column(
+        sa.Integer, server_default=sa.text("0"), default=0, nullable=False
+    )
 
     __table_args__ = (
         sa.Index(

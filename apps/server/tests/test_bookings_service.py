@@ -16,9 +16,11 @@ backstops at the storage layer:
 * every lifecycle event is durably queued as a JSON-serializable webhook in the same transaction;
 * cross-tenant isolation holds on every path.
 
-A pair of tests drive the ``effects`` bundle with in-memory fakes (a recording ``EmailSender`` and
-``TaskRunner``) — still no network — to prove the side-effects are wired and best-effort (an email
-failure never rolls the booking back).
+The ``effects`` tests drive the bundle with in-memory fakes (a recording ``EmailSender`` and
+``TaskRunner``) — still no network — to prove the durable side-effects are wired: the guest tokens
+are minted in-txn, the email is ENQUEUED to the transactional outbox (not sent inline pre-commit),
+the reminder is scheduled inline (best-effort), and draining the outbox runs the effect once (with
+retry + idempotent re-drain). The persisted iCal SEQUENCE increments across the lifecycle (F1-08).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from typing import Any
 
 import pytest
 from cryptography.fernet import Fernet
+from icalendar import Calendar
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,12 +44,14 @@ from aethercal.server.db.models import (
     Booking,
     EventType,
     GuestToken,
+    Outbox,
     Schedule,
     Tenant,
     User,
     Webhook,
     WebhookDelivery,
 )
+from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.bookings import (
     AvailabilityUnavailableError,
     BookingEffects,
@@ -64,6 +69,14 @@ from aethercal.server.services.bookings import (
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.outbox import (
+    OutboxEffect,
+    backoff_delay,
+    drain_outbox,
+    email_dedupe_key,
+    make_booking_effect_executor,
+    run_google_effect,
+)
 
 _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)}
 
@@ -140,6 +153,34 @@ async def _deliveries(session: AsyncSession, event: str) -> list[WebhookDelivery
     )
 
 
+async def _outbox_rows(
+    session: AsyncSession, *, booking_id: uuid.UUID | None = None
+) -> list[Outbox]:
+    stmt = select(Outbox)
+    if booking_id is not None:
+        stmt = stmt.where(Outbox.booking_id == booking_id)
+    return list((await session.scalars(stmt.order_by(Outbox.created_at))).all())
+
+
+def _ics_seq_and_uid(message: EmailMessage) -> tuple[int, str]:
+    """Parse the SEQUENCE and UID out of a composed email's ``text/calendar`` invite."""
+    for part in message.walk():
+        if part.get_content_type() == "text/calendar":
+            content = part.get_content()
+            text = content if isinstance(content, str) else content.decode("utf-8")
+            vevent: Any = Calendar.from_ical(text).walk("VEVENT")[0]
+            return int(vevent["SEQUENCE"]), str(vevent["UID"])
+    raise AssertionError("no text/calendar part found in the message")
+
+
+def _email_body(message: EmailMessage) -> str:
+    part = message.get_body(preferencelist=("plain",))
+    assert part is not None
+    content = part.get_content()
+    assert isinstance(content, str)
+    return content
+
+
 async def _active_count(session: AsyncSession, event_type: EventType) -> int:
     return (
         await session.scalar(
@@ -200,6 +241,79 @@ class _RecordingRunner:
         kwargs: Any = None,
     ) -> None:
         self.jobs.append((job_id, run_at))
+
+
+class _FakeExecute:
+    def __init__(self, result: Any, error: Exception | None = None) -> None:
+        self._result = result
+        self._error = error
+
+    def execute(self) -> Any:
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class _FakeEvents:
+    """Records the Google events an outbox Google effect creates and deletes (no network).
+
+    ``fail_first`` makes the first N inserts' ``.execute()`` raise (a transient Google outage), so a
+    created event is only recorded on a call that actually succeeds.
+    """
+
+    def __init__(self, *, fail_first: int = 0) -> None:
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+        self._fail_first = fail_first
+        self._calls = 0
+        self._n = 0
+
+    def insert(
+        self, *, calendarId: str, body: Any, conferenceDataVersion: int, sendUpdates: str
+    ) -> _FakeExecute:
+        self._calls += 1
+        if self._calls <= self._fail_first:
+            return _FakeExecute(None, RuntimeError("google transiently unavailable"))
+        self._n += 1
+        event_id = f"evt-{self._n}"
+        self.created.append(event_id)
+        return _FakeExecute({"id": event_id, "hangoutLink": f"https://meet.example/{event_id}"})
+
+    def delete(self, *, calendarId: str, eventId: str, sendUpdates: str) -> _FakeExecute:
+        self.deleted.append(eventId)
+        return _FakeExecute(None)
+
+
+class _FakeGoogle:
+    def __init__(self, *, fail_first: int = 0) -> None:
+        self.events_obj = _FakeEvents(fail_first=fail_first)
+
+    def events(self) -> _FakeEvents:
+        return self.events_obj
+
+
+async def _google_effects(session: AsyncSession, tenant: Tenant) -> BookingEffects:
+    """A BookingEffects with a host calendar connection, so the Google sync intents are enqueued."""
+    host = await _first_user(session, tenant)
+    connection = await store_google_connection(
+        session,
+        tenant_id=tenant.id,
+        user_id=host.id,
+        credential=GoogleCredential(account_email="host@gmail.com", token_json='{"token": "at"}'),
+        fernet=Fernet(derive_fernet_key("test-app-secret")),
+    )
+    # Stamp a fresh, wide busy-coverage window (no busy blocks) so the connected calendar reads as
+    # FRESH-empty and the slot is still offered — otherwise a connected-but-uncovered calendar makes
+    # slot validation refuse the booking (RF-13). This isolates the test to the Google outbox path.
+    connection.busy_synced_from = datetime(2026, 7, 1, tzinfo=UTC)
+    connection.busy_synced_to = datetime(2026, 7, 15, tzinfo=UTC)
+    connection.busy_synced_at = _BEFORE
+    await session.flush()
+    return BookingEffects(
+        signer=GuestTokenSigner("test-app-secret"),
+        booking_base_url="https://book.example.com",
+        connection=connection,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -522,28 +636,31 @@ async def test_cross_tenant_isolation_on_every_path(
 # --------------------------------------------------------------------------------------
 
 
-async def test_effects_mint_tokens_send_confirmation_and_schedule_reminder(
+def _effects(runner: Any = None) -> BookingEffects:
+    # The email intent is enqueued unconditionally now (the drain owns the live sender), so the
+    # bundle no longer carries a sender — tests hand a recording sender to the drain executor.
+    return BookingEffects(
+        signer=GuestTokenSigner("test-app-secret"),
+        booking_base_url="https://book.example.com",
+        reminder_runner=runner,
+    )
+
+
+async def test_create_mints_tokens_enqueues_the_email_intent_and_schedules_reminder(
     sqlite_session: AsyncSession, tenant_factory: Any
 ) -> None:
     tenant, event_type = await _seed(sqlite_session, tenant_factory)
-    sender = _RecordingSender()
     runner = _RecordingRunner()
-    effects = BookingEffects(
-        signer=GuestTokenSigner("test-app-secret"),
-        booking_base_url="https://book.example.com",
-        sender=sender,
-        reminder_runner=runner,
-    )
 
     booking = await create_booking(
         sqlite_session,
         tenant_id=tenant.id,
         params=_params(event_type.id, _SLOT_9),
         now=_BEFORE,
-        effects=effects,
+        effects=_effects(runner),
     )
 
-    # Two signed guest tokens (cancel + reschedule) are minted and stored (hashed) for this booking.
+    # Two signed guest tokens (cancel + reschedule) are minted and stored (hashed) in the same txn.
     tokens = list(
         (
             await sqlite_session.scalars(
@@ -552,22 +669,486 @@ async def test_effects_mint_tokens_send_confirmation_and_schedule_reminder(
         ).all()
     )
     assert {t.purpose for t in tokens} == {"cancel", "reschedule"}
-    # The confirmation email was sent once, and the reminder scheduled 24h before the start.
-    assert len(sender.sent) == 1
+    # The confirmation email is NOT sent inline — it is ENQUEUED as a durable outbox intent in the
+    # booking's transaction (drained post-commit), so it can never fire for a rolled-back booking.
+    rows = await _outbox_rows(sqlite_session, booking_id=booking.id)
+    assert len(rows) == 1
+    intent = rows[0]
+    assert intent.effect == OutboxEffect.EMAIL.value
+    assert intent.dedupe_key == email_dedupe_key(NotificationKind.CONFIRMATION)
+    assert intent.status == "pending"
+    assert intent.payload["cancel_url"].startswith("https://book.example.com/cancel?token=")
+    reschedule_url = intent.payload["reschedule_url"]
+    assert reschedule_url.startswith("https://book.example.com/reschedule?token=")
+    # The reminder is still scheduled inline (self-healing at fire time); Google unwired → no sync.
     assert runner.jobs == [(f"reminder:{booking.id}", _SLOT_9 - timedelta(hours=24))]
-    # No Google connection/service was supplied, so the calendar sync is skipped (left for retry).
     assert booking.external_event_id is None
+    assert booking.sequence == 0  # a fresh booking starts at the confirmation sequence
 
 
-async def test_a_failing_confirmation_email_never_rolls_back_the_booking(
+async def test_email_intent_is_enqueued_and_retryable_even_without_a_configured_sender(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Durability: the confirmation is domain-required, so its intent is ENQUEUED even when SMTP is
+    absent at booking time. The drain then FAILS RETRYABLY (rather than dropping it), so the notice
+    goes out once SMTP is configured — never silently lost."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),  # no sender wired in the bundle — the drain owns the live sender
+    )
+
+    rows = await _outbox_rows(sqlite_session, booking_id=booking.id)
+    assert [r.dedupe_key for r in rows] == [email_dedupe_key(NotificationKind.CONFIRMATION)]
+
+    # Draining with no sender configured fails the intent retryably (not delivered, not dropped).
+    execute = make_booking_effect_executor(sender=None, service_factory=None)
+    report = await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+    assert report.failed == [rows[0].id]
+    assert rows[0].status == "failed"
+
+
+async def test_draining_the_outbox_sends_the_confirmation_once_and_re_drain_is_idempotent(
     sqlite_session: AsyncSession, tenant_factory: Any
 ) -> None:
     tenant, event_type = await _seed(sqlite_session, tenant_factory)
-    effects = BookingEffects(
-        signer=GuestTokenSigner("test-app-secret"),
-        booking_base_url="https://book.example.com",
-        sender=_FailingSender(),
+    sender = _RecordingSender()
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
     )
+
+    execute = make_booking_effect_executor(sender=sender, service_factory=None)
+    report = await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    assert report.delivered == [(await _outbox_rows(sqlite_session, booking_id=booking.id))[0].id]
+    assert len(sender.sent) == 1
+    seq, uid = _ics_seq_and_uid(sender.sent[0])
+    assert seq == 0 and uid == booking.ical_uid
+
+    # A re-drain executes nothing (the intent is delivered) and never mails the guest twice.
+    again = await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+    assert again.attempted == 0
+    assert len(sender.sent) == 1
+
+
+async def test_a_failing_send_marks_the_intent_for_retry_without_touching_the_booking(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    execute = make_booking_effect_executor(sender=_FailingSender(), service_factory=None)
+    report = await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # The send raised → the intent is parked failed for a backoff retry; the booking is untouched.
+    rows = await _outbox_rows(sqlite_session, booking_id=booking.id)
+    assert report.failed == [rows[0].id]
+    assert rows[0].status == "failed"
+    assert rows[0].next_retry_at is not None
+    persisted = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
+    assert persisted is not None and persisted.status == BookingStatus.CONFIRMED
+
+
+async def test_cancel_enqueues_a_cancellation_email_intent(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    await cancel_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=booking.id,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    keys = {row.dedupe_key for row in await _outbox_rows(sqlite_session, booking_id=booking.id)}
+    assert email_dedupe_key(NotificationKind.CANCELLATION) in keys
+    assert sender.sent == []  # still nothing sent inline — both intents await the drain
+
+
+async def test_confirmation_and_cancellation_drained_together_only_sends_the_cancellation(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """When the confirmation and cancellation emails drain in the SAME pass (create then cancel
+    before any drain), the confirmation is already STALE — the booking was cancelled — so it is
+    DISCARDED and only the cancellation is sent (sequence 1). The guest never receives a "confirmed"
+    for a booking already cancelled, regardless of the internal drain order.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    await cancel_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=booking.id,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    # Drain BOTH email intents in one pass.
+    execute = make_booking_effect_executor(sender=sender, service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # Exactly one email — the cancellation (sequence 1); the stale confirmation was dropped.
+    assert len(sender.sent) == 1
+    seq, uid = _ics_seq_and_uid(sender.sent[0])
+    assert seq == 1 and uid == booking.ical_uid
+    assert "cancelada" in str(sender.sent[0]["Subject"]).lower()
+    # Both intents are consumed (delivered) — the discarded one is not left retrying.
+    email_rows = [
+        r
+        for r in await _outbox_rows(sqlite_session, booking_id=booking.id)
+        if r.effect == OutboxEffect.EMAIL.value
+    ]
+    assert {r.status for r in email_rows} == {"delivered"}
+
+
+async def test_a_confirmation_retried_after_cancellation_is_discarded_as_stale(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """The at-least-once hazard the guard closes: a confirmation email that kept FAILING and finally
+    retries AFTER the booking was cancelled must be DISCARDED (no "confirmed" after "cancelled"),
+    while the cancellation is still sent — the notifications keep causal order under retries."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )  # email:confirmation enqueued
+
+    # Pass 1: the confirmation send FAILS (SMTP down) → parked failed for a backoff retry.
+    failing = make_booking_effect_executor(sender=_FailingSender(), service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=failing)
+
+    # The booking is CANCELLED before the confirmation ever succeeds (cancellation email enqueued).
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_BEFORE, effects=_effects()
+    )
+
+    # Pass 2 (past the confirmation's retry): a WORKING sender drains both due intents.
+    sender = _RecordingSender()
+    working = make_booking_effect_executor(sender=sender, service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE + backoff_delay(1), execute=working)
+
+    # The retried confirmation is discarded as stale; only the cancellation reaches the guest.
+    subjects = [str(m["Subject"]).lower() for m in sender.sent]
+    assert not any("confirmada" in s for s in subjects)  # no "confirmed" after "cancelled"
+    assert any("cancelada" in s for s in subjects)  # the cancellation is delivered
+
+
+async def test_a_reschedule_email_retried_after_a_further_reschedule_is_discarded_as_stale(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Same guard for reschedules: a reschedule notice that kept failing and retries AFTER the
+    booking was rescheduled AGAIN is discarded — the guest gets only the LATEST reschedule, never an
+    outdated one for a slot already replaced."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=_effects(),
+    )  # reschedule email for b2 enqueued
+
+    # Pass 1: b2's reschedule send FAILS (b1's now-stale confirmation is silently discarded).
+    failing = make_booking_effect_executor(sender=_FailingSender(), service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=failing)
+
+    # b2 is rescheduled AGAIN to b3 before its own reschedule notice ever succeeds.
+    _SLOT_13 = datetime(2026, 7, 6, 13, 0, tzinfo=UTC)
+    b3 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b2.id,
+        new_start=_SLOT_13,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    # Pass 2 (past the retry): the stale b2 reschedule is discarded; only b3's reschedule is sent.
+    sender = _RecordingSender()
+    working = make_booking_effect_executor(sender=sender, service_factory=None)
+    await drain_outbox(sqlite_session, now=_BEFORE + backoff_delay(1), execute=working)
+
+    assert len(sender.sent) == 1
+    seq, uid = _ics_seq_and_uid(sender.sent[0])
+    assert seq == b3.sequence == 2  # the latest reschedule
+    assert uid == b1.ical_uid  # the whole chain shares one UID
+    assert "reprogramada" in str(sender.sent[0]["Subject"]).lower()
+
+
+async def test_persisted_sequence_strictly_increases_across_reschedules_and_cancel(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """F1-08: confirmation starts at 0, successive reschedules strictly increase, and a cancellation
+    uses the next value — proven on the actual emitted ``.ics`` SEQUENCE, drained after each step.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    execute = make_booking_effect_executor(sender=sender, service_factory=None)
+
+    async def _drain() -> None:
+        await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    await _drain()
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    await _drain()
+    _SLOT_13 = datetime(2026, 7, 6, 13, 0, tzinfo=UTC)
+    b3 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b2.id,
+        new_start=_SLOT_13,
+        now=_BEFORE,
+        effects=_effects(),
+    )
+    await _drain()
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=b3.id, now=_BEFORE, effects=_effects()
+    )
+    await _drain()
+
+    # The persisted counter advanced on every .ics-emitting mutation: the confirmation stays at 0,
+    # each reschedule carries its predecessor + 1, and the cancellation bumps b3 one more (2 → 3).
+    assert b1.sequence == 0  # a reschedule cancels the old row without bumping its sequence
+    assert b2.sequence == 1
+    assert b3.sequence == 3  # created at 2 by the reschedule, then bumped to 3 by the cancellation
+
+    # The whole chain shares ONE stable UID (the reschedule successors inherit b1's), and the
+    # emitted .ics sequences strictly increase over that single UID: confirmation 0, reschedules
+    # 1 → 2, cancellation 3 — exactly what RFC 5545 requires for a client to honor every update.
+    emitted = [_ics_seq_and_uid(msg) for msg in sender.sent]
+    assert b1.ical_uid == b2.ical_uid == b3.ical_uid  # inherited across the reschedule chain
+    assert {uid for _seq, uid in emitted} == {b1.ical_uid}  # every email addresses the same event
+    sequences = [seq for seq, _uid in emitted]
+    assert sequences == [0, 1, 2, 3]  # confirmation 0 < reschedule 1 < reschedule 2 < cancel 3
+
+
+async def test_create_then_cancel_before_drain_leaves_no_orphaned_google_event(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Both Google intents (upsert + delete) are enqueued before either drains. The drain must not
+    leave a live event for the cancelled booking, independent of the order it processes them — the
+    create reconciles to the booking's CURRENT (cancelled) state and skips, so nothing is orphaned.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    google = _FakeGoogle()
+    effects = await _google_effects(sqlite_session, tenant)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_BEFORE, effects=effects
+    )
+
+    execute = make_booking_effect_executor(sender=sender, service_factory=lambda _c: google)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # The create reconciled to "cancelled → no event" and skipped, so nothing was created and none
+    # dangles; the booking never points at a live Google event.
+    assert google.events_obj.created == []
+    assert set(google.events_obj.created) == set(google.events_obj.deleted)
+    refreshed = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
+    assert refreshed is not None and refreshed.external_event_id is None
+
+
+async def test_create_then_reschedule_before_drain_yields_one_event_for_the_survivor(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Create + reschedule enqueue two Google intents before either drains. Draining must leave
+    exactly ONE event — for the surviving (rescheduled) booking — never two, in any drain order."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    google = _FakeGoogle()
+    effects = await _google_effects(sqlite_session, tenant)
+
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=effects,
+    )
+
+    execute = make_booking_effect_executor(sender=sender, service_factory=lambda _c: google)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # Exactly one live event, owned by the surviving booking b2; b1 (cancelled by the reschedule)
+    # never keeps a live event.
+    live = set(google.events_obj.created) - set(google.events_obj.deleted)
+    assert len(live) == 1
+    b2_refreshed = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=b2.id)
+    assert b2_refreshed is not None and b2_refreshed.external_event_id in live
+    b1_refreshed = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=b1.id)
+    assert b1_refreshed is not None and b1_refreshed.external_event_id is None
+
+
+async def test_cancelling_a_not_yet_synced_reschedule_deletes_the_original_event(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Create + drain (event exists), reschedule WITHOUT draining, then cancel the successor and
+    drain: the cancellation must delete the ORIGINAL event (resolved by walking the reschedule
+    chain), leaving exactly one delete and no orphan — the successor never got an id of its own."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    google = _FakeGoogle()
+    effects = await _google_effects(sqlite_session, tenant)
+    execute = make_booking_effect_executor(sender=sender, service_factory=lambda _c: google)
+
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)  # E1 now exists for b1
+    assert google.events_obj.created == ["evt-1"]
+    assert b1.external_event_id == "evt-1"
+
+    # Reschedule WITHOUT draining (b2 never gets its own event id), then cancel b2.
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=effects,
+    )
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=b2.id, now=_BEFORE, effects=effects
+    )
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # Exactly one create (the original) and exactly one delete OF THAT SAME event — no orphan.
+    assert google.events_obj.created == ["evt-1"]
+    assert google.events_obj.deleted == ["evt-1"]
+
+
+async def _google_row(session: AsyncSession, booking_id: uuid.UUID) -> Outbox:
+    rows = await _outbox_rows(session, booking_id=booking_id)
+    return next(r for r in rows if r.effect == OutboxEffect.GOOGLE.value)
+
+
+async def test_reschedule_drained_before_the_original_upsert_never_recreates_the_old_event(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """Inverted order (two workers): the successor's RESCHEDULE runs BEFORE the original's UPSERT
+    (neither drained yet). The replaced predecessor's UPSERT must be SKIPPED — it is no longer the
+    chain's current booking — so exactly ONE event exists (for the successor) and the old one is
+    never recreated. Executed as two explicit steps to pin the inverted causal order."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    google = _FakeGoogle()
+    effects = await _google_effects(sqlite_session, tenant)
+
+    b1 = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )  # google:upsert enqueued, NOT drained
+    b2 = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=b1.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+        effects=effects,
+    )  # google:reschedule enqueued, NOT drained
+    upsert = await _google_row(sqlite_session, b1.id)
+    reschedule = await _google_row(sqlite_session, b2.id)
+
+    def factory(_conn: Any) -> _FakeGoogle:
+        return google
+
+    # RESCHEDULE first: b2 is the chain's current booking → it creates the event.
+    await run_google_effect(sqlite_session, reschedule, _BEFORE, service_factory=factory)
+    # Then the original UPSERT: b1 was replaced → skipped, no second/old event ever created.
+    await run_google_effect(sqlite_session, upsert, _BEFORE, service_factory=factory)
+
+    assert google.events_obj.created == ["evt-1"]  # exactly one event, old one never recreated
+    assert b2.external_event_id == "evt-1"
+    assert b1.external_event_id is None
+
+
+async def test_google_sync_runs_before_the_email_so_the_notice_carries_the_meet_link(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """The Google-sync and confirmation-email intents share a created_at (same txn). The drain runs
+    Google FIRST (deterministic priority), so it writes the Meet link onto the booking before the
+    email is composed — the confirmation carries the link instead of racing ahead of it."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    google = _FakeGoogle()
+    effects = await _google_effects(sqlite_session, tenant)
 
     booking = await create_booking(
         sqlite_session,
@@ -577,10 +1158,51 @@ async def test_a_failing_confirmation_email_never_rolls_back_the_booking(
         effects=effects,
     )
 
-    # The email raised, but the booking stands (best-effort side-effect, RF-08).
-    assert booking.status == BookingStatus.CONFIRMED
-    persisted = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
-    assert persisted is not None
+    execute = make_booking_effect_executor(sender=sender, service_factory=lambda _c: google)
+    await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+
+    # Google ran first and set the Meet link; the confirmation email (drained after) carries it.
+    assert booking.meeting_url == "https://meet.example/evt-1"
+    assert len(sender.sent) == 1
+    assert booking.meeting_url in _email_body(sender.sent[0])
+
+
+async def test_email_defers_without_consuming_attempts_until_google_delivers_the_link(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """A TRANSIENT Google failure must not let the confirmation go out without the Meet link. While
+    the sync is still pending/failed the email DEFERS (no attempt used), then sends WITH the link
+    once Google succeeds on retry — the dependency, not just same-pass ordering, is enforced."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    sender = _RecordingSender()
+    google = _FakeGoogle(fail_first=1)  # the first Google insert fails; its retry succeeds
+    effects = await _google_effects(sqlite_session, tenant)
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=effects,
+    )
+    execute = make_booking_effect_executor(sender=sender, service_factory=lambda _c: google)
+    rows = await _outbox_rows(sqlite_session, booking_id=booking.id)
+    email = next(r for r in rows if r.effect == OutboxEffect.EMAIL.value)
+
+    # Pass 1: Google fails, so the email defers — not sent, and its attempt budget is untouched.
+    first = await drain_outbox(sqlite_session, now=_BEFORE, execute=execute)
+    assert email.id in first.deferred
+    assert email.attempts == 0
+    assert sender.sent == []
+    assert booking.meeting_url is None
+
+    # Pass 2 (past the Google backoff + the defer delay): Google succeeds, then the email sends the
+    # notice WITH the link — and the deferral never counted toward the dead-letter budget.
+    later = _BEFORE + backoff_delay(1)
+    await drain_outbox(sqlite_session, now=later, execute=execute)
+    assert booking.meeting_url == "https://meet.example/evt-1"
+    assert len(sender.sent) == 1
+    assert booking.meeting_url in _email_body(sender.sent[0])
+    assert email.attempts == 1
 
 
 async def test_a_failing_reminder_runner_never_rolls_back_the_booking(

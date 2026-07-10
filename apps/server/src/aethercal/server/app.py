@@ -11,7 +11,8 @@ The lifespan does the things that must happen against a live process:
   SMTP/Google config leaves the effect ``None`` and never hard-fails boot (the path degrades);
 * when ``run_scheduler`` is set (the container turns it on in exactly ONE process — see
   ``deploy/README.md``), start the in-process scheduler: the persistent per-booking reminder runner
-  and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh jobs;
+  and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh +
+  transactional-outbox-drain jobs;
 * on shutdown -- or on a failure part-way through startup -- unwind every resource that was
   acquired (via an ``AsyncExitStack``): stop the scheduler(s), close the HTTP client, and dispose
   the async engine, so a partial boot never leaks a started scheduler/client/engine.
@@ -34,6 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from aethercal.schemas import ErrorResponse
+from aethercal.server.admin.mount import mount_admin
 from aethercal.server.api import api_router
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker, build_sync_engine
@@ -45,6 +47,7 @@ from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
     make_busy_refresh_tick,
+    make_outbox_drain_tick,
     make_webhook_delivery_tick,
     start_scheduler,
     stop_scheduler,
@@ -122,6 +125,7 @@ def create_app(settings: Settings) -> FastAPI:
                     interval_scheduler,
                     webhook_tick=make_webhook_delivery_tick(app),
                     busy_refresh_tick=make_busy_refresh_tick(app),
+                    outbox_tick=make_outbox_drain_tick(app),
                 )
                 stack.callback(stop_scheduler, interval_scheduler)
             app.state.reminder_runner = reminder_runner
@@ -136,6 +140,12 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.include_router(api_router)
     app.add_exception_handler(AuthenticationError, _handle_authentication_error)
+
+    # Additive, off-by-default: mounts the single-user Reflex admin at /admin only when the operator
+    # has configured credentials AND set AETHERCAL_ADMIN_ENABLED (F1-11). A no-op otherwise, so the
+    # plain API server and the offline test path are unchanged. The eager sessionmaker (built above)
+    # is handed in explicitly — the mount never reaches into app.state for it.
+    mount_admin(app, sessionmaker=sessionmaker)
 
     return app
 

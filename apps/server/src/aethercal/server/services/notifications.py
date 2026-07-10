@@ -37,8 +37,13 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
     sender: EmailSender,
     now: datetime,
     locale: str = "es",
+    sequence: int | None = None,
 ) -> bool:
     """Compose + send the ``kind`` email for ``booking`` and record it; return whether it sent.
+
+    ``sequence`` overrides the ``.ics`` SEQUENCE with the value snapshotted at the triggering
+    transition (F1-08 outbox intent); ``None`` falls back to the booking's current ``sequence`` (the
+    reminder path, which re-states the live event).
 
     Reserve-first idempotency (RF-08/RF-10): before sending, it INSERTs the ``(tenant_id,
     booking_id, kind)`` :class:`SentNotification` row inside a ``begin_nested`` SAVEPOINT (mirroring
@@ -48,11 +53,11 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
     under concurrency. Only when the reservation succeeds does it compose and hand the message to
     ``sender`` and return ``True``. Flushes (inside the savepoint); the caller owns the commit.
 
-    Residual (out of scope here): a send that succeeds but whose transaction the caller later rolls
-    back has mailed the guest yet leaves no ledger row — fully closing that gap needs a
-    transactional outbox + delivery worker. Reserve-first closes the concurrent-duplicate hole (two
-    callers both passing a pre-check and both mailing the guest), which the prior
-    SELECT-then-send-then-INSERT order left open.
+    Reserve-first closes the concurrent-duplicate hole (two callers both passing a pre-check and
+    both mailing the guest), which the prior SELECT-then-send-then-INSERT order left open. The
+    fires-for-a-rolled-back-booking hole is closed a layer up: F1-05 no longer calls this inline
+    pre-commit but enqueues a transactional-outbox intent that the post-commit drainer runs (so this
+    only ever executes for a booking that actually committed).
     """
     reservation = SentNotification(
         tenant_id=booking.tenant_id, booking_id=booking.id, kind=kind.value, sent_at=now
@@ -65,7 +70,7 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
         return False
 
     context = await _build_context(
-        session, booking, cancel_url=cancel_url, reschedule_url=reschedule_url
+        session, booking, cancel_url=cancel_url, reschedule_url=reschedule_url, sequence=sequence
     )
     message = build_notification_email(context, kind=kind, locale=locale)
     await sender.send(message)
@@ -78,6 +83,7 @@ async def _build_context(
     *,
     cancel_url: str | None,
     reschedule_url: str | None,
+    sequence: int | None = None,
 ) -> BookingEmailContext:
     """Resolve the event title + host (organizer) from the booking's FKs into a composer context.
 
@@ -87,7 +93,7 @@ async def _build_context(
     event_type = await session.get(EventType, booking.event_type_id)
     host = await session.get(User, event_type.host_id) if event_type is not None else None
     return BookingEmailContext(
-        uid=f"{booking.id}@aethercal",
+        uid=booking.ical_uid,
         event_title=event_type.title if event_type is not None else "",
         guest_name=booking.guest_name,
         guest_email=booking.guest_email,
@@ -96,6 +102,7 @@ async def _build_context(
         start_at=booking.start_at,
         end_at=booking.end_at,
         guest_timezone=booking.guest_timezone,
+        sequence=booking.sequence if sequence is None else sequence,
         meeting_url=booking.meeting_url,
         cancel_url=cancel_url,
         reschedule_url=reschedule_url,

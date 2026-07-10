@@ -373,6 +373,20 @@ def _pager(locale: Locale, prev_url: str, next_url: str) -> Any:
     )
 
 
+def slots_unavailable_fragment(locale: Locale) -> Any:
+    """The ``#slots`` region reduced to a friendly 'temporarily unavailable' notice.
+
+    Used when the backend can't be reached during an HTMX timezone swap: HTMX only swaps on a
+    2xx, so this is returned with a normal status and no event context — the guest sees a friendly
+    notice in place of the slot list instead of a broken swap or a leaked error (RF-16).
+    """
+    return Section(
+        Div(t(locale, "availability_unavailable"), cls="notice error"),
+        id="slots",
+        aria_live="polite",
+    )
+
+
 def slots_section(
     locale: Locale,
     *,
@@ -726,4 +740,5 @@ __all__ = [
     "reschedule_page",
     "reschedule_section",
     "slots_section",
+    "slots_unavailable_fragment",
 ]

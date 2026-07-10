@@ -6,16 +6,17 @@ Three layers, isolated so the wiring is fully offline-testable:
   inject a fake that records the registrations; production passes a live ``AsyncIOScheduler`` (held
   behind an ``Any`` seam, ``# pragma: no cover - live``).
 * **the wiring** — ``register_scheduler_jobs`` / ``start_scheduler`` / ``stop_scheduler`` decide
-  WHICH jobs (outbound-webhook delivery + busy-cache refresh) at WHICH intervals get registered,
-  and drive start/stop. This is what the fake-scheduler tests assert.
-* **the guarded ticks** — :func:`run_webhook_delivery_once` and :func:`run_busy_refresh_once` open
-  their OWN ``AsyncSession`` per tick and swallow any failure, so one bad tick logs and returns
-  rather than killing the loop. :func:`refresh_all_busy_caches` refreshes every active connection
-  and skips a failing one without stopping the rest.
+  WHICH jobs (outbound-webhook delivery + busy-cache refresh + transactional-outbox drain) at WHICH
+  intervals get registered, and drive start/stop. This is what the fake-scheduler tests assert.
+* **the guarded ticks** — :func:`run_webhook_delivery_once`, :func:`run_busy_refresh_once` and
+  :func:`run_outbox_drain_once` open their OWN ``AsyncSession`` per tick and swallow any failure, so
+  one bad tick logs and returns rather than killing the loop. :func:`refresh_all_busy_caches`
+  refreshes every active connection and skips a failing one without stopping the rest.
 
-The live tick *closures* (:func:`make_webhook_delivery_tick` / :func:`make_busy_refresh_tick`) read
-the runtime effects the app's lifespan puts on ``app.state`` (``sessionmaker`` / ``http_client`` /
-``fernet_key``) and are ``# pragma: no cover - live`` — importing this module starts no scheduler.
+The live tick *closures* (:func:`make_webhook_delivery_tick` / :func:`make_busy_refresh_tick` /
+:func:`make_outbox_drain_tick`) read the runtime effects the app's lifespan puts on ``app.state``
+(``sessionmaker`` / ``http_client`` / ``fernet_key`` / ``email_sender``) and are
+``# pragma: no cover - live`` — importing this module starts no scheduler.
 """
 
 from __future__ import annotations
@@ -39,6 +40,12 @@ from aethercal.server.services.calendars import (
     build_live_service,
     refresh_busy_cache,
 )
+from aethercal.server.services.outbox import (
+    OutboxExecutor,
+    OutboxReport,
+    drain_outbox,
+    make_booking_effect_executor,
+)
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
 
 if TYPE_CHECKING:
@@ -49,11 +56,15 @@ _logger = logging.getLogger(__name__)
 # Stable job ids so a restart replaces (never duplicates) each recurring job.
 WEBHOOK_DELIVERY_JOB_ID = "webhook-delivery"
 BUSY_REFRESH_JOB_ID = "busy-cache-refresh"
+OUTBOX_DRAIN_JOB_ID = "outbox-drain"
 
 # The outbound-webhook worker fires often (near-real-time delivery); the busy-cache refresh is
-# heavier and only needs to keep the slot math roughly warm, so it runs every few minutes.
+# heavier and only needs to keep the slot math roughly warm, so it runs every few minutes. The
+# outbox drain carries the booking's post-commit effects (email/Google), so it fires often like the
+# webhook worker to keep the guest's confirmation timely.
 DEFAULT_WEBHOOK_INTERVAL_SECONDS = 60
 DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS = 300
+DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS = 60
 
 # How far ahead the periodic busy-cache refresh pulls freebusy for each connected calendar.
 BUSY_REFRESH_HORIZON = timedelta(days=30)
@@ -89,15 +100,17 @@ class SchedulerLike(Protocol):
 # --------------------------------------------------------------------------------------
 
 
-def register_scheduler_jobs(
+def register_scheduler_jobs(  # noqa: PLR0913 - one keyword per recurring job/interval (a flat seam)
     scheduler: SchedulerLike,
     *,
     webhook_tick: Tick,
     busy_refresh_tick: Tick,
+    outbox_tick: Tick,
     webhook_interval_seconds: int = DEFAULT_WEBHOOK_INTERVAL_SECONDS,
     busy_refresh_interval_seconds: int = DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
+    outbox_drain_interval_seconds: int = DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
 ) -> None:
-    """Register the two recurring interval jobs (webhook delivery + busy-cache refresh).
+    """Register the recurring interval jobs (webhook delivery + busy-cache refresh + outbox drain).
 
     ``replace_existing`` keeps a restart idempotent — a re-registered id overwrites rather than
     duplicating the job.
@@ -116,23 +129,34 @@ def register_scheduler_jobs(
         id=BUSY_REFRESH_JOB_ID,
         replace_existing=True,
     )
+    scheduler.add_job(
+        outbox_tick,
+        trigger="interval",
+        seconds=outbox_drain_interval_seconds,
+        id=OUTBOX_DRAIN_JOB_ID,
+        replace_existing=True,
+    )
 
 
-def start_scheduler(
+def start_scheduler(  # noqa: PLR0913 - one keyword per recurring job/interval (a flat seam)
     scheduler: SchedulerLike,
     *,
     webhook_tick: Tick,
     busy_refresh_tick: Tick,
+    outbox_tick: Tick,
     webhook_interval_seconds: int = DEFAULT_WEBHOOK_INTERVAL_SECONDS,
     busy_refresh_interval_seconds: int = DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
+    outbox_drain_interval_seconds: int = DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
 ) -> None:
     """Register the interval jobs, then start the scheduler."""
     register_scheduler_jobs(
         scheduler,
         webhook_tick=webhook_tick,
         busy_refresh_tick=busy_refresh_tick,
+        outbox_tick=outbox_tick,
         webhook_interval_seconds=webhook_interval_seconds,
         busy_refresh_interval_seconds=busy_refresh_interval_seconds,
+        outbox_drain_interval_seconds=outbox_drain_interval_seconds,
     )
     scheduler.start()
 
@@ -163,6 +187,24 @@ async def run_webhook_delivery_once(
             return await deliver_due(session, http_client, now=moment, fernet_key=fernet_key)
     except Exception:
         _logger.exception("webhook-delivery tick failed; scheduler continues")
+        return None
+
+
+async def run_outbox_drain_once(
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    execute: OutboxExecutor,
+    now: datetime | None = None,
+) -> OutboxReport | None:
+    """One transactional-outbox drain pass, in its own transaction. Returns the report, or ``None``
+    if the tick failed (logged) — a failure never propagates, so the scheduler keeps ticking.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    try:
+        async with sessionmaker() as session, session.begin():
+            return await drain_outbox(session, now=moment, execute=execute)
+    except Exception:
+        _logger.exception("outbox-drain tick failed; scheduler continues")
         return None
 
 
@@ -264,6 +306,22 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     return _tick
 
 
+def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
+    """Bind an outbox-drain tick to ``app.state`` (sessionmaker + SMTP sender + a Fernet-built
+    Google factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+    """
+
+    async def _tick() -> None:
+        fernet = Fernet(app.state.fernet_key)
+        service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+        execute = make_booking_effect_executor(
+            sender=app.state.email_sender, service_factory=service_factory
+        )
+        await run_outbox_drain_once(sessionmaker=app.state.sessionmaker, execute=execute)
+
+    return _tick
+
+
 def build_interval_scheduler() -> Any:  # pragma: no cover - live
     """Construct the live in-memory ``AsyncIOScheduler`` for the recurring interval jobs.
 
@@ -278,17 +336,21 @@ __all__ = [
     "BUSY_REFRESH_HORIZON",
     "BUSY_REFRESH_JOB_ID",
     "DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS",
+    "DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS",
     "DEFAULT_WEBHOOK_INTERVAL_SECONDS",
+    "OUTBOX_DRAIN_JOB_ID",
     "WEBHOOK_DELIVERY_JOB_ID",
     "WEBHOOK_HTTP_TIMEOUT_SECONDS",
     "SchedulerLike",
     "Tick",
     "build_interval_scheduler",
     "make_busy_refresh_tick",
+    "make_outbox_drain_tick",
     "make_webhook_delivery_tick",
     "refresh_all_busy_caches",
     "register_scheduler_jobs",
     "run_busy_refresh_once",
+    "run_outbox_drain_once",
     "run_webhook_delivery_once",
     "start_scheduler",
     "stop_scheduler",
