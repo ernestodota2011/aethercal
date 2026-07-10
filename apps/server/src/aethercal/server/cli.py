@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -19,13 +20,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
-from aethercal.server.db.models import Tenant, User
+from aethercal.server.db.models import ApiKey, Tenant, User
 from aethercal.server.integrations.google.oauth import get_credentials
-from aethercal.server.services.api_keys import issue_api_key
+from aethercal.server.services.api_keys import issue_api_key, list_api_keys, revoke_api_key
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.settings import Settings
 
 app = typer.Typer(help="AetherCal admin CLI.", no_args_is_help=True)
+keys_app = typer.Typer(help="Manage API keys (C7b).", no_args_is_help=True)
+app.add_typer(keys_app, name="keys")
 
 # Default cache location for the Google OAuth token during the loopback consent flow (matches the
 # F0-11 spike). Outside the repo, so a token never lands in version control.
@@ -68,6 +71,65 @@ async def run_issue_key(
             raise LookupError(f"no tenant with slug {tenant_slug!r}")
         _, full_key = await issue_api_key(session, tenant_id=tenant.id, name=name)
         return full_key
+
+
+async def run_list_keys(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_slug: str,
+) -> list[ApiKey]:
+    """List the API keys (active and revoked) of the tenant identified by ``tenant_slug``."""
+    async with sessionmaker() as session:
+        tenant = (
+            await session.scalars(select(Tenant).where(Tenant.slug == tenant_slug))
+        ).one_or_none()
+        if tenant is None:
+            raise LookupError(f"no tenant with slug {tenant_slug!r}")
+        return await list_api_keys(session, tenant_id=tenant.id)
+
+
+class RevokeKeyOutcome(StrEnum):
+    """The three possible results of a revoke, so the Typer command can print a clean message
+    instead of letting an unhandled lookup failure surface as a traceback."""
+
+    REVOKED = "revoked"
+    ALREADY_REVOKED = "already_revoked"
+    NOT_FOUND = "not_found"
+
+
+async def run_revoke_key(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_slug: str,
+    api_key_id: uuid.UUID,
+) -> tuple[RevokeKeyOutcome, str | None]:
+    """Revoke the API key ``api_key_id`` iff it belongs to ``tenant_slug``. Returns ``(outcome,
+    prefix)`` — ``prefix`` identifies the key (never the secret) and is ``None`` on
+    :attr:`RevokeKeyOutcome.NOT_FOUND`.
+
+    Idempotent by design: revoking an already-revoked key reports
+    :attr:`RevokeKeyOutcome.ALREADY_REVOKED` rather than re-stamping ``revoked_at`` or raising. An
+    unknown id — or one that belongs to a different tenant — reports
+    :attr:`RevokeKeyOutcome.NOT_FOUND` (the two cases are indistinguishable on purpose: a
+    cross-tenant probe must not be able to tell "wrong tenant" from "no such key").
+    """
+    async with sessionmaker() as session, session.begin():
+        tenant = (
+            await session.scalars(select(Tenant).where(Tenant.slug == tenant_slug))
+        ).one_or_none()
+        if tenant is None:
+            raise LookupError(f"no tenant with slug {tenant_slug!r}")
+        api_key = (
+            await session.scalars(
+                select(ApiKey).where(ApiKey.id == api_key_id, ApiKey.tenant_id == tenant.id)
+            )
+        ).one_or_none()
+        if api_key is None:
+            return RevokeKeyOutcome.NOT_FOUND, None
+        if api_key.revoked_at is not None:
+            return RevokeKeyOutcome.ALREADY_REVOKED, api_key.prefix
+        await revoke_api_key(session, api_key_id=api_key.id, tenant_id=tenant.id)
+        return RevokeKeyOutcome.REVOKED, api_key.prefix
 
 
 async def run_connect_google(
@@ -136,6 +198,50 @@ def issue_api_key_command(
     """Issue an API key for a tenant and print the plaintext key ONCE (it is not recoverable)."""
     full_key = asyncio.run(run_issue_key(_sessionmaker(), tenant_slug=tenant_slug, name=name))
     typer.echo(full_key)
+
+
+@keys_app.command("list")
+def keys_list_command(
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the tenant to list keys for.")],
+) -> None:
+    """List a tenant's API keys — id, prefix, name, created_at, last_used_at, status.
+
+    Never prints ``hashed_key`` or any plaintext secret; a key is identified by its ``prefix``.
+    """
+    keys = asyncio.run(run_list_keys(_sessionmaker(), tenant_slug=tenant_slug))
+    if not keys:
+        typer.echo(f"no API keys for tenant {tenant_slug!r}")
+        return
+    for key in keys:
+        status = "revoked" if key.revoked_at is not None else "active"
+        last_used = key.last_used_at.isoformat() if key.last_used_at is not None else "never"
+        typer.echo(
+            f"{key.id}  prefix={key.prefix}  name={key.name!r}  "
+            f"created_at={key.created_at.isoformat()}  last_used_at={last_used}  status={status}"
+        )
+
+
+@keys_app.command("revoke")
+def keys_revoke_command(
+    api_key_id: Annotated[uuid.UUID, typer.Argument(help="Id of the API key to revoke.")],
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the tenant that owns the key.")],
+) -> None:
+    """Revoke an API key by id (sets ``revoked_at``; the row is never deleted).
+
+    Idempotent-safe: revoking an already-revoked key reports that instead of failing. An unknown
+    id (or one owned by a different tenant) prints a clean message and exits non-zero — never a
+    traceback.
+    """
+    outcome, prefix = asyncio.run(
+        run_revoke_key(_sessionmaker(), tenant_slug=tenant_slug, api_key_id=api_key_id)
+    )
+    if outcome is RevokeKeyOutcome.NOT_FOUND:
+        typer.echo(f"no API key {api_key_id} for tenant {tenant_slug!r}", err=True)
+        raise typer.Exit(code=1)
+    if outcome is RevokeKeyOutcome.ALREADY_REVOKED:
+        typer.echo(f"API key {prefix} (id={api_key_id}) was already revoked")
+        return
+    typer.echo(f"revoked API key {prefix} (id={api_key_id})")
 
 
 @app.command("connect-google")

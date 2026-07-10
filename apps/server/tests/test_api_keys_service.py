@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.server.db.models import Tenant
 from aethercal.server.services.api_keys import (
     issue_api_key,
+    list_api_keys,
     parse_key,
     revoke_api_key,
     verify_api_key,
@@ -86,3 +87,45 @@ async def test_revoke_is_tenant_scoped(
     revoked = await revoke_api_key(sqlite_session, api_key_id=api_key.id, tenant_id=other.id)
     assert revoked is False
     assert await verify_api_key(sqlite_session, full_key) is not None
+
+
+async def test_list_api_keys_returns_all_of_a_tenants_keys(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    first, _ = await issue_api_key(sqlite_session, tenant_id=tenant.id, name="ci")
+    second, _ = await issue_api_key(sqlite_session, tenant_id=tenant.id, name="cli")
+
+    keys = await list_api_keys(sqlite_session, tenant_id=tenant.id)
+
+    assert {key.id for key in keys} == {first.id, second.id}
+
+
+async def test_list_api_keys_includes_revoked_keys(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    api_key, _ = await issue_api_key(sqlite_session, tenant_id=tenant.id, name="ci")
+    await revoke_api_key(sqlite_session, api_key_id=api_key.id, tenant_id=tenant.id)
+
+    keys = await list_api_keys(sqlite_session, tenant_id=tenant.id)
+
+    assert len(keys) == 1
+    assert keys[0].revoked_at is not None
+
+
+async def test_list_api_keys_is_tenant_scoped(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    owner = await tenant_factory(sqlite_session, slug="owner")
+    other = await tenant_factory(sqlite_session, slug="other")
+    await issue_api_key(sqlite_session, tenant_id=owner.id, name="ci")
+
+    assert await list_api_keys(sqlite_session, tenant_id=other.id) == []
+
+
+async def test_list_api_keys_empty_for_tenant_with_no_keys(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    assert await list_api_keys(sqlite_session, tenant_id=tenant.id) == []

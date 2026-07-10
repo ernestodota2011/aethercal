@@ -111,6 +111,18 @@ async def verify_api_key(session: AsyncSession, presented: str) -> ApiKey | None
     return api_key
 
 
+async def list_api_keys(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[ApiKey]:
+    """Return all of ``tenant_id``'s API keys (active and revoked), newest first.
+
+    Never touches ``hashed_key`` beyond returning the row — callers (the admin CLI) must only
+    surface ``id``/``prefix``/``name``/timestamps/revocation status, never the hash or plaintext.
+    """
+    rows = await session.scalars(
+        select(ApiKey).where(ApiKey.tenant_id == tenant_id).order_by(ApiKey.created_at.desc())
+    )
+    return list(rows.all())
+
+
 async def revoke_api_key(
     session: AsyncSession, *, api_key_id: uuid.UUID, tenant_id: uuid.UUID
 ) -> bool:

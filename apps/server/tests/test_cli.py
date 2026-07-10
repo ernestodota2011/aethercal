@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -11,7 +12,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from aethercal.server.cli import run_connect_google, run_create_tenant, run_issue_key
+from aethercal.server.cli import (
+    RevokeKeyOutcome,
+    run_connect_google,
+    run_create_tenant,
+    run_issue_key,
+    run_list_keys,
+    run_revoke_key,
+)
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
 from aethercal.server.db.models import ExternalConnection
@@ -118,3 +126,125 @@ async def test_connect_google_unknown_user_raises(
             credential=GoogleCredential(account_email="host@gmail.com", token_json="{}"),
             fernet=fernet,
         )
+
+
+# --------------------------------------------------------------------------------------
+# `keys list` / `keys revoke` (C7b).
+# --------------------------------------------------------------------------------------
+
+
+async def test_list_keys_returns_the_tenants_keys(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    await run_issue_key(maker, tenant_slug="acme", name="ci-key")
+    await run_issue_key(maker, tenant_slug="acme", name="cli-key")
+
+    keys = await run_list_keys(maker, tenant_slug="acme")
+
+    assert {key.name for key in keys} == {"ci-key", "cli-key"}
+    # Never leaks the hashed secret through the listing seam — only prefix/id/name/status.
+    assert all(not hasattr(key, "full_key") for key in keys)
+
+
+async def test_list_keys_empty_for_tenant_with_no_keys(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    assert await run_list_keys(maker, tenant_slug="acme") == []
+
+
+async def test_list_keys_for_unknown_slug_raises(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(LookupError, match="ghost"):
+        await run_list_keys(maker, tenant_slug="ghost")
+
+
+async def test_list_keys_is_tenant_scoped(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    await run_create_tenant(
+        maker, slug="other", name="Other Inc", email="host@other.test", timezone="UTC"
+    )
+    await run_issue_key(maker, tenant_slug="acme", name="ci-key")
+
+    assert await run_list_keys(maker, tenant_slug="other") == []
+
+
+async def test_revoke_key_marks_it_revoked(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    full_key = await run_issue_key(maker, tenant_slug="acme", name="ci-key")
+    (issued,) = await run_list_keys(maker, tenant_slug="acme")
+
+    outcome, prefix = await run_revoke_key(maker, tenant_slug="acme", api_key_id=issued.id)
+
+    assert outcome is RevokeKeyOutcome.REVOKED
+    assert prefix == issued.prefix
+    async with maker() as session:
+        assert await verify_api_key(session, full_key) is None
+
+
+async def test_revoke_key_is_idempotent(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    await run_issue_key(maker, tenant_slug="acme", name="ci-key")
+    (issued,) = await run_list_keys(maker, tenant_slug="acme")
+
+    first = await run_revoke_key(maker, tenant_slug="acme", api_key_id=issued.id)
+    second = await run_revoke_key(maker, tenant_slug="acme", api_key_id=issued.id)
+
+    assert first == (RevokeKeyOutcome.REVOKED, issued.prefix)
+    # Revoking twice does not raise and reports the already-revoked state, not a fresh revoke.
+    assert second == (RevokeKeyOutcome.ALREADY_REVOKED, issued.prefix)
+
+
+async def test_revoke_key_unknown_id_is_reported_not_raised(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    outcome, prefix = await run_revoke_key(maker, tenant_slug="acme", api_key_id=uuid.uuid4())
+    assert outcome is RevokeKeyOutcome.NOT_FOUND
+    assert prefix is None
+
+
+async def test_revoke_key_is_tenant_scoped(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    await run_create_tenant(
+        maker, slug="other", name="Other Inc", email="host@other.test", timezone="UTC"
+    )
+    await run_issue_key(maker, tenant_slug="acme", name="ci-key")
+    (issued,) = await run_list_keys(maker, tenant_slug="acme")
+
+    # A different tenant's slug cannot revoke acme's key — reported as not-found, not leaked.
+    outcome, prefix = await run_revoke_key(maker, tenant_slug="other", api_key_id=issued.id)
+
+    assert outcome is RevokeKeyOutcome.NOT_FOUND
+    assert prefix is None
+
+
+async def test_revoke_key_for_unknown_slug_raises(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(LookupError, match="ghost"):
+        await run_revoke_key(maker, tenant_slug="ghost", api_key_id=uuid.uuid4())
