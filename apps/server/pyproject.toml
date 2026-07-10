@@ -13,14 +13,35 @@ classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
 # The persistence layer (F1-01) is the server's foundation, so SQLAlchemy, Alembic and the
 # Postgres driver are hard dependencies: the server cannot run without a database. psycopg 3 is a
 # single driver that serves both the async application engine and the sync Alembic/boot migrator.
-# aethercal-core is imported for the shared domain vocabulary (e.g. BookingStatus). FastAPI /
-# Reflex are added as their layers land later in F1. The Google Calendar SDKs stay an optional
-# extra (see below) so a bare `pip install aethercal-server` skips them until F1-07.
+# aethercal-core is imported for the shared domain vocabulary (e.g. BookingStatus).
+#
+# The F1 foundation (Ola 0) adds the web/runtime stack the later waves all extend:
+#   - fastapi + uvicorn: the ASGI app and its production server.
+#   - pydantic-settings: env-sourced Settings (RF-19, no secrets in source).
+#   - cryptography: Fernet key (derived from app_secret) that encrypts stored provider
+#     credentials once F1-07 (Google) lands.
+#   - apscheduler: the in-process scheduler that the busy-cache sync / reminder jobs run on.
+#   - aiosmtplib: async SMTP for the transactional `.ics` email.
+#   - typer: the `aethercal-admin` CLI (create tenant, issue API key).
+#   - httpx: the API client + FastAPI TestClient transport.
+#   - itsdangerous: signs the public guest booking tokens (GuestToken) in a later wave.
+# All are declared now so later feature waves need zero dependency changes.
+# The Google Calendar SDKs stay an optional extra (see below) so a bare
+# `pip install aethercal-server` skips them until F1-07.
 dependencies = [
     "aethercal-core",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic-settings>=2.4",
+    "cryptography>=43",
+    "apscheduler>=3.10",
+    "aiosmtplib>=3.0",
+    "typer>=0.12",
+    "httpx>=0.27",
+    "itsdangerous>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +50,10 @@ google = [
     "google-auth>=2.30",
     "google-auth-oauthlib>=1.2",
 ]
+
+# The agency admin CLI: `aethercal-admin create-tenant …` / `aethercal-admin issue-api-key …`.
+[project.scripts]
+aethercal-admin = "aethercal.server.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]
