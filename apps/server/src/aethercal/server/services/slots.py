@@ -68,6 +68,18 @@ def _as_utc(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
+def _shift_clamped(day: date, days: int) -> date:
+    """``day`` shifted by ``days``, clamped to the representable ``[date.min, date.max]`` range.
+
+    Padding an extreme bound (``date.min`` / ``date.max``) with ``timedelta`` would raise
+    ``OverflowError`` (and 500 the endpoint). Clamping the ordinal keeps the shift in range: the pad
+    only needs to *cover* the localized window, and there is nothing to cover beyond the last (or
+    before the first) representable calendar date.
+    """
+    ordinal = day.toordinal() + days
+    return date.fromordinal(min(date.max.toordinal(), max(date.min.toordinal(), ordinal)))
+
+
 def _busy_window(window_from: date, window_to: date) -> TimeInterval:
     """A UTC instant window that safely covers every localized availability in ``[from, to]``.
 
@@ -75,10 +87,11 @@ def _busy_window(window_from: date, window_to: date) -> TimeInterval:
     to ~a day in either direction once localized (an evening range in a far-western zone spills into
     the next UTC day; a morning range in a far-eastern zone into the previous one). Padding the date
     bounds by a day on each side guarantees the busy sets (internal bookings + the external
-    ``read_busy`` coverage) span every candidate slot, so no conflict can slip through the gap.
+    ``read_busy`` coverage) span every candidate slot, so no conflict can slip through the gap. The
+    pad is clamped to the representable date range so an extreme window bound never overflows.
     """
-    start = datetime.combine(window_from, time.min, tzinfo=UTC) - timedelta(days=1)
-    end = datetime.combine(window_to, time.min, tzinfo=UTC) + timedelta(days=2)
+    start = datetime.combine(_shift_clamped(window_from, -1), time.min, tzinfo=UTC)
+    end = datetime.combine(_shift_clamped(window_to, 2), time.min, tzinfo=UTC)
     return TimeInterval(start=start, end=end)
 
 
@@ -94,15 +107,27 @@ async def _load_schedule(
 
 
 async def _load_overrides(
-    session: AsyncSession, *, tenant_id: uuid.UUID, schedule_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    schedule_id: uuid.UUID,
+    window_from: date,
+    window_to: date,
 ) -> list[DateOverride]:
-    """Every per-date override for the schedule, tenant-scoped."""
+    """The schedule's per-date overrides inside ``[window_from, window_to]``, tenant-scoped.
+
+    Only the window's overrides are loaded, never the schedule's whole history: an override outside
+    the window can never change the computed availability, and the unique index on
+    ``(tenant_id, schedule_id, date)`` backs this range scan efficiently.
+    """
     return list(
         (
             await session.scalars(
                 select(DateOverride).where(
                     DateOverride.tenant_id == tenant_id,
                     DateOverride.schedule_id == schedule_id,
+                    DateOverride.date >= window_from,
+                    DateOverride.date <= window_to,
                 )
             )
         ).all()
@@ -170,7 +195,13 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     if schedule is None:
         available: list[TimeInterval] = []
     else:
-        overrides = await _load_overrides(session, tenant_id=tenant_id, schedule_id=schedule.id)
+        overrides = await _load_overrides(
+            session,
+            tenant_id=tenant_id,
+            schedule_id=schedule.id,
+            window_from=window_from,
+            window_to=window_to,
+        )
         available = available_intervals(
             to_core_schedule(schedule), to_core_overrides(overrides), window_from, window_to
         )
