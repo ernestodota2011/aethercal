@@ -10,11 +10,14 @@ are dropped.
 
 from __future__ import annotations
 
+import math
+import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
@@ -23,6 +26,10 @@ from aethercal.schemas.bookings import BookingCreate
 
 _QUESTION_FIELD_PREFIX = "q_"
 _KNOWN_KINDS = frozenset({"text", "textarea", "select", "email", "tel", "url", "number"})
+# Characters a phone answer may contain besides digits (formatting only).
+_TEL_ALLOWED = frozenset("0123456789 +-().")
+# One RFC 1123 hostname label: 1-63 alphanumerics/hyphens, never leading/trailing a hyphen.
+_HOSTNAME_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +112,11 @@ def _coerce_question(raw: Any, index: int) -> QuestionSpec | None:
         if isinstance(options_raw, Sequence) and not isinstance(options_raw, str | bytes)
         else ()
     )
+    # A select with no options is misconfigured: degrade it to a plain text input (same defensive
+    # philosophy as unknown kinds) so it collects a free answer instead of being a phantom
+    # "select" that would accept any crafted value.
+    if kind == "select" and not options:
+        kind = "text"
     return QuestionSpec(key=key, label=label, kind=kind, required=required, options=options)
 
 
@@ -123,6 +135,87 @@ def _looks_like_email(value: str) -> bool:
     candidate = value.strip()
     local, _, domain = candidate.partition("@")
     return bool(local) and bool(domain) and " " not in candidate and candidate.count("@") == 1
+
+
+def _looks_like_number(value: str) -> bool:
+    """A finite decimal number (rejects text, ``nan``/``inf``, and empty input)."""
+    try:
+        return math.isfinite(float(value))
+    except ValueError:
+        return False
+
+
+def _valid_hostname(host: str) -> bool:
+    """A multi-label RFC 1123 hostname (an optional trailing FQDN dot allowed).
+
+    Requiring >=2 non-empty, well-formed labels rejects the malformed hosts a bare ``"." in host``
+    check waves through: a leading dot, consecutive dots, a trailing-only dot, or empty labels.
+    """
+    trimmed = host[:-1] if host.endswith(".") else host  # tolerate a trailing FQDN root dot
+    labels = trimmed.split(".")
+    return len(labels) >= 2 and all(_HOSTNAME_LABEL.match(label) for label in labels)
+
+
+def _looks_like_url(value: str) -> bool:
+    """An http(s) URL with a valid multi-label host and port — rejects free text and bad hosts.
+
+    A bare ``bool(netloc)`` check waves through whitespace, ``https://word``, an invalid ``:port``,
+    and malformed hosts (leading/consecutive/trailing dots); this validates all of those.
+    """
+    candidate = value.strip()
+    if not candidate or any(char.isspace() for char in candidate):
+        return False
+    try:
+        parsed = urlparse(candidate)
+        has_valid_port = parsed.port is None or parsed.port >= 0  # accessing .port validates it
+    except ValueError:
+        return False
+    host = parsed.hostname
+    return (
+        has_valid_port
+        and parsed.scheme in ("http", "https")
+        and host is not None
+        and _valid_hostname(host)
+    )
+
+
+def _looks_like_tel(value: str) -> bool:
+    """A phone-ish answer: at least three digits and only digit/formatting characters."""
+    candidate = value.strip()
+    digits = sum(char.isdigit() for char in candidate)
+    return digits >= 3 and all(char in _TEL_ALLOWED for char in candidate)
+
+
+# Per-kind answer validators. Only the ``select`` kind is special-cased (it checks membership in
+# the configured options), so it is handled directly in ``_question_error`` rather than here.
+_ANSWER_VALIDATORS: dict[str, Callable[[str], bool]] = {
+    "email": _looks_like_email,
+    "number": _looks_like_number,
+    "url": _looks_like_url,
+    "tel": _looks_like_tel,
+}
+_ANSWER_ERROR_KEY: dict[str, str] = {
+    "email": "error_question_email",
+    "number": "error_question_number",
+    "url": "error_question_url",
+    "tel": "error_question_tel",
+}
+
+
+def _question_error(spec: QuestionSpec, answer: str, locale: Locale) -> str | None:
+    """Localized error for a non-empty ``answer`` that violates its question kind, else ``None``.
+
+    Server-side is the source of truth (RF-07): the browser's ``<select>``/``type=email`` hints
+    help, but a JS-less or crafted POST is still validated here before any booking is created.
+    """
+    if spec.kind == "select":
+        if spec.options and answer not in spec.options:
+            return t(locale, "error_question_select")
+        return None
+    validator = _ANSWER_VALIDATORS.get(spec.kind)
+    if validator is not None and not validator(answer):
+        return t(locale, _ANSWER_ERROR_KEY[spec.kind])
+    return None
 
 
 def _collect_values(form: Mapping[str, str], questions: Sequence[QuestionSpec]) -> dict[str, str]:
@@ -169,6 +262,10 @@ def build_booking(
         if not answer:
             if spec.required:
                 errors.append(FieldError(field_name, t(locale, "error_question_required")))
+            continue
+        type_error = _question_error(spec, answer, locale)
+        if type_error is not None:
+            errors.append(FieldError(field_name, type_error))
             continue
         answers[spec.key] = answer
 

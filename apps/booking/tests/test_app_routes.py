@@ -10,20 +10,26 @@ messages, never a stack trace) (RF-16/RF-13).
 from __future__ import annotations
 
 import json
+import logging
 import uuid
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
 from starlette.testclient import TestClient
 
+from aethercal.booking import app as booking_app
 from aethercal.booking.app import create_app
 from aethercal.booking.settings import BookingSettings
 from aethercal.client import AetherCalClient
 
 INTRO_ID = str(uuid.uuid4())
 DEEP_ID = str(uuid.uuid4())
+TYPED_ID = str(uuid.uuid4())
 BOOKING_ID = str(uuid.uuid4())
 API_KEY = "ack_server_side_secret"
+# A value the fake backend echoes in its internal error message; the guest must never see it.
+LEAK_MARKER = "internal stack secret"
 
 
 def _event_json(*, event_id: str, slug: str, title: str, questions: list[Any], active: bool = True):
@@ -85,6 +91,10 @@ class FakeAPI:
     def __init__(self) -> None:
         self.last_auth: str | None = None
         self.created_bookings: list[dict[str, Any]] = []
+        # Failure injection: when set, the matching endpoint answers with a 500 that carries an
+        # internal message (LEAK_MARKER) the guest must never see.
+        self.fail_event_types = False
+        self.fail_slots = False
 
     def _event_types(self) -> httpx.Response:
         return httpx.Response(
@@ -96,6 +106,26 @@ class FakeAPI:
                     slug="deep",
                     title="Deep Dive",
                     questions=[{"key": "company", "label": "Company", "required": True}],
+                ),
+                _event_json(
+                    event_id=TYPED_ID,
+                    slug="typed",
+                    title="Typed Questions",
+                    questions=[
+                        {
+                            "key": "size",
+                            "label": "Team size",
+                            "type": "select",
+                            "options": ["1-10", "11+"],
+                            "required": True,
+                        },
+                        {
+                            "key": "work_email",
+                            "label": "Work email",
+                            "type": "email",
+                            "required": True,
+                        },
+                    ],
                 ),
             ],
         )
@@ -117,16 +147,24 @@ class FakeAPI:
             )
         return httpx.Response(200, json=_booking_json(status=status))
 
+    def _boom(self) -> httpx.Response:
+        return httpx.Response(500, json={"error": "internal", "message": LEAK_MARKER})
+
+    def _slots(self, request: httpx.Request) -> httpx.Response:
+        if self.fail_slots:
+            return self._boom()
+        event_type = request.url.params.get("event_type", INTRO_ID)
+        return httpx.Response(
+            200, json=_slots_json(event_type, request.url.params.get("tz", "UTC"))
+        )
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.last_auth = request.headers.get("Authorization")
         path, method = request.url.path, request.method
         if method == "GET" and path == "/api/v1/event-types/":
-            return self._event_types()
+            return self._boom() if self.fail_event_types else self._event_types()
         if method == "GET" and path == "/api/v1/slots/":
-            event_type = request.url.params.get("event_type", INTRO_ID)
-            return httpx.Response(
-                200, json=_slots_json(event_type, request.url.params.get("tz", "UTC"))
-            )
+            return self._slots(request)
         if method == "POST" and path == "/api/v1/bookings/":
             return self._create_booking(request)
         if method == "POST" and path.endswith("/cancel"):
@@ -271,7 +309,8 @@ def test_taken_slot_shows_friendly_message() -> None:
             "email": "taken@example.com",
         },
     )
-    assert response.status_code == 200
+    # A slot conflict is a real 409 (not a masked 200); the guest still gets the friendly copy.
+    assert response.status_code == 409
     assert "ya no está disponible" in response.text
     assert "Traceback" not in response.text
 
@@ -289,7 +328,8 @@ def test_cancel_page_then_cancel_succeeds() -> None:
 def test_cancel_with_expired_token_is_friendly() -> None:
     client, _ = _make_client()
     done = client.post("/cancel", data={"booking": BOOKING_ID, "token": "expired", "lang": "es"})
-    assert done.status_code == 200
+    # An expired/invalid guest token is a real 403; the copy stays friendly and never leaks.
+    assert done.status_code == 403
     assert "expiró" in done.text.lower() or "no es válido" in done.text.lower()
     assert "Traceback" not in done.text
 
@@ -333,3 +373,127 @@ def test_healthz_is_ok_without_calling_the_api() -> None:
     assert response.status_code == 200
     assert response.text.strip().lower().startswith("ok")
     assert fake.last_auth is None  # no API round-trip for liveness
+
+
+# ---------------------------------------------------------------------------------------
+# (b) Graceful degradation when the backend SDK call fails — never a 500/stack (RF-16).
+# ---------------------------------------------------------------------------------------
+
+
+def test_index_event_load_failure_is_a_friendly_503() -> None:
+    client, fake = _make_client()
+    fake.fail_event_types = True
+    response = client.get("/?lang=es")
+    assert response.status_code == 503
+    assert "Traceback" not in response.text
+    assert LEAK_MARKER not in response.text
+    assert "intentarlo" in response.text.lower()  # friendly retry copy
+
+
+def test_event_page_load_failure_is_a_friendly_503_with_retry() -> None:
+    client, fake = _make_client()
+    fake.fail_event_types = True
+    response = client.get("/e/intro?lang=es")
+    assert response.status_code == 503
+    assert "Traceback" not in response.text
+    assert LEAK_MARKER not in response.text
+    assert "Reintentar" in response.text  # a retry affordance is offered
+    assert "/e/intro" in response.text  # the retry points back at this page
+
+
+def test_slots_fetch_failure_degrades_gracefully_on_the_event_page() -> None:
+    client, fake = _make_client()
+    fake.fail_slots = True
+    response = client.get("/e/intro?tz=UTC&lang=es")
+    # The event still renders (200); only the slot list degrades to a friendly notice.
+    assert response.status_code == 200
+    assert "Intro Call" in response.text
+    assert "Traceback" not in response.text
+    assert LEAK_MARKER not in response.text
+    assert "disponibilidad" in response.text.lower()
+
+
+def test_htmx_slots_partial_failure_degrades_to_a_fragment_notice() -> None:
+    client, fake = _make_client()
+    fake.fail_event_types = True
+    response = client.get("/e/intro/slots?tz=UTC&lang=es", headers={"HX-Request": "true"})
+    # HTMX only swaps on 2xx, so the degraded fragment must be 200, not an error status.
+    assert response.status_code == 200
+    assert "<html" not in response.text.lower()  # still a bare fragment
+    assert 'id="slots"' in response.text
+    assert "Traceback" not in response.text
+    assert LEAK_MARKER not in response.text
+
+
+def test_backend_failure_is_logged_for_observability(caplog: Any) -> None:
+    # The guest sees a friendly page; ops still gets the failure (with its traceback) in the log.
+    client, fake = _make_client()
+    fake.fail_event_types = True
+    with caplog.at_level(logging.ERROR, logger="aethercal.booking.app"):
+        response = client.get("/e/intro?lang=es")
+    assert response.status_code == 503
+    assert LEAK_MARKER not in response.text  # never leaked to the guest
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)  # observable to ops
+
+
+def test_booking_submit_backend_failure_is_friendly_and_no_leak() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "UTC",
+            "lang": "es",
+            "name": "Ada",
+            "email": "taken@example.com",
+        },
+    )
+    # Covered by test_taken_slot_shows_friendly_message too; this pins the no-leak contract.
+    assert response.status_code == 409
+    assert "Traceback" not in response.text
+    assert LEAK_MARKER not in response.text
+
+
+def test_reschedule_submit_expired_token_is_a_friendly_403() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/reschedule",
+        data={
+            "booking": BOOKING_ID,
+            "token": "expired",
+            "new_start": "2026-07-21T15:00:00+00:00",
+            "lang": "es",
+        },
+    )
+    assert response.status_code == 403
+    assert "Traceback" not in response.text
+    assert "enlace" in response.text.lower() or "no es válido" in response.text.lower()
+
+
+# ---------------------------------------------------------------------------------------
+# (a) Date navigation is anchored to the VISITOR's timezone, never the server clock.
+# ---------------------------------------------------------------------------------------
+
+
+def test_shifted_url_clamps_navigation_to_the_given_floor() -> None:
+    # The prev-window link can never point before the floor (the visitor's local "today").
+    url = booking_app._shifted_url(
+        "/e/intro",
+        {"tz": "America/New_York", "lang": "es"},
+        date(2026, 7, 13),
+        -booking_app.WINDOW_DAYS,
+        floor=date(2026, 7, 13),
+    )
+    assert "from=2026-07-13" in url
+
+
+def test_date_navigation_floor_follows_visitor_timezone_not_server(monkeypatch: Any) -> None:
+    # 02:00 UTC on the 14th is still 22:00 on the 13th in New York: the navigation floor must be
+    # the VISITOR's local day, so the same instant yields a DIFFERENT floor per timezone.
+    monkeypatch.setattr(booking_app, "_now", lambda: datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    client, _ = _make_client()
+    ny = client.get("/e/intro?tz=America/New_York&from=2026-07-01")
+    utc = client.get("/e/intro?tz=UTC&from=2026-07-01")
+    assert "from=2026-07-13" in ny.text  # New York floor = the 13th
+    assert "from=2026-07-14" in utc.text  # UTC floor = the 14th
+    assert "from=2026-07-13" not in utc.text
