@@ -15,7 +15,9 @@ Two backends, one contract:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
@@ -38,6 +40,12 @@ from aethercal.server.db import Base
 from aethercal.server.db.models import Tenant, User
 from aethercal.server.services.api_keys import issue_api_key
 from aethercal.server.settings import Settings
+
+# psycopg's async driver cannot run on Windows' default ProactorEventLoop; pytest-asyncio builds its
+# loops from the active policy, so select the SelectorEventLoop policy on Windows. Harmless on the
+# aiosqlite/httpx paths, and production runs on Linux where the default loop already works.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 PG_ENV = "AETHERCAL_TEST_DATABASE_URL"
 
