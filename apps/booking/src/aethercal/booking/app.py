@@ -256,20 +256,95 @@ def _is_trusted_peer(host: str, trusted: Sequence[_TrustedNetwork]) -> bool:
     return any(addr in net for net in trusted)
 
 
+def _normalize_ip(value: str) -> str | None:
+    """The canonical string form of ``value`` if it's a valid IP, else ``None``.
+
+    Normalizing collapses equivalent spellings (``2001:0db8::1`` ≡ ``2001:db8::1``) to one limiter
+    key, and returning ``None`` for non-IP input lets callers fail safe on a forged/garbage header.
+    """
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
 def _client_ip(request: Request, trusted_proxies: Sequence[_TrustedNetwork]) -> str:
     """The rate-limit key for this request: the real client IP, resolved SAFELY.
 
-    ``CF-Connecting-IP`` is honored ONLY when the transport peer (``request.client.host``) is a
-    trusted proxy — otherwise a direct client could forge the header to spoof its identity, evading
-    the per-IP limit or inflating the limiter's keyspace (a memory-exhaustion vector). When the peer
-    is not trusted (or no header is present), the transport address is authoritative.
+    ``CF-Connecting-IP`` is honored ONLY when (a) the transport peer (``request.client.host``) is a
+    trusted proxy AND (b) the header value is itself a valid IP — otherwise a direct client could
+    forge the header to spoof its identity, evading the per-IP limit or inflating the limiter's
+    keyspace (a memory-exhaustion vector). The chosen identity is normalized to its canonical IP
+    form so equivalent spellings share one key. When the header can't be trusted/parsed, the
+    transport address is authoritative (itself normalized when it is a valid IP).
     """
     client = request.client
     peer = client.host if client is not None else "unknown"
     header = request.headers.get("CF-Connecting-IP")
     if header and _is_trusted_peer(peer, trusted_proxies):
-        return header.strip()
-    return peer
+        forwarded = _normalize_ip(header)
+        if forwarded is not None:
+            return forwarded
+    return _normalize_ip(peer) or peer
+
+
+def _is_rate_limited_post(request: Request) -> bool:
+    """Whether this request is one of the public state-changing POSTs the limiter guards.
+
+    The three write endpoints (``/e/{slug}/book``, ``/cancel``, ``/reschedule``); read endpoints
+    and static assets are never limited.
+    """
+    if request.method != "POST":
+        return False
+    path = request.url.path
+    return path in ("/cancel", "/reschedule") or (path.startswith("/e/") and path.endswith("/book"))
+
+
+class _RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP rate limiting applied at the MIDDLEWARE layer — BEFORE the framework parses the body.
+
+    FastHTML eagerly parses the request form to build handler params, so a per-handler check would
+    still let a blocked request pay the (attacker-controlled) body-parse cost. Running the limit
+    here short-circuits a flood with a 429 before any body is read; the limiter only needs the
+    request's IP, never its body.
+    """
+
+    def __init__(
+        self,
+        app: Callable[..., object],
+        *,
+        limiter: _RateLimiter,
+        trusted_proxies: Sequence[_TrustedNetwork],
+        settings: BookingSettings,
+    ) -> None:
+        super().__init__(app)  # pyright: ignore[reportArgumentType]
+        self._limiter = limiter
+        self._trusted_proxies = trusted_proxies
+        self._settings = settings
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if _is_rate_limited_post(request) and not self._limiter.allow(
+            _client_ip(request, self._trusted_proxies)
+        ):
+            return self._too_many_requests(request)
+        return await call_next(request)
+
+    def _too_many_requests(self, request: Request) -> Response:
+        """The friendly, localized 429 for a rate-limited request (never a stack, never a body)."""
+        locale = select_locale(
+            query_lang=request.query_params.get("lang"),
+            accept_language=request.headers.get("accept-language"),
+            default=self._settings.default_locale,
+        )
+        body = views.message_page(
+            locale,
+            title=t(locale, "app_name"),
+            message=t(locale, "error_rate_limited"),
+            lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
+            is_error=True,
+        )
+        return HTMLResponse(views.render(body), status_code=429)
 
 
 # --------------------------------------------------------------------------------------
@@ -413,20 +488,15 @@ class _BookingApp:
         self._rate_limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
         self._trusted_proxies = _parse_trusted_networks(settings.trusted_proxies)
 
-    def _rate_limited_response(self, request: Request) -> Response | None:
-        """``None`` if this request is within the limit, else the friendly 429 to return."""
-        if self._rate_limiter.allow(_client_ip(request, self._trusted_proxies)):
-            return None
-        locale = self._locale(request)
-        body = views.message_page(
-            locale,
-            title=t(locale, "app_name"),
-            message=t(locale, "error_rate_limited"),
-            lang_urls=_lang_links_here(request),
-            base_url=self._settings.base_url,
-            is_error=True,
+    def rate_limit_middleware(self) -> Middleware:
+        """The per-IP rate-limit middleware bound to this app's limiter/trusted-proxy config, so the
+        limiter state stays encapsulated here (``create_app`` only wires the returned object)."""
+        return Middleware(
+            _RateLimitMiddleware,
+            limiter=self._rate_limiter,
+            trusted_proxies=self._trusted_proxies,
+            settings=self._settings,
         )
-        return HTMLResponse(views.render(body), status_code=429)
 
     async def _call(self, call: Callable[[AetherCalClient], T]) -> T:
         """Run a (blocking) SDK call in a threadpool with a fresh client, closing it after."""
@@ -647,16 +717,12 @@ class _BookingApp:
             base_url=self._settings.base_url,
         )
 
-    def _book_submit_guard(
+    def _honeypot_response(
         self, request: Request, *, form: Mapping[str, str], slug: str, start: str, tz: str
     ) -> Response | None:
-        """The rate-limit and honeypot pre-checks for ``book_submit``, combined into one seam so
-        the handler's own branch count stays readable. Returns a short-circuit response, or
-        ``None`` to proceed to the real booking flow.
+        """The honeypot post-parse check for ``book_submit`` (the rate-limit check runs BEFORE the
+        body is even parsed, so it is not here). Returns a short-circuit response, or ``None``.
         """
-        limited = self._rate_limited_response(request)
-        if limited is not None:
-            return limited
         if form.get(views.HONEYPOT_FIELD_NAME, "").strip():
             # Anti-spam honeypot: a bot filled a field hidden from real guests. Skip the backend
             # entirely and return a plausible "received" 200 — the bot sees success and doesn't
@@ -738,13 +804,15 @@ class _BookingApp:
         )
 
     async def book_submit(self, request: Request) -> object:
+        # Rate limiting runs in _RateLimitMiddleware, BEFORE FastHTML parses the body — so a blocked
+        # request never pays the body-parse cost. This handler only sees requests within the limit.
         form = _form_dict(await request.form())
         slug = str(request.path_params["slug"])
         tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
         start = form.get("start", "")
-        guard = self._book_submit_guard(request, form=form, slug=slug, start=start, tz=tz)
-        if guard is not None:
-            return guard
+        honeypot = self._honeypot_response(request, form=form, slug=slug, start=start, tz=tz)
+        if honeypot is not None:
+            return honeypot
         locale = self._locale(request, form.get("lang"))
         events = await self._events()
         if events is None:
@@ -781,9 +849,7 @@ class _BookingApp:
         )
 
     async def cancel_submit(self, request: Request) -> object:
-        limited = self._rate_limited_response(request)
-        if limited is not None:
-            return limited
+        # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
         booking_id = _parse_uuid(form.get("booking", ""))
@@ -881,9 +947,7 @@ class _BookingApp:
         )
 
     async def reschedule_submit(self, request: Request) -> object:
-        limited = self._rate_limited_response(request)
-        if limited is not None:
-            return limited
+        # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
         booking_id = _parse_uuid(form.get("booking", ""))
@@ -951,7 +1015,15 @@ def create_app(
     callers can omit it to get the default per-IP limiter.
     """
     booking = _BookingApp(settings, client_factory, rate_limiter=rate_limiter)
-    app = FastHTML(middleware=[Middleware(_SecurityHeadersMiddleware)])
+    # Order matters: the security-headers middleware is OUTERMOST so its headers are applied even to
+    # the rate limiter's early 429. The rate limiter is INNER but still ahead of routing/FastHTML's
+    # body parse — so a blocked POST is rejected before its body is read.
+    app = FastHTML(
+        middleware=[
+            Middleware(_SecurityHeadersMiddleware),
+            booking.rate_limit_middleware(),
+        ]
+    )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])

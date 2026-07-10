@@ -294,14 +294,19 @@ class AdminState(rx.State):
 
     @rx.event
     async def update_event_type(self, form_data: dict[str, str]) -> None:
-        """Update an event type's title/duration/EN translations (blank fields left unchanged).
+        """Update an event type's title/duration/EN translations.
 
-        Each optional field is OMITTED from the payload when blank, never sent as an explicit
-        ``None`` — ``title`` is NOT NULL in the DB, so a blank-means-``None`` payload would flush
-        as a constraint violation instead of a no-op (the bug this fixed while wiring the EN
-        translations through, A4). ``EventTypeUpdate.model_validate`` marks only the keys present
-        in ``update_fields`` as "set", matching the same ``exclude_unset`` contract every other
-        field in this handler already relies on.
+        CANONICAL fields (``title``, ``duration``) are OMITTED from the payload when blank, never
+        sent as an explicit ``None`` — ``title`` is NOT NULL in the DB, so a blank-means-``None``
+        payload would flush as a constraint violation instead of a no-op (the bug this fixed while
+        wiring the EN translations through, A4).
+
+        TRANSLATION fields (EN) use a DIFFERENT rule: PRESENCE in the form is the signal, not
+        truthiness. A present-but-blank EN field CLEARS the stored translation (sends ``{}``) so an
+        operator can undo a saved override; a present non-blank one SETS it (``{"en": value}``); an
+        ABSENT field leaves the stored map untouched. ``EventTypeUpdate.model_validate`` marks only
+        the keys present in ``update_fields`` as "set", matching the ``exclude_unset`` contract the
+        service relies on.
         """
         if not self._authenticated:
             return
@@ -314,12 +319,14 @@ class AdminState(rx.State):
             duration_raw = _clean(form_data, "duration_min")
             if duration_raw:
                 update_fields["duration_seconds"] = int(duration_raw) * 60
-            title_en = _en_translation(form_data, "title_en")
-            if title_en:
-                update_fields["title_translations"] = title_en
-            description_en = _en_translation(form_data, "description_en")
-            if description_en:
-                update_fields["description_translations"] = description_en
+            # Translations: keyed on FORM PRESENCE, so a blank field clears (``{}``) rather than
+            # being silently omitted — the opposite of the canonical omit-if-blank rule above.
+            if "title_en" in form_data:
+                update_fields["title_translations"] = _en_translation(form_data, "title_en")
+            if "description_en" in form_data:
+                update_fields["description_translations"] = _en_translation(
+                    form_data, "description_en"
+                )
             data = EventTypeUpdate.model_validate(update_fields)
             await service.update_event_type_action(
                 runtime.sessionmaker,

@@ -208,21 +208,25 @@ class FakeAPI:
         return httpx.Response(404, json={"error": "not_found", "message": "Unknown"})
 
 
+# The real deployment sits behind NPM/compose on a private/loopback peer, so the test harness
+# models "behind a trusted proxy" by default — the production DEFAULT is now empty (secure by
+# default), so a deploy sets the concrete proxy CIDR and the harness sets it here explicitly.
+_HARNESS_TRUSTED_PROXIES = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
 def _make_client(
     *,
     rate_limiter: booking_app._RateLimiter | None = None,
     client_host: str = "127.0.0.1",
-    trusted_proxies: tuple[str, ...] | None = None,
+    trusted_proxies: tuple[str, ...] = _HARNESS_TRUSTED_PROXIES,
 ) -> tuple[TestClient, FakeAPI]:
     fake = FakeAPI()
-    settings_kwargs: dict[str, Any] = {
-        "api_url": "http://api.test",
-        "api_key": API_KEY,
-        "default_locale": "es",
-    }
-    if trusted_proxies is not None:
-        settings_kwargs["trusted_proxies"] = trusted_proxies
-    settings = BookingSettings(**settings_kwargs)
+    settings = BookingSettings(
+        api_url="http://api.test",
+        api_key=API_KEY,
+        default_locale="es",
+        trusted_proxies=trusted_proxies,
+    )
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
@@ -561,6 +565,39 @@ def test_rate_limit_applies_to_book_submit_too() -> None:
     assert second.status_code == 429
 
 
+def test_rate_limit_precedes_form_parsing_on_book_submit(monkeypatch: Any) -> None:
+    # The rate-limit check must run BEFORE the request body is parsed — otherwise an attacker forces
+    # the server to parse an (arbitrarily large) form on every rejected request. A blocked POST must
+    # never reach `await request.form()`.
+    calls = {"n": 0}
+    original_form = Request.form
+
+    def _spy_form(self: Request, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return original_form(self, *args, **kwargs)
+
+    monkeypatch.setattr(Request, "form", _spy_form)
+
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter)
+    data = {
+        "start": "2026-07-14T13:00:00+00:00",
+        "tz": "UTC",
+        "lang": "es",
+        "name": "Ada",
+        "email": "ada@example.com",
+    }
+    headers = {"CF-Connecting-IP": "203.0.113.5"}
+    first = client.post("/e/intro/book", data=data, headers=headers)
+    assert first.status_code != 429
+    parsed_after_first = calls["n"]
+    assert parsed_after_first >= 1  # the allowed request DID parse the body
+
+    second = client.post("/e/intro/book", data=data, headers=headers)
+    assert second.status_code == 429
+    assert calls["n"] == parsed_after_first  # the blocked request never parsed the body
+
+
 def test_rate_limit_falls_back_to_the_transport_client_ip_without_the_header() -> None:
     # Without a CF-Connecting-IP header, the limiter must still key on *some* stable per-client
     # identity (the ASGI transport's client address) rather than silently not limiting at all.
@@ -615,6 +652,39 @@ def test_client_ip_non_ip_peer_is_never_trusted() -> None:
     # so a header from it is ignored and the raw peer string is used as the key.
     request = _request_with(client_host="testclient", headers={"CF-Connecting-IP": "9.9.9.9"})
     assert booking_app._client_ip(request, _TRUSTED) == "testclient"
+
+
+def test_client_ip_ignores_invalid_forged_header_from_trusted_peer() -> None:
+    # Even from a TRUSTED peer, a CF-Connecting-IP that isn't a valid IP is not usable as a key —
+    # it is ignored (fail-safe) and the transport peer is used, so junk can't inflate the keyspace.
+    request = _request_with(client_host="10.1.2.3", headers={"CF-Connecting-IP": "not-an-ip;rm"})
+    assert booking_app._client_ip(request, _TRUSTED) == "10.1.2.3"
+
+
+def test_client_ip_normalizes_the_forwarded_ip_key() -> None:
+    # The honored header is normalized (str(ip_address(...))), so equivalent spellings of the same
+    # IP collapse to ONE limiter key (a non-canonical form can't buy a fresh allowance).
+    request = _request_with(
+        client_host="10.1.2.3", headers={"CF-Connecting-IP": "2001:0db8:0000::0001"}
+    )
+    assert booking_app._client_ip(request, _TRUSTED) == "2001:db8::1"
+
+
+def test_client_ip_normalizes_the_transport_peer_key() -> None:
+    request = _request_with(client_host="2001:0db8:0000::0005", headers={})
+    assert booking_app._client_ip(request, _TRUSTED) == "2001:db8::5"
+
+
+def test_invalid_forged_header_from_untrusted_peer_still_limits_on_transport() -> None:
+    # End-to-end companion: an invalid forged header from a public peer neither bypasses the limit
+    # nor errors — every request keys on the (normalized) transport IP.
+    limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
+    client, _ = _make_client(rate_limiter=limiter, client_host="203.0.113.7", trusted_proxies=())
+    data = {"booking": BOOKING_ID, "token": "good", "lang": "es"}
+    first = client.post("/cancel", data=data, headers={"CF-Connecting-IP": "garbage"})
+    assert first.status_code != 429
+    second = client.post("/cancel", data=data, headers={"CF-Connecting-IP": "also-garbage"})
+    assert second.status_code == 429
 
 
 def test_forged_cf_header_from_public_peer_does_not_evade_rate_limit() -> None:

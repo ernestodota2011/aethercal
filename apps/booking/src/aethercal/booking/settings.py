@@ -24,19 +24,17 @@ DEFAULT_API_URL = "http://127.0.0.1:8000"
 DEFAULT_BASE_URL = "https://book.aetherlogik.com"
 
 #: CIDR ranges whose peer address (``request.client.host``) is trusted to have set the real client
-#: IP in ``CF-Connecting-IP``. The app ALWAYS runs behind NPM/compose, so the real transport peer
-#: is a private (RFC1918) or loopback address; a direct PUBLIC peer is by definition not our proxy
-#: and its ``CF-Connecting-IP`` header must NOT be honored (it would let a client forge its identity
-#: to evade the rate limit or inflate the limiter's keyspace). Override per deployment with
-#: ``AETHERCAL_BOOKING_TRUSTED_PROXIES`` (a comma-separated CIDR list).
-DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = (
-    "127.0.0.0/8",  # IPv4 loopback
-    "10.0.0.0/8",  # RFC1918 private
-    "172.16.0.0/12",  # RFC1918 private
-    "192.168.0.0/16",  # RFC1918 private
-    "::1/128",  # IPv6 loopback
-    "fc00::/7",  # IPv6 unique-local
-)
+#: IP in ``CF-Connecting-IP``.
+#:
+#: SECURE BY DEFAULT: this is EMPTY. With no configured proxy, NO peer is trusted, so the header is
+#: never honored and the transport address is always the rate-limit identity — a direct client
+#: cannot forge ``CF-Connecting-IP`` to spoof its identity (evading the limit or inflating the
+#: limiter's keyspace). ⚠️ PRODUCTION behind a reverse proxy (NPM/Cloudflare/compose) MUST set
+#: ``AETHERCAL_BOOKING_TRUSTED_PROXIES`` to the proxy's CONCRETE CIDR (e.g. the compose network or
+#: the NPM host address) — otherwise every guest collapses onto the proxy's single IP and shares
+#: one rate-limit budget. The value is a comma-separated CIDR list, parsed by
+#: :func:`_parse_trusted_proxies`.
+DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ()
 
 _ENV_API_URL = "AETHERCAL_API_URL"
 _ENV_API_KEY = "AETHERCAL_API_KEY"

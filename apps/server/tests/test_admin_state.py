@@ -338,9 +338,11 @@ async def test_update_event_type_sets_the_en_translation_and_reload_populates_it
     assert state.event_types[0]["title"] == "Introducción"
 
 
-async def test_update_event_type_blank_en_field_leaves_the_existing_translation_untouched(
+async def test_update_event_type_absent_en_field_leaves_the_existing_translation_untouched(
     seeded_maker: Sessionmaker,
 ) -> None:
+    # An update payload that does NOT carry the EN field at all leaves the stored translation as-is
+    # (presence in the form is the signal; absence = "don't touch this field").
     state = await _authenticated_state(seeded_maker)
     await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
     await AdminState.create_event_type.fn(
@@ -361,6 +363,68 @@ async def test_update_event_type_blank_en_field_leaves_the_existing_translation_
     assert state.error == ""
     assert state.event_types[0]["duration_min"] == "45"
     assert state.event_types[0]["title_en"] == "Discovery call"
+
+
+async def test_update_event_type_blank_en_field_clears_the_stored_translation(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # A present-but-BLANK EN field means "remove this translation": the admin must be able to undo a
+    # saved EN override, so a blank EN field sends title_translations={} (not omit-if-blank).
+    state = await _authenticated_state(seeded_maker)
+    await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
+    await AdminState.create_event_type.fn(
+        state,
+        {
+            "slug": "intro",
+            "title": "Introducción",
+            "schedule": "Weekly",
+            "duration_min": "30",
+            "max_advance_days": "30",
+            "title_en": "Discovery call",
+            "description_en": "A quick intro.",
+        },
+    )
+    event_type_id = state.event_types[0]["id"]
+    assert state.event_types[0]["title_en"] == "Discovery call"
+
+    # The admin re-submits the form with the EN fields cleared → both translations are removed.
+    await AdminState.update_event_type.fn(
+        state, {"id": event_type_id, "title_en": "", "description_en": "   "}
+    )
+
+    assert state.error == ""
+    assert state.event_types[0]["title_en"] == ""
+    assert state.event_types[0]["description_en"] == ""
+    # The canonical title, never in this payload, is untouched.
+    assert state.event_types[0]["title"] == "Introducción"
+
+
+async def test_update_event_type_blank_canonical_title_is_omitted_not_cleared(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # Canonical title/description stay omit-if-blank (NOT NULL in the DB): a present-but-blank
+    # canonical field must be a no-op, never an explicit None that would flush as a violation.
+    state = await _authenticated_state(seeded_maker)
+    await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
+    await AdminState.create_event_type.fn(
+        state,
+        {
+            "slug": "intro",
+            "title": "Introducción",
+            "schedule": "Weekly",
+            "duration_min": "30",
+            "max_advance_days": "30",
+        },
+    )
+    event_type_id = state.event_types[0]["id"]
+
+    await AdminState.update_event_type.fn(
+        state, {"id": event_type_id, "title": "", "duration_min": "45"}
+    )
+
+    assert state.error == ""
+    assert state.event_types[0]["title"] == "Introducción"  # blank canonical omitted, not cleared
+    assert state.event_types[0]["duration_min"] == "45"
 
 
 async def test_update_event_type_with_only_id_is_a_true_no_op(
