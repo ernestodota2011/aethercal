@@ -130,6 +130,14 @@ class ApschedulerTaskRunner:  # pragma: no cover - live
         )
         return cls(scheduler)
 
+    def start(self) -> None:
+        """Start the underlying scheduler so persisted reminders fire (called once, at boot)."""
+        self._scheduler.start()
+
+    def shutdown(self) -> None:
+        """Stop the scheduler without blocking on in-flight jobs (clean shutdown on teardown)."""
+        self._scheduler.shutdown(wait=False)
+
     def schedule(
         self,
         func: Callable[..., object],

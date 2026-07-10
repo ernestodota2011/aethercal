@@ -55,8 +55,11 @@ google = [
 ]
 
 # The agency admin CLI: `aethercal-admin create-tenant …` / `aethercal-admin issue-api-key …`.
+# `aethercal-serve` runs uvicorn on the env-built app factory (F1-12 self-host entrypoint):
+# it is equivalent to `uvicorn --factory aethercal.server.app:create_app_from_env`.
 [project.scripts]
 aethercal-admin = "aethercal.server.cli:app"
+aethercal-serve = "aethercal.server.app:serve"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]
