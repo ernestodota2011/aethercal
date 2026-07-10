@@ -21,7 +21,7 @@ from starlette.testclient import TestClient
 
 from aethercal.booking import app as booking_app
 from aethercal.booking.app import create_app
-from aethercal.booking.settings import BookingSettings
+from aethercal.booking.settings import DEFAULT_BASE_URL, BookingSettings
 from aethercal.client import AetherCalClient
 
 INTRO_ID = str(uuid.uuid4())
@@ -578,6 +578,73 @@ def test_reschedule_submit_succeeds() -> None:
     assert "reprogramada" in response.text.lower()
 
 
+# ---------------------------------------------------------------------------------------
+# A7: Open Graph/Twitter Card meta, favicon, and add-to-calendar links.
+# ---------------------------------------------------------------------------------------
+
+
+def test_home_page_includes_absolute_og_and_twitter_meta() -> None:
+    client, _ = _make_client()
+    response = client.get("/")
+    assert response.status_code == 200
+    assert f'content="{DEFAULT_BASE_URL}/static/og.png"' in response.text  # og:image, absolute
+    assert f'content="{DEFAULT_BASE_URL}/?lang=es"' in response.text  # og:url, absolute
+    assert 'content="es_ES"' in response.text  # og:locale
+    assert 'name="twitter:card"' in response.text
+    assert 'content="summary_large_image"' in response.text
+
+
+def test_event_page_includes_absolute_og_and_twitter_meta() -> None:
+    client, _ = _make_client()
+    response = client.get("/e/intro?tz=UTC")
+    assert response.status_code == 200
+    assert f'content="{DEFAULT_BASE_URL}/static/og.png"' in response.text
+    assert (
+        f"{DEFAULT_BASE_URL}/e/intro" in response.text
+    )  # og:url is absolute + points at this page
+
+
+def test_og_meta_uses_the_configured_base_url_not_just_the_default() -> None:
+    # Pins the actual `BookingSettings.base_url` wiring (not just views.py's own fallback
+    # default, which would mask this passing even if app.py never threaded the real value).
+    custom_base_url = "https://staging-book.example.com"
+    fake = FakeAPI()
+    settings = BookingSettings(
+        api_url="http://api.test", api_key=API_KEY, default_locale="es", base_url=custom_base_url
+    )
+    transport = httpx.MockTransport(fake.handler)
+
+    def client_factory() -> AetherCalClient:
+        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+
+    app = create_app(settings=settings, client_factory=client_factory)
+    client = TestClient(app)
+    response = client.get("/e/intro?tz=UTC")
+    assert response.status_code == 200
+    assert f'content="{custom_base_url}/static/og.png"' in response.text
+    assert DEFAULT_BASE_URL not in response.text
+
+
+def test_confirmation_page_includes_add_to_calendar_links() -> None:
+    client, _ = _make_client()
+    response = client.post(
+        "/e/intro/book",
+        data={
+            "start": "2026-07-14T13:00:00+00:00",
+            "tz": "America/New_York",
+            "lang": "en",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+        },
+    )
+    assert response.status_code == 200
+    assert "calendar.google.com/calendar/render" in response.text
+    assert "outlook.live.com/calendar/0/deeplink/compose" in response.text
+    # The fake backend's canned booking (see `_booking_json`) confirms 13:00Z-13:30Z.
+    assert "20260714T130000Z" in response.text
+    assert "20260714T133000Z" in response.text
+
+
 def test_robots_txt_disallows_everything_except_the_root() -> None:
     # A booking tool, not content SEO — noindex everything but the root (RNF audit minor).
     client, fake = _make_client()
@@ -895,6 +962,21 @@ def _assert_no_inline_scripts(html: str) -> None:
     for attrs, body in tags:
         assert "src=" in attrs, f"inline script with no src: <script{attrs}>{body}</script>"
         assert body.strip() == "", f"script tag carries an inline JS body: {body!r}"
+
+
+def test_static_favicon_is_served() -> None:
+    client, _ = _make_client()
+    response = client.get("/static/favicon.svg")
+    assert response.status_code == 200
+    assert "svg" in response.headers["content-type"].lower()
+    assert b"<svg" in response.content
+
+
+def test_home_page_includes_favicon_link() -> None:
+    client, _ = _make_client()
+    response = client.get("/")
+    assert 'rel="icon"' in response.text
+    assert 'href="/static/favicon.svg"' in response.text
 
 
 def test_static_htmx_bundle_is_served() -> None:

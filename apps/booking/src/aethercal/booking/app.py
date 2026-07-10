@@ -300,12 +300,13 @@ def _shifted_url(
     return f"{path}?{urlencode({**base, 'from': new_from.isoformat()})}"
 
 
-def _not_found(request: Request, locale: Locale) -> Response:
+def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
     body = views.message_page(
         locale,
         title=t(locale, "not_found_title"),
         message=t(locale, "not_found_body"),
         lang_urls=_lang_links_here(request),
+        base_url=base_url,
         is_error=True,
     )
     return HTMLResponse(views.render(body), status_code=404)
@@ -321,41 +322,6 @@ def _http_status_for(exc: Exception | None) -> int:
     if isinstance(exc, AetherCalAPIError) and 400 <= exc.status_code < 500:
         return exc.status_code
     return 503
-
-
-def _error_response(
-    locale: Locale,
-    *,
-    title: str,
-    exc: Exception | None,
-    lang_urls: dict[Locale, str],
-    retry: tuple[str, str] | None = None,
-) -> Response:
-    """A friendly, localized error page with the correct HTTP status — never leaks internals.
-
-    ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to times").
-    """
-    message = (
-        friendly_api_error(exc, locale)
-        if isinstance(exc, AetherCalAPIError)
-        else friendly_unexpected(locale)
-    )
-    status = _http_status_for(exc)
-    if status >= 500 and exc is not None:
-        # A backend 5xx, transport drop, or unexpected error — observable to ops, hidden from the
-        # guest. A clean client signal (409/403/404) is expected flow, not an error to log.
-        logger.error("booking page: backend failure rendering %r", title, exc_info=exc)
-    retry_url, retry_label = retry if retry is not None else (None, None)
-    body = views.message_page(
-        locale,
-        title=title,
-        message=message,
-        lang_urls=lang_urls,
-        back_url=retry_url,
-        back_label=retry_label,
-        is_error=True,
-    )
-    return HTMLResponse(views.render(body), status_code=status)
 
 
 def _register(app: FastHTML, path: str, handler: Callable[..., object], methods: list[str]) -> None:
@@ -387,6 +353,7 @@ class _BookingApp:
             title=t(locale, "app_name"),
             message=t(locale, "error_rate_limited"),
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
             is_error=True,
         )
         return HTMLResponse(views.render(body), status_code=429)
@@ -459,11 +426,50 @@ class _BookingApp:
             title=t(locale, "app_name"),
             message=t(locale, "error_generic"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
             back_url=retry_url,
             back_label=t(locale, "retry"),
             is_error=True,
         )
         return HTMLResponse(views.render(body), status_code=503)
+
+    def _error_response(
+        self,
+        locale: Locale,
+        *,
+        title: str,
+        exc: Exception | None,
+        lang_urls: dict[Locale, str],
+        retry: tuple[str, str] | None = None,
+    ) -> Response:
+        """A friendly, localized error page with the correct HTTP status — never leaks internals.
+
+        ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to
+        times"). A method (not a module function) so it can read ``self._settings.base_url``
+        without growing past the PLR0913 argument budget.
+        """
+        message = (
+            friendly_api_error(exc, locale)
+            if isinstance(exc, AetherCalAPIError)
+            else friendly_unexpected(locale)
+        )
+        status = _http_status_for(exc)
+        if status >= 500 and exc is not None:
+            # A backend 5xx, transport drop, or unexpected error — observable to ops, hidden from
+            # the guest. A clean client signal (409/403/404) is expected flow, not an error to log.
+            logger.error("booking page: backend failure rendering %r", title, exc_info=exc)
+        retry_url, retry_label = retry if retry is not None else (None, None)
+        body = views.message_page(
+            locale,
+            title=title,
+            message=message,
+            lang_urls=lang_urls,
+            base_url=self._settings.base_url,
+            back_url=retry_url,
+            back_label=retry_label,
+            is_error=True,
+        )
+        return HTMLResponse(views.render(body), status_code=status)
 
     # -- routes -------------------------------------------------------------------------
 
@@ -475,7 +481,12 @@ class _BookingApp:
                 locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
             )
         active = [event for event in events if event.active]
-        return views.index_page(locale, event_types=active, lang_urls=_lang_links_here(request))
+        return views.index_page(
+            locale,
+            event_types=active,
+            lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
+        )
 
     async def event(self, request: Request) -> object:
         locale = self._locale(request)
@@ -490,7 +501,7 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         section = await self._slots_section(found, tz, window_from, today, locale)
         # I4 (PRG): a 409 slot-conflict redirect from book_submit lands back here carrying
         # `?err=slot_unavailable` — render it as an inline notice, never re-post on a refresh.
@@ -511,6 +522,7 @@ class _BookingApp:
             slots_endpoint=f"/e/{slug}/slots",
             lang_urls=_lang_links_here(request),
             notice=notice,
+            base_url=self._settings.base_url,
         )
 
     async def slots_partial(self, request: Request) -> object:
@@ -530,7 +542,7 @@ class _BookingApp:
             return views.slots_unavailable_fragment(locale)
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         return await self._slots_section(found, tz, window_from, today, locale)
 
     async def book_form(self, request: Request) -> object:
@@ -545,7 +557,7 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         instant = _parse_instant(start)
         if instant is None:
             return RedirectResponse(
@@ -562,6 +574,7 @@ class _BookingApp:
             errors=[],
             action=f"/e/{slug}/book",
             lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+            base_url=self._settings.base_url,
         )
 
     def _book_submit_guard(
@@ -584,6 +597,7 @@ class _BookingApp:
                 title=t(locale, "app_name"),
                 message=t(locale, "honeypot_received_message"),
                 lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+                base_url=self._settings.base_url,
             )
         return None
 
@@ -624,6 +638,7 @@ class _BookingApp:
                 errors=result.errors,
                 action=f"/e/{slug}/book",
                 lang_urls=lang_urls,
+                base_url=self._settings.base_url,
             )
         try:
             booking = await self._call(lambda c: c.create_booking(booking_create))
@@ -636,7 +651,7 @@ class _BookingApp:
                     status_code=303,
                 )
             back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
-            return _error_response(
+            return self._error_response(
                 locale,
                 title=resolve_title(event, locale),
                 exc=exc,
@@ -649,6 +664,7 @@ class _BookingApp:
             booking=booking,
             when_label=label,
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def book_submit(self, request: Request) -> object:
@@ -669,7 +685,7 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         return await self._complete_booking(request, form=form, event=found, locale=locale, tz=tz)
 
     async def cancel_form(self, request: Request) -> object:
@@ -682,6 +698,7 @@ class _BookingApp:
                 title=t(locale, "cancel_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         return views.cancel_confirm_page(
@@ -690,6 +707,7 @@ class _BookingApp:
             token=token,
             action="/cancel",
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def cancel_submit(self, request: Request) -> object:
@@ -707,19 +725,24 @@ class _BookingApp:
                 title=t(locale, "cancel_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         try:
             await self._call(lambda c: c.cancel_booking(booking_id, token=token))
         except Exception as exc:
-            return _error_response(
-                locale, title=t(locale, "cancel_title"), exc=exc, lang_urls=lang_urls
+            return self._error_response(
+                locale,
+                title=t(locale, "cancel_title"),
+                exc=exc,
+                lang_urls=lang_urls,
             )
         return views.message_page(
             locale,
             title=t(locale, "cancel_title"),
             message=t(locale, "cancel_done"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
         )
 
     async def reschedule_form(self, request: Request) -> object:
@@ -733,6 +756,7 @@ class _BookingApp:
                 title=t(locale, "reschedule_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         tz, tz_explicit = _tz_of(request)
@@ -783,6 +807,7 @@ class _BookingApp:
             hidden=hidden,
             section=section,
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def reschedule_submit(self, request: Request) -> object:
@@ -801,6 +826,7 @@ class _BookingApp:
                 title=t(locale, "reschedule_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         try:
@@ -808,14 +834,18 @@ class _BookingApp:
                 lambda c: c.reschedule_booking(booking_id, new_start=new_start, token=token)
             )
         except Exception as exc:
-            return _error_response(
-                locale, title=t(locale, "reschedule_title"), exc=exc, lang_urls=lang_urls
+            return self._error_response(
+                locale,
+                title=t(locale, "reschedule_title"),
+                exc=exc,
+                lang_urls=lang_urls,
             )
         return views.message_page(
             locale,
             title=t(locale, "reschedule_title"),
             message=t(locale, "reschedule_done"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
         )
 
     def robots_txt(self, request: Request) -> Response:
@@ -836,7 +866,7 @@ class _BookingApp:
         Registered LAST in ``create_app`` so every specific route still matches first — this only
         catches what nothing else did.
         """
-        return _not_found(request, self._locale(request))
+        return _not_found(request, self._locale(request), base_url=self._settings.base_url)
 
 
 def create_app(

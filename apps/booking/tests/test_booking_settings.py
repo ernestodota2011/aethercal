@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aethercal.booking.settings import DEFAULT_API_URL, BookingSettings
+from aethercal.booking.settings import DEFAULT_API_URL, DEFAULT_BASE_URL, BookingSettings
 
 
 def test_from_env_uses_defaults_when_absent() -> None:
@@ -38,3 +38,13 @@ def test_from_env_treats_blank_api_key_as_absent() -> None:
 def test_from_env_falls_back_to_es_for_unsupported_locale() -> None:
     settings = BookingSettings.from_env({"AETHERCAL_BOOKING_DEFAULT_LOCALE": "fr"})
     assert settings.default_locale == "es"
+
+
+def test_from_env_uses_default_base_url_when_absent() -> None:
+    settings = BookingSettings.from_env({})
+    assert settings.base_url == DEFAULT_BASE_URL
+
+
+def test_from_env_reads_base_url_and_strips_trailing_slash() -> None:
+    settings = BookingSettings.from_env({"AETHERCAL_BOOKING_BASE_URL": "https://book.example.com/"})
+    assert settings.base_url == "https://book.example.com"

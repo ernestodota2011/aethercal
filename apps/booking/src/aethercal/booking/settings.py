@@ -16,9 +16,17 @@ from aethercal.booking.i18n import DEFAULT_LOCALE, Locale, normalize_locale
 #: Where the booking page looks for the API when ``AETHERCAL_API_URL`` is unset (local dev).
 DEFAULT_API_URL = "http://127.0.0.1:8000"
 
+#: The booking page's own public base URL, used to mint ABSOLUTE urls (Open Graph/Twitter Card
+#: ``og:url``/``og:image``) — a bare relative path is meaningless to a social unfurler or crawler,
+#: which has no request context of its own. Defaults to the agency's production instance;
+#: self-hosted deployments override it with ``AETHERCAL_BOOKING_BASE_URL`` (the same variable name
+#: the API server reads for guest links, so the two only need to agree once per deployment).
+DEFAULT_BASE_URL = "https://book.aetherlogik.com"
+
 _ENV_API_URL = "AETHERCAL_API_URL"
 _ENV_API_KEY = "AETHERCAL_API_KEY"
 _ENV_DEFAULT_LOCALE = "AETHERCAL_BOOKING_DEFAULT_LOCALE"
+_ENV_BASE_URL = "AETHERCAL_BOOKING_BASE_URL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +36,7 @@ class BookingSettings:
     api_url: str
     api_key: str | None
     default_locale: Locale
+    base_url: str = DEFAULT_BASE_URL
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> BookingSettings:
@@ -36,7 +45,12 @@ class BookingSettings:
         raw_key = environ.get(_ENV_API_KEY, "").strip()
         api_key = raw_key or None
         default_locale = normalize_locale(environ.get(_ENV_DEFAULT_LOCALE)) or DEFAULT_LOCALE
-        return cls(api_url=api_url, api_key=api_key, default_locale=default_locale)
+        base_url = (
+            environ.get(_ENV_BASE_URL, DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+        )
+        return cls(
+            api_url=api_url, api_key=api_key, default_locale=default_locale, base_url=base_url
+        )
 
 
-__all__ = ["DEFAULT_API_URL", "BookingSettings"]
+__all__ = ["DEFAULT_API_URL", "DEFAULT_BASE_URL", "BookingSettings"]

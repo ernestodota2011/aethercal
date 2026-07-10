@@ -18,6 +18,7 @@ need to inject pre-rendered markup (e.g. tests composing a page shell around a r
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
@@ -60,6 +61,7 @@ from fasthtml.common import (
 
 from aethercal.booking.forms import FieldError, QuestionSpec, question_field_name
 from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
+from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
@@ -210,16 +212,63 @@ def _hreflang_links(lang_urls: Mapping[Locale, str]) -> list[Any]:
     return links
 
 
-def page(locale: Locale, title: str, *content: Any, lang_urls: Mapping[Locale, str]) -> Any:
-    """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``."""
+#: Locale → Open Graph ``og:locale`` tag (RFC-ish ``language_TERRITORY`` form platforms expect).
+_OG_LOCALE: dict[Locale, str] = {"es": "es_ES", "en": "en_US"}
+
+#: The social-preview image every page references (absolute, since an unfurler has no request
+#: context of its own). The file itself is generated/uploaded separately — this module only wires
+#: the path.
+_OG_IMAGE_PATH = "/static/og.png"
+
+
+def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url: str) -> list[Any]:
+    """Open Graph + Twitter Card ``<meta>`` tags (A7) — every url is absolute (``base_url``-
+    prefixed) so a social unfurler (WhatsApp/email/Slack) fetched out-of-band still resolves them.
+    """
+    description = t(locale, "meta_description")
+    image_url = f"{base_url}{_OG_IMAGE_PATH}"
+    return [
+        Meta(property="og:title", content=full_title),
+        Meta(property="og:description", content=description),
+        Meta(property="og:type", content="website"),
+        Meta(property="og:site_name", content=t(locale, "app_name")),
+        Meta(property="og:url", content=current_url),
+        Meta(property="og:image", content=image_url),
+        Meta(property="og:locale", content=_OG_LOCALE.get(locale, _OG_LOCALE[DEFAULT_LOCALE])),
+        Meta(name="twitter:card", content="summary_large_image"),
+        Meta(name="twitter:title", content=full_title),
+        Meta(name="twitter:description", content=description),
+        Meta(name="twitter:image", content=image_url),
+    ]
+
+
+def page(
+    locale: Locale,
+    title: str,
+    *content: Any,
+    lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
+) -> Any:
+    """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
+
+    ``base_url`` mints the ABSOLUTE urls Open Graph/Twitter Card tags require (A7); callers that
+    don't thread a real ``BookingSettings.base_url`` through still get the production default
+    rather than a meaningless bare relative path.
+    """
+    full_title = f"{title} · {t(locale, 'app_name')}"
+    current_url = f"{base_url}{lang_urls.get(locale, '')}"
     return Html(
         Head(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
             Meta(name="description", content=t(locale, "meta_description")),
-            Title(f"{title} · {t(locale, 'app_name')}"),
+            *_social_meta(
+                locale, full_title=full_title, base_url=base_url, current_url=current_url
+            ),
+            Title(full_title),
             *_hreflang_links(lang_urls),
+            Link(rel="icon", type="image/svg+xml", href="/static/favicon.svg"),
             Style(_CSS),
             Script(src=_HTMX_SRC, defer=True),
         ),
@@ -247,6 +296,7 @@ def index_page(
     *,
     event_types: Sequence[EventTypeRead],
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """Landing page: the tenant's bookable meeting types, each linking into the booking flow."""
     if not event_types:
@@ -271,6 +321,7 @@ def index_page(
             H1(t(locale, "index_title")), P(t(locale, "index_lead"), cls="lead"), body, cls="stack"
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -358,6 +409,7 @@ def event_page(
     slots_endpoint: str,
     lang_urls: Mapping[Locale, str],
     notice: str | None = None,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
 
@@ -386,6 +438,7 @@ def event_page(
         ),
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -583,6 +636,7 @@ def booking_form_page(
     errors: Sequence[FieldError],
     action: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """Step 2: name, email, notes, and questions — re-renders inline errors on failure."""
     field_errors = _errors_by_field(errors)
@@ -661,6 +715,80 @@ def booking_form_page(
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
+    )
+
+
+def _calendar_details(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """A short plain-text body for the add-to-calendar links: the event description (if any),
+    plus the meeting link (if any) on its own line so it stays clickable in the guest's calendar
+    app."""
+    parts: list[str] = []
+    description = resolve_description(event, locale)
+    if description:
+        parts.append(description)
+    if booking.meeting_url:
+        parts.append(booking.meeting_url)
+    return "\n".join(parts)
+
+
+def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """A Google Calendar "quick add" deep link pre-filled with the confirmed booking (M-F3)."""
+
+    def google_dt(instant: datetime) -> str:
+        return instant.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+    params = {
+        "action": "TEMPLATE",
+        "text": resolve_title(event, locale),
+        "dates": f"{google_dt(booking.start)}/{google_dt(booking.end)}",
+        "details": _calendar_details(locale, event, booking),
+    }
+    if event.location:
+        params["location"] = event.location
+    return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
+
+
+def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """An Outlook Web "compose event" deep link pre-filled with the confirmed booking (M-F3)."""
+
+    def outlook_dt(instant: datetime) -> str:
+        return instant.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "subject": resolve_title(event, locale),
+        "startdt": outlook_dt(booking.start),
+        "enddt": outlook_dt(booking.end),
+        "body": _calendar_details(locale, event, booking),
+        "path": "/calendar/action/compose",
+        "rru": "addevent",
+    }
+    if event.location:
+        params["location"] = event.location
+    return f"https://outlook.live.com/calendar/0/deeplink/compose?{urlencode(params)}"
+
+
+def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: BookingRead) -> Any:
+    """The "add to calendar" links (M-F3): Google + Outlook deep links, no server round-trip."""
+    return Div(
+        H2(t(locale, "add_to_calendar_heading")),
+        Div(
+            A(
+                t(locale, "add_to_calendar_google"),
+                href=_google_calendar_url(locale, event, booking),
+                cls="btn secondary",
+                target="_blank",
+                rel="noopener noreferrer",
+            ),
+            A(
+                t(locale, "add_to_calendar_outlook"),
+                href=_outlook_calendar_url(locale, event, booking),
+                cls="btn secondary",
+                target="_blank",
+                rel="noopener noreferrer",
+            ),
+            cls="pager",
+        ),
     )
 
 
@@ -671,8 +799,10 @@ def confirmation_page(
     booking: BookingRead,
     when_label: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
-    """Step 3: a clear confirmation with the essentials (when, meeting link, email note)."""
+    """Step 3: a clear confirmation with the essentials (when, meeting link, email note) plus
+    add-to-calendar links (M-F3)."""
     summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
     if event.location:
         summary.append(Dd(event.location, cls="meta"))
@@ -686,9 +816,11 @@ def confirmation_page(
             H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
             Dl(*summary, cls="summary"),
             P(t(locale, "confirmed_email_note", email=booking.guest_email), cls="lead"),
+            _add_to_calendar_section(locale, event, booking),
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -706,12 +838,13 @@ def message_page(
     back_url: str | None = None,
     back_label: str | None = None,
     is_error: bool = False,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """A minimal, friendly single-message page (errors, not-found, done states) — never leaks."""
     body: list[Any] = [H1(title), Div(message, cls="notice error" if is_error else "notice")]
     if back_url and back_label:
         body.append(A(back_label, href=back_url, cls="btn secondary"))
-    return page(locale, title, Div(*body, cls="stack"), lang_urls=lang_urls)
+    return page(locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url)
 
 
 def cancel_confirm_page(
@@ -721,6 +854,7 @@ def cancel_confirm_page(
     token: str,
     action: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """The cancel confirmation: a POST form carrying the booking id + guest token."""
     form = Form(
@@ -742,6 +876,7 @@ def cancel_confirm_page(
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -800,6 +935,7 @@ def reschedule_page(
     hidden: Sequence[tuple[str, str]],
     section: Any,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """The reschedule flow: a timezone control plus the slot section (times POST ``new_start``)."""
     return page(
@@ -814,6 +950,7 @@ def reschedule_page(
         ),
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 

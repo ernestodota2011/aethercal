@@ -15,6 +15,7 @@ from fasthtml.common import to_xml
 
 from aethercal.booking import views
 from aethercal.booking.forms import FieldError, parse_questions
+from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, SlotChoice
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead
@@ -93,6 +94,58 @@ def test_page_shell_includes_meta_description_and_hreflang_alternates() -> None:
     assert 'href="/e/intro?lang=es"' in html
     assert 'href="/e/intro?lang=en"' in html
     assert 'hreflang="x-default"' in html
+
+
+def test_page_shell_includes_og_and_twitter_meta_with_absolute_urls() -> None:
+    # A7: a guest pasting the link into WhatsApp/email must see a real title, description, and
+    # image — every og:/twitter: value that points at "this page" must be an ABSOLUTE url, since
+    # an unfurler fetches out-of-band with no request context of its own.
+    html = to_xml(
+        views.page(
+            "es",
+            "Reserva",
+            views.NotStr("<p>hi</p>"),
+            lang_urls=LANG_URLS,
+            base_url="https://book.aetherlogik.test",
+        )
+    )
+    assert 'property="og:title"' in html
+    assert 'content="Reserva · AetherCal"' in html  # og:title/twitter:title share this value
+    assert 'property="og:description"' in html
+    assert 'property="og:type"' in html
+    assert 'content="website"' in html
+    assert 'property="og:site_name"' in html
+    assert 'property="og:url"' in html
+    assert 'content="https://book.aetherlogik.test/e/intro?lang=es"' in html
+    assert 'property="og:image"' in html
+    assert 'content="https://book.aetherlogik.test/static/og.png"' in html
+    assert 'name="twitter:card"' in html
+    assert 'content="summary_large_image"' in html
+    assert 'name="twitter:title"' in html
+    assert 'name="twitter:description"' in html
+    assert 'name="twitter:image"' in html
+
+
+def test_page_shell_og_locale_matches_the_active_locale() -> None:
+    es_html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    en_html = to_xml(views.page("en", "Book", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert 'content="es_ES"' in es_html
+    assert 'content="en_US"' in en_html
+
+
+def test_page_shell_defaults_base_url_when_not_given() -> None:
+    # Callers that don't thread a real settings value through still get an absolute url pointing
+    # at the real production instance, never a bare relative path.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert f'content="{DEFAULT_BASE_URL}/static/og.png"' in html
+    assert f'content="{DEFAULT_BASE_URL}/e/intro?lang=es"' in html
+
+
+def test_page_shell_includes_favicon_link() -> None:
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert 'rel="icon"' in html
+    assert 'type="image/svg+xml"' in html
+    assert 'href="/static/favicon.svg"' in html
 
 
 def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
@@ -341,6 +394,59 @@ def test_confirmation_shows_details_and_meeting_link() -> None:
     assert "Tuesday, July 14 at 9:00 AM" in html
     assert "ada@example.com" in html
     assert "https://meet.example/xyz" in html
+
+
+def test_confirmation_includes_add_to_calendar_links_with_correct_dates() -> None:
+    # M-F3: Google's `dates` param is `YYYYMMDDTHHMMSSZ`/`YYYYMMDDTHHMMSSZ` in UTC, built from the
+    # booking's actual start/end — never the display-formatted `when_label`.
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_event(title="Intro Call"),
+            booking=_booking(),  # start 13:00Z, end 13:30Z
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "calendar.google.com/calendar/render" in html
+    assert "action=TEMPLATE" in html
+    assert "20260714T130000Z" in html
+    assert "20260714T133000Z" in html
+    assert "outlook.live.com/calendar/0/deeplink/compose" in html
+    assert "2026-07-14T13%3A00%3A00Z" in html  # startdt, url-encoded
+    assert "2026-07-14T13%3A30%3A00Z" in html  # enddt, url-encoded
+
+
+def test_confirmation_calendar_links_use_localized_event_title() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "text=Discovery+call" in html  # Google's `text` param
+    assert "subject=Discovery+call" in html  # Outlook's `subject` param
+    assert "Llamada+de+descubrimiento" not in html
+
+
+def test_confirmation_calendar_link_labels_are_localized() -> None:
+    html_en = to_xml(
+        views.confirmation_page(
+            "en", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+        )
+    )
+    assert "Add to Google Calendar" in html_en
+    assert "Add to Outlook" in html_en
+    html_es = to_xml(
+        views.confirmation_page(
+            "es", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+        )
+    )
+    assert "Agregar a Google Calendar" in html_es
+    assert "Agregar a Outlook" in html_es
 
 
 def test_reschedule_section_slot_buttons_carry_localized_day_aria_label() -> None:
