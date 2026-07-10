@@ -78,6 +78,58 @@ def test_event_type_row_renders_duration_in_minutes_and_active_flag() -> None:
     assert row["active"] == "yes"
 
 
+def test_event_type_row_surfaces_the_en_translation_override() -> None:
+    event = EventTypeRead(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        host_id=uuid.uuid4(),
+        schedule_id=uuid.uuid4(),
+        slug="intro",
+        title="Introducción",
+        description="Una breve introducción.",
+        title_translations={"en": "Discovery call"},
+        description_translations={"en": "A quick intro."},
+        location=None,
+        duration_seconds=1800,
+        buffer_before_seconds=0,
+        buffer_after_seconds=0,
+        min_notice_seconds=0,
+        max_advance_seconds=86400,
+        increment_seconds=None,
+        max_per_day=None,
+        questions=[],
+        active=True,
+    )
+    row = event_type_row(event)
+    assert row["title_en"] == "Discovery call"
+    assert row["description_en"] == "A quick intro."
+
+
+def test_event_type_row_en_fields_are_blank_with_no_override() -> None:
+    event = EventTypeRead(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        host_id=uuid.uuid4(),
+        schedule_id=uuid.uuid4(),
+        slug="intro",
+        title="Intro",
+        description=None,
+        location=None,
+        duration_seconds=1800,
+        buffer_before_seconds=0,
+        buffer_after_seconds=0,
+        min_notice_seconds=0,
+        max_advance_seconds=86400,
+        increment_seconds=None,
+        max_per_day=None,
+        questions=[],
+        active=True,
+    )
+    row = event_type_row(event)
+    assert row["title_en"] == ""
+    assert row["description_en"] == ""
+
+
 def test_schedule_row_lists_its_open_weekdays() -> None:
     schedule = ScheduleRead(
         id=uuid.uuid4(),

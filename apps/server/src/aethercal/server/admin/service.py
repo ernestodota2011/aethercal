@@ -21,7 +21,7 @@ resolves the single tenant to pass down.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
@@ -84,6 +84,10 @@ class EventTypeForm:
     duration_seconds: int
     max_advance_seconds: int
     description: str | None = None
+    # Sparse ``{"en": ...}`` overrides (A4); ``title``/``description`` above stay the canonical
+    # (Spanish) text. Empty by default so a create with no EN override stores no translation key.
+    title_translations: dict[str, str] = field(default_factory=dict)
+    description_translations: dict[str, str] = field(default_factory=dict)
     location: str | None = None
     buffer_before_seconds: int = 0
     buffer_after_seconds: int = 0
@@ -259,6 +263,8 @@ async def create_event_type_action(
                 slug=form.slug,
                 title=form.title,
                 description=form.description,
+                title_translations=form.title_translations,
+                description_translations=form.description_translations,
                 location=form.location,
                 duration_seconds=form.duration_seconds,
                 buffer_before_seconds=form.buffer_before_seconds,

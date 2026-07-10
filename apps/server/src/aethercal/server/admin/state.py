@@ -81,6 +81,44 @@ def _clean(form_data: dict[str, str], key: str) -> str:
     return str(form_data.get(key, "")).strip()
 
 
+def _en_translation(form_data: dict[str, str], key: str) -> dict[str, str]:
+    """A sparse ``{"en": value}`` translation map from a form field; blank → ``{}`` (A4).
+
+    Blank never persists an ``"en"`` key at all — an empty override is not a meaningful override
+    (mirrors :func:`aethercal.schemas.event_types.resolve_title`'s own "blank falls back" rule).
+    """
+    value = _clean(form_data, key)
+    return {"en": value} if value else {}
+
+
+#: Values a checkbox form field carries when checked (radix Checkbox submits ``"on"``; other truthy
+#: spellings are accepted defensively). Unchecked omits the field entirely → not in this set.
+_CHECKED_VALUES = frozenset({"on", "true", "1", "yes"})
+
+
+def _is_checked(form_data: dict[str, str], key: str) -> bool:
+    """Whether a checkbox form field is checked (present with a truthy value)."""
+    return _clean(form_data, key).lower() in _CHECKED_VALUES
+
+
+def _translation_update(
+    form_data: dict[str, str], *, value_key: str, clear_key: str
+) -> dict[str, str] | None:
+    """The translation-map update for one EN field on the UPDATE form, or ``None`` to leave the
+    stored map UNTOUCHED.
+
+    Removal is EXPLICIT, never implicit: only the ``clear_key`` checkbox empties a translation
+    (``{}``), and it wins over any typed value. A new non-blank value sets ``{"en": value}``. A
+    blank field with the checkbox unchecked returns ``None`` → the field is omitted from the update
+    payload, PRESERVING the existing override — so editing another field (e.g. duration) can never
+    silently drop a saved translation.
+    """
+    if _is_checked(form_data, clear_key):
+        return {}
+    value = _clean(form_data, value_key)
+    return {"en": value} if value else None
+
+
 # --------------------------------------------------------------------------------------
 # Fetch helpers (free functions the handlers await).
 # --------------------------------------------------------------------------------------
@@ -271,6 +309,8 @@ class AdminState(rx.State):
                 schedule_id=_schedule_id(self.schedules, _clean(form_data, "schedule")),
                 duration_seconds=int(_clean(form_data, "duration_min")) * 60,
                 max_advance_seconds=int(_clean(form_data, "max_advance_days")) * 86_400,
+                title_translations=_en_translation(form_data, "title_en"),
+                description_translations=_en_translation(form_data, "description_en"),
             )
             await service.create_event_type_action(
                 runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
@@ -282,15 +322,42 @@ class AdminState(rx.State):
 
     @rx.event
     async def update_event_type(self, form_data: dict[str, str]) -> None:
-        """Update an event type's title and/or duration (blank fields are left unchanged)."""
+        """Update an event type's title/duration/EN translations.
+
+        CANONICAL fields (``title``, ``duration``) are OMITTED from the payload when blank, never
+        sent as an explicit ``None`` — ``title`` is NOT NULL in the DB, so a blank-means-``None``
+        payload would flush as a constraint violation instead of a no-op (the bug this fixed while
+        wiring the EN translations through, A4).
+
+        TRANSLATION fields (EN) DEFAULT TO PRESERVE: a blank EN field leaves the stored override
+        untouched, so editing another field (e.g. duration) never silently drops a saved
+        translation. A new value SETS it; removal is EXPLICIT via a per-field "clear" checkbox
+        (``clear_title_en`` / ``clear_description_en``) → ``{}`` (see :func:`_translation_update`).
+        ``EventTypeUpdate.model_validate`` marks only the keys present in ``update_fields`` as
+        "set", matching the ``exclude_unset`` contract the service relies on.
+        """
         if not self._authenticated:
             return
         runtime = current_runtime()
         try:
-            title = _clean(form_data, "title") or None
+            update_fields: dict[str, str | int | dict[str, str]] = {}
+            title = _clean(form_data, "title")
+            if title:
+                update_fields["title"] = title
             duration_raw = _clean(form_data, "duration_min")
-            duration = int(duration_raw) * 60 if duration_raw else None
-            data = EventTypeUpdate(title=title, duration_seconds=duration)
+            if duration_raw:
+                update_fields["duration_seconds"] = int(duration_raw) * 60
+            title_tr = _translation_update(
+                form_data, value_key="title_en", clear_key="clear_title_en"
+            )
+            if title_tr is not None:
+                update_fields["title_translations"] = title_tr
+            description_tr = _translation_update(
+                form_data, value_key="description_en", clear_key="clear_description_en"
+            )
+            if description_tr is not None:
+                update_fields["description_translations"] = description_tr
+            data = EventTypeUpdate.model_validate(update_fields)
             await service.update_event_type_action(
                 runtime.sessionmaker,
                 tenant_slug=runtime.config.tenant_slug,

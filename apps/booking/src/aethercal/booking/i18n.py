@@ -62,6 +62,9 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "confirmed_when": "Cuándo",
         "confirmed_email_note": "Te enviamos los detalles a {email}.",
         "confirmed_meeting_link": "Enlace de la reunión",
+        "add_to_calendar_heading": "Agregar a tu calendario",
+        "add_to_calendar_google": "Agregar a Google Calendar",
+        "add_to_calendar_outlook": "Agregar a Outlook",
         "cancel_title": "Cancelar la cita",
         "cancel_prompt": "¿Seguro que quieres cancelar esta cita?",
         "cancel_confirm": "Sí, cancelar",
@@ -78,6 +81,11 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "error_link_invalid": "Este enlace expiró o no es válido. Solicita uno nuevo.",
         "error_not_active": "Esta cita ya no se puede modificar.",
         "error_generic": "Algo salió mal. Vuelve a intentarlo en unos minutos.",
+        "error_rate_limited": "Demasiadas solicitudes. Espera un momento e inténtalo de nuevo.",
+        "honeypot_received_message": (
+            "Gracias. Hemos recibido tu solicitud y te contactaremos pronto."
+        ),
+        "meta_description": "Reserva tu cita en línea de forma rápida y sencilla con AetherCal.",
         "footer_powered": "Con la tecnología de AetherCal",
     },
     "en": {
@@ -123,6 +131,9 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "confirmed_when": "When",
         "confirmed_email_note": "We've sent the details to {email}.",
         "confirmed_meeting_link": "Meeting link",
+        "add_to_calendar_heading": "Add to your calendar",
+        "add_to_calendar_google": "Add to Google Calendar",
+        "add_to_calendar_outlook": "Add to Outlook",
         "cancel_title": "Cancel booking",
         "cancel_prompt": "Are you sure you want to cancel this booking?",
         "cancel_confirm": "Yes, cancel",
@@ -139,6 +150,11 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "error_link_invalid": "This link has expired or is invalid. Please request a new one.",
         "error_not_active": "This booking can no longer be changed.",
         "error_generic": "Something went wrong. Please try again in a few minutes.",
+        "error_rate_limited": "Too many requests. Please wait a moment and try again.",
+        "honeypot_received_message": (
+            "Thank you. We've received your request and will be in touch soon."
+        ),
+        "meta_description": "Book your appointment online, quickly and easily, with AetherCal.",
         "footer_powered": "Powered by AetherCal",
     },
 }

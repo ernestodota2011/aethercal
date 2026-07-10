@@ -9,12 +9,16 @@ attribute, semantic landmarks, labelled inputs, and ``aria-describedby`` wiring 
 FastHTML ships no type stubs, so the tag constructors are untyped upstream; builders are annotated
 ``-> Any`` (the strict-mode unknown-type family is silenced in ``pyright`` config) while every
 parameter this module owns is fully typed. Text passed to tag constructors is auto-escaped by
-FastHTML; the only raw string we inject is the timezone-detection script (via ``NotStr``).
+FastHTML. Every ``<script>`` this module emits (htmx, the timezone-detection script) is
+externally sourced (``src=``) with no inline body — required for the app's ``script-src 'self'``
+CSP (see ``app.py``'s security-headers middleware). ``NotStr`` stays exported for callers that
+need to inject pre-rendered markup (e.g. tests composing a page shell around a raw fragment).
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
@@ -37,6 +41,7 @@ from fasthtml.common import (
     Input,
     Label,
     Li,
+    Link,
     Main,
     Meta,
     Nav,
@@ -55,15 +60,18 @@ from fasthtml.common import (
 )
 
 from aethercal.booking.forms import FieldError, QuestionSpec, question_field_name
-from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, t
-from aethercal.booking.timefmt import DayGroup
+from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
+from aethercal.booking.settings import DEFAULT_BASE_URL
+from aethercal.booking.timefmt import DayGroup, slot_aria_label
 from aethercal.schemas.bookings import BookingRead
-from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
 from aethercal.schemas.slots import Availability
 
-# Served from the htmx CDN (deferred). Everything works WITHOUT it — the flow is plain forms; htmx
-# only live-swaps the slot list when the guest changes timezone. An integrator may self-host this.
-_HTMX_SRC = "https://unpkg.com/htmx.org@2.0.4"
+# Self-hosted (vendored at `static/htmx-2.0.4.min.js`, served by the app itself via `/static`) —
+# never a third-party CDN, so the page has no external script dependency and can run a strict
+# `script-src 'self'` CSP. Everything works WITHOUT it — the flow is plain forms; htmx only
+# live-swaps the slot list when the guest changes timezone.
+_HTMX_SRC = "/static/htmx-2.0.4.min.js"
 
 # Premium-dark, brand-warm (ember accent) — deliberately NOT the lavender/violet/cyan-glow AI-slop
 # palette. Boxless: hairline separators + air, not stacked cards. Light mode is provided for
@@ -189,14 +197,78 @@ def _footer(locale: Locale) -> Any:
     return Footer(P(t(locale, "footer_powered")), cls="site-footer")
 
 
-def page(locale: Locale, title: str, *content: Any, lang_urls: Mapping[Locale, str]) -> Any:
-    """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``."""
+def _hreflang_links(lang_urls: Mapping[Locale, str]) -> list[Any]:
+    """``<link rel="alternate" hreflang="...">`` for every locale ``page()`` was given a URL for,
+    plus ``x-default`` pointing at the default-locale URL — so a crawler (and any client that
+    parses it) knows the current page's URL in each language (RNF-1: ES primary + EN)."""
+    links = [
+        Link(rel="alternate", hreflang=candidate, href=lang_urls[candidate])
+        for candidate in SUPPORTED_LOCALES
+        if candidate in lang_urls
+    ]
+    default_url = lang_urls.get(DEFAULT_LOCALE)
+    if default_url:
+        links.append(Link(rel="alternate", hreflang="x-default", href=default_url))
+    return links
+
+
+#: Locale → Open Graph ``og:locale`` tag (RFC-ish ``language_TERRITORY`` form platforms expect).
+_OG_LOCALE: dict[Locale, str] = {"es": "es_ES", "en": "en_US"}
+
+#: The social-preview image every page references (absolute, since an unfurler has no request
+#: context of its own). The file itself is generated/uploaded separately — this module only wires
+#: the path.
+_OG_IMAGE_PATH = "/static/og.png"
+
+
+def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url: str) -> list[Any]:
+    """Open Graph + Twitter Card ``<meta>`` tags (A7) — every url is absolute (``base_url``-
+    prefixed) so a social unfurler (WhatsApp/email/Slack) fetched out-of-band still resolves them.
+    """
+    description = t(locale, "meta_description")
+    image_url = f"{base_url}{_OG_IMAGE_PATH}"
+    return [
+        Meta(property="og:title", content=full_title),
+        Meta(property="og:description", content=description),
+        Meta(property="og:type", content="website"),
+        Meta(property="og:site_name", content=t(locale, "app_name")),
+        Meta(property="og:url", content=current_url),
+        Meta(property="og:image", content=image_url),
+        Meta(property="og:locale", content=_OG_LOCALE.get(locale, _OG_LOCALE[DEFAULT_LOCALE])),
+        Meta(name="twitter:card", content="summary_large_image"),
+        Meta(name="twitter:title", content=full_title),
+        Meta(name="twitter:description", content=description),
+        Meta(name="twitter:image", content=image_url),
+    ]
+
+
+def page(
+    locale: Locale,
+    title: str,
+    *content: Any,
+    lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
+) -> Any:
+    """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
+
+    ``base_url`` mints the ABSOLUTE urls Open Graph/Twitter Card tags require (A7); callers that
+    don't thread a real ``BookingSettings.base_url`` through still get the production default
+    rather than a meaningless bare relative path.
+    """
+    full_title = f"{title} · {t(locale, 'app_name')}"
+    current_url = f"{base_url}{lang_urls.get(locale, '')}"
     return Html(
         Head(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
-            Title(f"{title} · {t(locale, 'app_name')}"),
+            Meta(name="description", content=t(locale, "meta_description")),
+            *_social_meta(
+                locale, full_title=full_title, base_url=base_url, current_url=current_url
+            ),
+            Title(full_title),
+            *_hreflang_links(lang_urls),
+            Link(rel="icon", type="image/svg+xml", href="/static/favicon.svg"),
             Style(_CSS),
             Script(src=_HTMX_SRC, defer=True),
         ),
@@ -224,6 +296,7 @@ def index_page(
     *,
     event_types: Sequence[EventTypeRead],
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """Landing page: the tenant's bookable meeting types, each linking into the booking flow."""
     if not event_types:
@@ -231,7 +304,11 @@ def index_page(
     else:
         items = [
             Li(
-                A(event.title, href=_with_lang(f"/e/{event.slug}", locale), cls="brand"),
+                A(
+                    resolve_title(event, locale),
+                    href=_with_lang(f"/e/{event.slug}", locale),
+                    cls="brand",
+                ),
                 Div(_duration_label(locale, event), cls="meta"),
             )
             for event in event_types
@@ -244,6 +321,7 @@ def index_page(
             H1(t(locale, "index_title")), P(t(locale, "index_lead"), cls="lead"), body, cls="stack"
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -251,9 +329,10 @@ def _event_intro(locale: Locale, event: EventTypeRead) -> Any:
     meta_parts = [_duration_label(locale, event)]
     if event.location:
         meta_parts.append(event.location)
-    bits: list[Any] = [H1(event.title), P(" · ".join(meta_parts), cls="meta")]
-    if event.description:
-        bits.append(P(event.description, cls="lead"))
+    bits: list[Any] = [H1(resolve_title(event, locale)), P(" · ".join(meta_parts), cls="meta")]
+    description = resolve_description(event, locale)
+    if description:
+        bits.append(P(description, cls="lead"))
     return Div(*bits)
 
 
@@ -303,19 +382,18 @@ def _tz_form(
 
 
 def _detect_script(tz_explicit: bool) -> Any:
-    explicit = "true" if tz_explicit else "false"
-    js = (
-        "(function(){var s=document.getElementById('tz');if(!s)return;try{"
-        "var tz=Intl.DateTimeFormat().resolvedOptions().timeZone;if(!tz)return;"
-        "var has=Array.prototype.some.call(s.options,function(o){return o.value===tz;});"
-        "if(!has){var o=document.createElement('option');o.value=tz;o.text=tz;s.appendChild(o);}"
-        f"if(!{explicit}&&s.value!==tz){{s.value=tz;"
-        "if(window.htmx){s.dispatchEvent(new Event('change',{bubbles:true}));}"
-        "else if(s.form){s.form.requestSubmit?s.form.requestSubmit():s.form.submit();}}"
-        "}catch(e){}})();"
+    """A deferred, externally-sourced script (``static/tz-detect.js``) that auto-detects the
+    guest's browser timezone and, unless it was explicitly chosen, applies it and triggers the
+    HTMX slot refresh (or a plain form submit without JS/HTMX). ``tz_explicit`` rides a
+    ``data-tz-explicit`` attribute so the script tag itself carries no inline JS body — required
+    for the strict ``script-src 'self'`` CSP (A5.3); the script reads it back via
+    ``document.currentScript.dataset.tzExplicit``.
+    """
+    return Script(
+        src="/static/tz-detect.js",
+        data_tz_explicit="true" if tz_explicit else "false",
+        defer=True,
     )
-    # FastHTML renders Script/Style content raw (unescaped); this JS reads only the Intl API.
-    return Script(js)
 
 
 def event_page(
@@ -330,13 +408,22 @@ def event_page(
     self_path: str,
     slots_endpoint: str,
     lang_urls: Mapping[Locale, str],
+    notice: str | None = None,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
-    """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list."""
+    """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
+
+    ``notice`` renders an inline error banner above the picker (I4) — used after the PRG redirect
+    a 409 slot conflict on submit sends the guest back to with ``?err=slot_unavailable``.
+    """
+    intro: list[Any] = [_event_intro(locale, event)]
+    if notice:
+        intro.append(Div(notice, cls="notice error"))
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
-            _event_intro(locale, event),
+            *intro,
             H2(t(locale, "choose_time")),
             _tz_form(
                 locale,
@@ -351,6 +438,7 @@ def event_page(
         ),
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -359,14 +447,24 @@ def event_page(
 # --------------------------------------------------------------------------------------
 
 
-def _slot_link(locale: Locale, *, book_path: str, iso: str, tz: str, label: str) -> Any:
+def _slot_link(
+    locale: Locale, *, book_path: str, iso: str, tz: str, label: str, aria_label: str
+) -> Any:
     href = f"{book_path}?{urlencode({'start': iso, 'tz': tz, 'lang': locale})}"
-    return A(label, href=href, cls="slot")
+    return A(label, href=href, cls="slot", aria_label=aria_label)
 
 
-def _pager(locale: Locale, prev_url: str, next_url: str) -> Any:
+def _pager(locale: Locale, prev_url: str, next_url: str, *, prev_disabled: bool = False) -> Any:
+    """Prev/next navigation. ``prev_disabled`` renders "previous week" as a non-link, non-focusable
+    notice instead of a dead link — the guest is already at the floor (the earliest allowed
+    window) and clicking it would just reload the same page (I2/audit minor)."""
+    prev_control: Any = (
+        Span(t(locale, "prev_week"), cls="btn secondary", aria_disabled="true")
+        if prev_disabled
+        else A(t(locale, "prev_week"), href=prev_url, cls="btn secondary")
+    )
     return Nav(
-        A(t(locale, "prev_week"), href=prev_url, cls="btn secondary"),
+        prev_control,
         A(t(locale, "next_week"), href=next_url, cls="btn secondary"),
         cls="pager",
         aria_label=t(locale, "choose_time"),
@@ -397,6 +495,7 @@ def slots_section(
     book_path: str,
     prev_url: str,
     next_url: str,
+    prev_disabled: bool = False,
 ) -> Any:
     """The bookable-times region (``id="slots"``): day-grouped time links, or a friendly notice."""
     if availability == "unavailable":
@@ -407,18 +506,51 @@ def slots_section(
         blocks: list[Any] = []
         for group in groups:
             links = [
-                _slot_link(locale, book_path=book_path, iso=choice.iso, tz=tz, label=choice.label)
+                _slot_link(
+                    locale,
+                    book_path=book_path,
+                    iso=choice.iso,
+                    tz=tz,
+                    label=choice.label,
+                    aria_label=slot_aria_label(choice.label, group.heading),
+                )
                 for choice in group.slots
             ]
             blocks.append(Div(group.heading, cls="day"))
             blocks.append(Div(*links, cls="slots"))
         inner = Div(*blocks)
-    return Section(inner, _pager(locale, prev_url, next_url), id="slots", aria_live="polite")
+    pager = _pager(locale, prev_url, next_url, prev_disabled=prev_disabled)
+    return Section(inner, pager, id="slots", aria_live="polite")
 
 
 # --------------------------------------------------------------------------------------
 # Booking form (step 2) + confirmation (step 3).
 # --------------------------------------------------------------------------------------
+
+
+#: The honeypot field name — plausible enough that a naive spam bot fills it, but no real guest
+#: ever sees or focuses it (CSS-hidden off-screen, `tabindex="-1"`, `aria-hidden`). A non-empty
+#: value on submit means a bot filled the form (see ``book_submit``'s honeypot check).
+HONEYPOT_FIELD_NAME = "company_website"
+
+
+def _honeypot_field() -> Any:
+    """A decoy input real guests never perceive or reach, but a naive bot fills.
+
+    `display:none`/`visibility:hidden` are common honeypot tells bots skip; positioning it
+    off-screen while it stays "visible" to a naive DOM-fill script is the more effective trap.
+    `tabindex="-1"` keeps it out of the keyboard tab order and `aria-hidden="true"` keeps it out
+    of the accessibility tree, so a real guest (sighted or assistive-tech) never encounters it.
+    """
+    return Input(
+        type="text",
+        name=HONEYPOT_FIELD_NAME,
+        id=HONEYPOT_FIELD_NAME,
+        tabindex="-1",
+        autocomplete="off",
+        aria_hidden="true",
+        style="position:absolute;left:-9999px;top:-9999px;",
+    )
 
 
 def _errors_by_field(errors: Sequence[FieldError]) -> dict[str, str]:
@@ -504,6 +636,7 @@ def booking_form_page(
     errors: Sequence[FieldError],
     action: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """Step 2: name, email, notes, and questions — re-renders inline errors on failure."""
     field_errors = _errors_by_field(errors)
@@ -563,16 +696,18 @@ def booking_form_page(
         Input(type="hidden", name="start", value=start_iso),
         Input(type="hidden", name="tz", value=tz),
         Input(type="hidden", name="lang", value=locale),
+        _honeypot_field(),
         *fields,
         Button(t(locale, "confirm_booking"), type="submit", cls="btn"),
         method="post",
         action=action,
+        enctype="application/x-www-form-urlencoded",
     )
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
-            H1(event.title),
+            H1(resolve_title(event, locale)),
             P(f"{t(locale, 'selected_time')}: {when_label}", cls="meta"),
             H2(t(locale, "your_details")),
             form,
@@ -580,6 +715,80 @@ def booking_form_page(
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
+    )
+
+
+def _calendar_details(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """A short plain-text body for the add-to-calendar links: the event description (if any),
+    plus the meeting link (if any) on its own line so it stays clickable in the guest's calendar
+    app."""
+    parts: list[str] = []
+    description = resolve_description(event, locale)
+    if description:
+        parts.append(description)
+    if booking.meeting_url:
+        parts.append(booking.meeting_url)
+    return "\n".join(parts)
+
+
+def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """A Google Calendar "quick add" deep link pre-filled with the confirmed booking (M-F3)."""
+
+    def google_dt(instant: datetime) -> str:
+        return instant.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+    params = {
+        "action": "TEMPLATE",
+        "text": resolve_title(event, locale),
+        "dates": f"{google_dt(booking.start)}/{google_dt(booking.end)}",
+        "details": _calendar_details(locale, event, booking),
+    }
+    if event.location:
+        params["location"] = event.location
+    return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
+
+
+def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+    """An Outlook Web "compose event" deep link pre-filled with the confirmed booking (M-F3)."""
+
+    def outlook_dt(instant: datetime) -> str:
+        return instant.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "subject": resolve_title(event, locale),
+        "startdt": outlook_dt(booking.start),
+        "enddt": outlook_dt(booking.end),
+        "body": _calendar_details(locale, event, booking),
+        "path": "/calendar/action/compose",
+        "rru": "addevent",
+    }
+    if event.location:
+        params["location"] = event.location
+    return f"https://outlook.live.com/calendar/0/deeplink/compose?{urlencode(params)}"
+
+
+def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: BookingRead) -> Any:
+    """The "add to calendar" links (M-F3): Google + Outlook deep links, no server round-trip."""
+    return Div(
+        H2(t(locale, "add_to_calendar_heading")),
+        Div(
+            A(
+                t(locale, "add_to_calendar_google"),
+                href=_google_calendar_url(locale, event, booking),
+                cls="btn secondary",
+                target="_blank",
+                rel="noopener noreferrer",
+            ),
+            A(
+                t(locale, "add_to_calendar_outlook"),
+                href=_outlook_calendar_url(locale, event, booking),
+                cls="btn secondary",
+                target="_blank",
+                rel="noopener noreferrer",
+            ),
+            cls="pager",
+        ),
     )
 
 
@@ -590,8 +799,10 @@ def confirmation_page(
     booking: BookingRead,
     when_label: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
-    """Step 3: a clear confirmation with the essentials (when, meeting link, email note)."""
+    """Step 3: a clear confirmation with the essentials (when, meeting link, email note) plus
+    add-to-calendar links (M-F3)."""
     summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
     if event.location:
         summary.append(Dd(event.location, cls="meta"))
@@ -600,14 +811,16 @@ def confirmation_page(
         summary.append(Dd(A(booking.meeting_url, href=booking.meeting_url)))
     return page(
         locale,
-        event.title,
+        resolve_title(event, locale),
         Div(
-            H1(t(locale, "confirmed_heading", title=event.title)),
+            H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
             Dl(*summary, cls="summary"),
             P(t(locale, "confirmed_email_note", email=booking.guest_email), cls="lead"),
+            _add_to_calendar_section(locale, event, booking),
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -625,12 +838,13 @@ def message_page(
     back_url: str | None = None,
     back_label: str | None = None,
     is_error: bool = False,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """A minimal, friendly single-message page (errors, not-found, done states) — never leaks."""
     body: list[Any] = [H1(title), Div(message, cls="notice error" if is_error else "notice")]
     if back_url and back_label:
         body.append(A(back_label, href=back_url, cls="btn secondary"))
-    return page(locale, title, Div(*body, cls="stack"), lang_urls=lang_urls)
+    return page(locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url)
 
 
 def cancel_confirm_page(
@@ -640,6 +854,7 @@ def cancel_confirm_page(
     token: str,
     action: str,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """The cancel confirmation: a POST form carrying the booking id + guest token."""
     form = Form(
@@ -649,6 +864,7 @@ def cancel_confirm_page(
         Button(t(locale, "cancel_confirm"), type="submit", cls="btn"),
         method="post",
         action=action,
+        enctype="application/x-www-form-urlencoded",
     )
     return page(
         locale,
@@ -660,6 +876,7 @@ def cancel_confirm_page(
             cls="stack",
         ),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
@@ -673,6 +890,7 @@ def reschedule_section(
     token: str,
     prev_url: str,
     next_url: str,
+    prev_disabled: bool = False,
 ) -> Any:
     """The reschedule slot list: each time is a POST button carrying ``new_start`` + the token."""
     if availability == "unavailable":
@@ -688,16 +906,23 @@ def reschedule_section(
                     Input(type="hidden", name="token", value=token),
                     Input(type="hidden", name="lang", value=locale),
                     Input(type="hidden", name="new_start", value=choice.iso),
-                    Button(choice.label, type="submit", cls="slot"),
+                    Button(
+                        choice.label,
+                        type="submit",
+                        cls="slot",
+                        aria_label=slot_aria_label(choice.label, group.heading),
+                    ),
                     method="post",
                     action=action,
+                    enctype="application/x-www-form-urlencoded",
                 )
                 for choice in group.slots
             ]
             blocks.append(Div(group.heading, cls="day"))
             blocks.append(Div(*buttons, cls="slots"))
         inner = Div(*blocks)
-    return Section(inner, _pager(locale, prev_url, next_url), id="slots", aria_live="polite")
+    pager = _pager(locale, prev_url, next_url, prev_disabled=prev_disabled)
+    return Section(inner, pager, id="slots", aria_live="polite")
 
 
 def reschedule_page(
@@ -710,6 +935,7 @@ def reschedule_page(
     hidden: Sequence[tuple[str, str]],
     section: Any,
     lang_urls: Mapping[Locale, str],
+    base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
     """The reschedule flow: a timezone control plus the slot section (times POST ``new_start``)."""
     return page(
@@ -724,10 +950,12 @@ def reschedule_page(
         ),
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
+        base_url=base_url,
     )
 
 
 __all__ = [
+    "HONEYPOT_FIELD_NAME",
     "NotStr",
     "booking_form_page",
     "cancel_confirm_page",

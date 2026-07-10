@@ -28,11 +28,17 @@ def booking_row(booking: BookingRead) -> dict[str, str]:
 
 
 def event_type_row(event_type: EventTypeRead) -> dict[str, str]:
-    """Flatten an event type into the string cells its table renders (duration shown in minutes)."""
+    """Flatten an event type into the string cells its table renders (duration shown in minutes).
+
+    ``title_en``/``description_en`` surface the current ``"en"`` override (A4), blank when none is
+    stored — so re-listing after a save/edit is how the admin sees the EN translation "populated".
+    """
     return {
         "id": str(event_type.id),
         "slug": event_type.slug,
         "title": event_type.title,
+        "title_en": event_type.title_translations.get("en", ""),
+        "description_en": event_type.description_translations.get("en", ""),
         "duration_min": str(event_type.duration_seconds // 60),
         "active": "yes" if event_type.active else "no",
     }

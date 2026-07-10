@@ -10,13 +10,24 @@ The routes deliver the ≤3-step flow (RF-07): an event landing with a slot pick
 a confirmation, plus token-authorized ``/cancel`` and ``/reschedule`` pages (RF-09). Blocking SDK
 calls run in a threadpool so they never stall the event loop. Every failure degrades to a friendly,
 localized page — a stack trace or internal message never reaches a guest (RF-16).
+
+The app owns its own security headers (A5.3) — set on every response by
+``_SecurityHeadersMiddleware`` via ``security_headers`` — rather than depending on an edge/CDN
+config, so the page is correct and portable behind any reverse proxy. It also serves its own
+static assets (self-hosted htmx + the externalized tz-detect script, A5.1/A5.2) from ``/static``,
+mounted from ``STATIC_DIR``, so the page has no third-party CDN dependency and its
+``script-src`` can be a strict ``'self'``.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlencode
 from uuid import UUID
@@ -25,8 +36,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fasthtml.common import FastHTML
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.staticfiles import StaticFiles
 
 from aethercal.booking import views
 from aethercal.booking.errors import friendly_api_error, friendly_unexpected
@@ -35,7 +49,7 @@ from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
 from aethercal.client import AetherCalAPIError, AetherCalClient
-from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.event_types import EventTypeRead, resolve_title
 
 T = TypeVar("T")
 
@@ -44,6 +58,8 @@ T = TypeVar("T")
 #: traceback) so operators can see a failing backend — the log never reaches the guest.
 logger = logging.getLogger(__name__)
 
+#: The status a slot-conflict `AetherCalAPIError` carries — the PRG-redirect trigger (I4).
+HTTP_409_CONFLICT = 409
 #: The default display zone when a guest hasn't chosen one yet (the browser then auto-detects).
 DEFAULT_TZ = "UTC"
 #: How many days of availability a single window shows (and the prev/next navigation step).
@@ -66,6 +82,269 @@ COMMON_TIMEZONES: tuple[str, ...] = (
     "Europe/London",
     "Europe/Paris",
 )
+
+#: The ``static/`` directory next to this module — the vendored htmx bundle and the tz-detect
+#: script (A5.1/A5.2), served by the app itself so it has no third-party CDN dependency.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+# --------------------------------------------------------------------------------------
+# Security headers (A5.3) — the app owns these outright rather than relying on an edge/CDN
+# config (portable, OSS-friendly, and correct even when the app is embedded behind a different
+# reverse proxy). ``script-src 'self'`` is strict — no CDN, no inline script — made possible by
+# self-hosting htmx (A5.1) and externalizing the timezone-detection script (A5.2).
+# --------------------------------------------------------------------------------------
+
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+_BASE_SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": _CONTENT_SECURITY_POLICY,
+    "X-Frame-Options": "SAMEORIGIN",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), usb=(), browsing-topics=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+def security_headers(path: str) -> dict[str, str]:
+    """The security headers for a response to ``path`` — every route gets the same conservative
+    baseline today. This is the single per-route seam a future ``/embed/*`` route (B0) will use to
+    relax ``frame-ancestors``/``X-Frame-Options`` for an allow-listed embedder, without touching
+    the middleware wiring itself.
+    """
+    del path  # no per-route variation yet — the seam future work (B0) will extend.
+    return dict(_BASE_SECURITY_HEADERS)
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Sets the app-owned security headers (``security_headers``) on every response."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        response = await call_next(request)
+        for name, value in security_headers(request.url.path).items():
+            response.headers[name] = value
+        return response
+
+
+# --------------------------------------------------------------------------------------
+# App-level per-IP rate limiting on the public POST handlers — an in-process replacement for the
+# Cloudflare rate-limit rule the free plan doesn't allow. The booking app runs single-process
+# (`python -m aethercal.booking`), so in-process state is sufficient; it is not shared across
+# replicas, which is an accepted trade-off for this deployment shape.
+# --------------------------------------------------------------------------------------
+
+#: A generous per-IP threshold — enough headroom for a guest retrying a real booking, low enough
+#: to blunt a scripted flood.
+_RATE_LIMIT_MAX_REQUESTS = 15
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+#: Hard cap on how many distinct client keys are tracked at once. Bounds the limiter's memory so a
+#: flood of clients (already reduced to REAL IPs by the ``_client_ip`` trust gate) can't grow it
+#: without limit — past the cap, the least-recently-used key is evicted (a DoS / memory-leak fix).
+_RATE_LIMIT_MAX_KEYS = 10_000
+
+
+class _RateLimiter:
+    """A sliding-window rate limiter keyed by client identity (in-process, no external store).
+
+    Exposed as an injectable instance (``create_app(..., rate_limiter=...)``) so tests can use a
+    small, fast threshold instead of the production default, and so each app instance owns
+    independent state (no cross-test bleed without an explicit shared instance).
+
+    State is BOUNDED (memory-safety): a key whose window has fully drained is dropped, an
+    opportunistic sweep prunes fully-expired least-recently-used keys on every call, and a hard
+    ``max_keys`` cap LRU-evicts beyond it — so the tracked set stays proportional to active clients
+    and can never grow without limit.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_requests: int = _RATE_LIMIT_MAX_REQUESTS,
+        window_seconds: float = _RATE_LIMIT_WINDOW_SECONDS,
+        max_keys: int = _RATE_LIMIT_MAX_KEYS,
+    ) -> None:
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._max_keys = max_keys
+        # LRU-ordered: most-recently-used at the end, so the front holds the stalest keys.
+        self._hits: OrderedDict[str, list[float]] = OrderedDict()
+
+    def allow(self, key: str, *, now: float | None = None) -> bool:
+        """Record a hit for ``key`` and report whether it's within the window's limit.
+
+        Expired hits are pruned from the front of ``key``'s list (chronological by construction, so
+        a prefix-pop is correct and cheap). The key is re-inserted as most-recently-used; if its
+        window is empty it is dropped entirely rather than left as dead state.
+        """
+        current = now if now is not None else time.monotonic()
+        window_start = current - self._window_seconds
+        hits = self._hits.pop(key, None) or []  # pop so a re-insert lands at the MRU end
+        while hits and hits[0] < window_start:
+            hits.pop(0)
+        allowed = len(hits) < self._max_requests
+        if allowed:
+            hits.append(current)
+        if hits:  # keep only live state; an empty window leaves no key behind
+            self._hits[key] = hits
+        self._sweep_expired(window_start)
+        self._evict_over_cap()
+        return allowed
+
+    def _sweep_expired(self, window_start: float) -> None:
+        """Drop fully-expired keys from the LRU front, stopping at the first still-live key.
+
+        The stalest keys sit at the front (least recently used), so this reclaims the keys that
+        would otherwise leak — the clients that hit once and never returned — in bounded work.
+        """
+        while self._hits:
+            oldest_key = next(iter(self._hits))
+            hits = self._hits[oldest_key]
+            if hits and hits[-1] >= window_start:
+                break
+            del self._hits[oldest_key]
+
+    def _evict_over_cap(self) -> None:
+        """Enforce the hard cardinality cap by evicting least-recently-used keys."""
+        while len(self._hits) > self._max_keys:
+            self._hits.popitem(last=False)
+
+    def key_count(self) -> int:
+        """The number of client keys currently tracked (test/observability seam)."""
+        return len(self._hits)
+
+    def reset(self) -> None:
+        """Clear all recorded hits (test seam)."""
+        self._hits.clear()
+
+
+#: A parsed trusted-proxy network (IPv4 or IPv6 CIDR).
+_TrustedNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_trusted_networks(cidrs: Sequence[str]) -> tuple[_TrustedNetwork, ...]:
+    """Parse CIDR strings (from settings) into networks; a malformed entry is logged and dropped
+    rather than crashing the app at startup (a bad env value must fail safe, not fatal)."""
+    networks: list[_TrustedNetwork] = []
+    for cidr in cidrs:
+        try:
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            logger.warning("booking: ignoring invalid trusted-proxy CIDR %r", cidr)
+    return tuple(networks)
+
+
+def _is_trusted_peer(host: str, trusted: Sequence[_TrustedNetwork]) -> bool:
+    """True if ``host`` parses as an IP inside any trusted network (a non-IP peer is never
+    trusted). ``addr in net`` short-circuits ``False`` across IP versions, so mixing v4/v6 nets is
+    safe."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(addr in net for net in trusted)
+
+
+def _normalize_ip(value: str) -> str | None:
+    """The canonical string form of ``value`` if it's a valid IP, else ``None``.
+
+    Normalizing collapses equivalent spellings (``2001:0db8::1`` ≡ ``2001:db8::1``) to one limiter
+    key, and returning ``None`` for non-IP input lets callers fail safe on a forged/garbage header.
+    """
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
+def _client_ip(request: Request, trusted_proxies: Sequence[_TrustedNetwork]) -> str:
+    """The rate-limit key for this request: the real client IP, resolved SAFELY.
+
+    ``CF-Connecting-IP`` is honored ONLY when (a) the transport peer (``request.client.host``) is a
+    trusted proxy AND (b) the header value is itself a valid IP — otherwise a direct client could
+    forge the header to spoof its identity, evading the per-IP limit or inflating the limiter's
+    keyspace (a memory-exhaustion vector). The chosen identity is normalized to its canonical IP
+    form so equivalent spellings share one key. When the header can't be trusted/parsed, the
+    transport address is authoritative (itself normalized when it is a valid IP).
+    """
+    client = request.client
+    peer = client.host if client is not None else "unknown"
+    header = request.headers.get("CF-Connecting-IP")
+    if header and _is_trusted_peer(peer, trusted_proxies):
+        forwarded = _normalize_ip(header)
+        if forwarded is not None:
+            return forwarded
+    return _normalize_ip(peer) or peer
+
+
+def _is_rate_limited_post(request: Request) -> bool:
+    """Whether this request is one of the public state-changing POSTs the limiter guards.
+
+    The three write endpoints (``/e/{slug}/book``, ``/cancel``, ``/reschedule``); read endpoints
+    and static assets are never limited.
+    """
+    if request.method != "POST":
+        return False
+    path = request.url.path
+    return path in ("/cancel", "/reschedule") or (path.startswith("/e/") and path.endswith("/book"))
+
+
+class _RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP rate limiting applied at the MIDDLEWARE layer — BEFORE the framework parses the body.
+
+    FastHTML eagerly parses the request form to build handler params, so a per-handler check would
+    still let a blocked request pay the (attacker-controlled) body-parse cost. Running the limit
+    here short-circuits a flood with a 429 before any body is read; the limiter only needs the
+    request's IP, never its body.
+    """
+
+    def __init__(
+        self,
+        app: Callable[..., object],
+        *,
+        limiter: _RateLimiter,
+        trusted_proxies: Sequence[_TrustedNetwork],
+        settings: BookingSettings,
+    ) -> None:
+        super().__init__(app)  # pyright: ignore[reportArgumentType]
+        self._limiter = limiter
+        self._trusted_proxies = trusted_proxies
+        self._settings = settings
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if _is_rate_limited_post(request) and not self._limiter.allow(
+            _client_ip(request, self._trusted_proxies)
+        ):
+            return self._too_many_requests(request)
+        return await call_next(request)
+
+    def _too_many_requests(self, request: Request) -> Response:
+        """The friendly, localized 429 for a rate-limited request (never a stack, never a body)."""
+        locale = select_locale(
+            query_lang=request.query_params.get("lang"),
+            accept_language=request.headers.get("accept-language"),
+            default=self._settings.default_locale,
+        )
+        body = views.message_page(
+            locale,
+            title=t(locale, "app_name"),
+            message=t(locale, "error_rate_limited"),
+            lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
+            is_error=True,
+        )
+        return HTMLResponse(views.render(body), status_code=429)
 
 
 # --------------------------------------------------------------------------------------
@@ -165,12 +444,13 @@ def _shifted_url(
     return f"{path}?{urlencode({**base, 'from': new_from.isoformat()})}"
 
 
-def _not_found(request: Request, locale: Locale) -> Response:
+def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
     body = views.message_page(
         locale,
         title=t(locale, "not_found_title"),
         message=t(locale, "not_found_body"),
         lang_urls=_lang_links_here(request),
+        base_url=base_url,
         is_error=True,
     )
     return HTMLResponse(views.render(body), status_code=404)
@@ -188,41 +468,6 @@ def _http_status_for(exc: Exception | None) -> int:
     return 503
 
 
-def _error_response(
-    locale: Locale,
-    *,
-    title: str,
-    exc: Exception | None,
-    lang_urls: dict[Locale, str],
-    retry: tuple[str, str] | None = None,
-) -> Response:
-    """A friendly, localized error page with the correct HTTP status — never leaks internals.
-
-    ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to times").
-    """
-    message = (
-        friendly_api_error(exc, locale)
-        if isinstance(exc, AetherCalAPIError)
-        else friendly_unexpected(locale)
-    )
-    status = _http_status_for(exc)
-    if status >= 500 and exc is not None:
-        # A backend 5xx, transport drop, or unexpected error — observable to ops, hidden from the
-        # guest. A clean client signal (409/403/404) is expected flow, not an error to log.
-        logger.error("booking page: backend failure rendering %r", title, exc_info=exc)
-    retry_url, retry_label = retry if retry is not None else (None, None)
-    body = views.message_page(
-        locale,
-        title=title,
-        message=message,
-        lang_urls=lang_urls,
-        back_url=retry_url,
-        back_label=retry_label,
-        is_error=True,
-    )
-    return HTMLResponse(views.render(body), status_code=status)
-
-
 def _register(app: FastHTML, path: str, handler: Callable[..., object], methods: list[str]) -> None:
     """Register a route by explicit call (not the ``@`` decorator) so handlers stay typed."""
     app.route(path, methods=methods)(handler)  # pyright: ignore[reportUnknownMemberType]
@@ -232,10 +477,26 @@ class _BookingApp:
     """Holds the settings + SDK factory; its methods are the route handlers (bound to state)."""
 
     def __init__(
-        self, settings: BookingSettings, client_factory: Callable[[], AetherCalClient]
+        self,
+        settings: BookingSettings,
+        client_factory: Callable[[], AetherCalClient],
+        *,
+        rate_limiter: _RateLimiter | None = None,
     ) -> None:
         self._settings = settings
         self._client_factory = client_factory
+        self._rate_limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
+        self._trusted_proxies = _parse_trusted_networks(settings.trusted_proxies)
+
+    def rate_limit_middleware(self) -> Middleware:
+        """The per-IP rate-limit middleware bound to this app's limiter/trusted-proxy config, so the
+        limiter state stays encapsulated here (``create_app`` only wires the returned object)."""
+        return Middleware(
+            _RateLimitMiddleware,
+            limiter=self._rate_limiter,
+            trusted_proxies=self._trusted_proxies,
+            settings=self._settings,
+        )
 
     async def _call(self, call: Callable[[AetherCalClient], T]) -> T:
         """Run a (blocking) SDK call in a threadpool with a fresh client, closing it after."""
@@ -278,6 +539,9 @@ class _BookingApp:
             book_path=f"/e/{event.slug}/book",
             prev_url=_shifted_url(f"/e/{event.slug}", base, window_from, -WINDOW_DAYS, floor=today),
             next_url=_shifted_url(f"/e/{event.slug}", base, window_from, WINDOW_DAYS, floor=today),
+            # `_window_of` already floors the requested date to `>= today` — equality means
+            # further "previous week" navigation would be a no-op (the floor clamps it in place).
+            prev_disabled=(window_from <= today),
         )
 
     async def _events(self) -> list[EventTypeRead] | None:
@@ -302,11 +566,50 @@ class _BookingApp:
             title=t(locale, "app_name"),
             message=t(locale, "error_generic"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
             back_url=retry_url,
             back_label=t(locale, "retry"),
             is_error=True,
         )
         return HTMLResponse(views.render(body), status_code=503)
+
+    def _error_response(
+        self,
+        locale: Locale,
+        *,
+        title: str,
+        exc: Exception | None,
+        lang_urls: dict[Locale, str],
+        retry: tuple[str, str] | None = None,
+    ) -> Response:
+        """A friendly, localized error page with the correct HTTP status — never leaks internals.
+
+        ``retry`` is an optional ``(url, label)`` affordance shown as a button (e.g. "back to
+        times"). A method (not a module function) so it can read ``self._settings.base_url``
+        without growing past the PLR0913 argument budget.
+        """
+        message = (
+            friendly_api_error(exc, locale)
+            if isinstance(exc, AetherCalAPIError)
+            else friendly_unexpected(locale)
+        )
+        status = _http_status_for(exc)
+        if status >= 500 and exc is not None:
+            # A backend 5xx, transport drop, or unexpected error — observable to ops, hidden from
+            # the guest. A clean client signal (409/403/404) is expected flow, not an error to log.
+            logger.error("booking page: backend failure rendering %r", title, exc_info=exc)
+        retry_url, retry_label = retry if retry is not None else (None, None)
+        body = views.message_page(
+            locale,
+            title=title,
+            message=message,
+            lang_urls=lang_urls,
+            base_url=self._settings.base_url,
+            back_url=retry_url,
+            back_label=retry_label,
+            is_error=True,
+        )
+        return HTMLResponse(views.render(body), status_code=status)
 
     # -- routes -------------------------------------------------------------------------
 
@@ -318,7 +621,12 @@ class _BookingApp:
                 locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
             )
         active = [event for event in events if event.active]
-        return views.index_page(locale, event_types=active, lang_urls=_lang_links_here(request))
+        return views.index_page(
+            locale,
+            event_types=active,
+            lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
+        )
 
     async def event(self, request: Request) -> object:
         locale = self._locale(request)
@@ -333,8 +641,15 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         section = await self._slots_section(found, tz, window_from, today, locale)
+        # I4 (PRG): a 409 slot-conflict redirect from book_submit lands back here carrying
+        # `?err=slot_unavailable` — render it as an inline notice, never re-post on a refresh.
+        notice = (
+            t(locale, "error_slot_unavailable")
+            if request.query_params.get("err") == "slot_unavailable"
+            else None
+        )
         return views.event_page(
             locale,
             event=found,
@@ -346,6 +661,8 @@ class _BookingApp:
             self_path=f"/e/{slug}",
             slots_endpoint=f"/e/{slug}/slots",
             lang_urls=_lang_links_here(request),
+            notice=notice,
+            base_url=self._settings.base_url,
         )
 
     async def slots_partial(self, request: Request) -> object:
@@ -365,7 +682,7 @@ class _BookingApp:
             return views.slots_unavailable_fragment(locale)
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         return await self._slots_section(found, tz, window_from, today, locale)
 
     async def book_form(self, request: Request) -> object:
@@ -380,7 +697,7 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
+            return _not_found(request, locale, base_url=self._settings.base_url)
         instant = _parse_instant(start)
         if instant is None:
             return RedirectResponse(
@@ -397,14 +714,106 @@ class _BookingApp:
             errors=[],
             action=f"/e/{slug}/book",
             lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+            base_url=self._settings.base_url,
+        )
+
+    def _honeypot_response(
+        self, request: Request, *, form: Mapping[str, str], slug: str, start: str, tz: str
+    ) -> Response | None:
+        """The honeypot post-parse check for ``book_submit`` (the rate-limit check runs BEFORE the
+        body is even parsed, so it is not here). Returns a short-circuit response, or ``None``.
+        """
+        if form.get(views.HONEYPOT_FIELD_NAME, "").strip():
+            # Anti-spam honeypot: a bot filled a field hidden from real guests. Skip the backend
+            # entirely and return a plausible "received" 200 — the bot sees success and doesn't
+            # retry — never creating a booking, never leaking that it was caught.
+            locale = self._locale(request, form.get("lang"))
+            return views.message_page(
+                locale,
+                title=t(locale, "app_name"),
+                message=t(locale, "honeypot_received_message"),
+                lang_urls=_lang_links(f"/e/{slug}/book", {"start": start, "tz": tz}),
+                base_url=self._settings.base_url,
+            )
+        return None
+
+    async def _complete_booking(
+        self,
+        request: Request,
+        *,
+        form: Mapping[str, str],
+        event: EventTypeRead,
+        locale: Locale,
+        tz: str,
+    ) -> object:
+        """Validate the submitted form and either create the booking or return the outcome page:
+        inline validation errors, a 409-conflict PRG redirect (I4), a friendly backend-failure
+        page, or the confirmation. ``event.slug`` and ``form["start"]`` stand in for the
+        ``slug``/``start`` the caller already resolved (kept out of the signature for PLR0913).
+        """
+        slug = event.slug
+        start = form.get("start", "")
+        questions = parse_questions(event.questions)
+        instant = _parse_instant(start)
+        label = _when_label(instant, tz, locale) if instant is not None else ""
+        lang_urls = _lang_links(f"/e/{slug}/book", {"start": start, "tz": tz})
+        booking_request = BookingRequest(
+            event_type_id=event.id, start_iso=start, guest_timezone=tz, locale=locale
+        )
+        result = build_booking(booking_request, questions=questions, form=form)
+        booking_create = result.booking
+        if booking_create is None:
+            return views.booking_form_page(
+                locale,
+                event=event,
+                start_iso=start,
+                tz=tz,
+                when_label=label,
+                questions=questions,
+                values=result.values,
+                errors=result.errors,
+                action=f"/e/{slug}/book",
+                lang_urls=lang_urls,
+                base_url=self._settings.base_url,
+            )
+        try:
+            booking = await self._call(lambda c: c.create_booking(booking_create))
+        except Exception as exc:
+            if isinstance(exc, AetherCalAPIError) and exc.status_code == HTTP_409_CONFLICT:
+                # I4 (PRG): redirect back to the picker instead of re-rendering the POST response
+                # inline — a guest refresh then re-GETs the picker instead of re-submitting.
+                return RedirectResponse(
+                    f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale, 'err': 'slot_unavailable'})}",
+                    status_code=303,
+                )
+            back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
+            return self._error_response(
+                locale,
+                title=resolve_title(event, locale),
+                exc=exc,
+                lang_urls=lang_urls,
+                retry=(back, t(locale, "back_to_times")),
+            )
+        return views.confirmation_page(
+            locale,
+            event=event,
+            booking=booking,
+            when_label=label,
+            lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def book_submit(self, request: Request) -> object:
+        # Rate limiting runs in _RateLimitMiddleware, BEFORE FastHTML parses the body — so a blocked
+        # request never pays the body-parse cost. This handler only sees requests within the limit.
         form = _form_dict(await request.form())
-        locale = self._locale(request, form.get("lang"))
         slug = str(request.path_params["slug"])
         tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
         start = form.get("start", "")
+        honeypot = self._honeypot_response(request, form=form, slug=slug, start=start, tz=tz)
+        if honeypot is not None:
+            return honeypot
+        locale = self._locale(request, form.get("lang"))
         events = await self._events()
         if events is None:
             return self._service_error(
@@ -414,47 +823,8 @@ class _BookingApp:
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale)
-        questions = parse_questions(found.questions)
-        instant = _parse_instant(start)
-        label = _when_label(instant, tz, locale) if instant is not None else ""
-        lang_urls = _lang_links(f"/e/{slug}/book", {"start": start, "tz": tz})
-        booking_request = BookingRequest(
-            event_type_id=found.id, start_iso=start, guest_timezone=tz, locale=locale
-        )
-        result = build_booking(booking_request, questions=questions, form=form)
-        booking_create = result.booking
-        if booking_create is None:
-            return views.booking_form_page(
-                locale,
-                event=found,
-                start_iso=start,
-                tz=tz,
-                when_label=label,
-                questions=questions,
-                values=result.values,
-                errors=result.errors,
-                action=f"/e/{slug}/book",
-                lang_urls=lang_urls,
-            )
-        try:
-            booking = await self._call(lambda c: c.create_booking(booking_create))
-        except Exception as exc:
-            back = f"/e/{slug}?{urlencode({'tz': tz, 'lang': locale})}"
-            return _error_response(
-                locale,
-                title=found.title,
-                exc=exc,
-                lang_urls=lang_urls,
-                retry=(back, t(locale, "back_to_times")),
-            )
-        return views.confirmation_page(
-            locale,
-            event=found,
-            booking=booking,
-            when_label=label,
-            lang_urls=_lang_links_here(request),
-        )
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        return await self._complete_booking(request, form=form, event=found, locale=locale, tz=tz)
 
     async def cancel_form(self, request: Request) -> object:
         locale = self._locale(request)
@@ -466,6 +836,7 @@ class _BookingApp:
                 title=t(locale, "cancel_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         return views.cancel_confirm_page(
@@ -474,9 +845,11 @@ class _BookingApp:
             token=token,
             action="/cancel",
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def cancel_submit(self, request: Request) -> object:
+        # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
         booking_id = _parse_uuid(form.get("booking", ""))
@@ -488,19 +861,24 @@ class _BookingApp:
                 title=t(locale, "cancel_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         try:
             await self._call(lambda c: c.cancel_booking(booking_id, token=token))
         except Exception as exc:
-            return _error_response(
-                locale, title=t(locale, "cancel_title"), exc=exc, lang_urls=lang_urls
+            return self._error_response(
+                locale,
+                title=t(locale, "cancel_title"),
+                exc=exc,
+                lang_urls=lang_urls,
             )
         return views.message_page(
             locale,
             title=t(locale, "cancel_title"),
             message=t(locale, "cancel_done"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
         )
 
     async def reschedule_form(self, request: Request) -> object:
@@ -514,6 +892,7 @@ class _BookingApp:
                 title=t(locale, "reschedule_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         tz, tz_explicit = _tz_of(request)
@@ -546,6 +925,7 @@ class _BookingApp:
             token=token,
             prev_url=_shifted_url("/reschedule", base, window_from, -WINDOW_DAYS, floor=today),
             next_url=_shifted_url("/reschedule", base, window_from, WINDOW_DAYS, floor=today),
+            prev_disabled=(window_from <= today),
         )
         hidden = [
             ("lang", str(locale)),
@@ -563,9 +943,11 @@ class _BookingApp:
             hidden=hidden,
             section=section,
             lang_urls=_lang_links_here(request),
+            base_url=self._settings.base_url,
         )
 
     async def reschedule_submit(self, request: Request) -> object:
+        # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
         booking_id = _parse_uuid(form.get("booking", ""))
@@ -578,6 +960,7 @@ class _BookingApp:
                 title=t(locale, "reschedule_title"),
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
+                base_url=self._settings.base_url,
                 is_error=True,
             )
         try:
@@ -585,32 +968,66 @@ class _BookingApp:
                 lambda c: c.reschedule_booking(booking_id, new_start=new_start, token=token)
             )
         except Exception as exc:
-            return _error_response(
-                locale, title=t(locale, "reschedule_title"), exc=exc, lang_urls=lang_urls
+            return self._error_response(
+                locale,
+                title=t(locale, "reschedule_title"),
+                exc=exc,
+                lang_urls=lang_urls,
             )
         return views.message_page(
             locale,
             title=t(locale, "reschedule_title"),
             message=t(locale, "reschedule_done"),
             lang_urls=lang_urls,
+            base_url=self._settings.base_url,
         )
+
+    def robots_txt(self, request: Request) -> Response:
+        """A conservative ``robots.txt``: this is a booking TOOL, not indexable content — every
+        path is disallowed except the root. Never touches the backend (like ``healthz``)."""
+        del request
+        body = "User-agent: *\nAllow: /$\nDisallow: /\n"
+        return PlainTextResponse(body)
 
     def healthz(self, request: Request) -> Response:
         """Liveness only — never calls the API, so it stays up even if the backend is down."""
         del request  # Starlette passes the request; liveness ignores it.
         return PlainTextResponse("ok")
 
+    def catch_all(self, request: Request) -> Response:
+        """The branded 404 for any path with no registered route (never Starlette's bare default).
+
+        Registered LAST in ``create_app`` so every specific route still matches first — this only
+        catches what nothing else did.
+        """
+        return _not_found(request, self._locale(request), base_url=self._settings.base_url)
+
 
 def create_app(
     *,
     settings: BookingSettings,
     client_factory: Callable[[], AetherCalClient],
+    rate_limiter: _RateLimiter | None = None,
 ) -> FastHTML:
-    """Build the FastHTML booking app bound to ``settings`` and an SDK ``client_factory``."""
-    booking = _BookingApp(settings, client_factory)
-    app = FastHTML()
+    """Build the FastHTML booking app bound to ``settings`` and an SDK ``client_factory``.
+
+    ``rate_limiter`` is an injection seam (tests pass a small-threshold instance); production
+    callers can omit it to get the default per-IP limiter.
+    """
+    booking = _BookingApp(settings, client_factory, rate_limiter=rate_limiter)
+    # Order matters: the security-headers middleware is OUTERMOST so its headers are applied even to
+    # the rate limiter's early 429. The rate limiter is INNER but still ahead of routing/FastHTML's
+    # body parse — so a blocked POST is rejected before its body is read.
+    app = FastHTML(
+        middleware=[
+            Middleware(_SecurityHeadersMiddleware),
+            booking.rate_limit_middleware(),
+        ]
+    )
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])
+    _register(app, "/robots.txt", booking.robots_txt, ["GET"])
     _register(app, "/cancel", booking.cancel_form, ["GET"])
     _register(app, "/cancel", booking.cancel_submit, ["POST"])
     _register(app, "/reschedule", booking.reschedule_form, ["GET"])
@@ -619,7 +1036,10 @@ def create_app(
     _register(app, "/e/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/e/{slug}/book", booking.book_form, ["GET"])
     _register(app, "/e/{slug}/book", booking.book_submit, ["POST"])
+    # Catch-all MUST be registered last: Starlette matches routes in registration order, so every
+    # specific path above still wins; only a truly unmatched path falls through to here.
+    _register(app, "/{path:path}", booking.catch_all, ["GET"])
     return app
 
 
-__all__ = ["COMMON_TIMEZONES", "create_app"]
+__all__ = ["COMMON_TIMEZONES", "STATIC_DIR", "create_app", "security_headers"]

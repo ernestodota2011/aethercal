@@ -355,6 +355,39 @@ async def test_update_unknown_event_type_is_an_action_error(sessionmaker: Sessio
         )
 
 
+async def test_create_event_type_action_persists_the_en_translations(
+    sessionmaker: Sessionmaker,
+) -> None:
+    await _seed_tenant(sessionmaker)
+    schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
+    created = await create_event_type_action(
+        sessionmaker,
+        tenant_slug=None,
+        form=EventTypeForm(
+            slug="intro",
+            title="Introducción",
+            schedule_id=schedule_id,
+            duration_seconds=1800,
+            max_advance_seconds=_MAX_ADVANCE,
+            title_translations={"en": "Discovery call"},
+            description_translations={"en": "A quick intro."},
+        ),
+    )
+    assert created.title_translations == {"en": "Discovery call"}
+    assert created.description_translations == {"en": "A quick intro."}
+
+
+async def test_create_event_type_action_defaults_to_no_translations(
+    sessionmaker: Sessionmaker,
+) -> None:
+    await _seed_tenant(sessionmaker)
+    schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
+    await _make_event_type(sessionmaker, tenant_slug=None, schedule_id=schedule_id)
+    listed = await list_event_types_view(sessionmaker, tenant_slug=None)
+    assert listed[0].title_translations == {}
+    assert listed[0].description_translations == {}
+
+
 # --------------------------------------------------------------------------------------
 # Schedules.
 # --------------------------------------------------------------------------------------

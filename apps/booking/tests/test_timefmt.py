@@ -8,6 +8,7 @@ from aethercal.booking.timefmt import (
     format_day_heading,
     format_time,
     group_slots,
+    slot_aria_label,
     today_in_zone,
 )
 from aethercal.schemas.slots import SlotRead
@@ -63,6 +64,12 @@ def test_group_slots_splits_across_local_day_boundary() -> None:
     ]
     groups = group_slots(slots, "America/New_York", "en")
     assert [group.day for group in groups] == [date(2026, 7, 14), date(2026, 7, 15)]
+
+
+def test_slot_aria_label_combines_time_and_day() -> None:
+    # I2: a bare time ("09:00") doesn't tell a screen-reader user which day the slot falls on.
+    assert slot_aria_label("09:00", "lunes 13 de julio") == "09:00, lunes 13 de julio"
+    assert slot_aria_label("9:00 AM", "Monday, July 13") == "9:00 AM, Monday, July 13"
 
 
 def test_group_slots_choice_iso_is_absolute_utc() -> None:

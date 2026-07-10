@@ -15,6 +15,7 @@ from fasthtml.common import to_xml
 
 from aethercal.booking import views
 from aethercal.booking.forms import FieldError, parse_questions
+from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, SlotChoice
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead
@@ -82,7 +83,94 @@ def test_page_shell_is_accessible_and_localized() -> None:
     assert "Saltar al contenido" in html  # skip link
     assert 'name="viewport"' in html
     assert "/e/intro?lang=en" in html  # language switcher exposes the other locale
-    assert views._HTMX_SRC in html  # the exact pinned HTMX CDN src is wired
+    assert views._HTMX_SRC in html  # the exact pinned HTMX src is wired
+
+
+def test_page_shell_includes_meta_description_and_hreflang_alternates() -> None:
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p>hi</p>"), lang_urls=LANG_URLS))
+    assert 'name="description"' in html
+    assert 'hreflang="es"' in html
+    assert 'hreflang="en"' in html
+    assert 'href="/e/intro?lang=es"' in html
+    assert 'href="/e/intro?lang=en"' in html
+    assert 'hreflang="x-default"' in html
+
+
+def test_page_shell_includes_og_and_twitter_meta_with_absolute_urls() -> None:
+    # A7: a guest pasting the link into WhatsApp/email must see a real title, description, and
+    # image — every og:/twitter: value that points at "this page" must be an ABSOLUTE url, since
+    # an unfurler fetches out-of-band with no request context of its own.
+    html = to_xml(
+        views.page(
+            "es",
+            "Reserva",
+            views.NotStr("<p>hi</p>"),
+            lang_urls=LANG_URLS,
+            base_url="https://book.aetherlogik.test",
+        )
+    )
+    assert 'property="og:title"' in html
+    assert 'content="Reserva · AetherCal"' in html  # og:title/twitter:title share this value
+    assert 'property="og:description"' in html
+    assert 'property="og:type"' in html
+    assert 'content="website"' in html
+    assert 'property="og:site_name"' in html
+    assert 'property="og:url"' in html
+    assert 'content="https://book.aetherlogik.test/e/intro?lang=es"' in html
+    assert 'property="og:image"' in html
+    assert 'content="https://book.aetherlogik.test/static/og.png"' in html
+    assert 'name="twitter:card"' in html
+    assert 'content="summary_large_image"' in html
+    assert 'name="twitter:title"' in html
+    assert 'name="twitter:description"' in html
+    assert 'name="twitter:image"' in html
+
+
+def test_page_shell_og_locale_matches_the_active_locale() -> None:
+    es_html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    en_html = to_xml(views.page("en", "Book", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert 'content="es_ES"' in es_html
+    assert 'content="en_US"' in en_html
+
+
+def test_page_shell_defaults_base_url_when_not_given() -> None:
+    # Callers that don't thread a real settings value through still get an absolute url pointing
+    # at the real production instance, never a bare relative path.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert f'content="{DEFAULT_BASE_URL}/static/og.png"' in html
+    assert f'content="{DEFAULT_BASE_URL}/e/intro?lang=es"' in html
+
+
+def test_page_shell_includes_favicon_link() -> None:
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert 'rel="icon"' in html
+    assert 'type="image/svg+xml"' in html
+    assert 'href="/static/favicon.svg"' in html
+
+
+def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
+    # A5.1 (I3 fix): htmx must be served by the app itself, never fetched from unpkg/a CDN.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p>hi</p>"), lang_urls=LANG_URLS))
+    assert "/static/htmx-2.0.4.min.js" in html
+    assert "unpkg.com" not in html
+    assert "cdn." not in html
+
+
+def test_detect_script_is_external_with_no_inline_body() -> None:
+    # A5.2: the timezone-detection script must be an external <script src=...>, not inline JS —
+    # a strict `script-src 'self'` CSP (A5.3) would otherwise block it.
+    html = to_xml(views._detect_script(True))
+    assert html == '<script src="/static/tz-detect.js" data-tz-explicit="true" defer></script>'
+
+
+def test_detect_script_carries_the_explicit_flag_as_a_data_attribute() -> None:
+    explicit_html = to_xml(views._detect_script(True))
+    implicit_html = to_xml(views._detect_script(False))
+    assert 'data-tz-explicit="true"' in explicit_html
+    assert 'data-tz-explicit="false"' in implicit_html
+    # Neither carries the old inline JS body.
+    assert "Intl.DateTimeFormat" not in explicit_html
+    assert "Intl.DateTimeFormat" not in implicit_html
 
 
 def test_index_lists_event_types_with_links() -> None:
@@ -117,6 +205,80 @@ def test_slots_section_renders_times_as_links() -> None:
     assert "/e/intro/book" in html
     # The absolute instant is carried, url-encoded, so the server books the exact time shown.
     assert "2026-07-14T13%3A00%3A00" in html
+
+
+def test_slots_section_slot_links_carry_localized_day_aria_label() -> None:
+    # I2: a screen-reader user must hear the day, not just the bare time, for each slot.
+    html_en = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="9:00 AM, Tuesday, July 14"' in html_en
+
+    es_group = DayGroup(
+        day=_group().day,
+        heading="martes 14 de julio",
+        slots=[SlotChoice(label="09:00", iso="2026-07-14T13:00:00+00:00")],
+    )
+    html_es = to_xml(
+        views.slots_section(
+            "es",
+            event=_event(),
+            groups=[es_group],
+            availability="ok",
+            tz="UTC",
+            book_path="/e/intro/book",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="09:00, martes 14 de julio"' in html_es
+
+
+def test_slots_section_pager_prev_disabled_at_the_floor() -> None:
+    # When the guest is already viewing the earliest allowed window, "previous week" is a dead
+    # link (the floor clamps it to the same window) — disable it instead of offering a no-op.
+    html = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="/e/intro?from=2026-07-14",
+            next_url="/e/intro?from=2026-07-28",
+            prev_disabled=True,
+        )
+    )
+    assert 'aria-disabled="true"' in html
+    assert 'href="/e/intro?from=2026-07-14"' not in html
+    assert 'href="/e/intro?from=2026-07-28"' in html  # next is still a live link
+
+
+def test_slots_section_pager_prev_enabled_when_not_at_floor() -> None:
+    html = to_xml(
+        views.slots_section(
+            "en",
+            event=_event(),
+            groups=[_group()],
+            availability="ok",
+            tz="America/New_York",
+            book_path="/e/intro/book",
+            prev_url="/e/intro?from=2026-07-07",
+            next_url="/e/intro?from=2026-07-28",
+        )
+    )
+    assert 'aria-disabled="true"' not in html
+    assert 'href="/e/intro?from=2026-07-07"' in html
 
 
 def test_slots_section_unavailable_shows_message_and_no_times() -> None:
@@ -175,6 +337,29 @@ def test_booking_form_has_labelled_inputs_and_questions() -> None:
     assert "Tuesday, July 14 at 9:00 AM" in html
 
 
+def test_booking_form_includes_honeypot_field_hidden_from_real_guests() -> None:
+    # Anti-spam honeypot: a decoy field a bot fills but a sighted/AT user never perceives.
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert 'name="company_website"' in html
+    assert 'tabindex="-1"' in html
+    assert 'autocomplete="off"' in html
+    assert 'aria-hidden="true"' in html
+    assert "-9999px" in html  # CSS-hidden off-screen, not display:none (bots ignore that)
+
+
 def test_booking_form_renders_inline_errors_accessibly() -> None:
     html = to_xml(
         views.booking_form_page(
@@ -211,6 +396,94 @@ def test_confirmation_shows_details_and_meeting_link() -> None:
     assert "https://meet.example/xyz" in html
 
 
+def test_confirmation_includes_add_to_calendar_links_with_correct_dates() -> None:
+    # M-F3: Google's `dates` param is `YYYYMMDDTHHMMSSZ`/`YYYYMMDDTHHMMSSZ` in UTC, built from the
+    # booking's actual start/end — never the display-formatted `when_label`.
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_event(title="Intro Call"),
+            booking=_booking(),  # start 13:00Z, end 13:30Z
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "calendar.google.com/calendar/render" in html
+    assert "action=TEMPLATE" in html
+    assert "20260714T130000Z" in html
+    assert "20260714T133000Z" in html
+    assert "outlook.live.com/calendar/0/deeplink/compose" in html
+    assert "2026-07-14T13%3A00%3A00Z" in html  # startdt, url-encoded
+    assert "2026-07-14T13%3A30%3A00Z" in html  # enddt, url-encoded
+
+
+def test_confirmation_calendar_links_use_localized_event_title() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "text=Discovery+call" in html  # Google's `text` param
+    assert "subject=Discovery+call" in html  # Outlook's `subject` param
+    assert "Llamada+de+descubrimiento" not in html
+
+
+def test_confirmation_calendar_link_labels_are_localized() -> None:
+    html_en = to_xml(
+        views.confirmation_page(
+            "en", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+        )
+    )
+    assert "Add to Google Calendar" in html_en
+    assert "Add to Outlook" in html_en
+    html_es = to_xml(
+        views.confirmation_page(
+            "es", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+        )
+    )
+    assert "Agregar a Google Calendar" in html_es
+    assert "Agregar a Outlook" in html_es
+
+
+def test_reschedule_section_slot_buttons_carry_localized_day_aria_label() -> None:
+    # I2, applies equally to the reschedule flow's POST-button slots.
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'aria-label="9:00 AM, Tuesday, July 14"' in html
+
+
+def test_reschedule_section_pager_prev_disabled_at_the_floor() -> None:
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="/reschedule?from=2026-07-14",
+            next_url="/reschedule?from=2026-07-28",
+            prev_disabled=True,
+        )
+    )
+    assert 'aria-disabled="true"' in html
+    assert 'href="/reschedule?from=2026-07-14"' not in html
+
+
 def test_message_page_never_leaks_internals() -> None:
     html = to_xml(
         views.message_page(
@@ -239,3 +512,232 @@ def test_cancel_confirm_has_post_form_with_hidden_context() -> None:
     assert str(booking_id) in html
     assert "signed.token" in html
     assert "cancelar" in html.lower()
+    assert 'enctype="application/x-www-form-urlencoded"' in html
+
+
+def test_booking_form_has_explicit_enctype() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert 'enctype="application/x-www-form-urlencoded"' in html
+
+
+def test_reschedule_section_slot_forms_have_explicit_enctype() -> None:
+    html = to_xml(
+        views.reschedule_section(
+            "en",
+            groups=[_group()],
+            availability="ok",
+            action="/reschedule",
+            booking_id=uuid.uuid4(),
+            token="good",
+            prev_url="#",
+            next_url="#",
+        )
+    )
+    assert 'enctype="application/x-www-form-urlencoded"' in html
+
+
+# --------------------------------------------------------------------------------------
+# Event-type content localization (C1): the resolved title/description must follow the
+# active locale, not the tenant's canonical-language text, in every view that renders them.
+# --------------------------------------------------------------------------------------
+
+_CANONICAL_TITLE = "Llamada de descubrimiento"
+_CANONICAL_DESC = "Una charla rápida de 30 minutos."
+_EN_TITLE = "Discovery call"
+_EN_DESC = "A quick 30-minute chat."
+
+
+def _localized_event(**overrides: Any) -> EventTypeRead:
+    base: dict[str, Any] = {
+        "title": _CANONICAL_TITLE,
+        "description": _CANONICAL_DESC,
+        "title_translations": {"en": _EN_TITLE},
+        "description_translations": {"en": _EN_DESC},
+    }
+    base.update(overrides)
+    return _event(**base)
+
+
+def test_index_page_uses_locale_title_override_when_present() -> None:
+    html = to_xml(views.index_page("en", event_types=[_localized_event()], lang_urls=LANG_URLS))
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+
+
+def test_index_page_falls_back_to_canonical_title_without_override() -> None:
+    event = _event(title=_CANONICAL_TITLE)
+    html = to_xml(views.index_page("en", event_types=[event], lang_urls=LANG_URLS))
+    assert _CANONICAL_TITLE in html
+
+
+def _render_event_page(locale: str, event: EventTypeRead) -> str:
+    return to_xml(
+        views.event_page(
+            locale,
+            event=event,
+            tz="UTC",
+            tz_options=["UTC"],
+            tz_explicit=False,
+            window_from="2026-07-14",
+            slots=views.NotStr(""),
+            self_path="/e/intro",
+            slots_endpoint="/e/intro/slots",
+            lang_urls=LANG_URLS,
+        )
+    )
+
+
+def test_event_page_localizes_title_and_description() -> None:
+    html = _render_event_page("en", _localized_event())
+    assert _EN_TITLE in html
+    assert _EN_DESC in html
+    assert _CANONICAL_TITLE not in html
+    assert _CANONICAL_DESC not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_event_page_falls_back_to_canonical_without_override() -> None:
+    html = _render_event_page("en", _event(title=_CANONICAL_TITLE, description=_CANONICAL_DESC))
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+
+
+def test_event_page_empty_string_override_falls_back_to_canonical() -> None:
+    event = _localized_event(title_translations={"en": ""}, description_translations={"en": ""})
+    html = _render_event_page("en", event)
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+
+
+def test_event_page_spanish_locale_always_shows_canonical() -> None:
+    html = _render_event_page("es", _localized_event())
+    assert _CANONICAL_TITLE in html
+    assert _CANONICAL_DESC in html
+    assert _EN_TITLE not in html
+
+
+def test_event_page_lang_switcher_marks_active_locale() -> None:
+    html = _render_event_page("en", _localized_event())
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+def test_event_page_renders_notice_when_given() -> None:
+    # I4: after a 409 slot-conflict PRG redirect, the picker shows an inline notice.
+    html = to_xml(
+        views.event_page(
+            "es",
+            event=_event(),
+            tz="UTC",
+            tz_options=["UTC"],
+            tz_explicit=False,
+            window_from="2026-07-14",
+            slots=views.NotStr(""),
+            self_path="/e/intro",
+            slots_endpoint="/e/intro/slots",
+            lang_urls=LANG_URLS,
+            notice="Ese horario ya no está disponible. Elige otro, por favor.",
+        )
+    )
+    assert "Ese horario ya no está disponible" in html
+    assert 'class="notice error"' in html
+
+
+def test_event_page_has_no_notice_by_default() -> None:
+    html = _render_event_page("es", _event())
+    assert 'class="notice error"' not in html
+
+
+def test_booking_form_page_localizes_title() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_localized_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_booking_form_page_lang_switcher_marks_active_locale() -> None:
+    html = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_localized_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="UTC",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+def test_confirmation_page_localizes_heading_title() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _EN_TITLE in html
+    assert _CANONICAL_TITLE not in html
+    assert f"<title>{_EN_TITLE} · AetherCal</title>" in html
+
+
+def test_confirmation_page_falls_back_to_canonical_without_override() -> None:
+    event = _event(title=_CANONICAL_TITLE)
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=event,
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert _CANONICAL_TITLE in html
+
+
+def test_confirmation_page_lang_switcher_marks_active_locale() -> None:
+    html = to_xml(
+        views.confirmation_page(
+            "en",
+            event=_localized_event(),
+            booking=_booking(),
+            when_label="Tuesday, July 14 at 9:00 AM",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
+    assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
