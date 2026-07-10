@@ -6,8 +6,8 @@ request path beyond ``read_busy`` reading the busy cache (RNF-6: no ``service_fa
 here). Query params: ``event_type`` (the event type id), ``from`` / ``to`` (the inclusive date
 window), and ``tz`` (the requested display timezone — validated as a real IANA zone and echoed back;
 the slot bounds are always absolute UTC instants regardless). Errors are clean and never leak
-internals (RF-16 error envelope): 404 for an unknown event type, 422 for a bad timezone or an
-inverted date range.
+internals (RF-16 error envelope): 404 for an unknown event type, 422 for a bad timezone, an
+inverted date range, or a window wider than ``MAX_QUERY_DAYS``.
 
 The orchestrator wires this ``router`` onto the ``/api/v1`` aggregator at integration; the module
 owns only its ``/slots`` prefix.
@@ -35,7 +35,14 @@ AuthDep = Annotated[AuthContext, Depends(require_api_key)]
 
 _INVALID_TIMEZONE = "invalid_timezone"
 _INVALID_RANGE = "invalid_range"
+_WINDOW_TOO_LARGE = "window_too_large"
 _NOT_FOUND = "not_found"
+
+# The widest ``from``..``to`` a single request may span. A booking calendar rarely needs more than a
+# couple of months of look-ahead at once; bounding it keeps the availability computation O(window)
+# — per-day interval expansion plus a busy-set scan — instead of letting one request materialize an
+# unbounded range (a cheap DoS guard, and a backstop against the extreme-date overflow path).
+MAX_QUERY_DAYS = 62
 
 
 def _unprocessable(error: str, message: str) -> HTTPException:
@@ -59,6 +66,18 @@ def _require_ordered_window(window_from: date, window_to: date) -> None:
         raise _unprocessable(_INVALID_RANGE, "'from' must not be after 'to'")
 
 
+def _require_window_within_cap(window_from: date, window_to: date) -> None:
+    """Reject a window wider than ``MAX_QUERY_DAYS`` with a clean 422 (bounded work per request).
+
+    Assumes ``window_from <= window_to`` (the caller runs ``_require_ordered_window`` first), so the
+    span is non-negative.
+    """
+    if (window_to - window_from).days > MAX_QUERY_DAYS:
+        raise _unprocessable(
+            _WINDOW_TOO_LARGE, f"Date window must not exceed {MAX_QUERY_DAYS} days"
+        )
+
+
 @router.get("/", response_model=SlotsResponse)
 async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + dependency as a parameter
     session: SessionDep,
@@ -71,6 +90,7 @@ async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + d
     """Bookable slots for one of the tenant's event types (404 unknown, 422 bad tz / range)."""
     _require_iana_zone(tz)
     _require_ordered_window(window_from, window_to)
+    _require_window_within_cap(window_from, window_to)
 
     result = await compute_slots(
         session,

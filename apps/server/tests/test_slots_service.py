@@ -32,7 +32,7 @@ from aethercal.server.db.models import (
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.event_types import create_event_type
-from aethercal.server.services.slots import SlotsResult, compute_slots
+from aethercal.server.services.slots import SlotsResult, _load_overrides, compute_slots
 
 # Mon-Fri 09:00-17:00 in the schedule's own zone (Monday=0 .. Sunday=6).
 _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)}
@@ -418,3 +418,79 @@ async def test_cross_tenant_isolation_returns_none(
     )
 
     assert result is None
+
+
+async def test_window_at_min_date_does_not_overflow(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule)
+
+    # ``date.min`` at the low end forces ``_busy_window`` to pad below ``date.min``: the padded
+    # bound must be clamped rather than raising ``OverflowError`` (which would 500 the endpoint).
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=date.min,
+        window_to=date.min + timedelta(days=1),
+        now=_BEFORE,
+    )
+
+    # A valid (here empty — the window is aeons before ``now``) result, never a crash.
+    assert result is not None
+    assert result.slots == []
+
+
+async def test_window_at_max_date_does_not_overflow(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule)
+
+    # ``date.max`` at the high end forces ``_busy_window`` to pad above ``date.max``: the padded
+    # bound must be clamped rather than raising ``OverflowError``.
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=date.max - timedelta(days=1),
+        window_to=date.max,
+        now=_BEFORE,
+    )
+
+    assert result is not None
+    assert result.slots == []
+
+
+async def test_load_overrides_only_returns_overrides_inside_window(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    schedule = await _schedule(sqlite_session, tenant)
+    # One override inside the [_MON, _FRI] window, one well outside it.
+    sqlite_session.add_all(
+        [
+            DateOverride(tenant_id=tenant.id, schedule_id=schedule.id, date=_WED, ranges=[]),
+            DateOverride(
+                tenant_id=tenant.id, schedule_id=schedule.id, date=date(2026, 8, 1), ranges=[]
+            ),
+        ]
+    )
+    await sqlite_session.flush()
+
+    loaded = await _load_overrides(
+        sqlite_session,
+        tenant_id=tenant.id,
+        schedule_id=schedule.id,
+        window_from=_MON,
+        window_to=_FRI,
+    )
+
+    # Only the in-window override is loaded (the perf fix: no full-history scan per query).
+    dates = [row.date for row in loaded]
+    assert dates == [_WED]

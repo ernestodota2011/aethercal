@@ -22,6 +22,8 @@ def _dates(start_date: date, end_date: date) -> Iterable[date]:
     current = start_date
     while current <= end_date:
         yield current
+        if current == date.max:
+            break  # ``date.max`` is the last representable date; stepping past it would overflow.
         current += timedelta(days=1)
 
 

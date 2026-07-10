@@ -13,7 +13,7 @@ host, a weekly Mon-Fri 09:00-17:00 UTC schedule, an event type, and its API key.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -127,6 +127,43 @@ async def test_inverted_date_range_returns_422(
     )
     assert resp.status_code == 422
     assert resp.json()["detail"]["error"] == "invalid_range"
+
+
+async def test_window_larger_than_cap_returns_422(
+    wired_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    today = datetime.now(UTC).date()
+    resp = await wired_client.get(
+        SLOTS,
+        params={
+            "event_type": str(uuid.uuid4()),
+            "tz": "UTC",
+            "from": today.isoformat(),
+            "to": (today + timedelta(days=slots.MAX_QUERY_DAYS + 1)).isoformat(),
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "window_too_large"
+
+
+async def test_extreme_date_window_never_500s(
+    wired_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    # ``date.min``..``date.max`` must never crash the endpoint (no ``OverflowError`` -> 500); the
+    # window cap rejects it cleanly with a 422 long before the service pads the range.
+    resp = await wired_client.get(
+        SLOTS,
+        params={
+            "event_type": str(uuid.uuid4()),
+            "tz": "UTC",
+            "from": date.min.isoformat(),
+            "to": date.max.isoformat(),
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "window_too_large"
 
 
 async def test_happy_path_returns_utc_slots_and_echoes_tz(
