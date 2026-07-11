@@ -84,6 +84,24 @@ def test_light_secondary_and_tertiary_text_meet_aa() -> None:
     assert _relative_luminance(light.muted) < _relative_luminance(light.faint)
 
 
+@pytest.mark.parametrize("name", ["dark", "midnight"])
+def test_dark_secondary_and_tertiary_text_meet_aa(name: str) -> None:
+    # The dark presets were held to AA only for the primary body text (fg-on-bg); their secondary
+    # (`muted`) and tertiary (`faint`) text must clear WCAG AA (>= 4.5:1) too — a real-browser axe run
+    # caught `faint` failing on the dark surfaces (hour axis, "all day" rowheader, legends, footer).
+    # Assert each token against every dark surface it renders on, mirroring the light-preset guard.
+    theme = PRESETS[name]
+    muted_surfaces = (theme.bg, theme.cell_bg, theme.event_bg, theme.cell_bg_outside)
+    faint_surfaces = (theme.bg, theme.cell_bg, theme.cell_bg_outside)
+    for surface in muted_surfaces:
+        assert _contrast_ratio(theme.muted, surface) >= 4.5, f"{name} `muted` fails AA on {surface}"
+    for surface in faint_surfaces:
+        assert _contrast_ratio(theme.faint, surface) >= 4.5, f"{name} `faint` fails AA on {surface}"
+    # Keep the visual hierarchy: on a dark surface the tertiary `faint` text stays DIMMER (lower
+    # luminance) than the secondary `muted` text — inverted vs the light theme's dark-on-light text.
+    assert _relative_luminance(theme.faint) < _relative_luminance(theme.muted)
+
+
 def test_preset_lookup_matches_the_classmethods() -> None:
     assert Theme.preset("dark") == Theme.dark()
     assert Theme.preset("midnight") == Theme.midnight()

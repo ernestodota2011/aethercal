@@ -95,7 +95,16 @@ ${defaultBaseTokenCss()}
   border-right: none;
   border-bottom: none;
 }
-.aethercal-event.is-locked { cursor: default; opacity: 0.75; }
+/* Locked (editable:false): de-emphasize only the CHROME, never the text. Dimming the whole chip with
+   opacity faded the muted time label below WCAG AA (~3.1:1, finding D-1). Instead the fill blends
+   toward the surface (reads as ghosted/locked, and moving AWAY from the text luminance keeps the
+   muted time + title >= AA in every preset) and the left accent turns dashed — a non-color "locked"
+   cue (WCAG 1.4.1) distinct from an editable chip's solid bar. */
+.aethercal-event.is-locked {
+  cursor: default;
+  border-left-style: dashed;
+  background: color-mix(in srgb, var(--ac-event-bg) 55%, var(--ac-bg));
+}
 .aethercal-event-time { color: var(--ac-muted); font-size: 11px; font-variant-numeric: tabular-nums; flex: none; }
 .aethercal-event-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .aethercal-more {

@@ -113,7 +113,16 @@ ${defaultTimeGridTokenCss()}
   cursor: grab;
   min-height: 14px;
 }
-.aethercal-tg-event.is-locked { cursor: default; opacity: 0.75; }
+/* Locked (editable:false): de-emphasize the CHROME only — same root fix as the month chip (finding
+   D-1). opacity dimmed the muted time label below WCAG AA; instead the fill blends toward the
+   surface and the accent bar turns dashed (a non-color "locked" cue), keeping the time + title text
+   at full AA contrast. The --ac-tg-event-bg token resolves to --ac-event-bg, so the blend matches the
+   month chip's. */
+.aethercal-tg-event.is-locked {
+  cursor: default;
+  border-left-style: dashed;
+  background: color-mix(in srgb, var(--ac-tg-event-bg) 55%, var(--ac-bg));
+}
 .aethercal-tg-event-time { color: var(--ac-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .aethercal-tg-event-title {
   font-weight: 500;

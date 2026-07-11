@@ -53,6 +53,20 @@ describe("week / day view roles", () => {
     expect(getByRole("grid")).toBeTruthy();
     expect(getAllByRole("columnheader")).toHaveLength(1);
   });
+
+  it("makes the scrollable hour body keyboard-focusable (scrollable-region-focusable)", () => {
+    // The hour body (overflow-y:auto, fixed height) must be reachable by keyboard so a keyboard-only
+    // user can scroll it; without tabindex axe flags it in week and day.
+    for (const view of ["week", "day"] as const) {
+      const { container, unmount } = render(
+        <AetherCalendar view={view} anchor={ANCHOR} now={NOW} events={events} />,
+      );
+      const body = container.querySelector(".aethercal-tg-body") as HTMLElement;
+      expect(body, `${view}: missing .aethercal-tg-body`).toBeTruthy();
+      expect(body.getAttribute("tabindex"), `${view}: body not focusable`).toBe("0");
+      unmount();
+    }
+  });
 });
 
 describe("list view roles (list semantics, NOT a grid)", () => {

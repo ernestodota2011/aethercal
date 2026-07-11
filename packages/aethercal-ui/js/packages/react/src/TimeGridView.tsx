@@ -802,7 +802,12 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
           ))}
         </div>
 
-        <div className="aethercal-tg-body" role="row">
+        {/* The hour body scrolls vertically (fixed height < the full-day column), so it is a scroll
+            container. Make it keyboard-focusable (tabIndex=0) so a keyboard-only user can reach and
+            scroll it — axe `scrollable-region-focusable`. The grid's own arrow-key navigation still
+            runs (the handler is on the focusable grid root and catches the bubbled keydown), so this
+            adds scroll access without changing the grid model. */}
+        <div className="aethercal-tg-body" role="row" tabIndex={0}>
           <div className="aethercal-tg-gutter" role="presentation" aria-hidden="true">
             {grid.hourMarks.map((mark) => (
               <div key={mark.hour} className="aethercal-tg-hour" style={{ top: pct(mark.topFraction) }}>

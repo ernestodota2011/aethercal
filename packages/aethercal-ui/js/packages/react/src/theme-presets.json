@@ -21,7 +21,7 @@
   "dark": {
     "--ac-fg": "#e6e8eb",
     "--ac-muted": "#9aa1ab",
-    "--ac-faint": "#6b7280",
+    "--ac-faint": "#868e99",
     "--ac-bg": "#14161a",
     "--ac-header-fg": "#b3b9c2",
     "--ac-border": "#2a2e35",
@@ -40,7 +40,7 @@
   "midnight": {
     "--ac-fg": "#dfe4ea",
     "--ac-muted": "#8b95a1",
-    "--ac-faint": "#5b6675",
+    "--ac-faint": "#828a95",
     "--ac-bg": "#0b0f14",
     "--ac-header-fg": "#a7b0bd",
     "--ac-border": "#1c232c",

@@ -57,6 +57,13 @@ const UI = {
       "En este demo el componente se consume desde el monorepo (workspace). La publicación a npm " +
       "acompaña al anuncio público.",
     repo: "Ver el código en GitHub",
+    // Unique labels for the focusable, scrollable code regions (N-1): distinct so the extra
+    // `role="region"` landmarks stay unique (no landmark-unique violation).
+    codeAria: {
+      install: "Código de ejemplo: instalación",
+      import: "Código de ejemplo: importación",
+      use: "Código de ejemplo: uso",
+    },
     views: { month: "Mes", week: "Semana", day: "Día", list: "Agenda" },
     presets: { light: "Claro", dark: "Oscuro", midnight: "Medianoche", high_contrast: "Alto contraste" },
     footer: "Proyecto de código abierto (MIT). Pre-alpha: la API puede cambiar.",
@@ -87,6 +94,11 @@ const UI = {
       "In this demo the component is consumed from the monorepo (workspace). npm publishing ships " +
       "with the public announcement.",
     repo: "View the source on GitHub",
+    codeAria: {
+      install: "Code sample: install",
+      import: "Code sample: import",
+      use: "Code sample: usage",
+    },
     views: { month: "Month", week: "Week", day: "Day", list: "Agenda" },
     presets: { light: "Light", dark: "Dark", midnight: "Midnight", high_contrast: "High contrast" },
     footer: "Open-source project (MIT). Pre-alpha: the API may change.",
@@ -282,108 +294,118 @@ export function App(): React.JSX.Element {
           </a>
         </header>
 
-        <section className="demo-hero">
-          <h1 className="demo-title">{t.tagline}</h1>
-          <p className="demo-lead">{t.lead}</p>
-        </section>
+        {/* One top-level landmark for the whole body (N-2): the hero, controls, hint, calendar,
+            status, and quickstart used to sit outside any landmark (only the calendar had a `<main>`),
+            leaving their content orphaned. Wrapping them in a single `<main>` keeps 0 content outside a
+            landmark; header/footer remain the banner/contentinfo. Pure semantics — no visual change. */}
+        <main className="demo-main">
+          <section className="demo-hero">
+            <h1 className="demo-title">{t.tagline}</h1>
+            <p className="demo-lead">{t.lead}</p>
+          </section>
 
-        <div className="demo-controls" role="region" aria-label={locale === "es" ? "Controles" : "Controls"}>
-          <Segmented
-            legend={t.view}
-            value={view}
-            options={VIEWS.map((v) => ({ value: v, label: t.views[v] }))}
-            onChange={setView}
-          />
-          <Segmented
-            legend={t.theme}
-            value={preset}
-            options={PRESET_NAMES.map((p) => ({ value: p, label: t.presets[p] }))}
-            onChange={setPreset}
-          />
-          <Segmented
-            legend={t.language}
-            value={locale}
-            options={[
-              { value: "es", label: "ES" },
-              { value: "en", label: "EN" },
-            ]}
-            onChange={setLocale}
-          />
-          <Segmented
-            legend={t.recon}
-            value={reject ? "reject" : "accept"}
-            options={[
-              { value: "accept", label: t.accept },
-              { value: "reject", label: t.reject },
-            ]}
-            onChange={(mode) => setReject(mode === "reject")}
-          />
-        </div>
-
-        <p className="demo-hint">{t.reconHelp}</p>
-
-        <main className="demo-calendar-wrap">
-          <div className="demo-calendar-scroll">
-            <OptimisticCalendar
-              key={resetNonce}
-              events={events}
-              mutate={mutate}
-              generateId={generateId}
-              view={view}
-              locale={locale}
-              theme={preset}
-              anchor={anchor}
-              navigation
-              navigationViews={false}
-              firstDayOfWeek={1}
-              dayStartHour={6}
-              dayEndHour={24}
-              rollbackFlashMs={1100}
-              onRangeChange={onRangeChange}
-              onRangeSelect={onRangeSelect}
-              onEventClick={onEventClick}
-              onContextMenu={onContextMenu}
+          <div className="demo-controls" role="region" aria-label={locale === "es" ? "Controles" : "Controls"}>
+            <Segmented
+              legend={t.view}
+              value={view}
+              options={VIEWS.map((v) => ({ value: v, label: t.views[v] }))}
+              onChange={setView}
+            />
+            <Segmented
+              legend={t.theme}
+              value={preset}
+              options={PRESET_NAMES.map((p) => ({ value: p, label: t.presets[p] }))}
+              onChange={setPreset}
+            />
+            <Segmented
+              legend={t.language}
+              value={locale}
+              options={[
+                { value: "es", label: "ES" },
+                { value: "en", label: "EN" },
+              ]}
+              onChange={setLocale}
+            />
+            <Segmented
+              legend={t.recon}
+              value={reject ? "reject" : "accept"}
+              options={[
+                { value: "accept", label: t.accept },
+                { value: "reject", label: t.reject },
+              ]}
+              onChange={(mode) => setReject(mode === "reject")}
             />
           </div>
-        </main>
 
-        <div className="demo-status" aria-live="polite">
-          <div>
-            <span className="demo-status-label">{t.lastAction}</span>
-            <span className="demo-status-value">{lastAction ?? t.idle}</span>
+          <p className="demo-hint">{t.reconHelp}</p>
+
+          {/* The calendar keeps its own scroll container; it is no longer the page's `<main>` (that is
+              now the wrapper above), so this is a plain block — the landmark moved up, not away. */}
+          <div className="demo-calendar-wrap">
+            <div className="demo-calendar-scroll">
+              <OptimisticCalendar
+                key={resetNonce}
+                events={events}
+                mutate={mutate}
+                generateId={generateId}
+                view={view}
+                locale={locale}
+                theme={preset}
+                anchor={anchor}
+                navigation
+                navigationViews={false}
+                firstDayOfWeek={1}
+                dayStartHour={6}
+                dayEndHour={24}
+                rollbackFlashMs={1100}
+                onRangeChange={onRangeChange}
+                onRangeSelect={onRangeSelect}
+                onEventClick={onEventClick}
+                onContextMenu={onContextMenu}
+              />
+            </div>
           </div>
-          <button type="button" className="demo-reset" onClick={resetData}>
-            {t.reset}
-          </button>
-        </div>
 
-        <section className="demo-quickstart">
-          <h2 className="demo-section-title">{t.quickstartTitle}</h2>
-          <ol className="demo-steps">
-            <li>
-              <p className="demo-step-text">{t.step1}</p>
-              <pre className="demo-code">
-                <code>{CODE_INSTALL}</code>
-              </pre>
-            </li>
-            <li>
-              <p className="demo-step-text">{t.step2}</p>
-              <pre className="demo-code">
-                <code>{CODE_IMPORT}</code>
-              </pre>
-            </li>
-            <li>
-              <p className="demo-step-text">{t.step3}</p>
-              <pre className="demo-code">
-                <code>{CODE_USE}</code>
-              </pre>
-            </li>
-          </ol>
-          <p className="demo-note">{t.quickstartNote}</p>
-          <a className="demo-cta" href={REPO_URL} target="_blank" rel="noreferrer noopener">
-            {t.repo}
-          </a>
-        </section>
+          <div className="demo-status" aria-live="polite">
+            <div>
+              <span className="demo-status-label">{t.lastAction}</span>
+              <span className="demo-status-value">{lastAction ?? t.idle}</span>
+            </div>
+            <button type="button" className="demo-reset" onClick={resetData}>
+              {t.reset}
+            </button>
+          </div>
+
+          <section className="demo-quickstart">
+            <h2 className="demo-section-title">{t.quickstartTitle}</h2>
+            <ol className="demo-steps">
+              <li>
+                <p className="demo-step-text">{t.step1}</p>
+                {/* Focusable, labeled scrollable region (N-1): the code overflows horizontally, so a
+                    keyboard-only user needs to be able to Tab into it to scroll it. */}
+                <pre className="demo-code" tabIndex={0} role="region" aria-label={t.codeAria.install}>
+                  <code>{CODE_INSTALL}</code>
+                </pre>
+              </li>
+              <li>
+                <p className="demo-step-text">{t.step2}</p>
+                <pre className="demo-code" tabIndex={0} role="region" aria-label={t.codeAria.import}>
+                  <code>{CODE_IMPORT}</code>
+                </pre>
+              </li>
+              <li>
+                <p className="demo-step-text">{t.step3}</p>
+                <pre className="demo-code" tabIndex={0} role="region" aria-label={t.codeAria.use}>
+                  <code>{CODE_USE}</code>
+                </pre>
+              </li>
+            </ol>
+            <p className="demo-note">{t.quickstartNote}</p>
+            <a className="demo-cta" href={REPO_URL} target="_blank" rel="noreferrer noopener">
+              {t.repo}
+            </a>
+          </section>
+        </main>
 
         <footer className="demo-footer">{t.footer}</footer>
       </div>
