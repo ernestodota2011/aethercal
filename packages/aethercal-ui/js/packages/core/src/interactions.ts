@@ -10,6 +10,7 @@
  * `revision` is echoed through unchanged (the server assigns the *new* revision on accept — §4).
  */
 import {
+  addCalendarDays,
   calendarDayDelta,
   computeDroppedRange,
   formatLocalDateTime,
@@ -67,6 +68,45 @@ export function fractionToMinuteOfDay(
   // the window off the grid so fraction 0 no longer lands on the window start.
   const snapped = windowStartMin + Math.round((raw - windowStartMin) / step) * step;
   return clamp(snapped, windowStartMin, windowEndMin);
+}
+
+/**
+ * Clamp a minute-of-day into the time grid's visible window `[dayStartHour*60, dayEndHour*60]`.
+ *
+ * The keyboard counterpart of the pointer's `fractionToMinuteOfDay` clamp: a keyboard move/resize
+ * steps the target minute by a snap increment and calls this so it can never leave the visible
+ * hours (F2-E a11y). Pure and DOM-free like the rest of `calendar-core` (RF-23).
+ */
+export function clampMinuteToWindow(minuteOfDay: number, config: ResolvedTimeGridConfig): number {
+  return clamp(minuteOfDay, config.dayStartHour * MINUTES_PER_HOUR, config.dayEndHour * MINUTES_PER_HOUR);
+}
+
+const MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR;
+
+/**
+ * Step a `(dateOnly, minuteOfDay)` INSTANT by `deltaMinutes`, treating day and minute as one point
+ * in time: a step that crosses local midnight rolls the day (so an event ending exactly at 00:00 can
+ * be shortened to 23:45 of the previous day), then the resulting minute is clamped into the visible
+ * window (F2-E keyboard move/resize, Crisol round-8). `minuteOfDay === 1440` is the day's midnight
+ * end and is kept (not rolled). Pure and DOM-free (RF-23).
+ */
+export function stepInstantMinutes(
+  dateOnly: string,
+  minuteOfDay: number,
+  deltaMinutes: number,
+  config: ResolvedTimeGridConfig,
+): { dateOnly: string; minuteOfDay: number } {
+  let m = minuteOfDay + deltaMinutes;
+  let d = dateOnly;
+  while (m < 0) {
+    m += MINUTES_PER_DAY;
+    d = addCalendarDays(d, -1);
+  }
+  while (m > MINUTES_PER_DAY) {
+    m -= MINUTES_PER_DAY;
+    d = addCalendarDays(d, 1);
+  }
+  return { dateOnly: d, minuteOfDay: clampMinuteToWindow(m, config) };
 }
 
 /**

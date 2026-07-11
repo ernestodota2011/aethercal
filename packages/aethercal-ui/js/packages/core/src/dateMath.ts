@@ -128,6 +128,19 @@ export function getMonthGridDays(
   return dateRange(startOfWeek(firstOfMonth, firstDayOfWeek), 42);
 }
 
+/**
+ * Add (or subtract) whole calendar days to a "YYYY-MM-DD" key, returning a "YYYY-MM-DD" key.
+ *
+ * Component-based (never a raw millisecond add) so it is DST-safe and rolls correctly across month
+ * and year boundaries. Used by keyboard drag to step a move target by ±1 day / ±1 week without a
+ * pointer (F2-E a11y). Any time-of-day in the input is ignored — this operates on the date only.
+ */
+export function addCalendarDays(dateOnly: string, delta: number): string {
+  const base = parseLocalDateTime(`${toDateOnly(dateOnly)}T00:00:00`);
+  const shifted = new Date(base.getFullYear(), base.getMonth(), base.getDate() + delta);
+  return `${shifted.getFullYear()}-${pad2(shifted.getMonth() + 1)}-${pad2(shifted.getDate())}`;
+}
+
 /** Whole calendar-day difference between two dates, DST-safe (a day is 23–25h across DST). */
 export function calendarDayDelta(from: Date, to: Date): number {
   const fromMidnight = new Date(from.getFullYear(), from.getMonth(), from.getDate());

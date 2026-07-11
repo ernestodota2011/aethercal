@@ -17,6 +17,22 @@ export {
 export { CALENDAR_CSS, ensureCalendarStyles } from "./styles";
 export { TimeGridView, type TimeGridViewProps } from "./TimeGridView";
 export { TIME_GRID_CSS, ensureTimeGridStyles } from "./timeGridStyles";
+export {
+  PRESETS,
+  PRESET_NAMES,
+  type ThemeInput,
+  type ThemePreset,
+  type ThemeTokens,
+  defaultBaseTokenCss,
+  defaultTimeGridTokenCss,
+  isThemePreset,
+  resolveThemeVars,
+} from "./theme";
+export {
+  type CalendarMessages,
+  DEFAULT_LOCALE_MESSAGES,
+  resolveMessages,
+} from "./i18n";
 export type {
   CalendarEvent,
   CalendarView,

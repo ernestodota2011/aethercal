@@ -11,18 +11,13 @@
  * day column using the fractions computed by `@aethercal/calendar-core` (top/height/left/width as
  * percentages).
  */
+import { defaultTimeGridTokenCss } from "./theme";
+
 export const TIME_GRID_STYLE_ELEMENT_ID = "aethercal-timegrid-styles";
 
 export const TIME_GRID_CSS = `
 :where(.aethercal-timegrid) {
-  --ac-tg-gutter: 56px;
-  --ac-tg-body-height: 640px;
-  --ac-tg-hour-min-height: 44px;
-  --ac-tg-line: var(--ac-border);
-  --ac-tg-now: #dc2626;
-  --ac-tg-event-bg: var(--ac-event-bg);
-  --ac-tg-event-fg: var(--ac-event-fg);
-  --ac-tg-event-accent: var(--ac-event-accent);
+${defaultTimeGridTokenCss()}
 }
 .aethercal-timegrid { display: flex; flex-direction: column; }
 .aethercal-tg-head,
@@ -171,6 +166,12 @@ export const TIME_GRID_CSS = `
   pointer-events: none;
   z-index: 1;
 }
+/* Keyboard a11y (F2-E, RNF-7): the active time column / event carries the visible focus ring, and a
+   keyboard-grabbed event (move or resize) reads a stronger ring — plain outlines, no glow. The
+   existing is-drop-target column highlight doubles as the keyboard move/resize target cue. */
+.aethercal-tg-col.is-active { outline: 2px solid var(--ac-focus); outline-offset: -2px; z-index: 1; }
+.aethercal-tg-event.is-active { outline: 2px solid var(--ac-focus); outline-offset: 1px; z-index: 4; }
+.aethercal-tg-event.is-grabbed { outline: 2px solid var(--ac-focus); outline-offset: 2px; z-index: 4; }
 `;
 
 /** Inject the time-grid stylesheet once into <head>. No-op without a DOM (SSR) or when present. */

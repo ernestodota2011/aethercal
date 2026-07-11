@@ -13,6 +13,7 @@ import pytest
 import reflex as rx
 
 from aethercal.ui.calendar import Calendar
+from aethercal.ui.theme import Theme
 
 
 def test_calendar_compiles_to_the_aether_calendar_react_tag() -> None:
@@ -116,6 +117,38 @@ def test_invalid_first_day_of_week_literal_raises() -> None:
     for bad in (-1, 7, 13, True, False):
         with pytest.raises(ValueError, match=r"first_day_of_week must be 0..6"):
             Calendar.create(first_day_of_week=bad)
+
+
+# --- F2-E theming ---------------------------------------------------------------------------------
+
+
+def test_default_theme_prop_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create()._render()
+    assert "theme" in tag.props
+    assert str(tag.props["theme"]) == '"light"'
+
+
+def test_explicit_theme_preset_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create(theme="dark")._render()
+    assert str(tag.props["theme"]) == '"dark"'
+
+
+def test_all_theme_presets_are_accepted() -> None:
+    for preset in ("light", "dark", "midnight", "high_contrast"):
+        assert str(Calendar.create(theme=preset)._render().props["theme"]) == f'"{preset}"'
+
+
+def test_invalid_theme_literal_raises() -> None:
+    with pytest.raises(ValueError, match=r"Calendar\.theme string must be one of"):
+        Calendar.create(theme="neon")
+
+
+def test_theme_dict_of_tokens_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create(theme=Theme.dark().to_css_vars())._render()
+    rendered = str(tag.props["theme"])
+    # A custom token dict (Theme.to_css_vars()) is passed straight through to the React layer.
+    assert "--ac-bg" in rendered
+    assert "--ac-fg" in rendered
 
 
 def test_on_event_drop_is_a_registered_event_trigger() -> None:

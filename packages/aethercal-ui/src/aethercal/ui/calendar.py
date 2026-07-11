@@ -36,12 +36,19 @@ import reflex as rx
 from reflex.vars import ObjectVar
 from reflex_base.components.component import field as rx_field
 
+from aethercal.ui.theme import PRESET_NAMES
+
 _BUNDLE = rx.asset(path="assets/aethercal-calendar.js", shared=True)
 
 # The four calendar surfaces (AetherCal-06 §5). Only ``month`` renders in F2-A; the rest are the
 # forward-looking contract (F2-B/C). Kept in sync with the TS ``CalendarView`` union
 # (js/packages/core/src/types.ts).
 _VALID_VIEWS = frozenset({"month", "week", "day", "list"})
+
+# The four theme presets (F2-E, AetherCal-06 §7). A literal ``theme`` string must be one of these;
+# a dict of ``--ac-*`` token overrides (e.g. ``Theme.dark().to_css_vars()``) is also accepted, and a
+# dynamic ``Var`` is not literal-checked (its value is a frontend concern the React layer resolves).
+_VALID_THEMES = frozenset(PRESET_NAMES)
 
 
 class CalendarEvent(TypedDict):
@@ -192,6 +199,15 @@ class Calendar(rx.NoSSRComponent):
         doc="First day of the week, 0=Sunday … 6=Saturday. Defaults to Monday (1).",
     )
 
+    theme: rx.Var[str | dict[str, str]] = rx_field(
+        default=rx.Var.create("light"),
+        doc=(
+            "Theme: a preset name ('light' | 'dark' | 'midnight' | 'high_contrast') or a dict of "
+            "--ac-* token overrides (e.g. Theme.dark().to_css_vars()). Applied as inline CSS "
+            "variables; the default is the neutral 'light' preset."
+        ),
+    )
+
     on_event_drop: rx.EventHandler[_on_event_drop_signature] = rx_field(
         doc=(
             "Fired when a user finishes dragging an event onto a new day/time. Receives the "
@@ -253,5 +269,12 @@ class Calendar(rx.NoSSRComponent):
         # valid weekday index) and reject any literal int outside 0..6. A dynamic `Var` is skipped.
         if isinstance(fdow, bool) or (isinstance(fdow, int) and fdow not in range(7)):
             msg = f"Calendar.first_day_of_week must be 0..6 (0=Sunday), got {fdow!r}"
+            raise ValueError(msg)
+        theme = props.get("theme")
+        # A literal theme string must be a known preset; a dict of --ac-* overrides or a dynamic Var
+        # is passed through (the React layer resolves/sanitizes it).
+        if isinstance(theme, str) and theme not in _VALID_THEMES:
+            valid = ", ".join(sorted(_VALID_THEMES))
+            msg = f"Calendar.theme string must be one of {{{valid}}}, got {theme!r}"
             raise ValueError(msg)
         return super().create(*children, **props)  # type: ignore[return-value]

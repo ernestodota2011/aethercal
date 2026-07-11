@@ -94,6 +94,10 @@ cmd = "python packages/aethercal-ui/scripts/verify_bundle.py"
 help = "Regenerate calendar-props.schema.json from the Python payload TypedDicts (F2-D contract)."
 cmd = "python packages/aethercal-ui/scripts/gen_calendar_schema.py"
 
+[tool.poe.tasks.gen-theme]
+help = "Regenerate theme-presets.json from the Python Theme presets (F2-E theming contract)."
+cmd = "python packages/aethercal-ui/scripts/gen_theme_presets.py"
+
 # --------------------------------------------------------------------------------------
 # Tooling config (shared across the workspace)
 # --------------------------------------------------------------------------------------

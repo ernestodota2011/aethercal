@@ -1,36 +1,23 @@
 /**
- * Neutral, premium base theme for the month view, expressed entirely through `--ac-*` CSS
- * custom properties (AetherCal-06 §7). The defaults are DELIBERATELY brand-neutral and light —
- * grayscale surfaces, a near-black today marker, a slate event accent. No lavender/violet/cyan
- * accents and no glows (the #1 AI-slop tell, reference_anti_ai_slop_doctrina). The agency brand
- * and dark/preset themes are applied by overriding these tokens (full preset system is F2-E).
+ * Neutral, premium base theme for the month/list views, expressed entirely through `--ac-*` CSS
+ * custom properties (AetherCal-06 §7). The default token VALUES are the `light` preset, injected
+ * from the single theming origin (`theme.ts` → generated from the Python `Theme`) via
+ * `defaultBaseTokenCss()`, so there is no second hardcoded copy of the palette here. The defaults
+ * are DELIBERATELY brand-neutral — grayscale surfaces, a near-black today marker, a slate event
+ * accent. No lavender/violet/cyan accents and no glows (the #1 AI-slop tell,
+ * reference_anti_ai_slop_doctrina). The agency brand and the dark/preset themes are applied by
+ * overriding these tokens (a preset name or a custom object → `resolveThemeVars`, applied inline).
  *
  * Token defaults live inside `:where(.aethercal-calendar)` (0 specificity) so a consumer can
- * override any `--ac-*` with a normal selector.
+ * override any `--ac-*` with a normal selector, and a per-instance `theme` wins via inline styles.
  */
+import { defaultBaseTokenCss } from "./theme";
+
 export const CALENDAR_STYLE_ELEMENT_ID = "aethercal-calendar-styles";
 
 export const CALENDAR_CSS = `
 :where(.aethercal-calendar) {
-  --ac-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --ac-fg: #1f2328;
-  --ac-muted: #6b7280;
-  --ac-faint: #9ca3af;
-  --ac-bg: #ffffff;
-  --ac-header-fg: #4b5563;
-  --ac-border: #e5e7eb;
-  --ac-cell-bg: #ffffff;
-  --ac-cell-bg-outside: #fafafa;
-  --ac-today-marker-bg: #111827;
-  --ac-today-marker-fg: #ffffff;
-  --ac-event-bg: #eef1f4;
-  --ac-event-fg: #1f2328;
-  --ac-event-accent: #64748b;
-  --ac-more-fg: #4b5563;
-  --ac-focus: #2563eb;
-  --ac-rollback: #b91c1c;
-  --ac-radius: 8px;
-  --ac-cell-min-height: 96px;
+${defaultBaseTokenCss()}
 }
 .aethercal-calendar {
   font-family: var(--ac-font);
@@ -171,6 +158,41 @@ export const CALENDAR_CSS = `
   text-overflow: ellipsis;
 }
 
+/* Keyboard a11y (F2-E, RNF-7): the grid container is a single tabstop that manages an
+   aria-activedescendant; the active cell/event carries the VISIBLE focus ring (so the container's
+   own focus outline is suppressed), and a grabbed event (keyboard drag) reads a stronger ring. No
+   glows — a plain outline, honoring the anti-slop palette. */
+.aethercal-calendar:focus { outline: none; }
+.aethercal-calendar:focus-visible { outline: none; }
+.aethercal-day.is-active,
+.aethercal-event.is-active,
+.aethercal-agenda-event.is-active {
+  outline: 2px solid var(--ac-focus);
+  outline-offset: -2px;
+}
+.aethercal-event.is-active { outline-offset: 1px; border-radius: calc(var(--ac-radius) - 3px); }
+.aethercal-event.is-grabbed {
+  outline: 2px solid var(--ac-focus);
+  outline-offset: 2px;
+}
+.aethercal-day.is-drop-target .aethercal-day-number {
+  text-decoration: underline;
+  text-decoration-color: var(--ac-focus);
+}
+/* Visually-hidden helper for the live-region announcer and keyboard-usage instructions: present in
+   the accessibility tree, invisible on screen (never display:none, which would mute it). */
+.aethercal-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Optimistic reconciliation affordances (F2-D, RF-21), shared by month chips & time-grid blocks.
    pending = an in-flight mutation (soft pulse); rolledback = a just-reverted mutation (brief flash).
    Both degrade to a static, motion-free cue under prefers-reduced-motion. */
@@ -202,6 +224,18 @@ export const CALENDAR_CSS = `
   .aethercal-event.is-rolledback,
   .aethercal-tg-event.is-rolledback {
     animation: none;
+  }
+  /* Belt-and-suspenders (F2-E, RNF-7): neutralize ANY animation/transition inside the calendar for
+     users who ask for reduced motion — the pending/rollback cues above stay as static states, and
+     any future animated affordance inherits this without a new opt-in. Keyboard focus/grab rings
+     are outlines (no motion), so nothing load-bearing is lost. */
+  .aethercal-calendar *,
+  .aethercal-calendar *::before,
+  .aethercal-calendar *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
 `;

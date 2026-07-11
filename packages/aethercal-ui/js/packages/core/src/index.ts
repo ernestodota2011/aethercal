@@ -11,6 +11,7 @@ export {
   buildAgenda,
 } from "./agenda";
 export {
+  addCalendarDays,
   computeDroppedRange,
   formatLocalDateTime,
   getMonthGridDays,
@@ -19,6 +20,7 @@ export {
   startOfWeek,
   toDateOnly,
 } from "./dateMath";
+export { type GridNavKey, nextGridIndex } from "./keyboard";
 export {
   type DragAction,
   type DragState,
@@ -39,10 +41,12 @@ export {
 } from "./interactionMachine";
 export {
   DEFAULT_SNAP_MINUTES,
+  clampMinuteToWindow,
   computeMovedRange,
   computeRangeSelection,
   computeResize,
   fractionToMinuteOfDay,
+  stepInstantMinutes,
 } from "./interactions";
 export {
   type AppliedEvents,

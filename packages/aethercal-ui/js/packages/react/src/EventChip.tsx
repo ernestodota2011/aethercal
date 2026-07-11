@@ -18,6 +18,19 @@ interface EventChipProps {
   onClick?: () => void;
   /** Right-click / context-menu on the chip (F2-D). */
   onContextMenu?: () => void;
+  /**
+   * Stable DOM id so the grid's `aria-activedescendant` can point at this chip (F2-E keyboard nav).
+   */
+  id?: string;
+  /**
+   * The chip has a real keyboard action (grab-to-move or click) — expose `role="button"` so it is
+   * announced as actionable. Left off when the event is unwired/locked (no ARIA lie).
+   */
+  interactive?: boolean;
+  /** This chip is the grid's active descendant (keyboard focus ring). */
+  isActive?: boolean;
+  /** This chip is currently grabbed for a keyboard move (stronger ring). */
+  isGrabbed?: boolean;
 }
 
 function cx(...parts: (string | false | undefined)[]): string {
@@ -40,6 +53,10 @@ export function EventChip({
   isRolledBack,
   onClick,
   onContextMenu,
+  id,
+  interactive,
+  isActive,
+  isGrabbed,
 }: EventChipProps): React.JSX.Element {
   const editable = event.editable !== false;
   const style: StyleWithVars | undefined = event.color
@@ -54,7 +71,11 @@ export function EventChip({
         !editable && "is-locked",
         isPending && "is-pending",
         isRolledBack && "is-rolledback",
+        isActive && "is-active",
+        isGrabbed && "is-grabbed",
       )}
+      {...(id ? { id } : {})}
+      {...(interactive ? { role: "button" } : {})}
       draggable={editable}
       data-event-id={event.id}
       aria-label={accessibleLabel}
