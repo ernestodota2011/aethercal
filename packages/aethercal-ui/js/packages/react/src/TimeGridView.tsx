@@ -191,6 +191,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
   const startResize = React.useCallback(
     (event: CalendarEvent, edge: Edge) => (e: React.PointerEvent<HTMLDivElement>) => {
       if (!onEventResize || event.editable === false || e.button !== 0) return;
+      if (gestureRef.current) return; // a gesture is already in progress — first pointer wins
       const colEl = (e.currentTarget as HTMLElement).closest<HTMLElement>(".aethercal-tg-col");
       if (!colEl?.dataset.date) return;
       e.preventDefault();
@@ -216,6 +217,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
       // ancestry (not target===currentTarget) means decorative children (hour lines, the select band)
       // never block a selection, without relying on their CSS pointer-events being none.
       if (!onRangeSelect || e.button !== 0) return;
+      if (gestureRef.current) return; // a gesture is already in progress — first pointer wins
       if ((e.target as Element).closest("[data-event-id], button")) return;
       const colEl = e.currentTarget;
       const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, colEl), grid.config);

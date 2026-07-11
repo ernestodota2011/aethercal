@@ -481,6 +481,33 @@ describe("F2-D — concurrent pointers do not corrupt an active gesture", () => 
     expect(onEventResize).toHaveBeenCalledTimes(1);
     expect(onEventResize).toHaveBeenCalledWith(expect.objectContaining({ end: "2026-07-15T12:00:00" }));
   });
+
+  it("ignores a second pointerdown that tries to start a new gesture (first pointer wins)", () => {
+    const onEventResize = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventResize={onEventResize}
+      />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    const endHandle = container.querySelector('.aethercal-tg-resize-handle[data-edge="end"]') as HTMLElement;
+    const startHandle = container.querySelector('.aethercal-tg-resize-handle[data-edge="start"]') as HTMLElement;
+    fireEvent.pointerDown(endHandle, { pointerId: 1, button: 0, clientY: 220 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientY: 240 }); // pointer 1 -> end 12:00
+    // A second pointer tries to hijack the gesture with a start-edge resize — must be ignored.
+    fireEvent.pointerDown(startHandle, { pointerId: 2, button: 0, clientY: 60 });
+    fireEvent.pointerMove(window, { pointerId: 2, clientY: 30 });
+    // Pointer 1 completes its ORIGINAL end resize, unaffected by pointer 2.
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(onEventResize).toHaveBeenCalledTimes(1);
+    expect(onEventResize).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T12:00:00" }),
+    );
+  });
 });
 
 describe("F2-D — context menu & click", () => {
