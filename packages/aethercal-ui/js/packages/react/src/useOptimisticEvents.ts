@@ -149,13 +149,33 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
         }, timeoutMs),
       );
 
+      const rollback = (): void => {
+        clearTimer(`to:${clientMutationId}`);
+        if (!mountedRef.current) return;
+        dispatch({ type: "REJECT", id: payload.id, clientMutationId });
+        scheduleFlash();
+      };
+
       const mutation: CalendarMutation = {
         kind,
         clientMutationId,
         payload: { ...payload, client_mutation_id: clientMutationId },
       };
-      mutate(mutation)
+      // Call `mutate` synchronously, but normalize a synchronous throw into a rejection so a
+      // sync-throwing adapter rolls back immediately instead of hanging until the timeout.
+      let pending: Promise<MutationResult>;
+      try {
+        pending = mutate(mutation);
+      } catch (error) {
+        pending = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+      pending
         .then((result) => {
+          // A response for a different event id is a contract violation — revert rather than apply it.
+          if (result.id !== payload.id) {
+            rollback();
+            return;
+          }
           clearTimer(`to:${clientMutationId}`);
           if (!mountedRef.current) return;
           dispatch({
@@ -167,12 +187,7 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
             revision: result.revision,
           });
         })
-        .catch(() => {
-          clearTimer(`to:${clientMutationId}`);
-          if (!mountedRef.current) return;
-          dispatch({ type: "REJECT", id: payload.id, clientMutationId });
-          scheduleFlash();
-        });
+        .catch(rollback);
     },
     [mutate, timeoutMs, rollbackFlashMs, generateId],
   );

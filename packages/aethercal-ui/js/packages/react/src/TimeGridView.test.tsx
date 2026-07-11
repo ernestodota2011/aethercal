@@ -366,6 +366,58 @@ describe("F2-D — range select (create) via pointer drag on empty space", () =>
     fireEvent.pointerUp(window, {});
     expect(onRangeSelect).not.toHaveBeenCalled();
   });
+
+  it("extends a timed selection into another day column (cross-day range)", () => {
+    const onRangeSelect = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="week" anchor={ANCHOR} events={[]} onRangeSelect={onRangeSelect} />,
+    );
+    const anchorCol = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    const targetCol = container.querySelector('.aethercal-tg-col[data-date="2026-07-16"]') as HTMLElement;
+    stubRect(anchorCol, 480);
+    stubRect(targetCol, 480);
+    // jsdom does no layout, so drive the "column under the pointer" via a stubbed elementFromPoint.
+    const originalEfp = document.elementFromPoint;
+    document.elementFromPoint = () => targetCol;
+    try {
+      fireEvent.pointerDown(anchorCol, { pointerId: 1, button: 0, clientY: 120 }); // 06:00 on 07-15
+      fireEvent.pointerMove(window, { pointerId: 1, clientX: 40, clientY: 240 }); // -> 12:00 on 07-16
+      fireEvent.pointerUp(window, { pointerId: 1 });
+    } finally {
+      document.elementFromPoint = originalEfp;
+    }
+    expect(onRangeSelect).toHaveBeenCalledWith({
+      start: "2026-07-15T06:00:00",
+      end: "2026-07-16T12:00:00",
+      allDay: false,
+    });
+  });
+});
+
+describe("F2-D — concurrent pointers do not corrupt an active gesture", () => {
+  it("ignores a second pointer's move/up while a resize is in flight", () => {
+    const onEventResize = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventResize={onEventResize}
+      />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    const handle = container.querySelector('.aethercal-tg-resize-handle[data-edge="end"]') as HTMLElement;
+    fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientY: 220 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientY: 240 }); // 12:00
+    // A different pointer (multi-touch) must not finish the gesture:
+    fireEvent.pointerUp(window, { pointerId: 2 });
+    expect(onEventResize).not.toHaveBeenCalled();
+    // The pointer that started it completes it:
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(onEventResize).toHaveBeenCalledTimes(1);
+    expect(onEventResize).toHaveBeenCalledWith(expect.objectContaining({ end: "2026-07-15T12:00:00" }));
+  });
 });
 
 describe("F2-D — context menu & click", () => {

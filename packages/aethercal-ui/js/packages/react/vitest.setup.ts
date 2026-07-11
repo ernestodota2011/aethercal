@@ -52,6 +52,15 @@ proto.setPointerCapture ??= () => {};
 proto.releasePointerCapture ??= () => {};
 proto.hasPointerCapture ??= () => false;
 
+// jsdom does no layout, so it has no hit-testing: `document.elementFromPoint` is undefined. The
+// time-grid resolves the column under the pointer for cross-day selection with it. Default to null
+// (falls back to the anchor column); the cross-day test overrides it to a specific column.
+const doc = (globalThis as unknown as { document?: Document }).document;
+if (doc && typeof doc.elementFromPoint !== "function") {
+  (doc as unknown as { elementFromPoint: (x: number, y: number) => Element | null }).elementFromPoint =
+    () => null;
+}
+
 if (typeof g.matchMedia !== "function") {
   g.matchMedia = (query: string): MediaQueryList =>
     ({

@@ -67,13 +67,23 @@ type StyleWithVars = React.CSSProperties & Record<`--${string}`, string | number
 type Gesture =
   | {
       kind: "resize";
+      pointerId: number;
       eventId: string;
       edge: Edge;
       dateOnly: string;
       colEl: HTMLElement;
       payload: EventResizePayload | null;
     }
-  | { kind: "select"; dateOnly: string; colEl: HTMLElement; anchorMinute: number; currentMinute: number };
+  | {
+      kind: "select";
+      pointerId: number;
+      anchorDate: string;
+      anchorCol: HTMLElement;
+      anchorMinute: number;
+      currentDate: string;
+      currentCol: HTMLElement;
+      currentMinute: number;
+    };
 
 function cx(...parts: (string | false | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -187,6 +197,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
       e.stopPropagation();
       gestureRef.current = {
         kind: "resize",
+        pointerId: e.pointerId,
         eventId: event.id,
         edge,
         dateOnly: colEl.dataset.date,
@@ -204,7 +215,16 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
       if (!onRangeSelect || e.button !== 0 || e.target !== e.currentTarget) return;
       const colEl = e.currentTarget;
       const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, colEl), grid.config);
-      gestureRef.current = { kind: "select", dateOnly, colEl, anchorMinute: minute, currentMinute: minute };
+      gestureRef.current = {
+        kind: "select",
+        pointerId: e.pointerId,
+        anchorDate: dateOnly,
+        anchorCol: colEl,
+        anchorMinute: minute,
+        currentDate: dateOnly,
+        currentCol: colEl,
+        currentMinute: minute,
+      };
       dispatch({ type: "SELECT_START", point: { dateOnly, minuteOfDay: minute } });
     },
     [onRangeSelect, grid.config],
@@ -215,28 +235,37 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
     if (!gestureActive) return;
     const onMove = (e: PointerEvent): void => {
       const g = gestureRef.current;
-      if (!g) return;
-      const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, g.colEl), grid.config);
+      // Only the pointer that started the gesture drives it — a second (multi-touch) pointer is ignored.
+      if (!g || e.pointerId !== g.pointerId) return;
       if (g.kind === "resize") {
+        const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, g.colEl), grid.config);
         const event = events.find((candidate) => candidate.id === g.eventId);
         if (!event) return;
         const payload = computeResize(event, g.edge, g.dateOnly, minute);
         g.payload = payload;
         setResizePreview(payload);
       } else {
-        g.currentMinute = minute;
+        // A timed selection can extend into another day column: resolve the column under the pointer
+        // so the emitted range spans days (the core geometry already supports it).
+        const under = document
+          .elementFromPoint(e.clientX, e.clientY)
+          ?.closest<HTMLElement>(".aethercal-tg-col");
+        const currentCol = under?.dataset.date ? under : g.currentCol;
+        g.currentCol = currentCol;
+        g.currentDate = currentCol.dataset.date ?? g.anchorDate;
+        g.currentMinute = fractionToMinuteOfDay(fractionInColumn(e.clientY, currentCol), grid.config);
         const range = computeRangeSelection(
-          { dateOnly: g.dateOnly, minuteOfDay: g.anchorMinute },
-          { dateOnly: g.dateOnly, minuteOfDay: minute },
+          { dateOnly: g.anchorDate, minuteOfDay: g.anchorMinute },
+          { dateOnly: g.currentDate, minuteOfDay: g.currentMinute },
         );
-        const blocks = layoutDayColumn(
-          [{ id: "__sel", title: "", start: range.start, end: range.end }],
-          g.dateOnly,
-          grid.config,
-        );
+        // The live band is a single-column indicator; only draw it when the range stays in one day.
+        const blocks =
+          g.currentDate === g.anchorDate
+            ? layoutDayColumn([{ id: "__sel", title: "", start: range.start, end: range.end }], g.anchorDate, grid.config)
+            : [];
         const b = blocks[0];
         setSelectBand(
-          b ? { dateOnly: g.dateOnly, topFraction: b.topFraction, heightFraction: b.heightFraction } : null,
+          b ? { dateOnly: g.anchorDate, topFraction: b.topFraction, heightFraction: b.heightFraction } : null,
         );
       }
     };
@@ -247,19 +276,29 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
       setSelectBand(null);
       if (commit && g) {
         if (g.kind === "resize" && g.payload && onEventResize) onEventResize(g.payload);
-        if (g.kind === "select" && g.currentMinute !== g.anchorMinute && onRangeSelect) {
+        if (
+          g.kind === "select" &&
+          onRangeSelect &&
+          (g.currentDate !== g.anchorDate || g.currentMinute !== g.anchorMinute)
+        ) {
           onRangeSelect(
             computeRangeSelection(
-              { dateOnly: g.dateOnly, minuteOfDay: g.anchorMinute },
-              { dateOnly: g.dateOnly, minuteOfDay: g.currentMinute },
+              { dateOnly: g.anchorDate, minuteOfDay: g.anchorMinute },
+              { dateOnly: g.currentDate, minuteOfDay: g.currentMinute },
             ),
           );
         }
       }
       dispatch({ type: commit ? "COMMIT" : "CANCEL" });
     };
-    const onUp = (): void => finish(true);
-    const onCancel = (): void => finish(false);
+    const onUp = (e: PointerEvent): void => {
+      if (gestureRef.current && e.pointerId !== gestureRef.current.pointerId) return;
+      finish(true);
+    };
+    const onCancel = (e: PointerEvent): void => {
+      if (gestureRef.current && e.pointerId !== gestureRef.current.pointerId) return;
+      finish(false);
+    };
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === "Escape") finish(false);
     };

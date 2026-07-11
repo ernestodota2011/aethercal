@@ -123,6 +123,46 @@ describe("useOptimisticEvents — rollback on timeout (no response)", () => {
   });
 });
 
+describe("useOptimisticEvents — adapter contract failures roll back", () => {
+  it("rolls back when mutate throws synchronously (never leaves it pending)", async () => {
+    const { result } = renderHook(() =>
+      useOptimisticEvents({
+        events: [EVENT],
+        mutate: () => {
+          throw new Error("adapter boom");
+        },
+        generateId: () => "cm-1",
+        rollbackFlashMs: 500,
+      }),
+    );
+    act(() => {
+      result.current.submit("drop", { id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 1 });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.pendingIds.has("e1")).toBe(false);
+    expect(result.current.rolledBackIds.has("e1")).toBe(true);
+    expect(result.current.events[0]!.start).toBe("2026-07-15T10:00:00");
+  });
+
+  it("rolls back when the server responds for a DIFFERENT event id (contract violation)", async () => {
+    const d = deferred<MutationResult>();
+    const { result } = renderHook(() =>
+      useOptimisticEvents({ events: [EVENT], mutate: () => d.promise, generateId: () => "cm-1", rollbackFlashMs: 500 }),
+    );
+    act(() => {
+      result.current.submit("drop", { id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 1 });
+    });
+    await act(async () => {
+      d.resolve({ id: "SOMEONE-ELSE", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 2 });
+    });
+    expect(result.current.rolledBackIds.has("e1")).toBe(true);
+    expect(result.current.events[0]!.start).toBe("2026-07-15T10:00:00");
+  });
+});
+
 describe("useOptimisticEvents — causal ordering (discard stale response)", () => {
   it("discards an out-of-order response with a lower revision and keeps the newer commit", async () => {
     const dA = deferred<MutationResult>();
