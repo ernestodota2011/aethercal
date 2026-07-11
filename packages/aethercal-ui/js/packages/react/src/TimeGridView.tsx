@@ -229,6 +229,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
         currentCol: colEl,
         currentMinute: minute,
       };
+      // Capture the pointer so the gesture stays bound to this column; if the platform starts a
+      // native scroll instead (touch), it fires pointercancel, which aborts the selection cleanly.
+      // (Full touch drag-select needs a long-press affordance — deferred to F2-E; see note in the PR.)
+      colEl.setPointerCapture?.(e.pointerId);
       dispatch({ type: "SELECT_START", point: { dateOnly, minuteOfDay: minute } });
     },
     [onRangeSelect, grid.config],

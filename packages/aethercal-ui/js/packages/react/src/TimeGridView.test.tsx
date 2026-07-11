@@ -373,6 +373,22 @@ describe("F2-D — range select (create) via pointer drag on empty space", () =>
     });
   });
 
+  it("aborts a selection cleanly on pointercancel (e.g. native touch scroll) with no stuck state", () => {
+    const onRangeSelect = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onRangeSelect={onRangeSelect} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    fireEvent.pointerDown(col, { pointerId: 1, button: 0, clientY: 120 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientY: 240 });
+    fireEvent.pointerCancel(window, { pointerId: 1 }); // the platform took over (scroll)
+    expect(onRangeSelect).not.toHaveBeenCalled();
+    // Gesture fully reset: a later pointerup does nothing.
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(onRangeSelect).not.toHaveBeenCalled();
+  });
+
   it("a plain click on empty space (no drag) does not create a range", () => {
     const onRangeSelect = vi.fn();
     const { container } = render(
