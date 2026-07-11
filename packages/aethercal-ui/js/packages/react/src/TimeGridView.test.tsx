@@ -2,6 +2,7 @@ import type { CalendarEvent } from "@aethercal/calendar-core";
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AetherCalendar } from "./AetherCalendar";
+import { formatEventTime } from "./labels";
 import { TimeGridView } from "./TimeGridView";
 
 afterEach(cleanup);
@@ -138,6 +139,73 @@ describe("week view — timed & all-day placement", () => {
     expect(a.style.width).toBe("50%");
     expect(b.style.width).toBe("50%");
     expect(new Set([a.style.left, b.style.left])).toEqual(new Set(["0%", "50%"]));
+  });
+});
+
+describe("week view — cross-midnight continuation labels (honest, per day)", () => {
+  // The time text a given day-column shows for an event block (the visible `<time>` label).
+  const timeTextIn = (container: HTMLElement, date: string, eventId: string): string | null => {
+    const col = container.querySelector(`.aethercal-tg-col[data-date="${date}"]`) as HTMLElement;
+    const block = col.querySelector(`[data-event-id="${eventId}"]`) as HTMLElement;
+    return block.querySelector(".aethercal-tg-event-time")!.textContent;
+  };
+
+  it("shows the start time on the start day and the END time on the next (final) day — not the stale start time", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[
+          evt({ id: "overnight", title: "Night shift", start: "2026-07-15T23:00:00", end: "2026-07-16T01:00:00" }),
+        ]}
+        continuesLabel="Continues"
+        formatEndsLabel={(t) => `ends ${t}`}
+      />,
+    );
+    const startLabel = formatEventTime("2026-07-15T23:00:00", "en");
+    const endLabel = formatEventTime("2026-07-16T01:00:00", "en");
+    // Start day: the real start time.
+    expect(timeTextIn(container, "2026-07-15", "overnight")).toBe(startLabel);
+    // Next day: the honest "ends {end time}" label — the F2-B bug rendered the start time here.
+    expect(timeTextIn(container, "2026-07-16", "overnight")).toBe(`ends ${endLabel}`);
+    expect(timeTextIn(container, "2026-07-16", "overnight")).not.toBe(startLabel);
+  });
+
+  it("labels the pass-through middle day of a 3-day timed event as continuing", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[
+          evt({ id: "long", title: "Conference", start: "2026-07-15T23:00:00", end: "2026-07-17T01:00:00" }),
+        ]}
+        continuesLabel="Continues"
+        formatEndsLabel={(t) => `ends ${t}`}
+      />,
+    );
+    expect(timeTextIn(container, "2026-07-15", "long")).toBe(formatEventTime("2026-07-15T23:00:00", "en"));
+    expect(timeTextIn(container, "2026-07-16", "long")).toBe("Continues"); // full pass-through day
+    expect(timeTextIn(container, "2026-07-17", "long")).toBe(
+      `ends ${formatEventTime("2026-07-17T01:00:00", "en")}`,
+    );
+  });
+
+  it("gives the continuation day an honest aria-label (no stale start time leaking into a11y)", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[
+          evt({ id: "overnight", title: "Night shift", start: "2026-07-15T23:00:00", end: "2026-07-16T01:00:00" }),
+        ]}
+        continuesLabel="Continues"
+        formatEndsLabel={(t) => `ends ${t}`}
+      />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-16"]') as HTMLElement;
+    const block = col.querySelector('[data-event-id="overnight"]') as HTMLElement;
+    const endLabel = formatEventTime("2026-07-16T01:00:00", "en");
+    expect(block.getAttribute("aria-label")).toBe(`ends ${endLabel} Night shift`);
   });
 });
 

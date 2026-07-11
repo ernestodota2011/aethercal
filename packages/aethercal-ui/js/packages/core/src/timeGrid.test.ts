@@ -284,7 +284,11 @@ describe("buildTimeGrid — columns per day", () => {
     expect(d16.timed[0]!.heightFraction).toBeCloseTo(1 / 24);
   });
 
-  it("spans a multi-day all-day event across each day it covers (inclusive range)", () => {
+  it("spans a multi-day all-day event over its occupied days, treating the end as EXCLUSIVE (matches buildAgenda)", () => {
+    // `end: "2026-07-17"` is the 17th's local midnight and is EXCLUSIVE, so the event occupies the
+    // 15th and 16th only — NOT the 17th. This mirrors occupiedDays/buildAgenda (see agenda.test.ts
+    // "treats an exclusive midnight end as not occupying the end day") so the week/day grid and the
+    // agenda draw the SAME span for the same event.
     const grid = buildTimeGrid(
       ["2026-07-14", "2026-07-15", "2026-07-16", "2026-07-17", "2026-07-18"],
       [evt({ id: "trip", start: "2026-07-15", end: "2026-07-17", allDay: true })],
@@ -295,8 +299,38 @@ describe("buildTimeGrid — columns per day", () => {
     expect(covers("2026-07-14")).toBe(false);
     expect(covers("2026-07-15")).toBe(true);
     expect(covers("2026-07-16")).toBe(true);
-    expect(covers("2026-07-17")).toBe(true);
+    expect(covers("2026-07-17")).toBe(false); // exclusive end day — not occupied
     expect(covers("2026-07-18")).toBe(false);
+  });
+
+  it("excludes the exclusive midnight end day of an all-day event (explicit datetime form)", () => {
+    // Canonical all-day encoding (explicit midnight end): a 3-day conference on the 15th–17th ends
+    // exclusively at the 18th's midnight, so it covers 15/16/17 but not 18 — the same result agenda
+    // gives for the identical event.
+    const grid = buildTimeGrid(
+      ["2026-07-15", "2026-07-16", "2026-07-17", "2026-07-18"],
+      [evt({ id: "conf", start: "2026-07-15T00:00:00", end: "2026-07-18T00:00:00", allDay: true })],
+      FULL_DAY,
+    );
+    const covers = (d: string) =>
+      grid.columns.find((c) => c.dateOnly === d)!.allDay.some((e) => e.id === "conf");
+    expect(covers("2026-07-15")).toBe(true);
+    expect(covers("2026-07-16")).toBe(true);
+    expect(covers("2026-07-17")).toBe(true);
+    expect(covers("2026-07-18")).toBe(false); // exclusive end — not occupied
+  });
+
+  it("keeps a single-day all-day event (start === end) on exactly its one day", () => {
+    const grid = buildTimeGrid(
+      ["2026-07-14", "2026-07-15", "2026-07-16"],
+      [evt({ id: "holiday", start: "2026-07-15", end: "2026-07-15", allDay: true })],
+      FULL_DAY,
+    );
+    const covers = (d: string) =>
+      grid.columns.find((c) => c.dateOnly === d)!.allDay.some((e) => e.id === "holiday");
+    expect(covers("2026-07-14")).toBe(false);
+    expect(covers("2026-07-15")).toBe(true);
+    expect(covers("2026-07-16")).toBe(false);
   });
 
   it("supports a single-day grid (the day view is a 1-column week)", () => {
@@ -310,6 +344,52 @@ describe("buildTimeGrid — columns per day", () => {
     expect(grid.hourMarks).toHaveLength(24);
     expect(grid.hourMarks[9]!.hour).toBe(9);
     expect(grid.hourMarks[9]!.topFraction).toBeCloseTo(9 / 24);
+  });
+});
+
+describe("buildTimeGrid — cross-midnight continuation flags on timed blocks", () => {
+  it("flags the start, pass-through, and final day of a multi-day timed event (mirrors AgendaEntry)", () => {
+    // A 23:00 → 01:00-two-days-later event occupies three local days. Each column's block must know
+    // WHERE in the span it sits, so the renderer can show the start time on the start day and an
+    // honest continuation label (not a stale start time) on the later days — the same isContinuation
+    // / continuesAfter semantics buildAgenda emits (agenda.test.ts "spans a timed event ... flags").
+    const grid = buildTimeGrid(
+      ["2026-07-15", "2026-07-16", "2026-07-17"],
+      [evt({ id: "long", start: "2026-07-15T23:00:00", end: "2026-07-17T01:00:00" })],
+      FULL_DAY,
+    );
+    const flagsOn = (d: string) => {
+      const b = grid.columns.find((c) => c.dateOnly === d)!.timed.find((x) => x.event.id === "long")!;
+      return [b.isContinuation, b.continuesAfter];
+    };
+    expect(flagsOn("2026-07-15")).toEqual([false, true]); // start day, continues after
+    expect(flagsOn("2026-07-16")).toEqual([true, true]); // full pass-through day
+    expect(flagsOn("2026-07-17")).toEqual([true, false]); // final day, ends here
+  });
+
+  it("leaves a single-day timed event unflagged (neither a continuation nor continuing)", () => {
+    const grid = buildTimeGrid(
+      ["2026-07-15"],
+      [evt({ id: "solo", start: "2026-07-15T09:00:00", end: "2026-07-15T10:00:00" })],
+      FULL_DAY,
+    );
+    const b = grid.columns[0]!.timed.find((x) => x.event.id === "solo")!;
+    expect([b.isContinuation, b.continuesAfter]).toEqual([false, false]);
+  });
+
+  it("treats an event ending exactly at midnight as NOT continuing into the next day (exclusive end)", () => {
+    // start 22:00 → end next-day 00:00 (exclusive). The start day is the only occupied day, so its
+    // block does not continue after; the next day gets no block at all.
+    const grid = buildTimeGrid(
+      ["2026-07-15", "2026-07-16"],
+      [evt({ id: "toMidnight", start: "2026-07-15T22:00:00", end: "2026-07-16T00:00:00" })],
+      FULL_DAY,
+    );
+    const day15 = grid.columns.find((c) => c.dateOnly === "2026-07-15")!;
+    const day16 = grid.columns.find((c) => c.dateOnly === "2026-07-16")!;
+    const b15 = day15.timed.find((x) => x.event.id === "toMidnight")!;
+    expect([b15.isContinuation, b15.continuesAfter]).toEqual([false, false]);
+    expect(day16.timed.some((x) => x.event.id === "toMidnight")).toBe(false);
   });
 });
 

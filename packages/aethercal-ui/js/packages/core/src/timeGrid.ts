@@ -10,7 +10,7 @@
  * presentational (percentages → CSS). The day view is a week with a single column, so both views
  * share this one engine.
  */
-import { parseLocalDateTime, toDateOnly } from "./dateMath";
+import { occupiedDayBounds, parseLocalDateTime } from "./dateMath";
 import type { CalendarEvent } from "./types";
 
 const MINUTES_PER_HOUR = 60;
@@ -43,6 +43,10 @@ export interface TimeGridBlock {
   topFraction: number;
   /** Height as a fraction [0, 1] of the visible window (clamped so `top + height <= 1`). */
   heightFraction: number;
+  /** This column is a later day of a multi-day event (it started on an earlier local day). */
+  isContinuation: boolean;
+  /** The event extends past this column (it ends on a later local day). */
+  continuesAfter: boolean;
 }
 
 /** A single day of the grid: its all-day events and its positioned timed blocks. */
@@ -197,8 +201,22 @@ export function layoutDayColumn(
     const topFraction = (top - windowStartMin) / config.windowMinutes;
     const heightFraction = (bottom - top) / config.windowMinutes;
 
+    // Where this column sits in the event's local-day span (exclusive end), so the renderer can show
+    // an honest label per day — the event's start time on its start day, a continuation label on a
+    // later day — instead of the start time bleeding onto every day it crosses. Same `occupiedDayBounds`
+    // criterion the agenda view uses, so week/day and list agree on the edges.
+    const { startKey, lastKey } = occupiedDayBounds(event);
+
     clusterBlockIdx.push(blocks.length);
-    blocks.push({ event, lane, laneCount: 1, topFraction, heightFraction });
+    blocks.push({
+      event,
+      lane,
+      laneCount: 1,
+      topFraction,
+      heightFraction,
+      isContinuation: dateOnly !== startKey,
+      continuesAfter: dateOnly !== lastKey,
+    });
     clusterEndMs = Math.max(clusterEndMs, endMs);
   }
   closeCluster();
@@ -258,11 +276,14 @@ export function buildTimeGrid(
         return s.startTs === s.endTs && s.startTs >= dayStartTs;
       })
       .map((s) => s.event);
-    // An all-day event covers every date in [start-date, end-date] inclusive (consistent with the
-    // single-day case where start === end covers exactly that one day).
-    const dayAllDay = allDay.filter(
-      (event) => toDateOnly(event.start) <= dateOnly && dateOnly <= toDateOnly(event.end),
-    );
+    // An all-day event covers the local days it occupies, treating its `end` as EXCLUSIVE (the same
+    // criterion as occupiedDays/buildAgenda): an end exactly at local midnight does NOT add the end
+    // day, and a single-day event (start === end) still covers its one day. Using the shared
+    // `occupiedDayBounds` keeps the week/day grid and the agenda in agreement on the span.
+    const dayAllDay = allDay.filter((event) => {
+      const { startKey, lastKey } = occupiedDayBounds(event);
+      return startKey <= dateOnly && dateOnly <= lastKey;
+    });
     return {
       dateOnly,
       allDay: dayAllDay,

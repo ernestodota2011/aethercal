@@ -6,6 +6,7 @@ import {
   type EventDropPayload,
   type EventResizePayload,
   type RangeSelectPayload,
+  type TimeGridBlock,
   type TimeGridConfig,
   buildTimeGrid,
   computeMovedRange,
@@ -26,6 +27,8 @@ import { formatEventTime } from "./labels";
 import { ensureCalendarStyles } from "./styles";
 import {
   DEFAULT_ALL_DAY_LABEL,
+  DEFAULT_CONTINUES_LABEL,
+  defaultFormatEndsLabel,
   formatDayColumnHeader,
   formatHourLabel,
   formatTimeGridTitle,
@@ -45,6 +48,10 @@ export interface TimeGridViewProps {
   now: Date;
   /** Label for the all-day rail (i18n presets are F2-E; overridable, English default). */
   allDayLabel?: string;
+  /** Label a timed block shows on a day it passes fully through (cross-midnight). Defaults to "Continues". */
+  continuesLabel?: string;
+  /** Label for the final day of a multi-day timed block, from its end time. Defaults to `ends {t}`. */
+  formatEndsLabel?: (endTimeLabel: string) => string;
   onEventDrop?: (payload: EventDropPayload) => void;
   /** Drag a resize handle on an event's top/bottom edge to change its duration (F2-D). */
   onEventResize?: (payload: EventResizePayload) => void;
@@ -93,6 +100,25 @@ const pct = (fraction: number): string => `${fraction * 100}%`;
 
 const EMPTY_IDS: ReadonlySet<string> = new Set();
 
+/**
+ * The honest time label for one timed block, given WHERE its column sits in the event's local-day
+ * span: its start time on the start day, a "continues" label on a day it passes fully through, and
+ * its real end time on the final day. Mirrors AgendaView's `rowTimeLabel` (a timed block never
+ * carries an all-day event — those live in the all-day rail) so both views label a cross-midnight
+ * event the same way, instead of the start time bleeding onto every day it crosses.
+ */
+function blockTimeLabel(
+  block: Pick<TimeGridBlock, "event" | "isContinuation" | "continuesAfter">,
+  locale: string,
+  continuesLabel: string,
+  formatEndsLabel: (endTimeLabel: string) => string,
+): string {
+  const { event, isContinuation, continuesAfter } = block;
+  if (!isContinuation) return formatEventTime(event.start, locale); // start day (or single day)
+  if (continuesAfter) return continuesLabel; // a full pass-through day
+  return formatEndsLabel(formatEventTime(event.end, locale)); // the final day: ends here
+}
+
 /** Fraction [0, 1] of a column the pointer's `clientY` falls at (0 when the column has no measured height). */
 function fractionInColumn(clientY: number, colEl: HTMLElement): number {
   const rect = colEl.getBoundingClientRect();
@@ -117,6 +143,8 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
     config,
     now,
     allDayLabel = DEFAULT_ALL_DAY_LABEL,
+    continuesLabel = DEFAULT_CONTINUES_LABEL,
+    formatEndsLabel = defaultFormatEndsLabel,
     onEventDrop,
     onEventResize,
     onRangeSelect,
@@ -455,7 +483,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
             {col.timed.map((block) => {
               const { event } = block;
               const editable = event.editable !== false;
-              const timeLabel = formatEventTime(event.start, locale);
+              const timeLabel = blockTimeLabel(block, locale, continuesLabel, formatEndsLabel);
               const previewed = resizePreview?.id === event.id ? resizePreview : null;
               const previewBlock = previewed
                 ? layoutDayColumn(

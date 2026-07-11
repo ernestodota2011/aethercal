@@ -11,6 +11,12 @@ import { parseLocalDateTime } from "@aethercal/calendar-core";
 /** English fallback for the all-day rail label; overridable via the `allDayLabel` prop (i18n → F2-E). */
 export const DEFAULT_ALL_DAY_LABEL = "All day";
 
+/** English fallback for the "passes fully through this day" label of a multi-day timed event. */
+export const DEFAULT_CONTINUES_LABEL = "Continues";
+
+/** English fallback formatter for a multi-day timed event's final-day label ("ends {end time}"). */
+export const defaultFormatEndsLabel = (endTimeLabel: string): string => `ends ${endTimeLabel}`;
+
 /** A day-column header like "Wed 15" in the caller's locale (weekday + day-of-month). */
 export function formatDayColumnHeader(dateOnly: string, locale: string): string {
   return new Intl.DateTimeFormat(locale, { weekday: "short", day: "numeric" }).format(

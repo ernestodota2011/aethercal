@@ -59,6 +59,39 @@ export function toDateOnly(iso: string): string {
   return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
 }
 
+/** Local "YYYY-MM-DD" key for a `Date` (its local date components, never UTC). */
+function dayKey(dt: Date): string {
+  return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+}
+
+/**
+ * The first and last LOCAL calendar day an event occupies, as "YYYY-MM-DD" keys, treating the
+ * event's `end` as EXCLUSIVE (the iCalendar DTEND convention): an end exactly at local midnight
+ * does NOT occupy the end day. A zero-duration or reversed range occupies only its start day.
+ * DST-safe — only local date components are read, never a raw millisecond span.
+ *
+ * The single source of truth for "which local days does this event cover", shared by the agenda
+ * grouping (buildAgenda) and the week/day grid (buildTimeGrid) so both surfaces draw the SAME span
+ * (and agree on the start / pass-through / final-day edges of a multi-day event).
+ */
+export function occupiedDayBounds(event: Pick<CalendarEvent, "start" | "end">): {
+  startKey: string;
+  lastKey: string;
+} {
+  const startDt = parseLocalDateTime(event.start);
+  const endDt = parseLocalDateTime(event.end);
+  const startDay = new Date(startDt.getFullYear(), startDt.getMonth(), startDt.getDate());
+  let lastDay = startDay;
+  if (endDt.getTime() > startDt.getTime()) {
+    // Step back 1ms so an end exactly at local midnight lands on the previous day (exclusive end);
+    // then read that day's local date. Clamp to the start day for a range that stays within a day.
+    const beforeEnd = new Date(endDt.getTime() - 1);
+    const candidate = new Date(beforeEnd.getFullYear(), beforeEnd.getMonth(), beforeEnd.getDate());
+    if (candidate.getTime() > startDay.getTime()) lastDay = candidate;
+  }
+  return { startKey: dayKey(startDay), lastKey: dayKey(lastDay) };
+}
+
 /** Offset (0..6) of `dt` from the configured first day of the week. */
 function dayOffsetFromWeekStart(dt: Date, firstDayOfWeek: number): number {
   return (dt.getDay() - firstDayOfWeek + 7) % 7;

@@ -11,7 +11,7 @@
  * Like the rest of calendar-core this is DISPLAY-ONLY wall-time arithmetic (no timezone library);
  * authoritative scheduling lives in aethercal-core (Python, RF-23). Dependency-free and DOM-free.
  */
-import { parseLocalDateTime } from "./dateMath";
+import { occupiedDayBounds, parseLocalDateTime } from "./dateMath";
 import type { CalendarEvent } from "./types";
 
 /** One event as it appears under a single agenda day. */
@@ -48,43 +48,29 @@ function dayKey(dt: Date): string {
   return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
 }
 
-/** Midnight of `dt`'s local calendar day. */
-function startOfDay(dt: Date): Date {
-  return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
-}
-
 /** `dt` advanced by `n` whole calendar days (component-based, so DST-safe). */
 function addCalendarDays(dt: Date, n: number): Date {
   return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() + n);
 }
 
-/** The ordered local-day keys an event occupies, plus its first/last key for edge flags. */
+/**
+ * The ordered local-day keys an event occupies, plus its first/last key for edge flags. The
+ * exclusive-end span math is `occupiedDayBounds` (the single source of truth shared with the
+ * week/day grid); this only enumerates the days between those bounds, capped defensively.
+ */
 function occupiedDays(event: CalendarEvent): { keys: string[]; startKey: string; lastKey: string } {
-  const startDt = parseLocalDateTime(event.start);
-  const endDt = parseLocalDateTime(event.end);
-  const startDay = startOfDay(startDt);
-
-  let lastDay: Date;
-  if (endDt.getTime() <= startDt.getTime()) {
-    // Zero-duration or reversed range: the event occupies only its start day.
-    lastDay = startDay;
-  } else {
-    // `end` is EXCLUSIVE, so an end exactly at local midnight does not occupy the end day. Stepping
-    // back one millisecond before reading the day handles that boundary; DST-safe because only the
-    // local date components are used.
-    lastDay = startOfDay(new Date(endDt.getTime() - 1));
-    if (lastDay.getTime() < startDay.getTime()) lastDay = startDay;
-  }
+  const { startKey, lastKey } = occupiedDayBounds(event);
 
   const keys: string[] = [];
-  let cursor = startDay;
-  for (let i = 0; i < MAX_EVENT_SPAN_DAYS && cursor.getTime() <= lastDay.getTime(); i += 1) {
+  // "YYYY-MM-DD" is fixed-width and zero-padded, so the string compare below is chronological.
+  let cursor = parseLocalDateTime(startKey);
+  for (let i = 0; i < MAX_EVENT_SPAN_DAYS && dayKey(cursor) <= lastKey; i += 1) {
     keys.push(dayKey(cursor));
     cursor = addCalendarDays(cursor, 1);
   }
   // With the cap engaged the true tail is beyond what we enumerate, so the last shown day keeps
   // `continuesAfter: true` (lastKey stays the un-shown real tail).
-  return { keys, startKey: dayKey(startDay), lastKey: dayKey(lastDay) };
+  return { keys, startKey, lastKey };
 }
 
 interface SortableEntry {

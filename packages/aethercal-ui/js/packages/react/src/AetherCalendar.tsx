@@ -16,6 +16,7 @@ import * as React from "react";
 import { AgendaView } from "./AgendaView";
 import { MonthView } from "./MonthView";
 import { ensureCalendarStyles } from "./styles";
+import { DEFAULT_CONTINUES_LABEL, defaultFormatEndsLabel } from "./timeGridLabels";
 import { TimeGridView } from "./TimeGridView";
 
 export interface AetherCalendarProps {
@@ -82,8 +83,6 @@ function resolveNow(now: Date | string | undefined): Date {
 
 const defaultFormatMore = (hiddenCount: number): string => `+${hiddenCount} more`;
 
-const defaultFormatEndsLabel = (endTimeLabel: string): string => `ends ${endTimeLabel}`;
-
 /**
  * The AetherCal calendar entry component (the React layer's public surface, and the tag the Reflex
  * wrapper mounts as `AetherCalendar`). Routes to the month view (F2-A), the week/day time-grid
@@ -104,7 +103,7 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     dayEndHour,
     allDayLabel = "All day",
     now,
-    continuesLabel = "Continues",
+    continuesLabel = DEFAULT_CONTINUES_LABEL,
     formatEndsLabel = defaultFormatEndsLabel,
     agendaEmptyLabel = "No events",
     onEventDrop,
@@ -203,6 +202,8 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
         config={timeGridConfig}
         now={nowDate}
         allDayLabel={allDayLabel}
+        continuesLabel={continuesLabel}
+        formatEndsLabel={formatEndsLabel}
         {...(onEventDrop ? { onEventDrop } : {})}
         {...(onEventResize ? { onEventResize } : {})}
         {...(onRangeSelect ? { onRangeSelect } : {})}
