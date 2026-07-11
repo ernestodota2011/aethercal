@@ -105,7 +105,14 @@ class EventClickPayload(TypedDict):
 
 class ContextMenuPayload(TypedDict):
     """The payload for ``on_context_menu`` — ``id`` when the gesture landed on an event, ``start``
-    when it landed on an empty slot (F2-D). At least one is present."""
+    when it landed on an empty slot (F2-D). At least one is present.
+
+    This flat TypedDict is intentionally permissive (both keys ``NotRequired``) so the Reflex
+    ``ObjectVar`` binding stays simple. The "at least one" refinement is NOT expressed by this flat
+    type; it is enforced by the generated ``calendar-props.schema.json`` (``minProperties: 1``) and
+    the TypeScript at-least-one union. The emitters only ever send a single key, and the
+    schema/vitest contract lock rejects ``{}`` (see tests/test_calendar_schema.py).
+    """
 
     id: NotRequired[str]
     start: NotRequired[str]
