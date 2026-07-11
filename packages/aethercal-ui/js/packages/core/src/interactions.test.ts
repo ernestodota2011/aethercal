@@ -40,6 +40,16 @@ describe("fractionToMinuteOfDay", () => {
     expect(fractionToMinuteOfDay(-1, business)).toBe(480);
     expect(fractionToMinuteOfDay(2, business)).toBe(1080);
   });
+
+  it("snaps relative to the window start with a step that does not divide it (45-min on 08:00)", () => {
+    // fraction 0 must land exactly on the window start (08:00 = 480), not be pulled onto a
+    // midnight-anchored 45-min grid point (which would give 08:15).
+    expect(fractionToMinuteOfDay(0, business, 45)).toBe(480);
+    // fraction 1 snaps to the last 45-min grid point within the window (480 + 13*45 = 1065 = 17:45).
+    expect(fractionToMinuteOfDay(1, business, 45)).toBe(1065);
+    // an interior fraction stays on the window-anchored grid: 08:00 + 90min = 09:30.
+    expect(fractionToMinuteOfDay(0.15, business, 45)).toBe(570);
+  });
 });
 
 describe("computeMovedRange", () => {

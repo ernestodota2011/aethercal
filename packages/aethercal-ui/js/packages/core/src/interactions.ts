@@ -54,7 +54,10 @@ export function fractionToMinuteOfDay(
   const windowEndMin = config.dayEndHour * MINUTES_PER_HOUR;
   const raw = windowStartMin + clamp(fraction, 0, 1) * config.windowMinutes;
   const step = snapMinutes > 0 ? snapMinutes : DEFAULT_SNAP_MINUTES;
-  const snapped = Math.round(raw / step) * step;
+  // Snap the grid to the WINDOW START, not midnight: with a step that does not divide the window
+  // start (e.g. a 45-minute step on an 08:00 window), anchoring at midnight would shift the top of
+  // the window off the grid so fraction 0 no longer lands on the window start.
+  const snapped = windowStartMin + Math.round((raw - windowStartMin) / step) * step;
   return clamp(snapped, windowStartMin, windowEndMin);
 }
 
