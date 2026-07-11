@@ -1,0 +1,6 @@
+# The Reflex build output and installed toolchain are reproducible; do not commit.
+.web/
+node_modules/
+*.log
+__pycache__/
+assets/external/
