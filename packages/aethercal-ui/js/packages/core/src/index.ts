@@ -6,6 +6,11 @@
  * React rendering layer is `@aethercal/calendar-react`.
  */
 export {
+  type AgendaDay,
+  type AgendaEntry,
+  buildAgenda,
+} from "./agenda";
+export {
   computeDroppedRange,
   formatLocalDateTime,
   getMonthGridDays,
