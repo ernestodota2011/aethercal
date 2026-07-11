@@ -40,3 +40,16 @@ export function formatEventTime(iso: string, locale: string): string {
     parseLocalDateTime(iso),
   );
 }
+
+/**
+ * The visible day header for the list/agenda view ("Wednesday, July 15, 2026" /
+ * "miércoles, 15 de julio de 2026"), derived from the caller's locale — nothing hardcoded.
+ */
+export function formatAgendaDayHeading(dateOnly: string, locale: string): string {
+  return new Intl.DateTimeFormat(locale, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  }).format(parseLocalDateTime(dateOnly));
+}

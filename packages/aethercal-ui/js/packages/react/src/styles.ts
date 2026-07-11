@@ -123,6 +123,52 @@ export const CALENDAR_CSS = `
 .aethercal-more:hover { text-decoration: underline; }
 .aethercal-more:focus-visible { outline: 2px solid var(--ac-focus); outline-offset: 1px; border-radius: 3px; }
 .aethercal-unavailable { padding: 24px; color: var(--ac-muted); font-family: var(--ac-font); }
+
+.aethercal-agenda { display: block; }
+.aethercal-agenda-empty {
+  margin: 0;
+  padding: 24px;
+  text-align: center;
+  color: var(--ac-muted);
+  font-family: var(--ac-font);
+}
+.aethercal-agenda-day { border-bottom: 1px solid var(--ac-border); }
+.aethercal-agenda-day:last-child { border-bottom: none; }
+.aethercal-agenda-day-title {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ac-header-fg);
+  background: var(--ac-bg);
+  border-bottom: 1px solid var(--ac-border);
+}
+.aethercal-agenda-day-events { list-style: none; margin: 0; padding: 4px 0; display: flex; flex-direction: column; }
+.aethercal-agenda-event {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 12px;
+  border-left: 3px solid var(--ac-event-accent);
+  color: var(--ac-event-fg);
+}
+.aethercal-agenda-event.is-continuation { opacity: 0.8; }
+.aethercal-agenda-event-time {
+  flex: none;
+  min-width: 76px;
+  color: var(--ac-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.aethercal-agenda-event-title {
+  color: var(--ac-fg);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 `;
 
 /** Inject the base stylesheet once into <head>. No-op when there is no DOM (SSR) or already present. */

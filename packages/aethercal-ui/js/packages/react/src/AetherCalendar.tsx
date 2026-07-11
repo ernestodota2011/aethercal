@@ -6,6 +6,7 @@ import {
   parseLocalDateTime,
 } from "@aethercal/calendar-core";
 import * as React from "react";
+import { AgendaView } from "./AgendaView";
 import { MonthView } from "./MonthView";
 import { ensureCalendarStyles } from "./styles";
 
@@ -25,8 +26,16 @@ export interface AetherCalendarProps {
   weekdayLabels?: readonly string[];
   /** Overflow label formatter. Defaults to `(n) => "+" + n + " more"`. */
   formatMore?: (hiddenCount: number) => string;
-  /** Message for views not yet implemented (week/day/list in F2-A). */
+  /** Message for views not yet implemented (week/day in F2-A/C). */
   unavailableLabel?: string;
+  /** List/agenda view: label for a real all-day event's row. Defaults to "All day". */
+  allDayLabel?: string;
+  /** List/agenda view: label for a day a timed event passes fully through. Defaults to "Continues". */
+  continuesLabel?: string;
+  /** List/agenda view: last-day label of a timed multi-day event, from its end time. Defaults to `ends {t}`. */
+  formatEndsLabel?: (endTimeLabel: string) => string;
+  /** List/agenda view: message shown when there are no events. Defaults to "No events". */
+  agendaEmptyLabel?: string;
   onEventDrop?: (payload: EventDropPayload) => void;
 }
 
@@ -37,6 +46,8 @@ function resolveAnchor(anchor: Date | string | undefined): Date {
 }
 
 const defaultFormatMore = (hiddenCount: number): string => `+${hiddenCount} more`;
+
+const defaultFormatEndsLabel = (endTimeLabel: string): string => `ends ${endTimeLabel}`;
 
 /**
  * The AetherCal calendar entry component (the React layer's public surface, and the tag the
@@ -54,6 +65,10 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     weekdayLabels,
     formatMore = defaultFormatMore,
     unavailableLabel = "This view is not available yet.",
+    allDayLabel = "All day",
+    continuesLabel = "Continues",
+    formatEndsLabel = defaultFormatEndsLabel,
+    agendaEmptyLabel = "No events",
     onEventDrop,
   } = props;
 
@@ -74,6 +89,19 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     Number.isInteger(maxEventsPerDay) && maxEventsPerDay >= 0 ? maxEventsPerDay : 3;
   const safeWeekdayLabels =
     weekdayLabels && weekdayLabels.length === 7 ? weekdayLabels : undefined;
+
+  if (view === "list") {
+    return (
+      <AgendaView
+        events={events ?? []}
+        locale={locale}
+        allDayLabel={allDayLabel}
+        continuesLabel={continuesLabel}
+        formatEndsLabel={formatEndsLabel}
+        emptyLabel={agendaEmptyLabel}
+      />
+    );
+  }
 
   if (view !== "month") {
     return (
