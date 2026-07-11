@@ -27,6 +27,35 @@ export {
   isDragging,
 } from "./dragMachine";
 export {
+  type InteractionAction,
+  type InteractionState,
+  activeEventId,
+  initialInteractionState,
+  interactionReducer,
+  isDragging as isInteractionDragging,
+  isIdle,
+  isResizing,
+  isSelecting,
+} from "./interactionMachine";
+export {
+  DEFAULT_SNAP_MINUTES,
+  computeMovedRange,
+  computeRangeSelection,
+  computeResize,
+  fractionToMinuteOfDay,
+} from "./interactions";
+export {
+  type AppliedEvents,
+  type OptimisticOverride,
+  type OverrideStatus,
+  type ReconcileAction,
+  type ReconcileState,
+  applyOverrides,
+  initialReconcileState,
+  reconcileReducer,
+  selectSettledIds,
+} from "./reconcile";
+export {
   buildTimeGrid,
   type HourMark,
   layoutDayColumn,
@@ -42,6 +71,14 @@ export {
 export type {
   CalendarEvent,
   CalendarView,
+  ContextMenuPayload,
+  Edge,
+  EventClickPayload,
   EventDropPayload,
+  EventResizePayload,
   FirstDayOfWeek,
+  GridPoint,
+  MutationKind,
+  RangeSelectPayload,
+  ViewChangePayload,
 } from "./types";

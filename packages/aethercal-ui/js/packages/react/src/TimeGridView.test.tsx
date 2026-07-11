@@ -25,6 +25,26 @@ function fakeDataTransfer() {
   };
 }
 
+/**
+ * jsdom never lays anything out, so a column's rect is all-zeros by default. Stubbing a known
+ * height lets the pointer geometry (clientY -> fraction -> minute) be exercised deterministically:
+ * with a 480px column over the default 24h window, 1px = 3min, so clientY 240 -> 12:00.
+ */
+function stubRect(el: HTMLElement, height: number, top = 0): void {
+  el.getBoundingClientRect = () =>
+    ({
+      top,
+      left: 0,
+      right: 100,
+      bottom: top + height,
+      width: 100,
+      height,
+      x: 0,
+      y: top,
+      toJSON() {},
+    }) as DOMRect;
+}
+
 describe("week view — structure & a11y", () => {
   it("renders an ARIA grid (not the F2-A placeholder)", () => {
     const { getByRole, queryByRole } = render(
@@ -256,19 +276,179 @@ describe("TimeGridView used directly (public export) is self-contained", () => {
   });
 });
 
-describe("week view — honest resize seam (resize itself is F2-D)", () => {
-  it("renders no resize handle: the onEventResize hook exists but has no affordance yet", () => {
-    const onEventResize = vi.fn();
+describe("F2-D — resize (duration) via pointer handles", () => {
+  it("renders start & end resize handles on an editable event when onEventResize is wired", () => {
     const { container } = render(
       <AetherCalendar
         view="week"
         anchor={ANCHOR}
         events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventResize={vi.fn()}
+      />,
+    );
+    const block = container.querySelector('[data-event-id="e1"]') as HTMLElement;
+    expect(block.querySelector('.aethercal-tg-resize-handle[data-edge="start"]')).toBeTruthy();
+    expect(block.querySelector('.aethercal-tg-resize-handle[data-edge="end"]')).toBeTruthy();
+  });
+
+  it("renders NO resize handle when no onEventResize handler is given (no dishonest affordance)", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+      />,
+    );
+    expect(container.querySelector(".aethercal-tg-resize-handle")).toBeNull();
+  });
+
+  it("renders NO resize handle on a locked (editable:false) event even with a handler", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", editable: false })]}
+        onEventResize={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".aethercal-tg-resize-handle")).toBeNull();
+  });
+
+  it("dragging the end handle emits onEventResize with the snapped new end (and echoes revision)", () => {
+    const onEventResize = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", revision: 2 })]}
         onEventResize={onEventResize}
       />,
     );
-    // The prop is accepted (typed seam for F2-D) but we do not fake a resize affordance.
-    expect(container.querySelector(".aethercal-tg-resize-handle")).toBeNull();
-    expect(onEventResize).not.toHaveBeenCalled();
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    const handle = container.querySelector('.aethercal-tg-resize-handle[data-edge="end"]') as HTMLElement;
+    fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientY: 220 });
+    fireEvent.pointerMove(window, { clientY: 240 }); // fraction 0.5 -> 720min -> 12:00
+    fireEvent.pointerUp(window, {});
+    expect(onEventResize).toHaveBeenCalledTimes(1);
+    expect(onEventResize).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T12:00:00", revision: 2 }),
+    );
+  });
+});
+
+describe("F2-D — range select (create) via pointer drag on empty space", () => {
+  it("drag-selecting empty time-grid space emits on_range_select for the covered slot", () => {
+    const onRangeSelect = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onRangeSelect={onRangeSelect} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    fireEvent.pointerDown(col, { pointerId: 1, button: 0, clientY: 120 }); // 0.25 -> 360 -> 06:00
+    fireEvent.pointerMove(window, { clientY: 240 }); // 0.5 -> 720 -> 12:00
+    fireEvent.pointerUp(window, {});
+    expect(onRangeSelect).toHaveBeenCalledWith({
+      start: "2026-07-15T06:00:00",
+      end: "2026-07-15T12:00:00",
+      allDay: false,
+    });
+  });
+
+  it("a plain click on empty space (no drag) does not create a range", () => {
+    const onRangeSelect = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onRangeSelect={onRangeSelect} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    fireEvent.pointerDown(col, { pointerId: 1, button: 0, clientY: 120 });
+    fireEvent.pointerUp(window, {});
+    expect(onRangeSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe("F2-D — context menu & click", () => {
+  it("right-click on an event emits on_context_menu with its id", () => {
+    const onContextMenu = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onContextMenu={onContextMenu}
+      />,
+    );
+    fireEvent.contextMenu(container.querySelector('[data-event-id="e1"]') as HTMLElement);
+    expect(onContextMenu).toHaveBeenCalledWith({ id: "e1" });
+  });
+
+  it("right-click on empty grid emits on_context_menu with a start slot", () => {
+    const onContextMenu = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onContextMenu={onContextMenu} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    fireEvent.contextMenu(col, { clientY: 240 }); // 12:00
+    expect(onContextMenu).toHaveBeenCalledWith({ start: "2026-07-15T12:00:00" });
+  });
+
+  it("clicking an event emits on_event_click with its id", () => {
+    const onEventClick = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventClick={onEventClick}
+      />,
+    );
+    fireEvent.click(container.querySelector('[data-event-id="e1"]') as HTMLElement);
+    expect(onEventClick).toHaveBeenCalledWith({ id: "e1" });
+  });
+});
+
+describe("F2-D — drag-to-move changes the time-of-day, not only the day", () => {
+  it("dropping on a timed column at a vertical position sets both the day and the hour", () => {
+    const onEventDrop = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventDrop={onEventDrop}
+      />,
+    );
+    const block = container.querySelector('[data-event-id="e1"]') as HTMLElement;
+    const target = container.querySelector('.aethercal-tg-col[data-date="2026-07-17"]') as HTMLElement;
+    stubRect(target, 480);
+    const dt = fakeDataTransfer();
+    fireEvent.dragStart(block, { dataTransfer: dt });
+    fireEvent.drop(target, { dataTransfer: dt, clientY: 240 }); // 0.5 -> 12:00
+    expect(onEventDrop).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "e1", start: "2026-07-17T12:00:00", end: "2026-07-17T13:00:00" }),
+    );
+  });
+});
+
+describe("F2-D — optimistic status classes", () => {
+  it("marks pending and rolled-back events with status classes", () => {
+    const { container } = render(
+      <AetherCalendar
+        view="day"
+        anchor={ANCHOR}
+        events={[
+          evt({ id: "p", start: "2026-07-15T09:00:00", end: "2026-07-15T10:00:00" }),
+          evt({ id: "r", start: "2026-07-15T11:00:00", end: "2026-07-15T12:00:00" }),
+        ]}
+        pendingIds={new Set(["p"])}
+        rolledBackIds={new Set(["r"])}
+      />,
+    );
+    expect((container.querySelector('[data-event-id="p"]') as HTMLElement).className).toContain("is-pending");
+    expect((container.querySelector('[data-event-id="r"]') as HTMLElement).className).toContain(
+      "is-rolledback",
+    );
   });
 });

@@ -1,8 +1,12 @@
 import {
   type CalendarEvent,
   type CalendarView,
+  type ContextMenuPayload,
+  type EventClickPayload,
   type EventDropPayload,
+  type EventResizePayload,
   type FirstDayOfWeek,
+  type RangeSelectPayload,
   formatLocalDateTime,
   getWeekGridDays,
   parseLocalDateTime,
@@ -48,12 +52,20 @@ export interface AetherCalendarProps {
   agendaEmptyLabel?: string;
   onEventDrop?: (payload: EventDropPayload) => void;
   /**
-   * Forward-compatible seam for drag-to-resize (change an event's duration). Declared here so the
-   * public contract is stable, but F2-B renders NO resize affordance and never calls it — the
-   * resize interaction (handle + pointer/keyboard logic on the time grid) is F2-D. Wiring a handle
-   * with no behavior would be a dishonest affordance, so it stays a typed hook until then.
+   * Drag an event's top/bottom edge handle on the week/day time grid to change its duration (F2-D).
+   * Only rendered for an editable event; the month/list views have no resize affordance.
    */
-  onEventResize?: (payload: EventDropPayload) => void;
+  onEventResize?: (payload: EventResizePayload) => void;
+  /** Drag across empty week/day grid space to create a new event (F2-D). */
+  onRangeSelect?: (payload: RangeSelectPayload) => void;
+  /** Click an event on any view (F2-D). */
+  onEventClick?: (payload: EventClickPayload) => void;
+  /** Right-click / context-menu on an event or an empty slot (F2-D). */
+  onContextMenu?: (payload: ContextMenuPayload) => void;
+  /** Events with an in-flight optimistic mutation (rendered pending). Driven by the reconciliation layer. */
+  pendingIds?: ReadonlySet<string>;
+  /** Events whose mutation was just reverted (rendered with the rollback flash). */
+  rolledBackIds?: ReadonlySet<string>;
 }
 
 function resolveAnchor(anchor: Date | string | undefined): Date {
@@ -96,6 +108,12 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     formatEndsLabel = defaultFormatEndsLabel,
     agendaEmptyLabel = "No events",
     onEventDrop,
+    onEventResize,
+    onRangeSelect,
+    onEventClick,
+    onContextMenu,
+    pendingIds,
+    rolledBackIds,
   } = props;
 
   React.useEffect(() => {
@@ -163,6 +181,10 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
         formatMore={formatMore}
         {...(safeWeekdayLabels ? { weekdayLabels: safeWeekdayLabels } : {})}
         {...(onEventDrop ? { onEventDrop } : {})}
+        {...(onEventClick ? { onEventClick } : {})}
+        {...(onContextMenu ? { onContextMenu } : {})}
+        {...(pendingIds ? { pendingIds } : {})}
+        {...(rolledBackIds ? { rolledBackIds } : {})}
       />
     );
   }
@@ -182,6 +204,12 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
         now={nowDate}
         allDayLabel={allDayLabel}
         {...(onEventDrop ? { onEventDrop } : {})}
+        {...(onEventResize ? { onEventResize } : {})}
+        {...(onRangeSelect ? { onRangeSelect } : {})}
+        {...(onEventClick ? { onEventClick } : {})}
+        {...(onContextMenu ? { onContextMenu } : {})}
+        {...(pendingIds ? { pendingIds } : {})}
+        {...(rolledBackIds ? { rolledBackIds } : {})}
       />
     );
   }

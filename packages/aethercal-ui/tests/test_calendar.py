@@ -133,3 +133,39 @@ def test_calendar_without_an_event_drop_handler_omits_the_prop() -> None:
     component = Calendar.create()
     tag = component._render()
     assert "onEventDrop" not in tag.props
+
+
+# --- F2-D interaction handlers --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "handler",
+    ["on_event_resize", "on_range_select", "on_event_click", "on_context_menu"],
+)
+def test_f2d_interaction_handlers_are_registered_event_triggers(handler: str) -> None:
+    assert handler in Calendar.get_event_triggers()
+
+
+@pytest.mark.parametrize(
+    ("handler", "jsx_prop"),
+    [
+        ("on_event_resize", "onEventResize"),
+        ("on_range_select", "onRangeSelect"),
+        ("on_event_click", "onEventClick"),
+        ("on_context_menu", "onContextMenu"),
+    ],
+)
+def test_f2d_interaction_handlers_wire_into_the_rendered_props(handler: str, jsx_prop: str) -> None:
+    component = Calendar.create(**{handler: rx.console_log("fired")})
+    tag = component._render()
+    # Reflex camel-cases Python prop names for the JSX tag.
+    assert jsx_prop in tag.props
+
+
+@pytest.mark.parametrize(
+    "jsx_prop",
+    ["onEventResize", "onRangeSelect", "onEventClick", "onContextMenu"],
+)
+def test_f2d_interaction_handlers_are_omitted_when_not_supplied(jsx_prop: str) -> None:
+    tag = Calendar.create()._render()
+    assert jsx_prop not in tag.props

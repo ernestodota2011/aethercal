@@ -1,0 +1,149 @@
+import { describe, expect, it } from "vitest";
+import { resolveTimeGridConfig } from "./timeGrid";
+import {
+  computeMovedRange,
+  computeRangeSelection,
+  computeResize,
+  fractionToMinuteOfDay,
+} from "./interactions";
+import type { CalendarEvent, GridPoint } from "./types";
+
+const full = resolveTimeGridConfig({});
+const business = resolveTimeGridConfig({ dayStartHour: 8, dayEndHour: 18 });
+
+function evt(partial: Partial<CalendarEvent> & Pick<CalendarEvent, "id" | "start" | "end">): CalendarEvent {
+  return { title: partial.title ?? partial.id, ...partial };
+}
+
+describe("fractionToMinuteOfDay", () => {
+  it("maps the middle of a full day to noon", () => {
+    expect(fractionToMinuteOfDay(0.5, full)).toBe(720);
+  });
+
+  it("maps within a narrowed business-hours window (start offset applies)", () => {
+    // 8:00 + 0.5 * 10h = 13:00 -> 780 minutes.
+    expect(fractionToMinuteOfDay(0.5, business)).toBe(780);
+    expect(fractionToMinuteOfDay(0, business)).toBe(480);
+  });
+
+  it("snaps to the nearest 15-minute step by default", () => {
+    // 0.51 * 1440 = 734.4 -> nearest 15 = 735 (12:15).
+    expect(fractionToMinuteOfDay(0.51, full)).toBe(735);
+  });
+
+  it("honors a custom snap step", () => {
+    // 0.51 * 1440 = 734.4 -> nearest 30 = 720.
+    expect(fractionToMinuteOfDay(0.51, full, 30)).toBe(720);
+  });
+
+  it("clamps an out-of-range fraction to the window bounds", () => {
+    expect(fractionToMinuteOfDay(-1, business)).toBe(480);
+    expect(fractionToMinuteOfDay(2, business)).toBe(1080);
+  });
+});
+
+describe("computeMovedRange", () => {
+  const e = evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", revision: 4 });
+
+  it("with a null minute preserves the time-of-day (day-only move)", () => {
+    expect(computeMovedRange(e, "2026-07-17", null)).toEqual({
+      id: "e1",
+      start: "2026-07-17T10:00:00",
+      end: "2026-07-17T11:00:00",
+      revision: 4,
+    });
+  });
+
+  it("with a minute changes BOTH the day and the time-of-day, preserving duration", () => {
+    // Dropped on 2026-07-17 at 13:00 -> keeps the 1h duration.
+    expect(computeMovedRange(e, "2026-07-17", 780)).toEqual({
+      id: "e1",
+      start: "2026-07-17T13:00:00",
+      end: "2026-07-17T14:00:00",
+      revision: 4,
+    });
+  });
+
+  it("omits revision when the event has none", () => {
+    const bare = evt({ id: "x", start: "2026-07-15T10:00:00", end: "2026-07-15T10:30:00" });
+    expect(computeMovedRange(bare, "2026-07-16", 600)).toEqual({
+      id: "x",
+      start: "2026-07-16T10:00:00",
+      end: "2026-07-16T10:30:00",
+    });
+  });
+});
+
+describe("computeResize", () => {
+  const e = evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", revision: 7 });
+
+  it("drags the END edge to a later minute, keeping the start", () => {
+    expect(computeResize(e, "end", "2026-07-15", 750)).toEqual({
+      id: "e1",
+      start: "2026-07-15T10:00:00",
+      end: "2026-07-15T12:30:00",
+      revision: 7,
+    });
+  });
+
+  it("drags the START edge to an earlier minute, keeping the end", () => {
+    expect(computeResize(e, "start", "2026-07-15", 570)).toEqual({
+      id: "e1",
+      start: "2026-07-15T09:30:00",
+      end: "2026-07-15T11:00:00",
+      revision: 7,
+    });
+  });
+
+  it("enforces a minimum duration when the END is dragged above the start", () => {
+    // Target minute 600 (10:00) == start; clamp end to start + 15 min.
+    expect(computeResize(e, "end", "2026-07-15", 600).end).toBe("2026-07-15T10:15:00");
+  });
+
+  it("enforces a minimum duration when the START is dragged past the end", () => {
+    // Target minute 660 (11:00) == end; clamp start to end - 15 min.
+    expect(computeResize(e, "start", "2026-07-15", 660).start).toBe("2026-07-15T10:45:00");
+  });
+
+  it("honors a custom minimum duration", () => {
+    expect(computeResize(e, "end", "2026-07-15", 600, { minDurationMinutes: 30 }).end).toBe(
+      "2026-07-15T10:30:00",
+    );
+  });
+});
+
+describe("computeRangeSelection", () => {
+  it("selects a single all-day cell as a one-day exclusive range", () => {
+    const p: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: null };
+    expect(computeRangeSelection(p, p)).toEqual({
+      start: "2026-07-15T00:00:00",
+      end: "2026-07-16T00:00:00",
+      allDay: true,
+    });
+  });
+
+  it("selects an all-day range across days, order-independent", () => {
+    const a: GridPoint = { dateOnly: "2026-07-17", minuteOfDay: null };
+    const b: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: null };
+    const expected = { start: "2026-07-15T00:00:00", end: "2026-07-18T00:00:00", allDay: true };
+    expect(computeRangeSelection(a, b)).toEqual(expected);
+    expect(computeRangeSelection(b, a)).toEqual(expected);
+  });
+
+  it("selects a timed range, order-independent", () => {
+    const a: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 660 };
+    const b: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 540 };
+    const expected = { start: "2026-07-15T09:00:00", end: "2026-07-15T11:00:00", allDay: false };
+    expect(computeRangeSelection(a, b)).toEqual(expected);
+    expect(computeRangeSelection(b, a)).toEqual(expected);
+  });
+
+  it("gives a zero-length timed click a default minimum slot", () => {
+    const p: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 540 };
+    expect(computeRangeSelection(p, p)).toEqual({
+      start: "2026-07-15T09:00:00",
+      end: "2026-07-15T09:15:00",
+      allDay: false,
+    });
+  });
+});

@@ -1,5 +1,7 @@
 import {
   type CalendarEvent,
+  type ContextMenuPayload,
+  type EventClickPayload,
   type EventDropPayload,
   type FirstDayOfWeek,
   computeDroppedRange,
@@ -14,6 +16,8 @@ import * as React from "react";
 import { EventChip } from "./EventChip";
 import { formatDayCellLabel, formatEventTime, formatMonthTitle, localeWeekdayLabels } from "./labels";
 
+const EMPTY_IDS: ReadonlySet<string> = new Set();
+
 export interface MonthViewProps {
   events: readonly CalendarEvent[];
   /** The month to display (any day within it). */
@@ -25,6 +29,14 @@ export interface MonthViewProps {
   maxEventsPerDay: number;
   formatMore: (hiddenCount: number) => string;
   onEventDrop?: (payload: EventDropPayload) => void;
+  /** Click an event (F2-D). */
+  onEventClick?: (payload: EventClickPayload) => void;
+  /** Right-click on an event ({id}) or an empty day cell ({start}) (F2-D). */
+  onContextMenu?: (payload: ContextMenuPayload) => void;
+  /** Events with an in-flight optimistic mutation (rendered pending). */
+  pendingIds?: ReadonlySet<string>;
+  /** Events whose mutation was just reverted (rendered with the rollback flash). */
+  rolledBackIds?: ReadonlySet<string>;
 }
 
 function cx(...parts: (string | false | undefined)[]): string {
@@ -65,6 +77,10 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
     maxEventsPerDay,
     formatMore,
     onEventDrop,
+    onEventClick,
+    onContextMenu,
+    pendingIds = EMPTY_IDS,
+    rolledBackIds = EMPTY_IDS,
   } = props;
 
   const days = React.useMemo(
@@ -149,6 +165,16 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                 aria-label={formatDayCellLabel(dateOnly, locale)}
                 onDragOver={dropEnabled ? (e) => e.preventDefault() : undefined}
                 onDrop={dropEnabled ? handleDrop(dateOnly) : undefined}
+                onContextMenu={
+                  onContextMenu
+                    ? (e) => {
+                        // Only an empty part of the cell (not a chip / "+N more" button) creates here.
+                        if (e.target !== e.currentTarget) return;
+                        e.preventDefault();
+                        onContextMenu({ start: `${dateOnly}T00:00:00` });
+                      }
+                    : undefined
+                }
               >
                 <div className="aethercal-day-head">
                   <span className="aethercal-day-number">{Number(dateOnly.slice(-2))}</span>
@@ -161,6 +187,10 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                       timeLabel={event.allDay ? null : formatEventTime(event.start, locale)}
                       onDragStart={(id) => dispatch({ type: "DRAG_START", eventId: id })}
                       onDragEnd={() => dispatch({ type: "DRAG_CANCEL" })}
+                      isPending={pendingIds.has(event.id)}
+                      isRolledBack={rolledBackIds.has(event.id)}
+                      {...(onEventClick ? { onClick: () => onEventClick({ id: event.id }) } : {})}
+                      {...(onContextMenu ? { onContextMenu: () => onContextMenu({ id: event.id }) } : {})}
                     />
                   ))}
                   {hidden > 0 && !isExpanded ? (

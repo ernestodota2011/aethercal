@@ -145,6 +145,32 @@ export const TIME_GRID_CSS = `
   border-radius: 50%;
   background: var(--ac-tg-now);
 }
+/* Resize handles (F2-D): thin grab strips on the block's top/bottom edges, only rendered when the
+   event is editable and an onEventResize handler is wired (no dishonest affordance otherwise). */
+.aethercal-tg-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  touch-action: none;
+  z-index: 3;
+}
+.aethercal-tg-resize-handle-start { top: -3px; }
+.aethercal-tg-resize-handle-end { bottom: -3px; }
+.aethercal-tg-event.is-resizing { outline: 1px dashed var(--ac-focus); outline-offset: -1px; }
+/* Live band drawn while drag-selecting empty space to create a new event (F2-D). */
+.aethercal-tg-select-band {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  min-height: 4px;
+  background: color-mix(in srgb, var(--ac-focus) 16%, transparent);
+  border: 1px solid var(--ac-focus);
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 1;
+}
 `;
 
 /** Inject the time-grid stylesheet once into <head>. No-op without a DOM (SSR) or when present. */

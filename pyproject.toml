@@ -90,6 +90,10 @@ sequence = [
 help = "OBSOLETE: the JS bundle is committed (no fetch needed). Verifies it exists; see the comment."
 cmd = "python packages/aethercal-ui/scripts/verify_bundle.py"
 
+[tool.poe.tasks.gen-schema]
+help = "Regenerate calendar-props.schema.json from the Python payload TypedDicts (F2-D contract)."
+cmd = "python packages/aethercal-ui/scripts/gen_calendar_schema.py"
+
 # --------------------------------------------------------------------------------------
 # Tooling config (shared across the workspace)
 # --------------------------------------------------------------------------------------

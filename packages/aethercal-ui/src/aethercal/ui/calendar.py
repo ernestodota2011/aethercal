@@ -61,20 +61,96 @@ class CalendarEvent(TypedDict):
 
 
 class EventDropPayload(TypedDict):
-    """The payload the JS core sends back on ``on_event_drop`` (js/packages/core/src/types.ts)."""
+    """The payload the JS core sends back on ``on_event_drop`` (js/packages/core/src/types.ts).
+
+    ``client_mutation_id`` is set by the F2-D reconciliation layer so the server can dedupe a
+    retried mutation idempotently; ``revision`` is echoed from the dragged event.
+    """
 
     id: str
     start: str
     end: str
     revision: NotRequired[int]
+    client_mutation_id: NotRequired[str]
+
+
+class EventResizePayload(TypedDict):
+    """The payload for ``on_event_resize`` — a duration change (one endpoint moved). Same shape as
+    the drop payload, named distinctly so the contract/schema separate the two gestures (F2-D)."""
+
+    id: str
+    start: str
+    end: str
+    revision: NotRequired[int]
+    client_mutation_id: NotRequired[str]
+
+
+class RangeSelectPayload(TypedDict):
+    """The payload for ``on_range_select`` — a new-event range created by dragging empty space.
+
+    No ``id``/``revision`` (nothing exists yet); ``allDay`` distinguishes an all-day/date-granular
+    selection from a timed one (F2-D).
+    """
+
+    start: str
+    end: str
+    allDay: bool
+
+
+class EventClickPayload(TypedDict):
+    """The payload for ``on_event_click`` — the clicked event's id (F2-D)."""
+
+    id: str
+
+
+class ContextMenuPayload(TypedDict):
+    """The payload for ``on_context_menu`` — ``id`` when the gesture landed on an event, ``start``
+    when it landed on an empty slot (F2-D). At least one is present."""
+
+    id: NotRequired[str]
+    start: NotRequired[str]
+
+
+# ``from`` is a Python keyword, so the navigation payload uses the functional TypedDict syntax.
+# It is the forward-compatible contract for ``on_view_change`` / ``on_range_change``; the F2-D
+# interaction layer emits the mutation/selection events, while the navigation chrome that fires
+# these is F2-E/F (declared here so the cross-language schema is complete, not wired yet).
+ViewChangePayload = TypedDict(
+    "ViewChangePayload",
+    {"view": str, "from": str, "to": str},
+)
 
 
 _DroppedEventVar = ObjectVar[EventDropPayload]
+_ResizeEventVar = ObjectVar[EventResizePayload]
+_RangeSelectVar = ObjectVar[RangeSelectPayload]
+_EventClickVar = ObjectVar[EventClickPayload]
+_ContextMenuVar = ObjectVar[ContextMenuPayload]
 
 
 def _on_event_drop_signature(event: _DroppedEventVar) -> list[rx.Var[EventDropPayload]]:
     """Pass the JS core's drop payload straight through, unmodified, to the backend handler."""
     return [event]
+
+
+def _on_event_resize_signature(event: _ResizeEventVar) -> list[rx.Var[EventResizePayload]]:
+    """Pass the JS core's resize payload straight through to the backend handler."""
+    return [event]
+
+
+def _on_range_select_signature(payload: _RangeSelectVar) -> list[rx.Var[RangeSelectPayload]]:
+    """Pass the JS core's range-select payload straight through to the backend handler."""
+    return [payload]
+
+
+def _on_event_click_signature(payload: _EventClickVar) -> list[rx.Var[EventClickPayload]]:
+    """Pass the clicked event's id straight through to the backend handler."""
+    return [payload]
+
+
+def _on_context_menu_signature(payload: _ContextMenuVar) -> list[rx.Var[ContextMenuPayload]]:
+    """Pass the context-menu payload straight through to the backend handler."""
+    return [payload]
 
 
 class Calendar(rx.NoSSRComponent):
@@ -111,9 +187,34 @@ class Calendar(rx.NoSSRComponent):
 
     on_event_drop: rx.EventHandler[_on_event_drop_signature] = rx_field(
         doc=(
-            "Fired when a user finishes dragging an event onto a new day. Receives the "
-            "event's id plus its recomputed start/end (same day count, original duration "
-            "and time-of-day preserved)."
+            "Fired when a user finishes dragging an event onto a new day/time. Receives the "
+            "event's id plus its recomputed start/end (day and, on the time grid, hour), with the "
+            "original duration preserved, plus revision and client_mutation_id."
+        ),
+    )
+
+    on_event_resize: rx.EventHandler[_on_event_resize_signature] = rx_field(
+        doc=(
+            "Fired when a user drags an event's edge handle to change its duration (week/day time "
+            "grid). Receives the event's id plus its recomputed start/end (one endpoint moved)."
+        ),
+    )
+
+    on_range_select: rx.EventHandler[_on_range_select_signature] = rx_field(
+        doc=(
+            "Fired when a user drags across empty grid space to create a new event. Receives the "
+            "selected start/end and whether it is an all-day range."
+        ),
+    )
+
+    on_event_click: rx.EventHandler[_on_event_click_signature] = rx_field(
+        doc="Fired when a user clicks an event. Receives the event's id.",
+    )
+
+    on_context_menu: rx.EventHandler[_on_context_menu_signature] = rx_field(
+        doc=(
+            "Fired on a right-click / context-menu gesture. Receives the event's id (on an event) "
+            "or a start slot (on empty space)."
         ),
     )
 

@@ -1,0 +1,184 @@
+{
+  "$defs": {
+    "CalendarEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "allDay": {
+          "type": "boolean"
+        },
+        "color": {
+          "type": "string"
+        },
+        "editable": {
+          "type": "boolean"
+        },
+        "end": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "start": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "end",
+        "id",
+        "start",
+        "title"
+      ],
+      "type": "object"
+    },
+    "ContextMenuPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "EventClickPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "EventDropPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "client_mutation_id": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "end",
+        "id",
+        "start"
+      ],
+      "type": "object"
+    },
+    "EventResizePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "client_mutation_id": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "end",
+        "id",
+        "start"
+      ],
+      "type": "object"
+    },
+    "RangeSelectPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "allDay": {
+          "type": "boolean"
+        },
+        "end": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "allDay",
+        "end",
+        "start"
+      ],
+      "type": "object"
+    },
+    "ViewChangePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "view": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "view"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://aethercal.dev/calendar-props.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from the Python payload TypedDicts in aethercal.ui.calendar (single source of truth). Validated against the TypeScript types in vitest as the anti-drift lock. Do not edit by hand - run `uv run poe gen-schema`.",
+  "events": {
+    "on_context_menu": {
+      "$ref": "#/$defs/ContextMenuPayload"
+    },
+    "on_event_click": {
+      "$ref": "#/$defs/EventClickPayload"
+    },
+    "on_event_drop": {
+      "$ref": "#/$defs/EventDropPayload"
+    },
+    "on_event_resize": {
+      "$ref": "#/$defs/EventResizePayload"
+    },
+    "on_range_change": {
+      "$ref": "#/$defs/ViewChangePayload"
+    },
+    "on_range_select": {
+      "$ref": "#/$defs/RangeSelectPayload"
+    },
+    "on_view_change": {
+      "$ref": "#/$defs/ViewChangePayload"
+    }
+  },
+  "revisionSemantics": "revision is a per-event monotonic-increasing integer the server assigns on each accepted mutation. The client applies a response only if its revision is greater than the highest already applied for that event; a stale/out-of-order response (revision <= applied) is discarded. A pending mutation with no response within the client budget is rolled back, so the UI never sticks in pending.",
+  "title": "AetherCal calendar-props contract"
+}

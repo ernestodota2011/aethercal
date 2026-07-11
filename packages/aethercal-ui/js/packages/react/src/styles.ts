@@ -28,6 +28,7 @@ export const CALENDAR_CSS = `
   --ac-event-accent: #64748b;
   --ac-more-fg: #4b5563;
   --ac-focus: #2563eb;
+  --ac-rollback: #b91c1c;
   --ac-radius: 8px;
   --ac-cell-min-height: 96px;
 }
@@ -168,6 +169,40 @@ export const CALENDAR_CSS = `
   font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Optimistic reconciliation affordances (F2-D, RF-21), shared by month chips & time-grid blocks.
+   pending = an in-flight mutation (soft pulse); rolledback = a just-reverted mutation (brief flash).
+   Both degrade to a static, motion-free cue under prefers-reduced-motion. */
+@keyframes aethercal-pending-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.85; }
+}
+@keyframes aethercal-rollback-flash {
+  0% { box-shadow: 0 0 0 2px var(--ac-rollback); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.aethercal-event.is-pending,
+.aethercal-tg-event.is-pending {
+  animation: aethercal-pending-pulse 1.1s ease-in-out infinite;
+  cursor: progress;
+}
+.aethercal-event.is-rolledback,
+.aethercal-tg-event.is-rolledback {
+  animation: aethercal-rollback-flash 0.5s ease-out;
+  outline: 1px solid var(--ac-rollback);
+  outline-offset: -1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .aethercal-event.is-pending,
+  .aethercal-tg-event.is-pending {
+    animation: none;
+    opacity: 0.6;
+  }
+  .aethercal-event.is-rolledback,
+  .aethercal-tg-event.is-rolledback {
+    animation: none;
+  }
 }
 `;
 

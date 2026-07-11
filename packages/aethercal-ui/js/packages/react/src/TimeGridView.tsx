@@ -1,15 +1,23 @@
 import {
   type CalendarEvent,
+  type ContextMenuPayload,
+  type Edge,
+  type EventClickPayload,
   type EventDropPayload,
-  type TimeGridBlock,
+  type EventResizePayload,
+  type RangeSelectPayload,
   type TimeGridConfig,
   buildTimeGrid,
-  computeDroppedRange,
-  dragReducer,
+  computeMovedRange,
+  computeRangeSelection,
+  computeResize,
   formatLocalDateTime,
-  initialDragState,
-  isDragging,
+  fractionToMinuteOfDay,
+  initialInteractionState,
+  interactionReducer,
+  layoutDayColumn,
   nowMarkerFraction,
+  parseLocalDateTime,
   toDateOnly,
 } from "@aethercal/calendar-core";
 import * as React from "react";
@@ -38,10 +46,34 @@ export interface TimeGridViewProps {
   /** Label for the all-day rail (i18n presets are F2-E; overridable, English default). */
   allDayLabel?: string;
   onEventDrop?: (payload: EventDropPayload) => void;
+  /** Drag a resize handle on an event's top/bottom edge to change its duration (F2-D). */
+  onEventResize?: (payload: EventResizePayload) => void;
+  /** Drag across empty grid space to create a new event (F2-D). */
+  onRangeSelect?: (payload: RangeSelectPayload) => void;
+  /** Click an event (F2-D). */
+  onEventClick?: (payload: EventClickPayload) => void;
+  /** Right-click / context-menu on an event or an empty slot (F2-D). */
+  onContextMenu?: (payload: ContextMenuPayload) => void;
+  /** Events with an in-flight optimistic mutation (rendered with a pending affordance). */
+  pendingIds?: ReadonlySet<string>;
+  /** Events whose mutation was just reverted (rendered with the rollback flash). */
+  rolledBackIds?: ReadonlySet<string>;
 }
 
 /** Allow setting `--ac-*` custom properties (and the numeric column count) via inline style. */
 type StyleWithVars = React.CSSProperties & Record<`--${string}`, string | number>;
+
+/** The in-flight pointer gesture (resize or select), tracked in a ref so window listeners see live data. */
+type Gesture =
+  | {
+      kind: "resize";
+      eventId: string;
+      edge: Edge;
+      dateOnly: string;
+      colEl: HTMLElement;
+      payload: EventResizePayload | null;
+    }
+  | { kind: "select"; dateOnly: string; colEl: HTMLElement; anchorMinute: number; currentMinute: number };
 
 function cx(...parts: (string | false | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -49,59 +81,22 @@ function cx(...parts: (string | false | undefined)[]): string {
 
 const pct = (fraction: number): string => `${fraction * 100}%`;
 
-/**
- * A single timed event, absolutely positioned inside its day column from the fractions computed by
- * `@aethercal/calendar-core` (top/height vertically, lane/laneCount horizontally). Pointer-draggable
- * (reusing the same HTML5 drag + drag-machine wiring as the month view's `EventChip`) unless the
- * event is locked. Presentational-only a11y for F2-B: an accessible label but no `button` role and
- * no keyboard action yet (that, plus the resize handle, is F2-D/E — claiming an interactive role
- * without a handler would be an ARIA lie).
- */
-function TimeGridBlockView(props: {
-  block: TimeGridBlock;
-  locale: string;
-  onDragStart: (eventId: string) => void;
-  onDragEnd: () => void;
-}): React.JSX.Element {
-  const { block, locale, onDragStart, onDragEnd } = props;
-  const { event } = block;
-  const editable = event.editable !== false;
-  const timeLabel = formatEventTime(event.start, locale);
-  const style: StyleWithVars = {
-    top: pct(block.topFraction),
-    height: pct(block.heightFraction),
-    left: pct(block.lane / block.laneCount),
-    width: pct(1 / block.laneCount),
-    ...(event.color ? { "--ac-tg-event-accent": event.color } : {}),
-  };
-  return (
-    <div
-      className={cx("aethercal-tg-event", !editable && "is-locked")}
-      draggable={editable}
-      data-event-id={event.id}
-      data-lane={block.lane}
-      data-lane-count={block.laneCount}
-      aria-label={`${timeLabel} ${event.title}`}
-      title={event.title}
-      style={style}
-      onDragStart={(e) => {
-        e.dataTransfer.setData("text/plain", event.id);
-        e.dataTransfer.effectAllowed = "move";
-        onDragStart(event.id);
-      }}
-      onDragEnd={onDragEnd}
-    >
-      <time className="aethercal-tg-event-time">{timeLabel}</time>
-      <span className="aethercal-tg-event-title">{event.title}</span>
-    </div>
-  );
+const EMPTY_IDS: ReadonlySet<string> = new Set();
+
+/** Fraction [0, 1] of a column the pointer's `clientY` falls at (0 when the column has no measured height). */
+function fractionInColumn(clientY: number, colEl: HTMLElement): number {
+  const rect = colEl.getBoundingClientRect();
+  if (!(rect.height > 0)) return 0;
+  return (clientY - rect.top) / rect.height;
 }
 
 /**
  * The shared week/day time-grid engine (AetherCal-06 §5): 7 (or 1) day columns × an hour axis, an
- * all-day rail above the grid, overlap-packed event blocks, drag-to-reschedule, and a "now" line.
- * The day view is literally this component with a single-day `days` array. All date/geometry math
- * comes from `@aethercal/calendar-core` (the RF-23 boundary); this file only renders and wires drag.
+ * all-day rail above the grid, overlap-packed event blocks, plus the full F2-D interaction set —
+ * drag-to-reschedule (day AND time-of-day), resize by dragging an edge handle, drag-select on empty
+ * space to create, click, and context-menu — driven by the headless `interactionReducer`. All
+ * date/geometry math comes from `@aethercal/calendar-core` (the RF-23 boundary); this file only
+ * renders and translates pointer input into gestures.
  */
 export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
   const {
@@ -113,6 +108,12 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
     now,
     allDayLabel = DEFAULT_ALL_DAY_LABEL,
     onEventDrop,
+    onEventResize,
+    onRangeSelect,
+    onEventClick,
+    onContextMenu,
+    pendingIds = EMPTY_IDS,
+    rolledBackIds = EMPTY_IDS,
   } = props;
 
   React.useEffect(() => {
@@ -127,36 +128,168 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
   const nowFraction = React.useMemo(() => nowMarkerFraction(now, config), [now, config]);
   const nowDateKey = React.useMemo(() => toDateOnly(formatLocalDateTime(now)), [now]);
 
-  const [dragState, dispatch] = React.useReducer(dragReducer, initialDragState);
+  const [interaction, dispatch] = React.useReducer(interactionReducer, initialInteractionState);
+  const gestureRef = React.useRef<Gesture | null>(null);
+  const [resizePreview, setResizePreview] = React.useState<EventResizePayload | null>(null);
+  const [selectBand, setSelectBand] = React.useState<{
+    dateOnly: string;
+    topFraction: number;
+    heightFraction: number;
+  } | null>(null);
 
+  const dropEnabled = Boolean(onEventDrop);
+  const resizeEnabled = Boolean(onEventResize);
+  const selectEnabled = Boolean(onRangeSelect);
+  const dragging = interaction.status === "dragging";
+
+  // ---- move (HTML5 drag): drop changes the DAY and, from the drop's vertical position, the HOUR --
   const handleDrop = React.useCallback(
-    (targetDateOnly: string) => (e: React.DragEvent<HTMLDivElement>) => {
+    (targetDateOnly: string, timed: boolean) => (e: React.DragEvent<HTMLDivElement>) => {
       e.preventDefault();
-      // The drag machine is the source of truth for WHICH event moved; a foreign/synthetic drop
-      // (no prior DRAG_START on this calendar) is ignored even if it carries a valid id. Mirrors
-      // the month view so both surfaces reschedule identically (day change, time-of-day preserved).
-      if (!isDragging(dragState)) {
-        dispatch({ type: "DROP" });
+      if (interaction.status !== "dragging") {
+        dispatch({ type: "COMMIT" });
         return;
       }
-      const draggedId = dragState.eventId;
+      const draggedId = interaction.eventId;
       const transferred = e.dataTransfer.getData("text/plain");
-      dispatch({ type: "DROP" });
+      dispatch({ type: "COMMIT" });
       if (transferred && transferred !== draggedId) return;
       if (!onEventDrop) return;
       const dragged = events.find((candidate) => candidate.id === draggedId);
       if (!dragged || dragged.editable === false) return;
-      onEventDrop(computeDroppedRange(dragged, targetDateOnly));
+      let minute: number | null = null;
+      if (timed && dragged.allDay !== true) {
+        const col = e.currentTarget;
+        const rect = col.getBoundingClientRect();
+        if (rect.height > 0 && Number.isFinite(e.clientY)) {
+          minute = fractionToMinuteOfDay((e.clientY - rect.top) / rect.height, grid.config);
+        }
+      }
+      onEventDrop(computeMovedRange(dragged, targetDateOnly, minute));
     },
-    [dragState, events, onEventDrop],
+    [interaction, events, onEventDrop, grid.config],
   );
 
-  const dropEnabled = Boolean(onEventDrop);
-  const onDragStart = React.useCallback(
-    (eventId: string) => dispatch({ type: "DRAG_START", eventId }),
-    [],
+  const onDragStart = React.useCallback((eventId: string) => {
+    // A resize gesture must not also start an HTML5 move drag from the same block.
+    if (gestureRef.current?.kind === "resize") return;
+    dispatch({ type: "DRAG_START", eventId });
+  }, []);
+  const onDragEnd = React.useCallback(() => dispatch({ type: "CANCEL" }), []);
+
+  // ---- resize / select (Pointer Events): a ref + window listeners track the drag to commit/cancel -
+  const startResize = React.useCallback(
+    (event: CalendarEvent, edge: Edge) => (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!onEventResize || event.editable === false || e.button !== 0) return;
+      const colEl = (e.currentTarget as HTMLElement).closest<HTMLElement>(".aethercal-tg-col");
+      if (!colEl?.dataset.date) return;
+      e.preventDefault();
+      e.stopPropagation();
+      gestureRef.current = {
+        kind: "resize",
+        eventId: event.id,
+        edge,
+        dateOnly: colEl.dataset.date,
+        colEl,
+        payload: null,
+      };
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      dispatch({ type: "RESIZE_START", eventId: event.id, edge });
+    },
+    [onEventResize],
   );
-  const onDragEnd = React.useCallback(() => dispatch({ type: "DRAG_CANCEL" }), []);
+
+  const startSelect = React.useCallback(
+    (dateOnly: string) => (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!onRangeSelect || e.button !== 0 || e.target !== e.currentTarget) return;
+      const colEl = e.currentTarget;
+      const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, colEl), grid.config);
+      gestureRef.current = { kind: "select", dateOnly, colEl, anchorMinute: minute, currentMinute: minute };
+      dispatch({ type: "SELECT_START", point: { dateOnly, minuteOfDay: minute } });
+    },
+    [onRangeSelect, grid.config],
+  );
+
+  const gestureActive = interaction.status === "resizing" || interaction.status === "selecting";
+  React.useEffect(() => {
+    if (!gestureActive) return;
+    const onMove = (e: PointerEvent): void => {
+      const g = gestureRef.current;
+      if (!g) return;
+      const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, g.colEl), grid.config);
+      if (g.kind === "resize") {
+        const event = events.find((candidate) => candidate.id === g.eventId);
+        if (!event) return;
+        const payload = computeResize(event, g.edge, g.dateOnly, minute);
+        g.payload = payload;
+        setResizePreview(payload);
+      } else {
+        g.currentMinute = minute;
+        const range = computeRangeSelection(
+          { dateOnly: g.dateOnly, minuteOfDay: g.anchorMinute },
+          { dateOnly: g.dateOnly, minuteOfDay: minute },
+        );
+        const blocks = layoutDayColumn(
+          [{ id: "__sel", title: "", start: range.start, end: range.end }],
+          g.dateOnly,
+          grid.config,
+        );
+        const b = blocks[0];
+        setSelectBand(
+          b ? { dateOnly: g.dateOnly, topFraction: b.topFraction, heightFraction: b.heightFraction } : null,
+        );
+      }
+    };
+    const finish = (commit: boolean): void => {
+      const g = gestureRef.current;
+      gestureRef.current = null;
+      setResizePreview(null);
+      setSelectBand(null);
+      if (commit && g) {
+        if (g.kind === "resize" && g.payload && onEventResize) onEventResize(g.payload);
+        if (g.kind === "select" && g.currentMinute !== g.anchorMinute && onRangeSelect) {
+          onRangeSelect(
+            computeRangeSelection(
+              { dateOnly: g.dateOnly, minuteOfDay: g.anchorMinute },
+              { dateOnly: g.dateOnly, minuteOfDay: g.currentMinute },
+            ),
+          );
+        }
+      }
+      dispatch({ type: commit ? "COMMIT" : "CANCEL" });
+    };
+    const onUp = (): void => finish(true);
+    const onCancel = (): void => finish(false);
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") finish(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [gestureActive, events, grid.config, onEventResize, onRangeSelect]);
+
+  const emptyContextMenu = React.useCallback(
+    (dateOnly: string, timed: boolean) => (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!onContextMenu || e.target !== e.currentTarget) return;
+      e.preventDefault();
+      if (!timed) {
+        onContextMenu({ start: `${dateOnly}T00:00:00` });
+        return;
+      }
+      const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, e.currentTarget), grid.config);
+      const midnight = parseLocalDateTime(`${dateOnly}T00:00:00`);
+      const slot = new Date(midnight.getFullYear(), midnight.getMonth(), midnight.getDate(), 0, minute, 0);
+      onContextMenu({ start: formatLocalDateTime(slot) });
+    },
+    [onContextMenu, grid.config],
+  );
 
   // Drive the day-column count AND the visible-hours count from geometry so a narrowed window
   // (e.g. business hours 08–18) is only as tall as its hours, not a fixed 24 (Crisol correctness).
@@ -167,7 +300,13 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
 
   return (
     <div
-      className={cx("aethercal-calendar", "aethercal-timegrid", isDragging(dragState) && "is-dragging")}
+      className={cx(
+        "aethercal-calendar",
+        "aethercal-timegrid",
+        dragging && "is-dragging",
+        interaction.status === "resizing" && "is-resizing",
+        interaction.status === "selecting" && "is-selecting",
+      )}
       role="grid"
       aria-label={formatTimeGridTitle(days, locale)}
       data-view={view}
@@ -198,7 +337,8 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
             className="aethercal-tg-allday-cell"
             data-date={col.dateOnly}
             onDragOver={dropEnabled ? (e) => e.preventDefault() : undefined}
-            onDrop={dropEnabled ? handleDrop(col.dateOnly) : undefined}
+            onDrop={dropEnabled ? handleDrop(col.dateOnly, false) : undefined}
+            onContextMenu={onContextMenu ? emptyContextMenu(col.dateOnly, false) : undefined}
           >
             {col.allDay.map((event) => (
               <EventChip
@@ -207,6 +347,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                 timeLabel={null}
                 onDragStart={onDragStart}
                 onDragEnd={onDragEnd}
+                isPending={pendingIds.has(event.id)}
+                isRolledBack={rolledBackIds.has(event.id)}
+                {...(onEventClick ? { onClick: () => onEventClick({ id: event.id }) } : {})}
+                {...(onContextMenu ? { onContextMenu: () => onContextMenu({ id: event.id }) } : {})}
               />
             ))}
           </div>
@@ -228,7 +372,9 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
             className={cx("aethercal-tg-col", col.dateOnly === nowDateKey && "is-today")}
             data-date={col.dateOnly}
             onDragOver={dropEnabled ? (e) => e.preventDefault() : undefined}
-            onDrop={dropEnabled ? handleDrop(col.dateOnly) : undefined}
+            onDrop={dropEnabled ? handleDrop(col.dateOnly, true) : undefined}
+            onPointerDown={selectEnabled ? startSelect(col.dateOnly) : undefined}
+            onContextMenu={onContextMenu ? emptyContextMenu(col.dateOnly, true) : undefined}
           >
             {grid.hourMarks.map((mark) => (
               <div
@@ -238,15 +384,95 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                 aria-hidden="true"
               />
             ))}
-            {col.timed.map((block) => (
-              <TimeGridBlockView
-                key={block.event.id}
-                block={block}
-                locale={locale}
-                onDragStart={onDragStart}
-                onDragEnd={onDragEnd}
+            {selectBand && selectBand.dateOnly === col.dateOnly ? (
+              <div
+                className="aethercal-tg-select-band"
+                style={{ top: pct(selectBand.topFraction), height: pct(selectBand.heightFraction) }}
+                aria-hidden="true"
               />
-            ))}
+            ) : null}
+            {col.timed.map((block) => {
+              const { event } = block;
+              const editable = event.editable !== false;
+              const timeLabel = formatEventTime(event.start, locale);
+              const previewed = resizePreview?.id === event.id ? resizePreview : null;
+              const previewBlock = previewed
+                ? layoutDayColumn(
+                    [{ ...event, start: previewed.start, end: previewed.end }],
+                    col.dateOnly,
+                    grid.config,
+                  )[0]
+                : undefined;
+              const top = previewBlock ? previewBlock.topFraction : block.topFraction;
+              const height = previewBlock ? previewBlock.heightFraction : block.heightFraction;
+              const style: StyleWithVars = {
+                top: pct(top),
+                height: pct(height),
+                left: pct(block.lane / block.laneCount),
+                width: pct(1 / block.laneCount),
+                ...(event.color ? { "--ac-tg-event-accent": event.color } : {}),
+              };
+              return (
+                <div
+                  key={event.id}
+                  className={cx(
+                    "aethercal-tg-event",
+                    !editable && "is-locked",
+                    pendingIds.has(event.id) && "is-pending",
+                    rolledBackIds.has(event.id) && "is-rolledback",
+                    Boolean(previewed) && "is-resizing",
+                  )}
+                  draggable={editable}
+                  data-event-id={event.id}
+                  data-lane={block.lane}
+                  data-lane-count={block.laneCount}
+                  aria-label={`${timeLabel} ${event.title}`}
+                  title={event.title}
+                  style={style}
+                  onDragStart={(e) => {
+                    if (gestureRef.current?.kind === "resize") {
+                      e.preventDefault();
+                      return;
+                    }
+                    e.dataTransfer.setData("text/plain", event.id);
+                    e.dataTransfer.effectAllowed = "move";
+                    onDragStart(event.id);
+                  }}
+                  onDragEnd={onDragEnd}
+                  onClick={onEventClick ? () => onEventClick({ id: event.id }) : undefined}
+                  onContextMenu={
+                    onContextMenu
+                      ? (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onContextMenu({ id: event.id });
+                        }
+                      : undefined
+                  }
+                >
+                  <time className="aethercal-tg-event-time">{timeLabel}</time>
+                  <span className="aethercal-tg-event-title">{event.title}</span>
+                  {resizeEnabled && editable ? (
+                    <>
+                      <div
+                        className="aethercal-tg-resize-handle aethercal-tg-resize-handle-start"
+                        data-edge="start"
+                        aria-hidden="true"
+                        draggable={false}
+                        onPointerDown={startResize(event, "start")}
+                      />
+                      <div
+                        className="aethercal-tg-resize-handle aethercal-tg-resize-handle-end"
+                        data-edge="end"
+                        aria-hidden="true"
+                        draggable={false}
+                        onPointerDown={startResize(event, "end")}
+                      />
+                    </>
+                  ) : null}
+                </div>
+              );
+            })}
             {nowFraction !== null && col.dateOnly === nowDateKey ? (
               <div className="aethercal-now-indicator" style={{ top: pct(nowFraction) }} aria-hidden="true" />
             ) : null}

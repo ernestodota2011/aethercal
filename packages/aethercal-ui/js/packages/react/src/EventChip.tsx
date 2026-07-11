@@ -10,18 +10,37 @@ interface EventChipProps {
   timeLabel: string | null;
   onDragStart: (eventId: string) => void;
   onDragEnd: () => void;
+  /** An optimistic mutation is in flight for this event (pending affordance). */
+  isPending?: boolean;
+  /** This event's mutation was just reverted (rollback flash). */
+  isRolledBack?: boolean;
+  /** Click the chip (F2-D). */
+  onClick?: () => void;
+  /** Right-click / context-menu on the chip (F2-D). */
+  onContextMenu?: () => void;
+}
+
+function cx(...parts: (string | false | undefined)[]): string {
+  return parts.filter(Boolean).join(" ");
 }
 
 /**
- * A single event chip inside a day cell: pointer-draggable (unless the event is not editable) and
- * themed through `--ac-event-*` tokens. Per-event `color` overrides the accent bar.
- *
- * F2-A a11y scope: the chip is a PRESENTATIONAL element with an accessible label — deliberately
- * NOT `role="button"`/focusable, because it has no keyboard action yet. Keyboard move/reschedule
- * (and the matching interactive role) land in F2-E; the list view is the accessible fallback
- * (AetherCal-06 §5/§7). Claiming a button role without a keyboard handler would be an ARIA lie.
+ * A single event chip inside a day cell / all-day rail: pointer-draggable (unless the event is not
+ * editable) and themed through `--ac-event-*` tokens. Per-event `color` overrides the accent bar.
+ * F2-D adds optional click / context-menu handlers and the optimistic status classes (`is-pending`
+ * / `is-rolledback`) the reconciliation layer drives; when no `onClick` is supplied the chip stays a
+ * presentational element (no dishonest interactive role — keyboard activation is F2-E).
  */
-export function EventChip({ event, timeLabel, onDragStart, onDragEnd }: EventChipProps): React.JSX.Element {
+export function EventChip({
+  event,
+  timeLabel,
+  onDragStart,
+  onDragEnd,
+  isPending,
+  isRolledBack,
+  onClick,
+  onContextMenu,
+}: EventChipProps): React.JSX.Element {
   const editable = event.editable !== false;
   const style: StyleWithVars | undefined = event.color
     ? { "--ac-event-accent": event.color }
@@ -30,7 +49,12 @@ export function EventChip({ event, timeLabel, onDragStart, onDragEnd }: EventChi
 
   return (
     <div
-      className={editable ? "aethercal-event" : "aethercal-event is-locked"}
+      className={cx(
+        "aethercal-event",
+        !editable && "is-locked",
+        isPending && "is-pending",
+        isRolledBack && "is-rolledback",
+      )}
       draggable={editable}
       data-event-id={event.id}
       aria-label={accessibleLabel}
@@ -42,6 +66,16 @@ export function EventChip({ event, timeLabel, onDragStart, onDragEnd }: EventChi
         onDragStart(event.id);
       }}
       onDragEnd={onDragEnd}
+      onClick={onClick}
+      onContextMenu={
+        onContextMenu
+          ? (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onContextMenu();
+            }
+          : undefined
+      }
     >
       {timeLabel ? <time className="aethercal-event-time">{timeLabel}</time> : null}
       <span className="aethercal-event-title">{event.title}</span>
