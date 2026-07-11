@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import schemaJson from "./calendar-props.schema.json";
 import type {
   CalendarEvent,
+  CalendarView,
   ContextMenuPayload,
   EventClickPayload,
   EventDropPayload,
@@ -108,6 +109,24 @@ function jsonTypeOf(value: unknown): string {
   if (typeof value === "string") return "string";
   return "unknown";
 }
+
+// Static EXACT-type lock: each payload type must equal its declared shape EXACTLY. This catches a
+// type WIDENING (e.g. `string` -> `string | number`) that the runtime sample check cannot — a
+// widened field would still validate a string sample, but `Equal` here goes false and typecheck
+// breaks. `Equal` is the standard invariant-position identity trick; `Expect<false>` is a type error.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type Expect<T extends true> = T;
+const _exactTypeLocks: [
+  Expect<Equal<CalendarEvent, { id: string; title: string; start: string; end: string; allDay?: boolean; color?: string; editable?: boolean; revision?: number }>>,
+  Expect<Equal<EventDropPayload, { id: string; start: string; end: string; revision?: number; client_mutation_id?: string }>>,
+  Expect<Equal<EventResizePayload, { id: string; start: string; end: string; revision?: number; client_mutation_id?: string }>>,
+  Expect<Equal<RangeSelectPayload, { start: string; end: string; allDay: boolean }>>,
+  Expect<Equal<EventClickPayload, { id: string }>>,
+  Expect<Equal<ContextMenuPayload, { id: string; start?: string } | { start: string; id?: string }>>,
+  Expect<Equal<ViewChangePayload, { view: CalendarView; from: string; to: string }>>,
+] = [true, true, true, true, true, true, true];
+void _exactTypeLocks;
 
 /**
  * Compile-time EXHAUSTIVE key tuple: the compiler rejects a tuple that omits ANY key of `T`
