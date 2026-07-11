@@ -36,7 +36,12 @@ def build_admin_app(runtime: AdminRuntime) -> rx.App:
     app.add_page(
         pages.bookings_page,
         route="/",
-        on_load=[AdminState.require_auth, AdminState.load_bookings],
+        # ``load_event_types`` populates the event-type choices the range-select create panel needs.
+        on_load=[
+            AdminState.require_auth,
+            AdminState.load_bookings,
+            AdminState.load_event_types,
+        ],
         title="Agenda · AetherCal admin",
     )
     app.add_page(

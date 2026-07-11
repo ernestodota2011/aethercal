@@ -164,6 +164,7 @@ version = "0.0.0"
 source = { editable = "apps/server" }
 dependencies = [
     { name = "aethercal-core" },
+    { name = "aethercal-ui", extra = ["reflex"] },
     { name = "aiosmtplib" },
     { name = "alembic" },
     { name = "apscheduler" },
@@ -190,6 +191,7 @@ google = [
 [package.metadata]
 requires-dist = [
     { name = "aethercal-core", editable = "packages/aethercal-core" },
+    { name = "aethercal-ui", extras = ["reflex"], editable = "packages/aethercal-ui" },
     { name = "aiosmtplib", specifier = ">=3.0" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "apscheduler", specifier = ">=3.10" },

@@ -50,6 +50,10 @@ dependencies = [
     # it is a direct server dependency. Pinned narrowly (< 0.10) per the F0-10 spike's version-
     # fragility note; already resolved in the workspace lock via aethercal-ui[reflex].
     "reflex>=0.9.6.post1,<0.10",
+    # F2-F: the admin agenda ADOPTS the bundled calendar component (aethercal.ui.Calendar), so the
+    # component (and its committed JS bundle) is now a direct server dependency, not merely a dev
+    # convenience. The [reflex] extra brings the reflex the wrapper needs (already server-pinned).
+    "aethercal-ui[reflex]",
 ]
 
 [project.optional-dependencies]

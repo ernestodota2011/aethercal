@@ -16,8 +16,12 @@ import reflex as rx
 from reflex.vars import ObjectVar
 
 from aethercal.server.admin.state import AdminState
+from aethercal.ui import Calendar
 
 _NAV = (("Agenda", "/"), ("Event types", "/event-types"), ("Schedules", "/schedules"))
+
+# The four calendar surfaces + their Spanish labels for the view toggle (RNF-1: admin ES-first).
+_CALENDAR_VIEWS = (("month", "Mes"), ("week", "Semana"), ("day", "Día"), ("list", "Lista"))
 
 
 def _error(message: str) -> rx.Component:
@@ -93,48 +97,159 @@ def login_page() -> rx.Component:
 # --------------------------------------------------------------------------------------
 
 
-def _booking_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
-    return rx.table.row(
-        rx.table.cell(row["start"]),
-        rx.table.cell(row["guest"]),
-        rx.table.cell(row["email"]),
-        rx.table.cell(row["status"]),
-        rx.table.cell(
-            rx.button(
-                "Cancel",
-                on_click=AdminState.cancel(row["id"]),
-                color_scheme="red",
-                variant="soft",
-                size="1",
-            )
+def _view_button(value: str, label: str) -> rx.Component:
+    """One button of the month/week/day/list view toggle (the active view rendered solid)."""
+    return rx.button(
+        label,
+        on_click=AdminState.set_calendar_view(value),
+        variant=rx.cond(AdminState.calendar_view == value, "solid", "soft"),
+        size="2",
+    )
+
+
+def _view_switcher() -> rx.Component:
+    """The Spanish month/week/day/list toggle that drives the calendar's ``view`` prop."""
+    return rx.hstack(*[_view_button(value, label) for value, label in _CALENDAR_VIEWS], spacing="2")
+
+
+def _calendar() -> rx.Component:
+    """The AetherCal calendar bound to the admin state (ES locale, Monday-first, neutral theme).
+
+    Drag/resize reschedule (optimistically), a range-select opens the create panel, and a click
+    selects a booking to manage — every gesture routed to a state handler that reuses the existing
+    booking service.
+    """
+    return rx.box(
+        Calendar.create(
+            view=AdminState.calendar_view,
+            events=AdminState.calendar_events,
+            locale="es",
+            first_day_of_week=1,
+            theme="light",
+            on_event_drop=AdminState.on_calendar_event_drop,
+            on_event_resize=AdminState.on_calendar_event_resize,
+            on_range_select=AdminState.on_calendar_range_select,
+            on_event_click=AdminState.on_calendar_event_click,
+        ),
+        width="100%",
+        min_height="32em",
+    )
+
+
+def _manage_panel() -> rx.Component:
+    """The click-to-manage panel (RF-22): view the selected booking, reschedule it accessibly
+    (no ID typing — it uses the selected booking), cancel, or close. The booking id is shown here
+    (copyable) so it is discoverable for the manual fallback form too.
+    """
+    return rx.cond(
+        AdminState.selected_booking_id != "",
+        rx.card(
+            rx.vstack(
+                rx.heading("Reserva seleccionada", size="4"),
+                rx.text(AdminState.selected_booking_guest),
+                rx.text(AdminState.selected_booking_start),
+                rx.code(AdminState.selected_booking_id),
+                rx.form(
+                    rx.hstack(
+                        rx.input(name="new_start", type="datetime-local", required=True),
+                        rx.button("Reprogramar", type="submit"),
+                        spacing="3",
+                        align="end",
+                    ),
+                    on_submit=AdminState.reschedule_selected,
+                    reset_on_submit=True,
+                ),
+                rx.hstack(
+                    rx.button(
+                        "Cancelar reserva",
+                        on_click=AdminState.cancel(AdminState.selected_booking_id),
+                        color_scheme="red",
+                        variant="soft",
+                    ),
+                    rx.button("Cerrar", on_click=AdminState.clear_selection, variant="soft"),
+                    spacing="3",
+                ),
+                rx.text(
+                    "También puedes arrastrar la reserva en el calendario para moverla.",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                spacing="3",
+            ),
+        ),
+    )
+
+
+def _new_booking_option(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.select.item(row["title"], value=row["id"])
+
+
+def _new_booking_panel() -> rx.Component:
+    """The range-select create panel: book a slot for a guest (reuses the booking service)."""
+    return rx.cond(
+        AdminState.show_new_booking,
+        rx.card(
+            rx.form(
+                rx.vstack(
+                    rx.heading("Nueva reserva", size="4"),
+                    rx.select.root(
+                        rx.select.trigger(placeholder="Tipo de evento"),
+                        rx.select.content(rx.foreach(AdminState.event_types, _new_booking_option)),
+                        name="event_type_id",
+                        required=True,
+                    ),
+                    rx.input(
+                        name="start",
+                        default_value=AdminState.new_booking_start,
+                        placeholder="Inicio (ISO, UTC)",
+                        required=True,
+                    ),
+                    rx.input(name="guest_name", placeholder="Nombre del invitado", required=True),
+                    rx.input(name="guest_email", placeholder="Email del invitado", required=True),
+                    rx.input(name="guest_timezone", placeholder="Zona horaria (por defecto UTC)"),
+                    rx.hstack(
+                        rx.button("Crear reserva", type="submit"),
+                        rx.button(
+                            "Cancelar",
+                            on_click=AdminState.close_new_booking,
+                            variant="soft",
+                            type="button",
+                        ),
+                        spacing="3",
+                    ),
+                    spacing="3",
+                    width="100%",
+                    max_width="24em",
+                ),
+                on_submit=AdminState.create_booking,
+                reset_on_submit=True,
+            ),
         ),
     )
 
 
 def bookings_page() -> rx.Component:
-    """The agenda: every booking, with cancel + a reschedule form."""
+    """The agenda: bookings on the AetherCal calendar (month/week/day/list), with drag-reschedule,
+    range-select-to-create, and click-to-manage — the booking list is now the calendar's list view.
+    """
     return _shell(
         "Agenda",
         _error(AdminState.error),
-        rx.table.root(
-            rx.table.header(
-                rx.table.row(
-                    rx.table.column_header_cell("Start"),
-                    rx.table.column_header_cell("Guest"),
-                    rx.table.column_header_cell("Email"),
-                    rx.table.column_header_cell("Status"),
-                    rx.table.column_header_cell("Actions"),
-                )
-            ),
-            rx.table.body(rx.foreach(AdminState.bookings, _booking_row)),
-            width="100%",
+        _view_switcher(),
+        _calendar(),
+        _manage_panel(),
+        _new_booking_panel(),
+        rx.heading("Reprogramar manualmente", size="4"),
+        rx.text(
+            "Alternativa accesible al arrastre: reprograma por ID de reserva y nuevo inicio.",
+            size="1",
+            color_scheme="gray",
         ),
-        rx.heading("Reschedule a booking", size="4"),
         rx.form(
             rx.hstack(
-                rx.input(name="booking_id", placeholder="Booking id", required=True),
+                rx.input(name="booking_id", placeholder="ID de reserva", required=True),
                 rx.input(name="new_start", type="datetime-local", required=True),
-                rx.button("Reschedule", type="submit"),
+                rx.button("Reprogramar", type="submit"),
                 spacing="3",
                 align="end",
             ),

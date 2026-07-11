@@ -25,16 +25,21 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import reflex as rx
 from reflex.event import EventSpec
+from sqlalchemy.exc import SQLAlchemyError
 
+from aethercal.core.model import BookingStatus
+from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate
 from aethercal.server.admin import service
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.format import (
+    booking_event,
     booking_row,
     event_type_row,
     parse_weekdays,
@@ -43,6 +48,7 @@ from aethercal.server.admin.format import (
 )
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
+from aethercal.ui import CalendarEvent
 
 # Internal (prefix-free) routes; the mount prefix is applied by Reflex's ``frontend_path`` basename.
 LOGIN_ROUTE = "/login"
@@ -124,11 +130,149 @@ def _translation_update(
 # --------------------------------------------------------------------------------------
 
 
-async def _fetch_bookings(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_bookings_view(
+#: The calendar surfaces the operator can switch between (kept in sync with the TS ``CalendarView``
+#: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback.
+_VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list"})
+
+#: Shown when a resize would only change a booking's DURATION (its start is unchanged). A booking's
+#: end is derived from its event type, so duration can't be edited — the operator drags to MOVE it.
+_DURATION_FIXED_MESSAGE = (
+    "La duración de una reserva la determina su tipo de evento; "
+    "arrastra la reserva para moverla en el tiempo."
+)
+
+#: Shown when a reschedule PERSISTED but the follow-up refresh failed. The move is real (kept in the
+#: view); only the authoritative sync is pending, so the operator is asked to reload — never a
+#: rollback (which would desync the view from the committed DB state).
+_RESYNC_MESSAGE = (
+    "La reserva se reprogramó, pero no se pudo actualizar la vista. Recarga la agenda."
+)
+
+
+async def _fetch_booking_views(
+    runtime: AdminRuntime,
+) -> tuple[list[dict[str, str]], list[CalendarEvent]]:
+    """Load the tenant's bookings once, projected into BOTH the table rows and the calendar events.
+
+    Cancelled bookings are omitted from the calendar (a reschedule cancels the predecessor, so
+    showing it would duplicate the moved chip), while the row list keeps the full history.
+    """
+    reads: list[BookingRead] = await service.list_bookings_view(
         runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
     )
-    return [booking_row(row) for row in rows]
+    rows = [booking_row(read) for read in reads]
+    events = [booking_event(read) for read in reads if read.status is not BookingStatus.CANCELLED]
+    return rows, events
+
+
+def _find_calendar_event(events: list[CalendarEvent], booking_id: str) -> CalendarEvent | None:
+    """A shallow copy of the event with ``booking_id`` (a rollback snapshot), or ``None``."""
+    for event in events:
+        if event["id"] == booking_id:
+            return dict(event)  # type: ignore[return-value]  # a shallow snapshot for rollback
+    return None
+
+
+def _with_moved_event(
+    events: list[CalendarEvent], booking_id: str, start: str, end: str
+) -> list[CalendarEvent]:
+    """The event list with ``booking_id`` moved to ``start``/``end`` (the optimistic apply)."""
+    return [
+        ({**event, "start": start, "end": end} if event["id"] == booking_id else event)
+        for event in events
+    ]
+
+
+def _with_restored_event(
+    events: list[CalendarEvent], snapshot: CalendarEvent
+) -> list[CalendarEvent]:
+    """The event list with the snapshotted event put back in place (the rollback)."""
+    return [(snapshot if event["id"] == snapshot["id"] else event) for event in events]
+
+
+def _parse_admin_start(raw: str) -> datetime:
+    """Parse an ISO datetime from the admin/calendar; a naive value is stamped UTC (admin contract).
+
+    The calendar echoes naive local wall-time and the ``datetime-local`` field is naive; both are
+    interpreted as UTC (the inverse of :func:`aethercal.server.admin.format._wall_time_utc`). An
+    already-aware value is honored as sent.
+    """
+    value = datetime.fromisoformat(raw)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value
+
+
+def _same_instant(a: str, b: str) -> bool:
+    """Whether two admin/calendar datetime strings denote the same instant (format-tolerant)."""
+    try:
+        return _parse_admin_start(a) == _parse_admin_start(b)
+    except ValueError:
+        return a == b
+
+
+async def _optimistic_reschedule(
+    state: AdminState, payload: dict[str, str], *, require_start_change: bool = False
+) -> AsyncIterator[None]:
+    """Optimistic reschedule (RF-21) shared by drag and resize.
+
+    Applies the move to ``calendar_events`` IMMEDIATELY and ``yield``s so the client sees the chip
+    in its new slot with no lag; then calls the real ``reschedule_booking_action``. On success it
+    COMMITS the server's confirmed state (a refetch — the reschedule opens a new confirmed booking
+    and cancels the old, so the authoritative list is the source of truth for the new revision); on
+    a refusal (off-hours, taken slot, ...) it ROLLS BACK to the snapshot and surfaces the error.
+
+    ``require_start_change`` guards the resize gesture: a booking's duration is derived from its
+    event type, so a resize that leaves the START unchanged (only the end/duration edited) has no
+    valid server operation — it is refused up front with a clear message and NO service call,
+    instead of opening a pointless same-start successor whose end would just snap back. A resize
+    that moves the start reschedules exactly like a drag (the duration re-derives).
+
+    The caller (the public drag/resize handlers) owns the auth guard; this reads only public state.
+    """
+    booking_id = str(payload.get("id", ""))
+    snapshot = _find_calendar_event(state.calendar_events, booking_id)
+    if snapshot is None:
+        return  # a gesture on an event the server no longer has: nothing to move
+    new_start_raw = str(payload.get("start", ""))
+    if require_start_change and _same_instant(new_start_raw, str(snapshot["start"])):
+        # A pure duration change (start unchanged): not editable, and never a DB round-trip.
+        state.error = _DURATION_FIXED_MESSAGE
+        return
+    # Optimistic apply: move the chip now, before any DB round-trip.
+    state.calendar_events = _with_moved_event(
+        state.calendar_events, booking_id, new_start_raw, str(payload.get("end", ""))
+    )
+    state.error = ""
+    yield
+    runtime = current_runtime()
+    committed = False
+    try:
+        new_start = _parse_admin_start(new_start_raw)
+        await service.reschedule_booking_action(
+            runtime.sessionmaker,
+            tenant_slug=runtime.config.tenant_slug,
+            booking_id=uuid.UUID(booking_id),
+            new_start=new_start,
+        )
+        committed = True
+        # The reschedule replaced the booking with a new-id successor, so a manage panel open on the
+        # old (now cancelled) id is stale — clear it, like reschedule / reschedule_selected do.
+        state.selected_booking_id = ""
+        # Commit the authoritative state (the confirmed successor at its new revision).
+        state.bookings, state.calendar_events = await _fetch_booking_views(runtime)
+        state.error = ""
+    except (ValueError, service.AdminError, SQLAlchemyError) as exc:
+        if committed:
+            # The reschedule PERSISTED but the refresh failed. Rolling back would desync the view
+            # from the DB (which really moved), so KEEP the optimistic move and ask for a reload —
+            # the next load reconciles to the authoritative revision.
+            state.error = _RESYNC_MESSAGE
+        else:
+            # Refused or failed BEFORE commit → roll the chip back to the authoritative slot. Every
+            # exit reconciles the optimistic state: no path leaves an unconfirmed move applied.
+            state.calendar_events = _with_restored_event(state.calendar_events, snapshot)
+            state.error = _error_text(exc)
 
 
 async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
@@ -162,6 +306,19 @@ class AdminState(rx.State):
     bookings: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     event_types: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     schedules: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+
+    # -- calendar (F2-F) ------------------------------------------------------------
+    # The agenda's calendar events (active bookings) + the operator-selected view. The calendar
+    # component reads both; ``calendar_events`` also carries the optimistic in-flight move.
+    calendar_events: list[CalendarEvent] = []  # noqa: RUF012 (reflex state var)
+    calendar_view: str = "month"
+    # The booking selected by a click, surfaced in the manage panel (view / cancel / reschedule).
+    selected_booking_id: str = ""
+    selected_booking_start: str = ""
+    selected_booking_guest: str = ""
+    # The range-select create affordance: the pre-filled start + whether the create panel is open.
+    new_booking_start: str = ""
+    show_new_booking: bool = False
 
     # -- auth -----------------------------------------------------------------------
 
@@ -228,12 +385,12 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_bookings(self) -> None:
-        """Load the tenant's bookings into the agenda (``on_load``)."""
+        """Load the tenant's bookings into the agenda calendar + row list (``on_load``)."""
         if not self._authenticated:
             return
         self.error = ""
         try:
-            self.bookings = await _fetch_bookings(current_runtime())
+            self.bookings, self.calendar_events = await _fetch_booking_views(current_runtime())
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -249,14 +406,15 @@ class AdminState(rx.State):
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=uuid.UUID(booking_id),
             )
-            self.bookings = await _fetch_bookings(runtime)
+            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
+            self.selected_booking_id = ""
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
 
     @rx.event
     async def reschedule(self, form_data: dict[str, str]) -> None:
-        """Reschedule a booking to a new start.
+        """Reschedule a booking to a new start (the manual, keyboard-friendly fallback form).
 
         The ``datetime-local`` field is timezone-naive; the admin's contract is that its times are
         UTC, so a naive value is stamped as UTC explicitly here (rather than relying on a downstream
@@ -267,19 +425,151 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             booking_id = uuid.UUID(_clean(form_data, "booking_id"))
-            new_start = datetime.fromisoformat(_clean(form_data, "new_start"))
-            if new_start.tzinfo is None:
-                new_start = new_start.replace(tzinfo=UTC)
+            new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
                 runtime.sessionmaker,
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=booking_id,
                 new_start=new_start,
             )
-            self.bookings = await _fetch_bookings(runtime)
+            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
+            self.selected_booking_id = ""
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
+
+    # -- calendar interactions (F2-F) -----------------------------------------------
+
+    @rx.event
+    def set_calendar_view(self, view: str) -> None:
+        """Switch the calendar surface (month / week / day / list) from the view toggle."""
+        if not self._authenticated:
+            return
+        if view in _VALID_CALENDAR_VIEWS:
+            self.calendar_view = view
+
+    @rx.event
+    async def on_calendar_event_drop(self, payload: dict[str, str]) -> AsyncIterator[None]:
+        """Drag an event onto a new day/time → reschedule, optimistically (RF-21)."""
+        if not self._authenticated:
+            return
+        async for _ in _optimistic_reschedule(self, payload):
+            yield
+
+    @rx.event
+    async def on_calendar_event_resize(self, payload: dict[str, str]) -> AsyncIterator[None]:
+        """Resize an event's edge → reschedule to the new start (duration stays event-type-derived).
+
+        A booking's ``end`` is derived from its event type, so a resize that only changes duration
+        (start unchanged) is refused with a clear message and no service call; a resize that moves
+        the start reschedules exactly like a drag (same optimistic apply → commit / rollback path).
+        """
+        if not self._authenticated:
+            return
+        async for _ in _optimistic_reschedule(self, payload, require_start_change=True):
+            yield
+
+    @rx.event
+    def on_calendar_range_select(self, payload: dict[str, str]) -> None:
+        """Drag across empty grid space → open the create-booking panel (pre-filled start)."""
+        if not self._authenticated:
+            return
+        self.new_booking_start = str(payload.get("start", ""))
+        self.show_new_booking = True
+        self.selected_booking_id = ""
+        self.error = ""
+
+    @rx.event
+    def on_calendar_event_click(self, payload: dict[str, str]) -> None:
+        """Click an event → select it for the manage panel (view / cancel / reschedule)."""
+        if not self._authenticated:
+            return
+        booking_id = str(payload.get("id", ""))
+        for event in self.calendar_events:
+            if event["id"] == booking_id:
+                self.selected_booking_id = booking_id
+                self.selected_booking_start = str(event["start"])
+                self.selected_booking_guest = str(event["title"])
+                self.show_new_booking = False
+                self.error = ""
+                return
+
+    @rx.event
+    async def reschedule_selected(self, form_data: dict[str, str]) -> None:
+        """Reschedule the CLICKED booking to a new start (the accessible panel form).
+
+        Uses ``selected_booking_id`` from state, so the operator never needs to know/type a booking
+        id — clicking the event on the calendar selects it. This is the keyboard-accessible path
+        that does not rely on drag.
+        """
+        if not self._authenticated or not self.selected_booking_id:
+            return
+        runtime = current_runtime()
+        committed = False
+        try:
+            new_start = _parse_admin_start(_clean(form_data, "new_start"))
+            await service.reschedule_booking_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                booking_id=uuid.UUID(self.selected_booking_id),
+                new_start=new_start,
+            )
+            committed = True
+            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
+            self.selected_booking_id = ""
+            self.error = ""
+        except (ValueError, service.AdminError, SQLAlchemyError) as exc:
+            if committed:
+                # Rescheduled, but the refresh failed: close the now-stale panel and ask for a
+                # reload instead of leaving it pointed at the replaced booking (ambiguous retry).
+                self.selected_booking_id = ""
+                self.error = _RESYNC_MESSAGE
+            else:
+                self.error = _error_text(exc)
+
+    @rx.event
+    def clear_selection(self) -> None:
+        """Close the manage panel."""
+        self.selected_booking_id = ""
+
+    @rx.event
+    def close_new_booking(self) -> None:
+        """Close the create-booking panel without creating."""
+        self.show_new_booking = False
+        self.new_booking_start = ""
+
+    @rx.event
+    async def create_booking(self, form_data: dict[str, str]) -> None:
+        """Create a booking for the range-selected slot (reuses the domain booking service)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        committed = False
+        try:
+            form = service.BookingForm(
+                event_type_id=uuid.UUID(_clean(form_data, "event_type_id")),
+                start=_parse_admin_start(_clean(form_data, "start")),
+                guest_name=_clean(form_data, "guest_name"),
+                guest_email=_clean(form_data, "guest_email"),
+                guest_timezone=_clean(form_data, "guest_timezone") or "UTC",
+            )
+            await service.create_booking_action(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
+            )
+            committed = True
+            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
+            self.show_new_booking = False
+            self.new_booking_start = ""
+            self.error = ""
+        except (ValueError, service.AdminError, SQLAlchemyError) as exc:
+            if committed:
+                # Created, but the refresh failed: close the form so the operator does not re-submit
+                # (an ambiguous retry) — the booking persisted; ask for a reload.
+                self.show_new_booking = False
+                self.new_booking_start = ""
+                self.error = _RESYNC_MESSAGE
+            else:
+                self.error = _error_text(exc)
 
     # -- event types ----------------------------------------------------------------
 

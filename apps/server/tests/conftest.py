@@ -15,8 +15,18 @@ Two backends, one contract:
 
 from __future__ import annotations
 
-import asyncio
 import os
+
+# The admin adopts the bundled ``aethercal.ui.Calendar`` (F2-F), whose module scope calls
+# ``rx.asset(path=..., shared=True)`` at import time. In a real Reflex app that also symlinks the
+# asset into ``assets/external/`` (relative to cwd) — correct there, but this repo root is not a
+# Reflex app, and on Windows the symlink needs Developer Mode/elevation (WinError 1314/3). Setting
+# ``REFLEX_BACKEND_ONLY`` before the first import skips that side effect while still resolving (and
+# validating the existence of) the asset — the same guard ``packages/aethercal-ui``'s own conftest
+# uses. Set at collection start so every admin-importing test module is covered.
+os.environ.setdefault("REFLEX_BACKEND_ONLY", "1")
+
+import asyncio
 import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable

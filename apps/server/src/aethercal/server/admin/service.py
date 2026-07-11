@@ -75,6 +75,23 @@ class AdminContext:
 
 
 @dataclass(frozen=True, slots=True)
+class BookingForm:
+    """The admin-controlled fields for a manually-created booking (F2-F, range-select → create).
+
+    The operator books a slot on a guest's behalf; the tenant/host come from the resolved context,
+    and ``end`` is server-derived from the event type's duration (never sent). ``guest_timezone``
+    defaults to UTC (the admin's time contract), so a minimal create form need only pick the event
+    type + start and name the guest.
+    """
+
+    event_type_id: uuid.UUID
+    start: datetime
+    guest_name: str
+    guest_email: str
+    guest_timezone: str = "UTC"
+
+
+@dataclass(frozen=True, slots=True)
 class EventTypeForm:
     """The admin-controlled fields of an event type; ``host_id`` is injected from the context."""
 
@@ -220,6 +237,41 @@ async def reschedule_booking_action(
                 tenant_id=ctx.tenant_id,
                 booking_id=booking_id,
                 new_start=new_start,
+                now=_now(now),
+            )
+        except bookings_service.BookingError as exc:
+            raise _booking_action_error(exc) from exc
+        await session.refresh(booking)
+        return BookingRead.model_validate(booking)
+
+
+async def create_booking_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    form: BookingForm,
+    now: datetime | None = None,
+) -> BookingRead:
+    """Create a booking for ``form``'s slot on the guest's behalf (F2-F range-select → create).
+
+    Thin reuse of the SAME domain ``bookings_service.create_booking`` the public booking page uses —
+    no new booking logic. The event type + slot are validated against the host's real availability
+    (an off-hours or taken slot maps to a safe :class:`AdminActionError`), and ``end`` is derived
+    from the event type's duration inside the service.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            booking = await bookings_service.create_booking(
+                session,
+                tenant_id=ctx.tenant_id,
+                params=bookings_service.BookingParams(
+                    event_type_id=form.event_type_id,
+                    start=form.start,
+                    guest_name=form.guest_name,
+                    guest_email=form.guest_email,
+                    guest_timezone=form.guest_timezone,
+                ),
                 now=_now(now),
             )
         except bookings_service.BookingError as exc:
@@ -386,8 +438,10 @@ __all__ = [
     "AdminContext",
     "AdminError",
     "AdminSetupError",
+    "BookingForm",
     "EventTypeForm",
     "cancel_booking_action",
+    "create_booking_action",
     "create_event_type_action",
     "create_schedule_action",
     "deactivate_event_type_action",
