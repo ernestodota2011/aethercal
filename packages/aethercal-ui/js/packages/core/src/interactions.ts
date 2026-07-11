@@ -90,27 +90,27 @@ export function computeMovedRange(
 
   const originalStart = parseLocalDateTime(event.start);
   const originalEnd = parseLocalDateTime(event.end);
-  const target = parseLocalDateTime(`${targetDateOnly}T00:00:00`);
-  // The move = shift the whole event by (dayDelta calendar days, minuteDelta wall minutes), applied
-  // identically to both endpoints so the local duration is preserved.
-  const dayDelta = calendarDayDelta(originalStart, target);
+  // The new start is placed exactly on the snapped grid slot (seconds zeroed); the new end preserves
+  // the event's LOCAL span — whole calendar days + minute-of-day delta — applied with component
+  // arithmetic so it is DST-safe. Sub-minute seconds are intentionally dropped by the snap.
+  const newStart = dateAtMinute(targetDateOnly, minuteOfDay);
+  const daySpan = calendarDayDelta(originalStart, originalEnd);
   const startMinuteOfDay = originalStart.getHours() * MINUTES_PER_HOUR + originalStart.getMinutes();
-  const minuteDelta = minuteOfDay - startMinuteOfDay;
-
-  const shift = (dt: Date): Date =>
-    new Date(
-      dt.getFullYear(),
-      dt.getMonth(),
-      dt.getDate() + dayDelta,
-      dt.getHours(),
-      dt.getMinutes() + minuteDelta,
-      dt.getSeconds(),
-    );
+  const endMinuteOfDay = originalEnd.getHours() * MINUTES_PER_HOUR + originalEnd.getMinutes();
+  const minuteSpan = endMinuteOfDay - startMinuteOfDay;
+  const newEnd = new Date(
+    newStart.getFullYear(),
+    newStart.getMonth(),
+    newStart.getDate() + daySpan,
+    newStart.getHours(),
+    newStart.getMinutes() + minuteSpan,
+    0,
+  );
 
   const payload: EventDropPayload = {
     id: event.id,
-    start: formatLocalDateTime(shift(originalStart)),
-    end: formatLocalDateTime(shift(originalEnd)),
+    start: formatLocalDateTime(newStart),
+    end: formatLocalDateTime(newEnd),
   };
   if (event.revision !== undefined) payload.revision = event.revision;
   return payload;

@@ -241,7 +241,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
   );
 
   const gestureActive = interaction.status === "resizing" || interaction.status === "selecting";
-  React.useEffect(() => {
+  // useLayoutEffect (not useEffect): the window listeners must be attached synchronously right after
+  // the pointerdown that starts the gesture commits, before the browser dispatches the next pointer
+  // event — a passive effect could miss a pointerup that fires before it flushes.
+  React.useLayoutEffect(() => {
     if (!gestureActive) return;
     const onMove = (e: PointerEvent): void => {
       const g = gestureRef.current;

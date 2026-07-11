@@ -83,6 +83,15 @@ describe("computeMovedRange", () => {
     });
   });
 
+  it("snaps the moved start to the grid, dropping sub-minute seconds on both endpoints", () => {
+    const secs = evt({ id: "s", start: "2026-07-15T10:00:37", end: "2026-07-15T10:45:37" });
+    expect(computeMovedRange(secs, "2026-07-16", 720)).toEqual({
+      id: "s",
+      start: "2026-07-16T12:00:00",
+      end: "2026-07-16T12:45:00",
+    });
+  });
+
   it("preserves the LOCAL (wall-clock) duration across a spring-forward DST day", () => {
     // The vitest env runs in America/New_York; 2026-03-08 skips 02:00->03:00. A 2h event moved to
     // start at 01:00 that day keeps its visible 2h length (01:00->03:00) — a raw ms-add would render

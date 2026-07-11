@@ -88,6 +88,27 @@ const menu = { id: "e1", start: "2026-07-15T09:00:00" } satisfies ContextMenuPay
 const viewChange = { view: "week", from: "2026-07-13", to: "2026-07-19" } satisfies ViewChangePayload;
 const event = { id: "e1", title: "Consult", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", allDay: false, color: "#64748b", editable: true, revision: 1 } satisfies CalendarEvent;
 
+// Every $def with a TS-typed sample that carries all of its fields (so each field's runtime value
+// reflects its TS type). Used to lock field TYPES, not just names/optionality, against the schema.
+const SAMPLES: Record<string, Record<string, unknown>> = {
+  CalendarEvent: event,
+  EventDropPayload: drop,
+  EventResizePayload: resize,
+  RangeSelectPayload: range,
+  EventClickPayload: click,
+  ContextMenuPayload: menu,
+  ViewChangePayload: viewChange,
+};
+
+/** The JSON-Schema `type` a runtime value maps to (integers distinguished from other numbers). */
+function jsonTypeOf(value: unknown): string {
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "string") return "string";
+  return "unknown";
+}
+
 /**
  * Compile-time EXHAUSTIVE key tuple: the compiler rejects a tuple that omits ANY key of `T`
  * (including optional ones). So adding a field to a TS payload type WITHOUT adding it here fails
@@ -201,6 +222,18 @@ describe("calendar-props contract — cross-language field-name lock", () => {
     for (const [name, keys] of Object.entries(REQUIRED_TUPLES)) {
       const schemaRequired = [...((schema.$defs[name].required as string[] | undefined) ?? [])].sort();
       expect(schemaRequired, `optionality drift in ${name}`).toEqual([...keys].sort());
+    }
+  });
+
+  it("each field's schema TYPE matches its TS-typed sample value's JSON type", () => {
+    // The samples `satisfies` their TS types, so a TS field type change forces the sample value to
+    // change (or fail to compile), and this assertion then catches any divergence from the schema.
+    for (const [name, sample] of Object.entries(SAMPLES)) {
+      for (const [key, value] of Object.entries(sample)) {
+        expect(schema.$defs[name].properties[key].type, `type drift in ${name}.${key}`).toBe(
+          jsonTypeOf(value),
+        );
+      }
     }
   });
 
