@@ -105,6 +105,11 @@ def _schema_for(td: Any) -> dict[str, Any]:
     }
     if required:
         schema["required"] = sorted(required)
+    else:
+        # An all-optional payload (e.g. ContextMenuPayload: id? / start?) must still carry at least
+        # one field — the empty object is never a valid event payload. The TS side models the same
+        # invariant as an at-least-one union.
+        schema["minProperties"] = 1
     return schema
 
 

@@ -42,6 +42,9 @@ function validate(node: JsonSchema, value: unknown, root: JsonSchema, path = "$"
       for (const req of node.required ?? []) {
         if (!(req in obj)) errs.push(`${path}.${req}: missing required`);
       }
+      if (typeof node.minProperties === "number" && Object.keys(obj).length < node.minProperties) {
+        errs.push(`${path}: expected at least ${node.minProperties} propertie(s)`);
+      }
       if (node.additionalProperties === false) {
         for (const key of Object.keys(obj)) {
           if (!(key in (node.properties ?? {}))) errs.push(`${path}.${key}: additional property`);
@@ -85,14 +88,33 @@ const menu = { id: "e1", start: "2026-07-15T09:00:00" } satisfies ContextMenuPay
 const viewChange = { view: "week", from: "2026-07-13", to: "2026-07-19" } satisfies ViewChangePayload;
 const event = { id: "e1", title: "Consult", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", allDay: false, color: "#64748b", editable: true, revision: 1 } satisfies CalendarEvent;
 
-const SAMPLES: Record<string, object> = {
-  CalendarEvent: event,
-  EventDropPayload: drop,
-  EventResizePayload: resize,
-  RangeSelectPayload: range,
-  EventClickPayload: click,
-  ContextMenuPayload: menu,
-  ViewChangePayload: viewChange,
+/**
+ * Compile-time EXHAUSTIVE key tuple: the compiler rejects a tuple that omits ANY key of `T`
+ * (including optional ones). So adding a field to a TS payload type WITHOUT adding it here fails
+ * `pnpm typecheck` — closing the gap where a TS-only optional field could drift from the schema.
+ */
+const keysOf =
+  <T>() =>
+  <U extends readonly (keyof T)[]>(
+    keys: U & ([keyof T] extends [U[number]] ? unknown : never),
+  ): U =>
+    keys;
+
+// Regression proof that the exhaustive check bites: omitting a key (here `revision`) MUST be a
+// compile error. `@ts-expect-error` fails typecheck if the line does NOT error — i.e. if the lock
+// ever stops detecting a missing/added field, `pnpm typecheck` breaks here.
+// @ts-expect-error - an incomplete key tuple must not type-check
+void keysOf<EventDropPayload>()(["id", "start", "end", "client_mutation_id"]);
+
+// Every payload type's full key set, exhaustively pinned by the compiler.
+const KEY_TUPLES: Record<string, readonly string[]> = {
+  CalendarEvent: keysOf<CalendarEvent>()(["id", "title", "start", "end", "allDay", "color", "editable", "revision"]),
+  EventDropPayload: keysOf<EventDropPayload>()(["id", "start", "end", "revision", "client_mutation_id"]),
+  EventResizePayload: keysOf<EventResizePayload>()(["id", "start", "end", "revision", "client_mutation_id"]),
+  RangeSelectPayload: keysOf<RangeSelectPayload>()(["start", "end", "allDay"]),
+  EventClickPayload: keysOf<EventClickPayload>()(["id"]),
+  ContextMenuPayload: keysOf<ContextMenuPayload>()(["id", "start"]),
+  ViewChangePayload: keysOf<ViewChangePayload>()(["view", "from", "to"]),
 };
 
 describe("calendar-props contract — TS payloads validate against the generated schema", () => {
@@ -120,6 +142,12 @@ describe("calendar-props contract — TS payloads validate against the generated
   it("rejects a payload missing a required field", () => {
     expect(validate(schema.$defs.EventDropPayload, { id: "e1", start: "x" }, schema).length).toBeGreaterThan(0);
   });
+
+  it("rejects the empty context-menu payload (minProperties: 1 — at least one of id/start)", () => {
+    expect(validate(schema.$defs.ContextMenuPayload, {}, schema).length).toBeGreaterThan(0);
+    expect(validate(schema.$defs.ContextMenuPayload, { id: "e1" }, schema)).toEqual([]);
+    expect(validate(schema.$defs.ContextMenuPayload, { start: "2026-07-15T09:00:00" }, schema)).toEqual([]);
+  });
 });
 
 describe("calendar-props contract — cross-language field-name lock", () => {
@@ -130,10 +158,10 @@ describe("calendar-props contract — cross-language field-name lock", () => {
     }
   });
 
-  it("each $def's field names exactly match its TS type's field names", () => {
-    for (const [name, sample] of Object.entries(SAMPLES)) {
+  it("each $def's field names exactly match its TS type's exhaustive key set", () => {
+    for (const [name, keys] of Object.entries(KEY_TUPLES)) {
       const schemaKeys = Object.keys(schema.$defs[name].properties).sort();
-      expect(schemaKeys, `field-name drift in ${name}`).toEqual(Object.keys(sample).sort());
+      expect(schemaKeys, `field-name drift in ${name}`).toEqual([...keys].sort());
     }
   });
 

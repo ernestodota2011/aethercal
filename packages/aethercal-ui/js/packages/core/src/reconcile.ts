@@ -87,19 +87,26 @@ export function reconcileReducer(state: ReconcileState, action: ReconcileAction)
       // Causal ordering: a response no newer than what we already applied is stale — discard it.
       if (action.revision <= applied) return state;
       const existing = state.overrides[action.id];
-      const overrides =
-        existing && existing.clientMutationId === action.clientMutationId
-          ? {
-              ...state.overrides,
-              [action.id]: {
-                clientMutationId: action.clientMutationId,
-                status: "committed" as const,
-                start: action.start,
-                end: action.end,
-                revision: action.revision,
-              },
-            }
-          : state.overrides; // a newer mutation is in flight; keep its pending override
+      // Only a still-PENDING override for this exact mutation may commit visually. A response that
+      // arrives after the mutation was already rolled back (TIMEOUT/REJECT) or superseded by a newer
+      // edit only advances the revision watermark — it must NOT resurrect the reverted change (the
+      // user already saw it fail); the next authoritative refresh reconciles the confirmed state.
+      const canCommit =
+        existing !== undefined &&
+        existing.clientMutationId === action.clientMutationId &&
+        existing.status === "pending";
+      const overrides = canCommit
+        ? {
+            ...state.overrides,
+            [action.id]: {
+              clientMutationId: action.clientMutationId,
+              status: "committed" as const,
+              start: action.start,
+              end: action.end,
+              revision: action.revision,
+            },
+          }
+        : state.overrides;
       return {
         overrides,
         appliedRevision: { ...state.appliedRevision, [action.id]: action.revision },

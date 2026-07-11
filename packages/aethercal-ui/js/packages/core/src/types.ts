@@ -83,12 +83,12 @@ export interface EventClickPayload {
 /**
  * Payload emitted on a right-click / context-menu gesture (`on_context_menu`, §4). `id` is present
  * when the gesture landed on an event, `start` when it landed on empty space (a day/slot) — so a
- * host can offer "edit this event" vs. "create here". At least one is present.
+ * host can offer "edit this event" vs. "create here". Modeled as an at-least-one union so the empty
+ * object is not a valid payload (the schema enforces the same with `minProperties: 1`).
  */
-export interface ContextMenuPayload {
-  id?: string;
-  start?: string;
-}
+export type ContextMenuPayload =
+  | { id: string; start?: string }
+  | { start: string; id?: string };
 
 /**
  * Payload emitted when the visible view or range changes (`on_view_change` / `on_range_change`,

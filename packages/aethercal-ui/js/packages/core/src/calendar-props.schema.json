@@ -38,6 +38,7 @@
     },
     "ContextMenuPayload": {
       "additionalProperties": false,
+      "minProperties": 1,
       "properties": {
         "id": {
           "type": "string"

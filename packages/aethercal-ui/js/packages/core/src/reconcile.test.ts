@@ -102,6 +102,27 @@ describe("reconcileReducer — rollback on rejection / timeout", () => {
     expect(rolledBackIds.size).toBe(0);
     expect(pendingIds.size).toBe(0);
   });
+
+  it("a late accept AFTER a timeout rollback does not resurrect the reverted change", () => {
+    let state = submit(initialReconcileState);
+    state = reconcileReducer(state, { type: "TIMEOUT", id: "e1", clientMutationId: "cm-1" });
+    // The server actually accepted it, but its response arrives after the client already rolled back.
+    state = reconcileReducer(state, {
+      type: "RESOLVE",
+      id: "e1",
+      clientMutationId: "cm-1",
+      start: "2026-07-16T10:00:00",
+      end: "2026-07-16T11:00:00",
+      revision: 6,
+    });
+    const { events, rolledBackIds, pendingIds } = applyOverrides([base], state);
+    // Still rolled back to the authoritative times — NOT resurrected to the optimistic 07-16 change.
+    expect(pendingIds.size).toBe(0);
+    expect(rolledBackIds.has("e1")).toBe(true);
+    expect(events[0]).toMatchObject({ start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" });
+    // The revision watermark still advances, so a later stale response stays discarded.
+    expect(state.appliedRevision.e1).toBe(6);
+  });
 });
 
 describe("reconcileReducer — causal ordering (discard stale responses)", () => {
