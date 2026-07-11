@@ -26,6 +26,19 @@ export {
   initialDragState,
   isDragging,
 } from "./dragMachine";
+export {
+  buildTimeGrid,
+  type HourMark,
+  layoutDayColumn,
+  nowMarkerFraction,
+  resolveTimeGridConfig,
+  splitAllDay,
+  type ResolvedTimeGridConfig,
+  type TimeGrid,
+  type TimeGridBlock,
+  type TimeGridColumn,
+  type TimeGridConfig,
+} from "./timeGrid";
 export type {
   CalendarEvent,
   CalendarView,

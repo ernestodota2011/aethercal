@@ -7,6 +7,8 @@
  */
 export { AetherCalendar, default, type AetherCalendarProps } from "./AetherCalendar";
 export { CALENDAR_CSS, ensureCalendarStyles } from "./styles";
+export { TimeGridView, type TimeGridViewProps } from "./TimeGridView";
+export { TIME_GRID_CSS, ensureTimeGridStyles } from "./timeGridStyles";
 export type {
   CalendarEvent,
   CalendarView,

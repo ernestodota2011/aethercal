@@ -201,13 +201,6 @@ describe("AetherCalendar month view — a11y honesty", () => {
     expect(queryByRole("button")).toBeNull();
   });
 });
-
-describe("AetherCalendar — views not yet implemented in F2-A", () => {
-  it("shows an honest 'view unavailable' status for week/day/list (built in F2-B/C)", () => {
-    const { getByRole, queryByRole } = render(
-      <AetherCalendar view="week" anchor={ANCHOR} events={[]} />,
-    );
-    expect(getByRole("status")).toBeTruthy();
-    expect(queryByRole("grid")).toBeNull();
-  });
-});
+// All four views (month F2-A, week/day F2-B, list F2-C) are implemented; the former
+// "view unavailable" placeholder test is gone. Week/day live in TimeGridView.test.tsx and
+// list/agenda in its own suite.
