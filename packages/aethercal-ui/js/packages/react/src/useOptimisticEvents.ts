@@ -17,7 +17,6 @@ import {
   type EventDropPayload,
   type EventResizePayload,
   type MutationKind,
-  type ReconcileState,
   applyOverrides,
   initialReconcileState,
   reconcileReducer,
@@ -82,8 +81,6 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
   const [state, dispatch] = React.useReducer(reconcileReducer, initialReconcileState);
 
   // Refs so the stable `submit` callback and cleanup see the latest values without re-subscribing.
-  const stateRef = React.useRef<ReconcileState>(state);
-  stateRef.current = state;
   const eventsRef = React.useRef(events);
   eventsRef.current = events;
   const mountedRef = React.useRef(true);
@@ -103,13 +100,16 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
   }, []);
 
   // Prune committed overrides once the authoritative prop has caught up to their revision, so the
-  // override map converges instead of growing (runs only when the events prop actually changes).
+  // override map converges instead of growing. Depends on BOTH events and state: a commit (state
+  // change) that lands AFTER the prop already reached that revision must still be pruned — depending
+  // on events alone would miss that ordering and leak the override for the component's lifetime.
+  // Converges: CLEAR shrinks state, the re-run finds nothing settled, and it stops.
   React.useEffect(() => {
-    for (const id of selectSettledIds(events, stateRef.current)) {
-      const ov = stateRef.current.overrides[id];
+    for (const id of selectSettledIds(events, state)) {
+      const ov = state.overrides[id];
       dispatch({ type: "CLEAR", id, ...(ov ? { clientMutationId: ov.clientMutationId } : {}) });
     }
-  }, [events]);
+  }, [events, state]);
 
   const submit = React.useCallback(
     (kind: MutationKind, payload: EventDropPayload | EventResizePayload) => {
