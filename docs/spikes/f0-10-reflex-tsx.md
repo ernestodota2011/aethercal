@@ -11,6 +11,12 @@ question — whether Reflex's own frontend build correctly deduplicates React fo
 spike's timebox (see "What this spike did not verify") and should be the first thing F2 confirms,
 cheaply, before investing in the full month/week/day/list feature set.
 
+> **UPDATE (F2-DR): risk #1 below is CLOSED — GO.** React deduplication was confirmed
+> empirically by building a real Reflex app with `Calendar` mounted: exactly one React
+> (19.2.6) in the tree, the component's chunk shares the host's React chunk, hooks run with
+> no "Invalid hook call", and a negative control (React vendored in) reproduces the crash.
+> Full evidence + the root-cause `peerDependencies` fix: `docs/spikes/f2-dr-react-dedupe.md`.
+
 ## Resolution at F0 integration (bundle is committed)
 
 The spike originally left the built bundle **gitignored**, on the model that a `fetch-js-bundle`

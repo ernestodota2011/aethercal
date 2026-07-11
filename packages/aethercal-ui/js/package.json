@@ -1,26 +1,27 @@
 {
-  "name": "@aetherlogik/aethercal-calendar-core",
+  "name": "@aethercal/calendar-workspace",
   "version": "0.0.0",
   "private": true,
-  "description": "Custom TSX calendar core for aethercal-ui, wrapped as a Reflex component (F0-10 spike).",
+  "description": "AetherCal calendar JS workspace: headless core + React layer, bundled for the Reflex wrapper.",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "react": "^18.3.1"
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "check-react": "node scripts/check-react-alignment.mjs"
   },
   "devDependencies": {
-    "@types/react": "^18.3.12",
+    "@eslint/js": "^9.15.0",
     "esbuild": "^0.28.1",
+    "eslint": "^9.15.0",
     "typescript": "^5.6.3",
-    "vitest": "^3.2.7"
+    "typescript-eslint": "^8.15.0"
   },
   "pnpm": {
     "overrides": {
       "vite": "^6.4.3"
-    }
+    },
+    "onlyBuiltDependencies": ["esbuild"]
   }
 }
