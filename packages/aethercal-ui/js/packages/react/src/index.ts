@@ -6,6 +6,15 @@
  * `AetherCalendar` named component (the Reflex `tag`). Views beyond `month` are F2-B/C.
  */
 export { AetherCalendar, default, type AetherCalendarProps } from "./AetherCalendar";
+// Headless navigation helpers, re-exported for a consumer that builds its own controlled chrome:
+// `getVisibleRange`/`stepAnchor` compute the visible period, `parseLocalDateTime` turns an emitted
+// `from` string back into the anchor Date (F2-NAV).
+export {
+  getVisibleRange,
+  parseLocalDateTime,
+  stepAnchor,
+} from "@aethercal/calendar-core";
+export { CalendarNav, type CalendarNavProps } from "./CalendarNav";
 export { OptimisticCalendar, type OptimisticCalendarProps } from "./OptimisticCalendar";
 export {
   type CalendarMutation,

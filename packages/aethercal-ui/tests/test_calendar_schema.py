@@ -12,6 +12,8 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType
 
+from aethercal.ui.calendar import Calendar
+
 _GENERATOR = Path(__file__).resolve().parents[1] / "scripts" / "gen_calendar_schema.py"
 
 
@@ -37,6 +39,20 @@ def test_schema_exists_at_the_path_vitest_imports() -> None:
     gen = _load_generator()
     assert gen.SCHEMA_PATH.name == "calendar-props.schema.json"
     assert gen.SCHEMA_PATH.exists()
+
+
+def test_schema_events_are_all_wired_as_wrapper_event_triggers() -> None:
+    # The candado that keeps the Reflex wrapper in sync with the cross-language contract: every
+    # event the schema declares (including on_view_change / on_range_change, F2-NAV) must be a real
+    # EventHandler trigger on the Calendar component — a schema event with no wrapper trigger (or a
+    # renamed handler) is drift the contract must not allow.
+    gen = _load_generator()
+    schema_events = set(gen.build_schema()["events"])
+    triggers = set(Calendar.get_event_triggers())
+    missing = schema_events - triggers
+    assert not missing, f"schema events without a wrapper trigger: {sorted(missing)}"
+    assert {"on_view_change", "on_range_change"} <= schema_events
+    assert {"on_view_change", "on_range_change"} <= triggers
 
 
 def test_context_menu_at_least_one_is_enforced_by_the_schema_not_the_flat_typeddict() -> None:

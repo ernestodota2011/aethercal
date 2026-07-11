@@ -69,6 +69,11 @@ describe("resolveMessages", () => {
       m.resized("1 h"),
       m.createHere("lunes"),
       m.cancelled,
+      m.navToolbar,
+      m.navPrevious,
+      m.navNext,
+      m.navToday,
+      ...Object.values(m.viewNames),
     ].join(" ");
     // A blocklist of Río-de-la-Plata voseo imperative/verb forms — none may appear.
     expect(samples).not.toMatch(/\b(usá|pulsá|agarrá|soltá|hacé|tené|poné|movelo|apretá|dale)\b/i);

@@ -7,6 +7,7 @@ import {
   type EventResizePayload,
   type FirstDayOfWeek,
   type RangeSelectPayload,
+  type ViewChangePayload,
   formatLocalDateTime,
   getWeekGridDays,
   parseLocalDateTime,
@@ -14,6 +15,7 @@ import {
 } from "@aethercal/calendar-core";
 import * as React from "react";
 import { AgendaView } from "./AgendaView";
+import { CalendarNav } from "./CalendarNav";
 import { type CalendarMessages, resolveMessages } from "./i18n";
 import { MonthView } from "./MonthView";
 import { ensureCalendarStyles } from "./styles";
@@ -72,6 +74,23 @@ export interface AetherCalendarProps {
   onEventClick?: (payload: EventClickPayload) => void;
   /** Right-click / context-menu on an event or an empty slot (F2-D). */
   onContextMenu?: (payload: ContextMenuPayload) => void;
+  /**
+   * Render the built-in navigation toolbar (F2-NAV): accessible previous / today / next controls,
+   * a period title, and a view switcher. Off by default — a consumer that builds its own chrome
+   * (or wants the bare grid) gets no toolbar. When on, the component is CONTROLLED: it emits
+   * `onRangeChange` / `onViewChange` and the host keeps `anchor` / `view` in its own state.
+   */
+  navigation?: boolean;
+  /** When the toolbar is shown, also render its view switcher (emits `onViewChange`). Default true. */
+  navigationViews?: boolean;
+  /**
+   * Fired when the visible range changes via prev / next / today. Carries `{ view, from, to }` (the
+   * new period; `from` doubles as the new anchor). The host updates its `anchor` and loads that
+   * period's events.
+   */
+  onRangeChange?: (payload: ViewChangePayload) => void;
+  /** Fired when the view switcher changes the view. Carries `{ view, from, to }` for the new view. */
+  onViewChange?: (payload: ViewChangePayload) => void;
   /** Events with an in-flight optimistic mutation (rendered pending). Driven by the reconciliation layer. */
   pendingIds?: ReadonlySet<string>;
   /** Events whose mutation was just reverted (rendered with the rollback flash). */
@@ -80,7 +99,17 @@ export interface AetherCalendarProps {
 
 function resolveAnchor(anchor: Date | string | undefined): Date {
   if (anchor instanceof Date) return anchor;
-  if (typeof anchor === "string") return parseLocalDateTime(anchor);
+  if (typeof anchor === "string") {
+    // A blank anchor (the Reflex wrapper's "not set" default) means "today". An unparseable value
+    // from a plain-JS consumer degrades to today rather than throwing and blanking the whole grid.
+    const trimmed = anchor.trim();
+    if (trimmed === "") return new Date();
+    try {
+      return parseLocalDateTime(trimmed);
+    } catch {
+      return new Date();
+    }
+  }
   return new Date();
 }
 
@@ -122,6 +151,10 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     onRangeSelect,
     onEventClick,
     onContextMenu,
+    navigation = false,
+    navigationViews = true,
+    onRangeChange,
+    onViewChange,
     pendingIds,
     rolledBackIds,
   } = props;
@@ -194,69 +227,98 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     [dayStartHour, dayEndHour],
   );
 
-  if (view === "list") {
+  const viewElement: React.JSX.Element = (() => {
+    if (view === "list") {
+      return (
+        <AgendaView
+          events={events ?? []}
+          locale={locale}
+          messages={messages}
+          themeVars={themeVars}
+        />
+      );
+    }
+
+    if (view === "month") {
+      return (
+        <MonthView
+          events={events ?? []}
+          anchor={anchorDate}
+          locale={locale}
+          messages={messages}
+          themeVars={themeVars}
+          firstDayOfWeek={safeFirstDayOfWeek}
+          maxEventsPerDay={safeMaxEventsPerDay}
+          {...(safeWeekdayLabels ? { weekdayLabels: safeWeekdayLabels } : {})}
+          {...(onEventDrop ? { onEventDrop } : {})}
+          {...(onRangeSelect ? { onRangeSelect } : {})}
+          {...(onEventClick ? { onEventClick } : {})}
+          {...(onContextMenu ? { onContextMenu } : {})}
+          {...(pendingIds ? { pendingIds } : {})}
+          {...(rolledBackIds ? { rolledBackIds } : {})}
+        />
+      );
+    }
+
+    if (view === "week" || view === "day") {
+      const days =
+        view === "week"
+          ? getWeekGridDays(anchorDate, safeFirstDayOfWeek)
+          : [toDateOnly(formatLocalDateTime(anchorDate))];
+      return (
+        <TimeGridView
+          view={view}
+          days={days}
+          events={events ?? []}
+          locale={locale}
+          messages={messages}
+          themeVars={themeVars}
+          config={timeGridConfig}
+          now={nowDate}
+          {...(onEventDrop ? { onEventDrop } : {})}
+          {...(onEventResize ? { onEventResize } : {})}
+          {...(onRangeSelect ? { onRangeSelect } : {})}
+          {...(onEventClick ? { onEventClick } : {})}
+          {...(onContextMenu ? { onContextMenu } : {})}
+          {...(pendingIds ? { pendingIds } : {})}
+          {...(rolledBackIds ? { rolledBackIds } : {})}
+        />
+      );
+    }
+
+    // Defensive fallback for an unrecognized `view` from a plain-JS consumer (all four views above
+    // are implemented; a valid CalendarView never reaches here).
     return (
-      <AgendaView events={events ?? []} locale={locale} messages={messages} themeVars={themeVars} />
+      <div
+        className="aethercal-calendar aethercal-unavailable"
+        role="status"
+        data-view={view}
+        style={themeVars}
+      >
+        {messages.unavailable}
+      </div>
     );
+  })();
+
+  // No toolbar unless the host opts in — the bare grid keeps the exact same DOM (retrocompatible).
+  if (!navigation) {
+    return viewElement;
   }
 
-  if (view === "month") {
-    return (
-      <MonthView
-        events={events ?? []}
-        anchor={anchorDate}
-        locale={locale}
-        messages={messages}
-        themeVars={themeVars}
-        firstDayOfWeek={safeFirstDayOfWeek}
-        maxEventsPerDay={safeMaxEventsPerDay}
-        {...(safeWeekdayLabels ? { weekdayLabels: safeWeekdayLabels } : {})}
-        {...(onEventDrop ? { onEventDrop } : {})}
-        {...(onRangeSelect ? { onRangeSelect } : {})}
-        {...(onEventClick ? { onEventClick } : {})}
-        {...(onContextMenu ? { onContextMenu } : {})}
-        {...(pendingIds ? { pendingIds } : {})}
-        {...(rolledBackIds ? { rolledBackIds } : {})}
-      />
-    );
-  }
-
-  if (view === "week" || view === "day") {
-    const days =
-      view === "week"
-        ? getWeekGridDays(anchorDate, safeFirstDayOfWeek)
-        : [toDateOnly(formatLocalDateTime(anchorDate))];
-    return (
-      <TimeGridView
-        view={view}
-        days={days}
-        events={events ?? []}
-        locale={locale}
-        messages={messages}
-        themeVars={themeVars}
-        config={timeGridConfig}
-        now={nowDate}
-        {...(onEventDrop ? { onEventDrop } : {})}
-        {...(onEventResize ? { onEventResize } : {})}
-        {...(onRangeSelect ? { onRangeSelect } : {})}
-        {...(onEventClick ? { onEventClick } : {})}
-        {...(onContextMenu ? { onContextMenu } : {})}
-        {...(pendingIds ? { pendingIds } : {})}
-        {...(rolledBackIds ? { rolledBackIds } : {})}
-      />
-    );
-  }
-
-  // Defensive fallback for an unrecognized `view` from a plain-JS consumer (all four views above
-  // are implemented; a valid CalendarView never reaches here).
   return (
-    <div
-      className="aethercal-calendar aethercal-unavailable"
-      role="status"
-      data-view={view}
-      style={themeVars}
-    >
-      {messages.unavailable}
+    <div className="aethercal-calendar-shell" style={themeVars}>
+      <CalendarNav
+        view={view}
+        anchor={anchorDate}
+        now={nowDate}
+        locale={locale}
+        firstDayOfWeek={safeFirstDayOfWeek}
+        messages={messages}
+        showViews={navigationViews}
+        {...(onRangeChange ? { onRangeChange } : {})}
+        {...(onViewChange ? { onViewChange } : {})}
+      />
+      {viewElement}
     </div>
   );
 }

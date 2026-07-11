@@ -202,3 +202,74 @@ def test_f2d_interaction_handlers_wire_into_the_rendered_props(handler: str, jsx
 def test_f2d_interaction_handlers_are_omitted_when_not_supplied(jsx_prop: str) -> None:
     tag = Calendar.create()._render()
     assert jsx_prop not in tag.props
+
+
+# --- F2-NAV period navigation ---------------------------------------------------------------------
+
+
+def test_anchor_defaults_to_empty_string_meaning_today() -> None:
+    # The wrapper cannot know "today" server-side; it passes a blank anchor and the React layer
+    # resolves an empty/absent anchor to the current day.
+    tag = Calendar.create()._render()
+    assert "anchor" in tag.props
+    assert str(tag.props["anchor"]) == '""'
+
+
+def test_explicit_anchor_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create(anchor="2026-07-01T00:00:00")._render()
+    assert str(tag.props["anchor"]) == '"2026-07-01T00:00:00"'
+
+
+def test_anchor_accepts_a_bare_date() -> None:
+    tag = Calendar.create(anchor="2026-07-15")._render()
+    assert str(tag.props["anchor"]) == '"2026-07-15"'
+
+
+def test_invalid_anchor_literal_raises() -> None:
+    bad_anchors = (
+        "not-a-date",
+        "2026-13-01",  # month out of range
+        "2026/07/15",  # wrong separator
+        "07-15-2026",  # wrong order
+        "2026-07-15T25:00:00",  # hour out of range
+        "2026-07-15T12:60:00",  # minute out of range
+        "2026-07-15T12:00:61",  # second out of range
+    )
+    for bad in bad_anchors:
+        with pytest.raises(ValueError, match=r"Calendar\.anchor"):
+            Calendar.create(anchor=bad)
+
+
+def test_anchor_accepts_a_valid_datetime_with_a_time() -> None:
+    tag = Calendar.create(anchor="2026-07-15T23:59:59")._render()
+    assert str(tag.props["anchor"]) == '"2026-07-15T23:59:59"'
+
+
+def test_navigation_flag_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create(navigation=True)._render()
+    assert "navigation" in tag.props
+    assert str(tag.props["navigation"]) == "true"
+
+
+def test_navigation_defaults_to_false() -> None:
+    tag = Calendar.create()._render()
+    assert str(tag.props["navigation"]) == "false"
+
+
+@pytest.mark.parametrize("handler", ["on_view_change", "on_range_change"])
+def test_nav_handlers_are_registered_event_triggers(handler: str) -> None:
+    assert handler in Calendar.get_event_triggers()
+
+
+@pytest.mark.parametrize(
+    ("handler", "jsx_prop"),
+    [("on_view_change", "onViewChange"), ("on_range_change", "onRangeChange")],
+)
+def test_nav_handlers_wire_into_the_rendered_props(handler: str, jsx_prop: str) -> None:
+    tag = Calendar.create(**{handler: rx.console_log("navigated")})._render()
+    assert jsx_prop in tag.props
+
+
+@pytest.mark.parametrize("jsx_prop", ["onViewChange", "onRangeChange"])
+def test_nav_handlers_are_omitted_when_not_supplied(jsx_prop: str) -> None:
+    assert jsx_prop not in Calendar.create()._render().props

@@ -14,9 +14,10 @@ websocket triggers in a browser), proving:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.server.admin import runtime as runtime_mod
 from aethercal.server.admin import service
+from aethercal.server.admin import state as state_mod
 from aethercal.server.admin.config import AdminConfig
 from aethercal.server.admin.format import booking_event
 from aethercal.server.admin.passwords import hash_password
@@ -67,6 +69,21 @@ def _naive_iso(moment: datetime) -> str:
 SLOT_A = _future_weekday(9)
 SLOT_B = _future_weekday(11)  # same weekday, still inside 09:00-17:00
 OFF_HOURS = _future_weekday(3)  # outside the schedule → a refused reschedule
+
+
+def _month_window(moment: datetime) -> dict[str, str]:
+    """A calendar on_range_change payload for the month containing ``moment`` (F2-NAV).
+
+    Mirrors the JS ``getVisibleRange("month", ...)`` output: ``from`` = the 1st at midnight, ``to``
+    = the exclusive 1st of the next month, as naive-local ISO strings.
+    """
+    first = date(moment.year, moment.month, 1)
+    nxt = date(moment.year + (moment.month == 12), (moment.month % 12) + 1, 1)
+    return {
+        "view": "month",
+        "from": f"{first.isoformat()}T00:00:00",
+        "to": f"{nxt.isoformat()}T00:00:00",
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -353,7 +370,7 @@ async def test_drag_keeps_the_move_when_the_refresh_fails_after_commit(
     booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
     await AdminState.load_bookings.fn(state)
 
-    async def _boom(_runtime: object) -> None:
+    async def _boom(_runtime: object, **_window: object) -> None:
         raise service.AdminSetupError("database unavailable")
 
     monkeypatch.setattr("aethercal.server.admin.state._fetch_booking_views", _boom)
@@ -469,6 +486,238 @@ async def test_set_calendar_view_accepts_valid_and_rejects_invalid(
     assert state.calendar_view == "week"  # unchanged
 
 
+# --------------------------------------------------------------------------------------
+# Period navigation (F2-NAV): prev/next/today move the anchor AND load the visible period.
+# --------------------------------------------------------------------------------------
+
+
+async def test_range_change_navigates_the_anchor_and_loads_the_visible_period(
+    seeded_maker: Sessionmaker,
+) -> None:
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+
+    payload = _month_window(SLOT_A)
+    await AdminState.on_calendar_range_change.fn(state, payload)
+
+    assert state.error == ""
+    # The anchor moved to the navigated period, and the booking in that period is loaded.
+    assert state.calendar_anchor == payload["from"]
+    assert [e["id"] for e in state.calendar_events] == [str(booking_id)]
+
+
+async def test_range_change_scopes_out_events_from_a_different_period(
+    seeded_maker: Sessionmaker,
+) -> None:
+    # The core of "load the events of the VISIBLE period, not everything": a booking two months away
+    # is NOT loaded when the operator navigates to a month that does not contain it.
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+    await AdminState.load_bookings.fn(state)  # populate the full-history rows first
+
+    other_month = SLOT_A + timedelta(days=62)
+    await AdminState.on_calendar_range_change.fn(state, _month_window(other_month))
+
+    # The calendar events are scoped to the navigated (empty) period...
+    assert state.calendar_events == []
+    # ...but the row list keeps the FULL history (the booking from the other period is still there).
+    assert len(state.bookings) == 1
+
+
+async def test_view_change_sets_the_view_and_loads_the_period(seeded_maker: Sessionmaker) -> None:
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+
+    payload = {**_month_window(SLOT_A), "view": "week"}
+    await AdminState.on_calendar_view_change.fn(state, payload)
+
+    assert state.calendar_view == "week"
+    assert state.calendar_anchor == payload["from"]
+    assert [e["id"] for e in state.calendar_events] == [str(booking_id)]
+
+
+async def test_view_change_rejects_an_invalid_view_without_navigating(
+    seeded_maker: Sessionmaker,
+) -> None:
+    state = await _authed_state(seeded_maker)
+    await AdminState.on_calendar_view_change.fn(state, {**_month_window(SLOT_A), "view": "bogus"})
+    assert state.calendar_view == "month"  # unchanged
+    assert state.calendar_anchor == ""  # a rejected view never navigates
+
+
+async def test_reload_applies_only_the_latest_request_for_the_same_range(
+    seeded_maker: Sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Out-of-order guard for the A → B → A shape: two reloads for the SAME period resolve in REVERSE
+    # order. The monotonic token must let ONLY the latest request apply — an old, stale response for
+    # the same range must not overwrite the fresh one. Anchor/range comparison alone can't catch it.
+    state = await _authed_state(seeded_maker)
+    state.calendar_anchor = "2026-07-01T00:00:00"
+    state.calendar_range_to = "2026-08-01T00:00:00"
+
+    old_may_finish = asyncio.Event()
+    call = {"n": 0}
+
+    async def _fetch_reverse_order(_runtime: object, **_window: object) -> list[dict[str, str]]:
+        call["n"] += 1
+        if call["n"] == 1:
+            # The OLD reload: hold until the NEWER one has finished, then return stale data.
+            await old_may_finish.wait()
+            return [{"id": "OLD", "title": "OLD", "start": "s", "end": "e"}]
+        try:
+            return [{"id": "NEW", "title": "NEW", "start": "s", "end": "e"}]
+        finally:
+            old_may_finish.set()  # release the old fetch so it resolves LAST
+
+    monkeypatch.setattr(state_mod, "_fetch_calendar_events", _fetch_reverse_order)
+
+    old = asyncio.create_task(state_mod._reload_calendar(state))
+    new = asyncio.create_task(state_mod._reload_calendar(state))
+    await asyncio.gather(old, new)
+
+    # The latest request wins; the stale same-range response is dropped.
+    assert [e["id"] for e in state.calendar_events] == ["NEW"]
+
+
+async def test_mutation_refetch_is_dropped_when_a_navigation_supersedes_it(
+    seeded_maker: Sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A mutation's authoritative refetch shares the token guard: if a navigation moved the visible
+    # period while the mutation's DB round-trip was in flight, the (stale-window) refetch is dropped
+    # instead of overwriting the newer period's events.
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+    await AdminState.load_bookings.fn(state)
+
+    nav_events = [{"id": "NAV", "title": "NAV", "start": "s", "end": "e"}]
+
+    async def _fetch_overtaken_by_navigation(
+        _runtime: object, **_window: object
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        # A newer navigation reload lands (bumps the token + applies its events AND its error) while
+        # this mutation refetch is resolving; the mutation's result is now stale.
+        state.calendar_reload_seq += 1
+        state.calendar_events = nav_events
+        state.error = "newer-navigation-owns-this"
+        return ([], [{"id": str(booking_id), "title": "STALE", "start": "s", "end": "e"}])
+
+    monkeypatch.setattr(state_mod, "_fetch_booking_views", _fetch_overtaken_by_navigation)
+    await AdminState.cancel.fn(state, str(booking_id))
+
+    # The mutation succeeded, but its stale refetch was dropped: neither the events nor the error of
+    # the newer navigation are clobbered by the superseded mutation.
+    assert [e["id"] for e in state.calendar_events] == ["NAV"]
+    assert state.error == "newer-navigation-owns-this"
+
+
+async def test_mutation_applies_history_rows_even_when_navigation_supersedes_the_events(
+    seeded_maker: Sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rows have INDEPENDENT causality from the visible events: a navigation supersedes the events
+    # refresh but never touches the rows, so the mutation's row update must still be applied.
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+    await AdminState.load_bookings.fn(state)
+
+    fresh_rows = [{"id": "ROW-1", "guest": "fresh"}]
+
+    async def _fetch_overtaken_by_nav_events_only(
+        _runtime: object, **_window: object
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        # A newer navigation bumps ONLY the events token (as _reload_calendar does) mid-flight.
+        state.calendar_reload_seq += 1
+        state.calendar_events = [{"id": "NAV", "title": "NAV", "start": "s", "end": "e"}]
+        return (fresh_rows, [{"id": "STALE", "title": "STALE", "start": "s", "end": "e"}])
+
+    monkeypatch.setattr(state_mod, "_fetch_booking_views", _fetch_overtaken_by_nav_events_only)
+    await AdminState.cancel.fn(state, str(booking_id))
+
+    # The events refresh was superseded (the navigation's events stand)...
+    assert [e["id"] for e in state.calendar_events] == ["NAV"]
+    # ...but the mutation's history rows were applied (navigation never owns the rows).
+    assert [r["id"] for r in state.bookings] == ["ROW-1"]
+
+
+async def test_navigation_does_not_reload_the_full_booking_history(
+    seeded_maker: Sessionmaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Perf: navigating between periods refreshes ONLY the visible events, never re-queries the full
+    # booking history — so `_fetch_booking_views` (rows + events) must not be called on navigation.
+    state = await _authed_state(seeded_maker)
+    await _seed_event_type(state)
+    event_type_id = uuid.UUID(state.event_types[0]["id"])
+    await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
+    await AdminState.load_bookings.fn(state)
+    history_before = list(state.bookings)
+    assert history_before  # the full-history rows were loaded on-load
+
+    async def _must_not_be_called(*_a: object, **_k: object) -> object:
+        raise AssertionError("navigation must not re-query the full booking history")
+
+    monkeypatch.setattr(state_mod, "_fetch_booking_views", _must_not_be_called)
+    await AdminState.on_calendar_range_change.fn(state, _month_window(SLOT_A))
+
+    # Navigation left the history rows in place (it used the events-only path, not a full reload).
+    assert state.bookings == history_before
+
+
+def test_window_is_the_exact_month_grid_extent() -> None:
+    # The month window is the exact 6-week Monday-first grid (period != data range), so every
+    # visible adjacent-month cell loads. July 2026 starts on a Wed → grid Mon Jun 29..Sun Aug 9.
+    state = _state()
+    state.calendar_view = "month"
+    state.calendar_anchor = "2026-07-01T00:00:00"
+    state.calendar_range_to = "2026-08-01T00:00:00"
+    window = state_mod._window(state)
+    assert window["date_from"] == date(2026, 6, 29)
+    assert window["date_to"] == date(2026, 8, 9)  # 42 days: 2026-06-29 + 41
+
+
+def test_window_covers_deep_trailing_spillover_of_a_short_february() -> None:
+    # A 28-day February that begins on a Sunday pushes the 6-week Monday-first grid to show EIGHT
+    # trailing days of March; the window must include the 8th (a fixed 7-day margin would miss it).
+    # Feb 2026 starts on Sunday (2026-02-01): grid = Mon Jan 26 .. Sun Mar 8.
+    state = _state()
+    state.calendar_view = "month"
+    state.calendar_anchor = "2026-02-01T00:00:00"
+    state.calendar_range_to = "2026-03-01T00:00:00"
+    window = state_mod._window(state)
+    assert window["date_from"] == date(2026, 1, 26)
+    assert window["date_to"] == date(
+        2026, 3, 8
+    )  # Feb 28 is Sat; the 8th trailing day (Mar 8) loads
+
+
+def test_window_is_exact_for_non_grid_views() -> None:
+    # week / day have no adjacent-period spillover, so the window is the exact period (no padding).
+    state = _state()
+    state.calendar_view = "week"
+    state.calendar_anchor = "2026-07-13T00:00:00"
+    state.calendar_range_to = "2026-07-20T00:00:00"
+    window = state_mod._window(state)
+    assert window["date_from"] == date(2026, 7, 13)
+    assert window["date_to"] == date(2026, 7, 19)  # exclusive 'to' -> last inclusive day
+
+
+async def test_nav_handlers_are_noops_when_unauthenticated() -> None:
+    state = _state()  # unauthenticated; runtime deliberately unconfigured
+    await AdminState.on_calendar_range_change.fn(state, _month_window(SLOT_A))
+    await AdminState.on_calendar_view_change.fn(state, {**_month_window(SLOT_A), "view": "week"})
+    assert state.calendar_anchor == ""
+    assert state.calendar_view == "month"
+    assert state.calendar_events == []
+
+
 async def test_create_booking_closes_the_form_when_the_refresh_fails_after_commit(
     seeded_maker: Sessionmaker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -480,7 +729,7 @@ async def test_create_booking_closes_the_form_when_the_refresh_fails_after_commi
     await AdminState.load_bookings.fn(state)
     state.show_new_booking = True
 
-    async def _boom(_runtime: object) -> None:
+    async def _boom(_runtime: object, **_window: object) -> None:
         raise service.AdminSetupError("database unavailable")
 
     monkeypatch.setattr("aethercal.server.admin.state._fetch_booking_views", _boom)
@@ -512,7 +761,7 @@ async def test_reschedule_selected_clears_selection_when_refresh_fails_after_com
     await AdminState.load_bookings.fn(state)
     AdminState.on_calendar_event_click.fn(state, {"id": str(booking_id)})
 
-    async def _boom(_runtime: object) -> None:
+    async def _boom(_runtime: object, **_window: object) -> None:
         raise service.AdminSetupError("database unavailable")
 
     monkeypatch.setattr("aethercal.server.admin.state._fetch_booking_views", _boom)

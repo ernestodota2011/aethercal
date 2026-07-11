@@ -16,7 +16,7 @@ import { defaultBaseTokenCss } from "./theme";
 export const CALENDAR_STYLE_ELEMENT_ID = "aethercal-calendar-styles";
 
 export const CALENDAR_CSS = `
-:where(.aethercal-calendar) {
+:where(.aethercal-calendar, .aethercal-calendar-shell) {
 ${defaultBaseTokenCss()}
 }
 .aethercal-calendar {
@@ -111,6 +111,56 @@ ${defaultBaseTokenCss()}
 .aethercal-more:hover { text-decoration: underline; }
 .aethercal-more:focus-visible { outline: 2px solid var(--ac-focus); outline-offset: 1px; border-radius: 3px; }
 .aethercal-unavailable { padding: 24px; color: var(--ac-muted); font-family: var(--ac-font); }
+
+/* Navigation toolbar (F2-NAV): previous / today / next + period title + view switcher. The shell
+   stacks the toolbar above the grid and carries the theme tokens so the toolbar themes with the
+   calendar. Neutral, no glows — same anti-slop palette as the grid. */
+.aethercal-calendar-shell {
+  font-family: var(--ac-font);
+  color: var(--ac-fg);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.aethercal-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.aethercal-nav-group { display: inline-flex; align-items: center; gap: 4px; }
+.aethercal-nav-btn {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ac-fg);
+  background: var(--ac-cell-bg);
+  border: 1px solid var(--ac-border);
+  border-radius: calc(var(--ac-radius) - 2px);
+  padding: 4px 10px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.aethercal-nav-btn:hover { background: var(--ac-cell-bg-outside); }
+.aethercal-nav-btn:focus-visible { outline: 2px solid var(--ac-focus); outline-offset: 1px; }
+.aethercal-nav-arrow {
+  min-width: 32px;
+  padding: 4px 8px;
+  font-size: 16px;
+  line-height: 1;
+  text-align: center;
+}
+.aethercal-nav-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ac-fg);
+  flex: 1 1 auto;
+}
+.aethercal-nav-views { display: inline-flex; gap: 4px; margin-left: auto; }
+.aethercal-nav-view[aria-pressed="true"] {
+  background: var(--ac-today-marker-bg);
+  color: var(--ac-today-marker-fg);
+  border-color: var(--ac-today-marker-bg);
+}
 
 .aethercal-agenda { display: block; }
 .aethercal-agenda-empty {

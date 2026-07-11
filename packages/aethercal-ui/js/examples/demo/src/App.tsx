@@ -16,8 +16,10 @@ import {
   type ContextMenuPayload,
   type EventClickPayload,
   type MutationResult,
+  parseLocalDateTime,
   type RangeSelectPayload,
   type ThemePreset,
+  type ViewChangePayload,
 } from "@aethercal/calendar-react";
 import * as React from "react";
 import { buildSampleEvents } from "./sampleData";
@@ -148,6 +150,8 @@ function sleep(ms: number): Promise<void> {
 export function App(): React.JSX.Element {
   const today = React.useMemo(() => new Date(), []);
   const [events, setEvents] = React.useState<CalendarEvent[]>(() => buildSampleEvents(today));
+  // The visible-period anchor (F2-NAV): the built-in prev/today/next toolbar drives it, controlled.
+  const [anchor, setAnchor] = React.useState<Date>(today);
   const [view, setView] = React.useState<CalendarView>("month");
   const [preset, setPreset] = React.useState<ThemePreset>(initialPreset);
   const [locale, setLocale] = React.useState<Locale>("es");
@@ -222,15 +226,33 @@ export function App(): React.JSX.Element {
     [locale, titleOf],
   );
 
+  // Controlled period navigation (F2-NAV): the toolbar emits {view, from, to}; adopt `from` as the
+  // new anchor and rebuild the sample data around it so every visited period shows events. Bump the
+  // generation + remount (resetNonce) so any in-flight optimistic mutation is dropped, like Reset.
+  const onRangeChange = React.useCallback(
+    (p: ViewChangePayload) => {
+      const nextAnchor = parseLocalDateTime(p.from);
+      genRef.current += 1;
+      revRef.current = 1;
+      setAnchor(nextAnchor);
+      setEvents(buildSampleEvents(nextAnchor));
+      setResetNonce((n) => n + 1);
+      setLastAction(
+        `${locale === "es" ? "Periodo" : "Period"}: ${p.from.slice(0, 10)} → ${p.to.slice(0, 10)}`,
+      );
+    },
+    [locale],
+  );
+
   const resetData = React.useCallback(() => {
     genRef.current += 1;
     revRef.current = 1;
-    // Rebuild from the SAME immutable anchor the calendar renders (`today`), so the this-week cluster
-    // stays aligned with the visible range even if the wall-clock day rolled over since mount.
-    setEvents(buildSampleEvents(today));
+    // Rebuild around the CURRENT anchor, so Reset restores the sample data for the period on screen
+    // (even after navigating away from today), keeping the visible cluster aligned with the range.
+    setEvents(buildSampleEvents(anchor));
     setLastAction(null);
     setResetNonce((n) => n + 1);
-  }, [today]);
+  }, [anchor]);
 
   const rootStyle = PRESETS[preset];
 
@@ -300,11 +322,14 @@ export function App(): React.JSX.Element {
               view={view}
               locale={locale}
               theme={preset}
-              anchor={today}
+              anchor={anchor}
+              navigation
+              navigationViews={false}
               firstDayOfWeek={1}
               dayStartHour={6}
               dayEndHour={24}
               rollbackFlashMs={1100}
+              onRangeChange={onRangeChange}
               onRangeSelect={onRangeSelect}
               onEventClick={onEventClick}
               onContextMenu={onContextMenu}

@@ -78,6 +78,22 @@ describe("App (demo shell)", () => {
     expect(container.querySelector('.aethercal-calendar[data-view="month"]')).toBeTruthy();
   });
 
+  it("navigates the visible period with the built-in prev/today/next toolbar", () => {
+    const { container, getByRole } = render(<App />);
+    const titleOf = (): string =>
+      container.querySelector(".aethercal-nav-title")?.textContent ?? "";
+    const start = titleOf();
+    // Next moves forward a month (the period title changes).
+    fireEvent.click(getByRole("button", { name: /siguiente/i }));
+    const afterNext = titleOf();
+    expect(afterNext).not.toBe(start);
+    // The new period still has sample events (data is rebuilt relative to the anchor).
+    expect(container.querySelectorAll("[data-event-id]").length).toBeGreaterThan(0);
+    // Today returns to the starting period.
+    fireEvent.click(getByRole("button", { name: /^hoy$/i }));
+    expect(titleOf()).toBe(start);
+  });
+
   it("applies the theme presets to the whole page", () => {
     const { container } = render(<App />);
     const root = container.querySelector(".demo-root") as HTMLElement;

@@ -20,9 +20,6 @@ from aethercal.ui import Calendar
 
 _NAV = (("Agenda", "/"), ("Event types", "/event-types"), ("Schedules", "/schedules"))
 
-# The four calendar surfaces + their Spanish labels for the view toggle (RNF-1: admin ES-first).
-_CALENDAR_VIEWS = (("month", "Mes"), ("week", "Semana"), ("day", "Día"), ("list", "Lista"))
-
 
 def _error(message: str) -> rx.Component:
     """Show an error banner only when there is a message (``message`` is a reflex ``str`` var)."""
@@ -97,32 +94,20 @@ def login_page() -> rx.Component:
 # --------------------------------------------------------------------------------------
 
 
-def _view_button(value: str, label: str) -> rx.Component:
-    """One button of the month/week/day/list view toggle (the active view rendered solid)."""
-    return rx.button(
-        label,
-        on_click=AdminState.set_calendar_view(value),
-        variant=rx.cond(AdminState.calendar_view == value, "solid", "soft"),
-        size="2",
-    )
-
-
-def _view_switcher() -> rx.Component:
-    """The Spanish month/week/day/list toggle that drives the calendar's ``view`` prop."""
-    return rx.hstack(*[_view_button(value, label) for value, label in _CALENDAR_VIEWS], spacing="2")
-
-
 def _calendar() -> rx.Component:
     """The AetherCal calendar bound to the admin state (ES locale, Monday-first, neutral theme).
 
-    Drag/resize reschedule (optimistically), a range-select opens the create panel, and a click
-    selects a booking to manage — every gesture routed to a state handler that reuses the existing
-    booking service.
+    The component's built-in navigation toolbar (F2-NAV) owns previous / today / next AND the
+    month/week/day/list view switcher, driving the controlled ``anchor`` / ``view`` state. Drag or
+    resize reschedule (optimistically), a range-select opens the create panel, and a click selects a
+    booking to manage — every gesture routed to a state handler that reuses the booking service.
     """
     return rx.box(
         Calendar.create(
             view=AdminState.calendar_view,
             events=AdminState.calendar_events,
+            anchor=AdminState.calendar_anchor,
+            navigation=True,
             locale="es",
             first_day_of_week=1,
             theme="light",
@@ -130,6 +115,8 @@ def _calendar() -> rx.Component:
             on_event_resize=AdminState.on_calendar_event_resize,
             on_range_select=AdminState.on_calendar_range_select,
             on_event_click=AdminState.on_calendar_event_click,
+            on_view_change=AdminState.on_calendar_view_change,
+            on_range_change=AdminState.on_calendar_range_change,
         ),
         width="100%",
         min_height="32em",
@@ -235,7 +222,6 @@ def bookings_page() -> rx.Component:
     return _shell(
         "Agenda",
         _error(AdminState.error),
-        _view_switcher(),
         _calendar(),
         _manage_panel(),
         _new_booking_panel(),

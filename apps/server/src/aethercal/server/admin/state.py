@@ -24,9 +24,10 @@ helper is not turned into an event handler by Reflex.
 from __future__ import annotations
 
 import asyncio
+import enum
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import reflex as rx
 from reflex.event import EventSpec
@@ -134,6 +135,14 @@ def _translation_update(
 #: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback.
 _VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list"})
 
+#: The month view renders a FIXED 6-week (42-day) grid (``getMonthGridDays`` + ``_calendar()``'s
+#: ``first_day_of_week=1``), so its cells can show up to ~2 weeks of the adjacent months — a 28-day
+#: February that begins on the week's last day shows 8 trailing days, which a fixed 6/7-day margin
+#: would miss. The data-load window is therefore the EXACT grid extent (computed below), the
+#: deliberate "period range vs. data range" split: the emitted period stays re-anchorable while the
+#: load covers every day the grid actually renders.
+_MONTH_GRID_DAYS = 42
+
 #: Shown when a resize would only change a booking's DURATION (its start is unchanged). A booking's
 #: end is derived from its event type, so duration can't be edited — the operator drags to MOVE it.
 _DURATION_FIXED_MESSAGE = (
@@ -151,18 +160,174 @@ _RESYNC_MESSAGE = (
 
 async def _fetch_booking_views(
     runtime: AdminRuntime,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> tuple[list[dict[str, str]], list[CalendarEvent]]:
-    """Load the tenant's bookings once, projected into BOTH the table rows and the calendar events.
+    """Load the tenant's bookings, projected into the FULL-history row list AND the visible-period
+    calendar events.
 
-    Cancelled bookings are omitted from the calendar (a reschedule cancels the predecessor, so
-    showing it would duplicate the moved chip), while the row list keeps the full history.
+    The two projections have DIFFERENT scopes on purpose (F2-NAV): the row list keeps the FULL
+    history (never windowed — its contract), while the calendar events are scoped to the visible
+    period via ``date_from`` / ``date_to`` (inclusive calendar dates matched against each booking's
+    start) so navigating shows that period's events without preloading everything. Cancelled
+    bookings are omitted from the calendar (a reschedule cancels the predecessor, so showing it
+    would duplicate the moved chip); the row list keeps them. Before any navigation (no window) a
+    single query feeds both; a navigated window adds one scoped query for the events.
     """
+    tenant_slug = runtime.config.tenant_slug
     reads: list[BookingRead] = await service.list_bookings_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+        runtime.sessionmaker, tenant_slug=tenant_slug
     )
     rows = [booking_row(read) for read in reads]
-    events = [booking_event(read) for read in reads if read.status is not BookingStatus.CANCELLED]
+    if date_from is None and date_to is None:
+        event_reads = reads
+    else:
+        event_reads = await service.list_bookings_view(
+            runtime.sessionmaker, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
+        )
+    events = [
+        booking_event(read) for read in event_reads if read.status is not BookingStatus.CANCELLED
+    ]
     return rows, events
+
+
+async def _fetch_calendar_events(
+    runtime: AdminRuntime,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[CalendarEvent]:
+    """Load ONLY the visible-period calendar events (one scoped query).
+
+    Navigation uses this instead of :func:`_fetch_booking_views` so moving between periods never
+    re-queries the full booking history (perf) — ``state.bookings`` (the full-history rows) is left
+    in place, refreshed only on initial load and after mutations that actually change the rows.
+    """
+    reads = await service.list_bookings_view(
+        runtime.sessionmaker,
+        tenant_slug=runtime.config.tenant_slug,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return [booking_event(read) for read in reads if read.status is not BookingStatus.CANCELLED]
+
+
+def _window(state: AdminState) -> dict[str, date | None]:
+    """The (date_from, date_to) DATA-load window for the current calendar view (F2-NAV).
+
+    Both ends are inclusive calendar dates. The PERIOD comes straight from the calendar's own
+    on_range_change / on_view_change payload (``calendar_anchor`` = the period's ``from``,
+    ``calendar_range_to`` = its EXCLUSIVE upper bound), so there is no duplicated "which period"
+    geometry on the Python side — the JS core is the single source of truth. The last INCLUSIVE day
+    is the instant just before the exclusive ``to`` (``list_bookings`` treats ``date_to`` as an
+    inclusive calendar date). Before any navigation (blank), the window is unbounded (load all).
+
+    For the month VIEW the window is the EXACT 6-week grid extent (``_MONTH_GRID_DAYS`` days from
+    the Monday of the 1st's week — the same grid ``getMonthGridDays`` + ``_calendar()`` render).
+    That grid shows a variable number of adjacent-month days whose events must be fetched too. This
+    is the deliberate "period range vs. data range" split: the emitted period stays re-anchorable
+    while the month load covers every day the grid shows. Other views (week / day / agenda-list)
+    render only their own period, so their window is exactly that period.
+    """
+    if not state.calendar_anchor or not state.calendar_range_to:
+        return {"date_from": None, "date_to": None}
+    try:
+        period_start = datetime.fromisoformat(state.calendar_anchor).date()
+        period_end = (datetime.fromisoformat(state.calendar_range_to) - timedelta(seconds=1)).date()
+    except ValueError:
+        return {"date_from": None, "date_to": None}
+    if state.calendar_view == "month":
+        # The Monday of the week containing the 1st (period_start), then the last of the 42 days.
+        # ``weekday()`` is Mon=0, so subtracting it lands on Monday — the admin's Monday-first grid.
+        grid_start = period_start - timedelta(days=period_start.weekday())
+        grid_end = grid_start + timedelta(days=_MONTH_GRID_DAYS - 1)
+        return {"date_from": grid_start, "date_to": grid_end}
+    return {"date_from": period_start, "date_to": period_end}
+
+
+class _ReloadResult(enum.Enum):
+    """The outcome of a token-guarded calendar reload (F2-NAV), so a caller can token-guard its own
+    follow-up (e.g. only write ``state.error`` when it is still the latest reload)."""
+
+    APPLIED = "applied"  # fetched and applied — this reload is still the latest
+    SUPERSEDED = "superseded"  # a newer reload won; nothing was applied, do not touch view/error
+    FAILED = "failed"  # the fetch failed AND this reload is still the latest (caller may report it)
+
+
+#: Free functions (not state methods) on purpose, so Reflex does not turn a plain "reload" helper
+#: into a client-callable event handler — the same reason the fetch helpers live here.
+#:
+#: Out-of-order guard (monotonic ``calendar_reload_seq`` token): rapid prev/next/today — and a
+#: mutation's follow-up refetch — issue overlapping async reloads. Each reload takes the NEXT token
+#: and captures it before the ``await``; it applies its result ONLY if it is still the latest. A
+#: token (not the anchor/range) because two DIFFERENT requests can target the SAME period
+#: (A → B → A): a stale A-response must not overwrite the fresh A-response. Same ordering-causal
+#: discipline as the F1 outbox / the client reconciliation ``revision``.
+
+
+async def _reload_calendar(state: AdminState) -> None:
+    """Navigation reload: refresh ONLY the visible-period calendar events, token-guarded.
+
+    Leaves ``state.bookings`` (the full history) untouched — navigation never re-queries it (perf) —
+    and applies the events + clears/sets ``state.error`` only if this reload is still the latest, so
+    an out-of-order response from a rapid navigation sequence cannot restore stale events or clobber
+    a newer navigation's error.
+    """
+    state.calendar_reload_seq += 1
+    token = state.calendar_reload_seq
+    try:
+        events = await _fetch_calendar_events(current_runtime(), **_window(state))
+    except service.AdminError as exc:
+        if token == state.calendar_reload_seq:
+            state.error = _error_text(exc)
+        return
+    if token != state.calendar_reload_seq:
+        return  # a newer reload was requested while this was in flight — drop the stale result
+    state.calendar_events = events
+    state.error = ""
+
+
+async def _commit_calendar_view(state: AdminState) -> _ReloadResult:
+    """Refresh the FULL rows + the visible-period events after a mutation, token-guarded (F2-NAV).
+
+    Shares the token with the navigation reload, so if a navigation moved the visible period while
+    the mutation's DB round-trip was in flight, this (possibly stale-window) refetch is DROPPED
+    (returns ``SUPERSEDED``) instead of overwriting the newer period's data. It swallows the fetch
+    error and returns ``FAILED`` (when still latest) so the caller writes ``state.error`` only when
+    it actually owns the view — a superseded mutation must not publish a stale error over a newer
+    navigation.
+
+    The full-history ``bookings`` rows have INDEPENDENT causality (their own token): a navigation
+    supersedes the events but never the rows (it doesn't load them), so this mutation's row update
+    is applied even when its events refresh is superseded — while a newer load/mutation still wins.
+    """
+    state.calendar_reload_seq += 1
+    state.bookings_reload_seq += 1
+    events_token = state.calendar_reload_seq
+    rows_token = state.bookings_reload_seq
+    try:
+        rows, events = await _fetch_booking_views(current_runtime(), **_window(state))
+    except (service.AdminError, SQLAlchemyError):
+        if events_token != state.calendar_reload_seq:
+            return _ReloadResult.SUPERSEDED
+        return _ReloadResult.FAILED
+    if rows_token == state.bookings_reload_seq:
+        state.bookings = rows  # rows: dropped only by a newer LOAD/MUTATION, not by navigation
+    if events_token != state.calendar_reload_seq:
+        return _ReloadResult.SUPERSEDED
+    state.calendar_events = events
+    return _ReloadResult.APPLIED
+
+
+def _settle_mutation(state: AdminState, outcome: _ReloadResult) -> None:
+    """Write ``state.error`` after a mutation's token-guarded refetch, but ONLY if this reload still
+    owns the view: cleared on APPLIED, the resync notice on FAILED, and left UNTOUCHED on SUPERSEDED
+    (a newer navigation owns the view + error, so a superseded mutation must not clobber it)."""
+    if outcome is _ReloadResult.APPLIED:
+        state.error = ""
+    elif outcome is _ReloadResult.FAILED:
+        state.error = _RESYNC_MESSAGE
 
 
 def _find_calendar_event(events: list[CalendarEvent], booking_id: str) -> CalendarEvent | None:
@@ -246,7 +411,6 @@ async def _optimistic_reschedule(
     state.error = ""
     yield
     runtime = current_runtime()
-    committed = False
     try:
         new_start = _parse_admin_start(new_start_raw)
         await service.reschedule_booking_action(
@@ -255,24 +419,18 @@ async def _optimistic_reschedule(
             booking_id=uuid.UUID(booking_id),
             new_start=new_start,
         )
-        committed = True
-        # The reschedule replaced the booking with a new-id successor, so a manage panel open on the
-        # old (now cancelled) id is stale — clear it, like reschedule / reschedule_selected do.
-        state.selected_booking_id = ""
-        # Commit the authoritative state (the confirmed successor at its new revision).
-        state.bookings, state.calendar_events = await _fetch_booking_views(runtime)
-        state.error = ""
     except (ValueError, service.AdminError, SQLAlchemyError) as exc:
-        if committed:
-            # The reschedule PERSISTED but the refresh failed. Rolling back would desync the view
-            # from the DB (which really moved), so KEEP the optimistic move and ask for a reload —
-            # the next load reconciles to the authoritative revision.
-            state.error = _RESYNC_MESSAGE
-        else:
-            # Refused or failed BEFORE commit → roll the chip back to the authoritative slot. Every
-            # exit reconciles the optimistic state: no path leaves an unconfirmed move applied.
-            state.calendar_events = _with_restored_event(state.calendar_events, snapshot)
-            state.error = _error_text(exc)
+        # Refused or failed BEFORE commit → roll the chip back to the authoritative slot. Every exit
+        # reconciles the optimistic state: no path leaves an unconfirmed move applied.
+        state.calendar_events = _with_restored_event(state.calendar_events, snapshot)
+        state.error = _error_text(exc)
+        return
+    # Committed. The reschedule replaced the booking with a new-id successor, so a manage panel open
+    # on the old (now cancelled) id is stale — clear it, like reschedule / reschedule_selected do.
+    state.selected_booking_id = ""
+    # Commit the authoritative state (token-guarded). On a FAILED refresh KEEP the optimistic move
+    # (the DB really moved) + resync; on SUPERSEDED a newer navigation owns the view (leave it).
+    _settle_mutation(state, await _commit_calendar_view(state))
 
 
 async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
@@ -312,6 +470,22 @@ class AdminState(rx.State):
     # component reads both; ``calendar_events`` also carries the optimistic in-flight move.
     calendar_events: list[CalendarEvent] = []  # noqa: RUF012 (reflex state var)
     calendar_view: str = "month"
+    # The visible-period anchor (a day within the shown period) + the period's EXCLUSIVE upper
+    # bound, both set from the calendar's on_range_change / on_view_change payload.
+    # ``calendar_anchor`` feeds the component's ``anchor`` prop; together they scope the booking
+    # load to the visible period. Blank (before any navigation) = "today" / unbounded. (F2-NAV)
+    calendar_anchor: str = ""
+    calendar_range_to: str = ""
+    # Monotonic token for the period-load: each reload takes the next value and applies its result
+    # only if it is still the latest, so an out-of-order response from a rapid navigation sequence
+    # (even back to the SAME period) cannot restore stale events. Server-owned; a client that pokes
+    # it can't defeat the guard (each reload increments THEN captures, so the next load re-syncs).
+    # (F2-NAV)
+    calendar_reload_seq: int = 0
+    # A SEPARATE token for the full-history rows: navigation refreshes only the events (never the
+    # rows), so a navigation must not drop a mutation's row update. Only loads + mutation refetches
+    # bump this, giving `bookings` its own causality independent of the events token. (F2-NAV)
+    bookings_reload_seq: int = 0
     # The booking selected by a click, surfaced in the manage panel (view / cancel / reschedule).
     selected_booking_id: str = ""
     selected_booking_start: str = ""
@@ -385,14 +559,29 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_bookings(self) -> None:
-        """Load the tenant's bookings into the agenda calendar + row list (``on_load``)."""
+        """Load the tenant's full-history rows + the visible-period calendar events (``on_load``).
+
+        Token-guarded like navigation, so an on-load refresh can't clobber a period the operator has
+        already moved to, nor an in-flight navigation clobber this initial load.
+        """
         if not self._authenticated:
             return
-        self.error = ""
+        self.calendar_reload_seq += 1
+        self.bookings_reload_seq += 1
+        events_token = self.calendar_reload_seq
+        rows_token = self.bookings_reload_seq
         try:
-            self.bookings, self.calendar_events = await _fetch_booking_views(current_runtime())
+            rows, events = await _fetch_booking_views(current_runtime(), **_window(self))
         except service.AdminError as exc:
-            self.error = _error_text(exc)
+            if events_token == self.calendar_reload_seq:
+                self.error = _error_text(exc)
+            return
+        if rows_token == self.bookings_reload_seq:
+            self.bookings = rows
+        if events_token != self.calendar_reload_seq:
+            return
+        self.calendar_events = events
+        self.error = ""
 
     @rx.event
     async def cancel(self, booking_id: str) -> None:
@@ -406,11 +595,11 @@ class AdminState(rx.State):
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=uuid.UUID(booking_id),
             )
-            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
-            self.selected_booking_id = ""
-            self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
+            return
+        self.selected_booking_id = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
 
     @rx.event
     async def reschedule(self, form_data: dict[str, str]) -> None:
@@ -432,11 +621,11 @@ class AdminState(rx.State):
                 booking_id=booking_id,
                 new_start=new_start,
             )
-            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
-            self.selected_booking_id = ""
-            self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
+            return
+        self.selected_booking_id = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
 
     # -- calendar interactions (F2-F) -----------------------------------------------
 
@@ -447,6 +636,37 @@ class AdminState(rx.State):
             return
         if view in _VALID_CALENDAR_VIEWS:
             self.calendar_view = view
+
+    @rx.event
+    async def on_calendar_range_change(self, payload: dict[str, str]) -> None:
+        """Navigate to a new visible period (previous / today / next) and load its events (F2-NAV).
+
+        The calendar's built-in toolbar emits ``{view, from, to}``; ``from`` becomes the new anchor
+        and ``[from, to)`` scopes the booking load — so the agenda shows the events of the period
+        the operator is looking at, not only the ones around today.
+        """
+        if not self._authenticated:
+            return
+        self.calendar_anchor = str(payload.get("from", ""))
+        self.calendar_range_to = str(payload.get("to", ""))
+        await _reload_calendar(self)
+
+    @rx.event
+    async def on_calendar_view_change(self, payload: dict[str, str]) -> None:
+        """Switch the view from the toolbar's switcher and load the new period's events (F2-NAV).
+
+        An unrecognized view is ignored (never navigate on a bad value) — the view stays put and no
+        load happens, mirroring ``set_calendar_view``'s validation.
+        """
+        if not self._authenticated:
+            return
+        view = str(payload.get("view", ""))
+        if view not in _VALID_CALENDAR_VIEWS:
+            return
+        self.calendar_view = view
+        self.calendar_anchor = str(payload.get("from", ""))
+        self.calendar_range_to = str(payload.get("to", ""))
+        await _reload_calendar(self)
 
     @rx.event
     async def on_calendar_event_drop(self, payload: dict[str, str]) -> AsyncIterator[None]:
@@ -505,7 +725,6 @@ class AdminState(rx.State):
         if not self._authenticated or not self.selected_booking_id:
             return
         runtime = current_runtime()
-        committed = False
         try:
             new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
@@ -514,18 +733,13 @@ class AdminState(rx.State):
                 booking_id=uuid.UUID(self.selected_booking_id),
                 new_start=new_start,
             )
-            committed = True
-            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
-            self.selected_booking_id = ""
-            self.error = ""
         except (ValueError, service.AdminError, SQLAlchemyError) as exc:
-            if committed:
-                # Rescheduled, but the refresh failed: close the now-stale panel and ask for a
-                # reload instead of leaving it pointed at the replaced booking (ambiguous retry).
-                self.selected_booking_id = ""
-                self.error = _RESYNC_MESSAGE
-            else:
-                self.error = _error_text(exc)
+            self.error = _error_text(exc)
+            return
+        # Committed: clear the now-stale panel (it pointed at the replaced booking), then refresh
+        # the view token-guarded — a FAILED refresh asks for a reload, SUPERSEDED defers to the nav.
+        self.selected_booking_id = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
 
     @rx.event
     def clear_selection(self) -> None:
@@ -544,7 +758,6 @@ class AdminState(rx.State):
         if not self._authenticated:
             return
         runtime = current_runtime()
-        committed = False
         try:
             form = service.BookingForm(
                 event_type_id=uuid.UUID(_clean(form_data, "event_type_id")),
@@ -556,20 +769,14 @@ class AdminState(rx.State):
             await service.create_booking_action(
                 runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
             )
-            committed = True
-            self.bookings, self.calendar_events = await _fetch_booking_views(runtime)
-            self.show_new_booking = False
-            self.new_booking_start = ""
-            self.error = ""
         except (ValueError, service.AdminError, SQLAlchemyError) as exc:
-            if committed:
-                # Created, but the refresh failed: close the form so the operator does not re-submit
-                # (an ambiguous retry) — the booking persisted; ask for a reload.
-                self.show_new_booking = False
-                self.new_booking_start = ""
-                self.error = _RESYNC_MESSAGE
-            else:
-                self.error = _error_text(exc)
+            self.error = _error_text(exc)
+            return
+        # Committed: close the form (so the operator can't re-submit an ambiguous retry), then
+        # refresh the view token-guarded — FAILED asks for a reload, SUPERSEDED defers to the nav.
+        self.show_new_booking = False
+        self.new_booking_start = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
 
     # -- event types ----------------------------------------------------------------
 

@@ -30,6 +30,8 @@ public surface.
 
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
 from typing import NotRequired, TypedDict
 
 import reflex as rx
@@ -49,6 +51,31 @@ _VALID_VIEWS = frozenset({"month", "week", "day", "list"})
 # a dict of ``--ac-*`` token overrides (e.g. ``Theme.dark().to_css_vars()``) is also accepted, and a
 # dynamic ``Var`` is not literal-checked (its value is a frontend concern the React layer resolves).
 _VALID_THEMES = frozenset(PRESET_NAMES)
+
+# A calendar anchor is a naive-local ISO date ("2026-07-15") or datetime ("2026-07-15T09:00:00"),
+# matching the React layer's `parseLocalDateTime`. Blank means "today" (resolved client-side); a
+# non-blank literal must be well-formed AND a real calendar date (so "2026-13-01" is rejected).
+_ANCHOR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$")
+
+
+def _is_valid_anchor(value: str) -> bool:
+    """Whether ``value`` is a well-formed, real naive-local ISO date/datetime anchor.
+
+    Validates the WHOLE value, not just the date: a date+time is checked with
+    ``datetime.fromisoformat`` (which range-checks the hours/minutes/seconds, rejecting e.g.
+    ``25:00:00`` or ``12:60:00``), a bare date with ``date.fromisoformat``.
+    """
+    if not _ANCHOR_RE.match(value):
+        return False
+    normalized = value.replace(" ", "T")
+    try:
+        if "T" in normalized:
+            datetime.fromisoformat(normalized)
+        else:
+            date.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return True
 
 
 class CalendarEvent(TypedDict):
@@ -167,6 +194,19 @@ def _on_context_menu_signature(payload: _ContextMenuVar) -> list[rx.Var[ContextM
     return [payload]
 
 
+_ViewChangeVar = ObjectVar[ViewChangePayload]
+
+
+def _on_view_change_signature(payload: _ViewChangeVar) -> list[rx.Var[ViewChangePayload]]:
+    """Pass the view-change payload (the new view + its visible range) through to the handler."""
+    return [payload]
+
+
+def _on_range_change_signature(payload: _ViewChangeVar) -> list[rx.Var[ViewChangePayload]]:
+    """Pass the range-change payload (the new visible period) through to the handler."""
+    return [payload]
+
+
 class Calendar(rx.NoSSRComponent):
     """The AetherCal calendar: a production month view with drag-to-reschedule.
 
@@ -182,6 +222,15 @@ class Calendar(rx.NoSSRComponent):
     view: rx.Var[str] = rx_field(
         default=rx.Var.create("month"),
         doc='Which surface to render: "month" (F2-A) | "week" | "day" | "list" (F2-B/C).',
+    )
+
+    anchor: rx.Var[str] = rx_field(
+        default=rx.Var.create(""),
+        doc=(
+            "Any day within the period to show, as a naive-local ISO date ('2026-07-15') or "
+            "datetime ('2026-07-15T09:00:00'). Blank = today (resolved client-side). Bind this to "
+            "state and update it from on_range_change / on_view_change for a controlled calendar."
+        ),
     )
 
     events: rx.Var[list[CalendarEvent]] = rx_field(
@@ -205,6 +254,15 @@ class Calendar(rx.NoSSRComponent):
             "Theme: a preset name ('light' | 'dark' | 'midnight' | 'high_contrast') or a dict of "
             "--ac-* token overrides (e.g. Theme.dark().to_css_vars()). Applied as inline CSS "
             "variables; the default is the neutral 'light' preset."
+        ),
+    )
+
+    navigation: rx.Var[bool] = rx_field(
+        default=rx.Var.create(False),
+        doc=(
+            "Render the built-in navigation toolbar (previous / today / next + a period title + a "
+            "view switcher). Off by default. When on, drive the calendar controlled: bind anchor / "
+            "view to state and update them from on_range_change / on_view_change."
         ),
     )
 
@@ -238,6 +296,20 @@ class Calendar(rx.NoSSRComponent):
         doc=(
             "Fired on a right-click / context-menu gesture. Receives the event's id (on an event) "
             "or a start slot (on empty space)."
+        ),
+    )
+
+    on_view_change: rx.EventHandler[_on_view_change_signature] = rx_field(
+        doc=(
+            "Fired when the view switcher picks a new view. Receives {view, from, to} for that "
+            "view's range (same shape as on_range_change)."
+        ),
+    )
+
+    on_range_change: rx.EventHandler[_on_range_change_signature] = rx_field(
+        doc=(
+            "Fired when previous / today / next change the period. Receives {view, from, to}; "
+            "`from` is the new anchor and [from, to) is the period's events window."
         ),
     )
 
@@ -276,5 +348,14 @@ class Calendar(rx.NoSSRComponent):
         if isinstance(theme, str) and theme not in _VALID_THEMES:
             valid = ", ".join(sorted(_VALID_THEMES))
             msg = f"Calendar.theme string must be one of {{{valid}}}, got {theme!r}"
+            raise ValueError(msg)
+        anchor = props.get("anchor")
+        # A literal anchor must be a well-formed, real ISO date/datetime; blank ("today") is ok,
+        # and a dynamic Var (bound to state) is resolved defensively by the React layer.
+        if isinstance(anchor, str) and anchor != "" and not _is_valid_anchor(anchor):
+            msg = (
+                "Calendar.anchor must be a naive-local ISO date ('2026-07-15') or datetime "
+                f"('2026-07-15T09:00:00'), got {anchor!r}"
+            )
             raise ValueError(msg)
         return super().create(*children, **props)  # type: ignore[return-value]

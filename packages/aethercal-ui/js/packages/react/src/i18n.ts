@@ -12,6 +12,7 @@
  * without forking, and per-string overrides so a single label can be tweaked. Locale lookup falls
  * back from an exact tag ("es-MX") to its primary subtag ("es") to English.
  */
+import type { CalendarView } from "@aethercal/calendar-core";
 
 /** Every non-`Intl` user-facing string the calendar renders, including a11y announcements. */
 export interface CalendarMessages {
@@ -45,6 +46,16 @@ export interface CalendarMessages {
   createHere: (label: string) => string;
   /** Announced when a keyboard gesture is cancelled (Escape). */
   cancelled: string;
+  /** Accessible name of the built-in navigation toolbar (F2-NAV). */
+  navToolbar: string;
+  /** Accessible label of the "previous period" button. */
+  navPrevious: string;
+  /** Accessible label of the "next period" button. */
+  navNext: string;
+  /** Label of the "jump to today" button. */
+  navToday: string;
+  /** Display name of each view, for the toolbar's view switcher. */
+  viewNames: Record<CalendarView, string>;
 }
 
 const en: CalendarMessages = {
@@ -68,6 +79,11 @@ const en: CalendarMessages = {
   resized: (label) => `Duration set to ${label}`,
   createHere: (label) => `Create an event on ${label}`,
   cancelled: "Cancelled",
+  navToolbar: "Calendar navigation",
+  navPrevious: "Previous",
+  navNext: "Next",
+  navToday: "Today",
+  viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda" },
 };
 
 // Neutral Spanish ("tú"). Reviewed to avoid voseo (usá/pulsá/agarrá/soltá…) — a locked test guards it.
@@ -93,6 +109,11 @@ const es: CalendarMessages = {
   resized: (label) => `Duración establecida en ${label}`,
   createHere: (label) => `Crear un evento en ${label}`,
   cancelled: "Cancelado",
+  navToolbar: "Navegación del calendario",
+  navPrevious: "Anterior",
+  navNext: "Siguiente",
+  navToday: "Hoy",
+  viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda" },
 };
 
 /** The built-in locale registry. Extend it by passing your own to `resolveMessages`. */

@@ -21,6 +21,7 @@ export {
   toDateOnly,
 } from "./dateMath";
 export { type GridNavKey, nextGridIndex } from "./keyboard";
+export { getVisibleRange, stepAnchor } from "./navigation";
 export {
   type DragAction,
   type DragState,
