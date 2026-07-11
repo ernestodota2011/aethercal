@@ -1,2 +1,5 @@
 packages:
   - "packages/*"
+  # Example apps that consume the calendar packages (e.g. the public demo, F2-G). Kept out of
+  # `packages/*` so the shipped component surface stays exactly `core` + `react`.
+  - "examples/*"
