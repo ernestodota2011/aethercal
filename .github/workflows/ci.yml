@@ -37,6 +37,34 @@ jobs:
       - name: Import contracts (import-linter)
         run: uv run lint-imports
 
+  calendar-js:
+    name: Calendar JS (boundaries, typecheck, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethercal-ui/js
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # No third-party JS setup action: ubuntu-latest ships Node 20 + npm, so we install a
+      # pinned pnpm with the preinstalled npm. This keeps the CI supply-chain surface to the
+      # single already-SHA-pinned action above (CLAUDE.md agentic-security).
+      - name: Install pnpm (Node preinstalled on the runner)
+        working-directory: ${{ github.workspace }}
+        run: npm install -g pnpm@10.32.1
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      # ESLint import boundary: the headless calendar-core must never import React (RF-23).
+      - name: Boundaries + lint
+        run: pnpm lint
+      - name: Type-check
+        run: pnpm typecheck
+      - name: Test (vitest + fast-check + testing-library)
+        run: pnpm test
+      # React dedupe contract base: react is a peerDependency, dev react aligned to 19 (F2-DR).
+      - name: React alignment
+        run: pnpm check-react
+
   test:
     name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}

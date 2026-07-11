@@ -9,6 +9,7 @@ produces a real event chain when wired to a handler ("events out").
 
 from __future__ import annotations
 
+import pytest
 import reflex as rx
 
 from aethercal.ui.calendar import Calendar
@@ -70,6 +71,51 @@ def test_events_prop_flows_into_the_rendered_props() -> None:
     rendered_events = str(tag.props["events"])
     assert "evt-1" in rendered_events
     assert "Consult" in rendered_events
+
+
+def test_day_and_list_views_are_accepted_contract_values() -> None:
+    # F2-A only renders `month`, but the contract (AetherCal-06 §5) is 4 views; `day`/`list`
+    # must be accepted so F2-B/C can render them without touching the wrapper.
+    for view in ("month", "week", "day", "list"):
+        component = Calendar.create(view=view)
+        assert str(component._render().props["view"]) == f'"{view}"'
+
+
+def test_invalid_view_literal_raises() -> None:
+    with pytest.raises(ValueError, match=r"Calendar\.view must be one of"):
+        Calendar.create(view="year")
+
+
+def test_default_locale_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create()._render()
+    assert "locale" in tag.props
+    assert str(tag.props["locale"]) == '"en"'
+
+
+def test_explicit_locale_flows_into_the_rendered_props() -> None:
+    tag = Calendar.create(locale="es")._render()
+    assert str(tag.props["locale"]) == '"es"'
+
+
+def test_first_day_of_week_flows_into_the_rendered_props_camelcased() -> None:
+    tag = Calendar.create(first_day_of_week=0)._render()
+    # Reflex camel-cases Python prop names for the JSX tag; the bundle reads `firstDayOfWeek`.
+    assert "firstDayOfWeek" in tag.props
+    assert str(tag.props["firstDayOfWeek"]) == "0"
+
+
+def test_first_day_of_week_boundary_values_are_accepted() -> None:
+    for good in (0, 1, 6):
+        assert str(
+            Calendar.create(first_day_of_week=good)._render().props["firstDayOfWeek"]
+        ) == str(good)
+
+
+def test_invalid_first_day_of_week_literal_raises() -> None:
+    # bool is an int subclass; True/False must be rejected too (they are not a valid weekday int).
+    for bad in (-1, 7, 13, True, False):
+        with pytest.raises(ValueError, match=r"first_day_of_week must be 0..6"):
+            Calendar.create(first_day_of_week=bad)
 
 
 def test_on_event_drop_is_a_registered_event_trigger() -> None:

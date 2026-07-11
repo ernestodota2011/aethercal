@@ -26,7 +26,7 @@ class DedupeState(rx.State):
     last_drop: str = "(no drop yet)"
 
     @rx.event
-    def on_drop(self, payload: dict):  # noqa: ANN001 - payload is the JS drop object
+    def on_drop(self, payload: dict) -> None:  # payload is the JS drop object
         self.last_drop = str(payload)
 
 
