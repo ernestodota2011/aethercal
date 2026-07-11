@@ -96,7 +96,7 @@ export function getMonthGridDays(
 }
 
 /** Whole calendar-day difference between two dates, DST-safe (a day is 23–25h across DST). */
-function calendarDayDelta(from: Date, to: Date): number {
+export function calendarDayDelta(from: Date, to: Date): number {
   const fromMidnight = new Date(from.getFullYear(), from.getMonth(), from.getDate());
   const toMidnight = new Date(to.getFullYear(), to.getMonth(), to.getDate());
   return Math.round((toMidnight.getTime() - fromMidnight.getTime()) / 86_400_000);

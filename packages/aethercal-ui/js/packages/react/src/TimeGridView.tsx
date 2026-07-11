@@ -246,10 +246,16 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
       // Only the pointer that started the gesture drives it — a second (multi-touch) pointer is ignored.
       if (!g || e.pointerId !== g.pointerId) return;
       if (g.kind === "resize") {
-        const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, g.colEl), grid.config);
+        // Resize can drag an edge into another day column (e.g. extend the end past midnight),
+        // resolving the column under the pointer — the same way selection does.
+        const under = document
+          .elementFromPoint(e.clientX, e.clientY)
+          ?.closest<HTMLElement>(".aethercal-tg-col");
+        const col = under?.dataset.date ? under : g.colEl;
+        const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, col), grid.config);
         const event = events.find((candidate) => candidate.id === g.eventId);
         if (!event) return;
-        const payload = computeResize(event, g.edge, g.dateOnly, minute);
+        const payload = computeResize(event, g.edge, col.dataset.date ?? g.dateOnly, minute);
         g.payload = payload;
         setResizePreview(payload);
       } else {

@@ -72,6 +72,18 @@ describe("computeMovedRange", () => {
       end: "2026-07-16T10:30:00",
     });
   });
+
+  it("preserves the LOCAL (wall-clock) duration across a spring-forward DST day", () => {
+    // The vitest env runs in America/New_York; 2026-03-08 skips 02:00->03:00. A 2h event moved to
+    // start at 01:00 that day keeps its visible 2h length (01:00->03:00) — a raw ms-add would render
+    // it 01:00->04:00 (absolute 2h, DST hour shifted onto the wall clock).
+    const e = evt({ id: "e", start: "2026-03-07T10:00:00", end: "2026-03-07T12:00:00" });
+    expect(computeMovedRange(e, "2026-03-08", 60)).toEqual({
+      id: "e",
+      start: "2026-03-08T01:00:00",
+      end: "2026-03-08T03:00:00",
+    });
+  });
 });
 
 describe("computeResize", () => {

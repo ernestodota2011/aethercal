@@ -9,7 +9,12 @@
  * All results are naive local "YYYY-MM-DDTHH:mm:ss" strings via `formatLocalDateTime`, and event
  * `revision` is echoed through unchanged (the server assigns the *new* revision on accept — §4).
  */
-import { computeDroppedRange, formatLocalDateTime, parseLocalDateTime } from "./dateMath";
+import {
+  calendarDayDelta,
+  computeDroppedRange,
+  formatLocalDateTime,
+  parseLocalDateTime,
+} from "./dateMath";
 import type { ResolvedTimeGridConfig } from "./timeGrid";
 import type {
   CalendarEvent,
@@ -56,7 +61,14 @@ export function fractionToMinuteOfDay(
 /**
  * Recompute an event's range when it is moved. With `minuteOfDay === null` this is a day-only move
  * that preserves the wall-clock time-of-day (delegates to `computeDroppedRange`); with a minute it
- * is a time-grid move that changes BOTH the day and the time-of-day, keeping the original duration.
+ * is a time-grid move that changes BOTH the day and the time-of-day.
+ *
+ * DST-safe by construction (consistent with `computeDroppedRange`): it applies the SAME calendar-day
+ * and minute-of-day shift to BOTH endpoints with component-based date arithmetic, rather than adding
+ * a raw millisecond duration. This preserves the event's LOCAL (wall-clock) duration — the visible
+ * block length stays the same — instead of its absolute duration, which a raw ms add would keep at
+ * the cost of shifting the wall time by the DST hour. Display-only; authoritative scheduling and any
+ * zone-aware duration semantics live server-side (RF-23).
  */
 export function computeMovedRange(
   event: CalendarEvent,
@@ -67,14 +79,27 @@ export function computeMovedRange(
 
   const originalStart = parseLocalDateTime(event.start);
   const originalEnd = parseLocalDateTime(event.end);
-  const durationMs = originalEnd.getTime() - originalStart.getTime();
-  const newStart = dateAtMinute(targetDateOnly, minuteOfDay);
-  const newEnd = new Date(newStart.getTime() + durationMs);
+  const target = parseLocalDateTime(`${targetDateOnly}T00:00:00`);
+  // The move = shift the whole event by (dayDelta calendar days, minuteDelta wall minutes), applied
+  // identically to both endpoints so the local duration is preserved.
+  const dayDelta = calendarDayDelta(originalStart, target);
+  const startMinuteOfDay = originalStart.getHours() * MINUTES_PER_HOUR + originalStart.getMinutes();
+  const minuteDelta = minuteOfDay - startMinuteOfDay;
+
+  const shift = (dt: Date): Date =>
+    new Date(
+      dt.getFullYear(),
+      dt.getMonth(),
+      dt.getDate() + dayDelta,
+      dt.getHours(),
+      dt.getMinutes() + minuteDelta,
+      dt.getSeconds(),
+    );
 
   const payload: EventDropPayload = {
     id: event.id,
-    start: formatLocalDateTime(newStart),
-    end: formatLocalDateTime(newEnd),
+    start: formatLocalDateTime(shift(originalStart)),
+    end: formatLocalDateTime(shift(originalEnd)),
   };
   if (event.revision !== undefined) payload.revision = event.revision;
   return payload;

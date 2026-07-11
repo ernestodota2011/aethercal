@@ -335,6 +335,35 @@ describe("F2-D — resize (duration) via pointer handles", () => {
       expect.objectContaining({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T12:00:00", revision: 2 }),
     );
   });
+
+  it("resizes the end edge into the next day column (multi-day event)", () => {
+    const onEventResize = vi.fn();
+    const { container } = render(
+      <AetherCalendar
+        view="week"
+        anchor={ANCHOR}
+        events={[evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00" })]}
+        onEventResize={onEventResize}
+      />,
+    );
+    const col15 = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    const col16 = container.querySelector('.aethercal-tg-col[data-date="2026-07-16"]') as HTMLElement;
+    stubRect(col15, 480);
+    stubRect(col16, 480);
+    const handle = container.querySelector('.aethercal-tg-resize-handle[data-edge="end"]') as HTMLElement;
+    const originalEfp = document.elementFromPoint;
+    document.elementFromPoint = () => col16;
+    try {
+      fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientY: 220 });
+      fireEvent.pointerMove(window, { pointerId: 1, clientX: 200, clientY: 240 }); // 12:00 on 07-16
+      fireEvent.pointerUp(window, { pointerId: 1 });
+    } finally {
+      document.elementFromPoint = originalEfp;
+    }
+    expect(onEventResize).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-16T12:00:00" }),
+    );
+  });
 });
 
 describe("F2-D — range select (create) via pointer drag on empty space", () => {
