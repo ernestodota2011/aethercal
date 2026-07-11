@@ -78,9 +78,17 @@ sequence = [
     { cmd = "pytest" },
 ]
 
+# OBSOLETE (F2-H, deliberately not implemented): `fetch-js-bundle` existed to repopulate the JS
+# bundle for source/editable installs back when it was gitignored. That premise is gone — the
+# bundle is now COMMITTED (docs/spikes/f0-10-reflex-tsx.md, "Resolution at F0 integration"), so a
+# fresh clone / `uv sync` already has it on disk; there is nothing to fetch. Building it from source
+# after a TSX change is `pnpm build` in packages/aethercal-ui/js (guarded by CI's rebuild-and-diff
+# drift guard), and releasing it is `scripts/build_release.py` (anti wheel-without-asset). This task
+# is kept only to explain that if an old doc/muscle-memory still invokes it, and to verify the
+# committed bundle is actually present.
 [tool.poe.tasks.fetch-js-bundle]
-help = "Fetch the prebuilt aethercal-ui JS bundle for contributors without Node (added in F0-10/F2)."
-cmd = "python -c \"print('fetch-js-bundle: implemented alongside the aethercal-ui bundle in F0-10/F2')\""
+help = "OBSOLETE: the JS bundle is committed (no fetch needed). Verifies it exists; see the comment."
+cmd = "python packages/aethercal-ui/scripts/verify_bundle.py"
 
 # --------------------------------------------------------------------------------------
 # Tooling config (shared across the workspace)

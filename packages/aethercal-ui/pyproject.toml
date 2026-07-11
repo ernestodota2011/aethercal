@@ -16,8 +16,16 @@ classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
 dependencies = []
 
 [project.optional-dependencies]
+# Pinned `<0.10` on purpose (F2-H): `calendar.py` declares its props with `field()` from Reflex's
+# INTERNAL `reflex_base.components.component` (the public `reflex`/`rx` surface has no equivalent) —
+# a real version-fragility (docs/spikes/f0-10-reflex-tsx.md, "What was awkward"). `reflex_base` is
+# not covered by Reflex's public-API semver promise, so a minor bump could rename/restructure it.
+# The upper bound keeps a `uv sync` from silently pulling an incompatible Reflex; the smoke test in
+# tests/test_release_hardening.py turns any regression into a red CI run instead of a prod
+# ImportError. Matches the same bound aethercal-server already declares. Re-verify this import (and
+# lift the bound) deliberately when moving to Reflex 0.10.
 reflex = [
-    "reflex>=0.9.6.post1",
+    "reflex>=0.9.6.post1,<0.10",
 ]
 
 [tool.hatch.build.targets.wheel]

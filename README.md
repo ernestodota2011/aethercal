@@ -54,8 +54,11 @@ uv run poe check     # format-check, lint, typecheck, import contracts, tests
 uv run poe test      # tests only
 ```
 
-Contributors without Node can fetch the prebuilt UI bundle with `uv run poe fetch-js-bundle`
-instead of building it locally.
+The prebuilt UI bundle (`packages/aethercal-ui/src/aethercal/ui/assets/aethercal-calendar.js`) is
+committed to the repo, so contributors without Node need no extra step — a fresh `uv sync` already
+has it. If you change the calendar's TSX, rebuild it with `pnpm build` in `packages/aethercal-ui/js`
+and commit the regenerated bundle (CI's rebuild-and-diff drift guard fails a stale commit). Run
+`uv run poe fetch-js-bundle` to verify the committed bundle is present.
 
 ## Documentation
 

@@ -221,7 +221,7 @@ reflex = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "reflex", marker = "extra == 'reflex'", specifier = ">=0.9.6.post1" }]
+requires-dist = [{ name = "reflex", marker = "extra == 'reflex'", specifier = ">=0.9.6.post1,<0.10" }]
 provides-extras = ["reflex"]
 
 [[package]]

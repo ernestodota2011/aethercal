@@ -36,6 +36,14 @@ jobs:
         run: uv run pyright
       - name: Import contracts (import-linter)
         run: uv run lint-imports
+      # React alignment DERIVED from the installed Reflex (the source of truth), so a Reflex bump is
+      # tracked automatically instead of drifting against a hardcoded literal. Node is preinstalled
+      # on the runner; `uv run` puts the venv's Python (with reflex_base) on PATH for the script's
+      # derivation. Lives here (not in calendar-js) because only this job has Reflex installed.
+      - name: React alignment (derived from installed Reflex)
+        # --require-derived: this job HAS Reflex, so a silent fallback (which would pass CI without
+        # actually checking the installed Reflex) is a hard error here, not a warning.
+        run: uv run node packages/aethercal-ui/js/scripts/check-react-alignment.mjs --require-derived
 
   calendar-js:
     name: Calendar JS (boundaries, typecheck, test)
@@ -61,9 +69,15 @@ jobs:
         run: pnpm typecheck
       - name: Test (vitest + fast-check + testing-library)
         run: pnpm test
-      # React dedupe contract base: react is a peerDependency, dev react aligned to 19 (F2-DR).
-      - name: React alignment
-        run: pnpm check-react
+      # Drift guard (fuente versionada sin drift): the committed bundle MUST equal a fresh rebuild.
+      # `.gitattributes` normalizes it to LF on every platform and the frozen lockfile pins esbuild,
+      # so the rebuild is reproducible cross-runner. A stale commit (TSX changed but the bundle not
+      # rebuilt-and-recommitted) fails here — the hard gate for "source of truth is versioned".
+      - name: Bundle drift guard (rebuild-and-diff)
+        run: |
+          pnpm build
+          git diff --exit-code -- ':/packages/aethercal-ui/src/aethercal/ui/assets/aethercal-calendar.js' \
+            || { echo "::error::aethercal-calendar.js is stale — run 'pnpm build' in packages/aethercal-ui/js and commit the regenerated bundle."; exit 1; }
 
   test:
     name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -121,3 +135,24 @@ jobs:
         env:
           AETHERCAL_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aethercal_test
         run: uv run pytest -m db
+
+  calendar-release:
+    name: Calendar release (wheel ships the JS bundle)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Sync workspace (locked)
+        run: uv sync --locked
+      # Anti "wheel-without-asset": hatchling silently builds a VALID wheel MISSING the JS bundle if
+      # the asset is absent (F0-10 silent failure mode). This verifies the committed source asset,
+      # builds the wheel, and re-opens it to assert the bundle is actually inside — a release can
+      # never ship an asset-less wheel unnoticed. Relies on the committed bundle (kept fresh by the
+      # calendar-js drift guard), so it needs no Node toolchain.
+      - name: Build wheel + verify it ships the bundle
+        run: uv run python packages/aethercal-ui/scripts/build_release.py --out-dir packages/aethercal-ui/dist
