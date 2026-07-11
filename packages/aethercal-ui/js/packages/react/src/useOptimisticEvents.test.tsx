@@ -1,5 +1,6 @@
 import type { CalendarEvent } from "@aethercal/calendar-core";
 import { act, renderHook } from "@testing-library/react";
+import * as React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type CalendarMutation,
@@ -120,6 +121,27 @@ describe("useOptimisticEvents — rollback on timeout (no response)", () => {
     expect(result.current.pendingIds.has("e1")).toBe(false);
     expect(result.current.rolledBackIds.has("e1")).toBe(true);
     expect(result.current.events[0]!.end).toBe("2026-07-15T11:00:00"); // reverted
+  });
+});
+
+describe("useOptimisticEvents — React StrictMode double-invoke", () => {
+  it("still commits after StrictMode's mount -> cleanup -> mount (mountedRef restored)", async () => {
+    const d = deferred<MutationResult>();
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      React.createElement(React.StrictMode, null, children);
+    const { result } = renderHook(
+      () => useOptimisticEvents({ events: [EVENT], mutate: () => d.promise, generateId: () => "cm-1" }),
+      { wrapper },
+    );
+    act(() => {
+      result.current.submit("drop", { id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 1 });
+    });
+    await act(async () => {
+      d.resolve({ id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 2 });
+    });
+    // Would stay pending if the double-invoke had left the hook marked unmounted.
+    expect(result.current.pendingIds.has("e1")).toBe(false);
+    expect(result.current.events[0]!.revision).toBe(2);
   });
 });
 

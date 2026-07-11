@@ -90,6 +90,10 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
   const timersRef = React.useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   React.useEffect(() => {
+    // Set true on (re)mount, not just once: React StrictMode runs mount -> cleanup -> mount in dev,
+    // so a cleanup-only `false` would leave the ref permanently unmounted and silently drop every
+    // resolve/reject/timeout dispatch after the double-invoke.
+    mountedRef.current = true;
     const timers = timersRef.current;
     return () => {
       mountedRef.current = false;
