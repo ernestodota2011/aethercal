@@ -132,6 +132,14 @@ describe("computeResize", () => {
       "2026-07-15T10:30:00",
     );
   });
+
+  it("clamps the minimum duration in LOCAL minutes on a spring-forward DST day", () => {
+    // America/New_York skips 02:00->03:00 on 2026-03-08. Dragging the end back to the start clamps
+    // to start + 15 LOCAL minutes; the result is wall-clock 01:15, not a raw-millisecond artifact.
+    const dst = evt({ id: "e", start: "2026-03-08T01:00:00", end: "2026-03-08T04:00:00" });
+    const out = computeResize(dst, "end", "2026-03-08", 60); // drag end down to 01:00 == start
+    expect(out).toMatchObject({ start: "2026-03-08T01:00:00", end: "2026-03-08T01:15:00" });
+  });
 });
 
 describe("computeRangeSelection", () => {

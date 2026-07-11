@@ -26,7 +26,6 @@ import type {
 } from "./types";
 
 const MINUTES_PER_HOUR = 60;
-const MS_PER_MINUTE = 60_000;
 /** Default snap and minimum-slot granularity (minutes). */
 export const DEFAULT_SNAP_MINUTES = 15;
 
@@ -38,6 +37,15 @@ function clamp(value: number, min: number, max: number): number {
 function dateAtMinute(dateOnly: string, minuteOfDay: number): Date {
   const midnight = parseLocalDateTime(`${dateOnly}T00:00:00`);
   return new Date(midnight.getFullYear(), midnight.getMonth(), midnight.getDate(), 0, minuteOfDay, 0);
+}
+
+/**
+ * A `Date` `minutes` after `dt` in LOCAL wall-clock terms (component-based, so it is DST-safe — a
+ * raw millisecond add would shift the wall clock by the DST hour across a transition). Used for the
+ * minimum-duration clamps so a resized/selected slot keeps its intended local length.
+ */
+function addLocalMinutes(dt: Date, minutes: number): Date {
+  return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate(), dt.getHours(), dt.getMinutes() + minutes, dt.getSeconds());
 }
 
 /**
@@ -120,7 +128,7 @@ export function computeResize(
   minuteOfDay: number,
   opts: { minDurationMinutes?: number } = {},
 ): EventResizePayload {
-  const minDurationMs = (opts.minDurationMinutes ?? DEFAULT_SNAP_MINUTES) * MS_PER_MINUTE;
+  const minDurationMinutes = opts.minDurationMinutes ?? DEFAULT_SNAP_MINUTES;
   const start = parseLocalDateTime(event.start);
   const end = parseLocalDateTime(event.end);
   const candidate = dateAtMinute(targetDateOnly, minuteOfDay);
@@ -128,11 +136,12 @@ export function computeResize(
   let newStart = start;
   let newEnd = end;
   if (edge === "end") {
-    const minEndMs = start.getTime() + minDurationMs;
-    newEnd = new Date(Math.max(candidate.getTime(), minEndMs));
+    // Keep at least a minDuration slot, measured in LOCAL minutes (DST-safe).
+    const minEnd = addLocalMinutes(start, minDurationMinutes);
+    newEnd = candidate.getTime() >= minEnd.getTime() ? candidate : minEnd;
   } else {
-    const maxStartMs = end.getTime() - minDurationMs;
-    newStart = new Date(Math.min(candidate.getTime(), maxStartMs));
+    const maxStart = addLocalMinutes(end, -minDurationMinutes);
+    newStart = candidate.getTime() <= maxStart.getTime() ? candidate : maxStart;
   }
 
   const payload: EventResizePayload = {
@@ -179,7 +188,7 @@ export function computeRangeSelection(
   const startDate = a.getTime() <= c.getTime() ? a : c;
   let endDate = a.getTime() <= c.getTime() ? c : a;
   if (endDate.getTime() === startDate.getTime()) {
-    endDate = new Date(startDate.getTime() + minDurationMinutes * MS_PER_MINUTE);
+    endDate = addLocalMinutes(startDate, minDurationMinutes);
   }
   return { start: formatLocalDateTime(startDate), end: formatLocalDateTime(endDate), allDay: false };
 }
