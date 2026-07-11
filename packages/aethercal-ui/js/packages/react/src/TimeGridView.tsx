@@ -913,6 +913,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                       }
                     >
                       <time className="aethercal-tg-event-time">{timeLabel}</time>
+                      {/* Whitespace text node so the block's visible text ("9:00Consulta") matches
+                          its accessible name ("9:00 Consulta") — the visual gap is a flex `gap`, not
+                          text (finding M-2 / WCAG 2.5.3). No layout change; SR name unchanged. */}
+                      {" "}
                       <span className="aethercal-tg-event-title">{event.title}</span>
                       {resizeEnabled && editable ? (
                         <>

@@ -1,8 +1,8 @@
 {
   "light": {
     "--ac-fg": "#1f2328",
-    "--ac-muted": "#6b7280",
-    "--ac-faint": "#9ca3af",
+    "--ac-muted": "#5f6672",
+    "--ac-faint": "#676e79",
     "--ac-bg": "#ffffff",
     "--ac-header-fg": "#4b5563",
     "--ac-border": "#e5e7eb",

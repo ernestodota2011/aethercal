@@ -32,6 +32,7 @@ const VIEWS: readonly CalendarView[] = ["month", "week", "day", "list"];
 /** Demo-chrome copy, localized alongside the calendar itself (neutral Spanish "tú", no voseo). */
 const UI = {
   es: {
+    docTitle: "AetherCal — Demo del calendario",
     tagline: "Infraestructura de calendario y agendamiento, de código abierto (MIT).",
     lead:
       "Un componente headless-first: motor de geometría puro + capa React. Cuatro vistas, " +
@@ -61,6 +62,7 @@ const UI = {
     footer: "Proyecto de código abierto (MIT). Pre-alpha: la API puede cambiar.",
   },
   en: {
+    docTitle: "AetherCal — Calendar demo",
     tagline: "Open-source calendar and appointment-scheduling infrastructure (MIT).",
     lead:
       "A headless-first component: a pure geometry engine + a React layer. Four views, " +
@@ -161,6 +163,14 @@ export function App(): React.JSX.Element {
   const [resetNonce, setResetNonce] = React.useState(0);
 
   const t = UI[locale];
+
+  // Keep the document's language and title in sync with the locale toggle (finding M-4): the static
+  // index.html ships `lang="es"`, so switching to EN must update both `<html lang>` (for assistive
+  // tech + translation heuristics) and the `<title>`. Runs on the client only (the demo is static).
+  React.useEffect(() => {
+    document.documentElement.lang = locale;
+    document.title = t.docTitle;
+  }, [locale, t.docTitle]);
 
   // Refs so the stable `mutate`/`generateId` callbacks see the latest toggles without re-subscribing.
   const rejectRef = React.useRef(reject);

@@ -99,6 +99,11 @@ export function EventChip({
       }
     >
       {timeLabel ? <time className="aethercal-event-time">{timeLabel}</time> : null}
+      {/* A real whitespace text node between the time and the title (the visual gap is a flex `gap`,
+          which is NOT text): without it the chip's visible text is "9:00Consulta" while its
+          accessible name is "9:00 Consulta", tripping axe's label-content-name-mismatch (WCAG 2.5.3,
+          finding M-2). The space matches the two, changes no layout, and keeps the SR name intact. */}
+      {timeLabel ? " " : null}
       <span className="aethercal-event-title">{event.title}</span>
     </div>
   );

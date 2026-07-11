@@ -10,5 +10,9 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     globals: false,
     setupFiles: ["./vitest.setup.ts"],
+    // Let the transform pipeline honor `?raw` CSS imports so styles.overflow.test.ts can read the
+    // stylesheet source and lock the I-1 overflow-containment invariants (vitest otherwise short-
+    // circuits `.css` to an empty module).
+    css: true,
   },
 });

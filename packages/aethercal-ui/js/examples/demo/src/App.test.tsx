@@ -113,6 +113,21 @@ describe("App (demo shell)", () => {
     expect(getByText(/Open-source calendar/i)).toBeTruthy();
   });
 
+  it("syncs <html lang> and document.title with the language toggle (M-4)", () => {
+    const { container } = render(<App />);
+    // Defaults to Spanish on mount.
+    expect(document.documentElement.lang).toBe("es");
+    expect(document.title).toBe("AetherCal — Demo del calendario");
+    // Switching to EN updates both the lang attribute and the title.
+    clickControl(container, "EN");
+    expect(document.documentElement.lang).toBe("en");
+    expect(document.title).toBe("AetherCal — Calendar demo");
+    // And back to ES.
+    clickControl(container, "ES");
+    expect(document.documentElement.lang).toBe("es");
+    expect(document.title).toBe("AetherCal — Demo del calendario");
+  });
+
   it("resets the sample data without crashing and keeps a usable board", () => {
     const { container } = render(<App />);
     const reset = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(

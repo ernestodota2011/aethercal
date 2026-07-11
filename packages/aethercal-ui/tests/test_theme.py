@@ -67,6 +67,23 @@ def test_every_preset_has_readable_body_text() -> None:
         assert _contrast_ratio(theme.fg, theme.bg) >= 4.5, f"{name} fails AA fg-on-bg"
 
 
+def test_light_secondary_and_tertiary_text_meet_aa() -> None:
+    # Regression for the web-qa finding M-1: secondary (`muted`) and tertiary (`faint`) text in the
+    # light (default) theme must also clear WCAG AA (>= 4.5:1), not just the primary body text.
+    # `muted` (event times, day numbers) is worst-case on the event-chip fill; `faint` (out-of-month
+    # numbers, axis, legend) is worst-case on the out-of-month cell. Assert each token against every
+    # light surface it renders on so a palette tweak can't regress it.
+    light = PRESETS["light"]
+    muted_surfaces = (light.bg, light.cell_bg, light.event_bg, light.cell_bg_outside)
+    faint_surfaces = (light.bg, light.cell_bg, light.cell_bg_outside)
+    for surface in muted_surfaces:
+        assert _contrast_ratio(light.muted, surface) >= 4.5, f"light `muted` fails AA on {surface}"
+    for surface in faint_surfaces:
+        assert _contrast_ratio(light.faint, surface) >= 4.5, f"light `faint` fails AA on {surface}"
+    # Keep the visual hierarchy: secondary text stays darker than tertiary text.
+    assert _relative_luminance(light.muted) < _relative_luminance(light.faint)
+
+
 def test_preset_lookup_matches_the_classmethods() -> None:
     assert Theme.preset("dark") == Theme.dark()
     assert Theme.preset("midnight") == Theme.midnight()

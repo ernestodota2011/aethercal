@@ -267,6 +267,10 @@ body {
   counter-increment: step;
   position: relative;
   padding-left: 44px;
+  /* A grid item defaults to `min-width: auto`, so the wide `white-space: pre` <pre> below would
+   * expand this track past the viewport and scroll the WHOLE page sideways on mobile. Pin it to 0 so
+   * the code block honors its own `overflow-x: auto` and scrolls INSIDE its box instead (finding I-1). */
+  min-width: 0;
 }
 
 .demo-steps > li::before {
@@ -296,6 +300,8 @@ body {
   margin: 0;
   padding: 14px 16px;
   overflow-x: auto;
+  /* Belt-and-suspenders for I-1: never let the code block itself exceed its container's width. */
+  max-width: 100%;
   background: var(--ac-cell-bg-outside);
   border: 1px solid var(--ac-border);
   border-radius: 10px;

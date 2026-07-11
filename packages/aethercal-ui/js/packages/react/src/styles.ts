@@ -193,7 +193,10 @@ ${defaultBaseTokenCss()}
   border-left: 3px solid var(--ac-event-accent);
   color: var(--ac-event-fg);
 }
-.aethercal-agenda-event.is-continuation { opacity: 0.8; }
+/* 0.9, not lower: the continuation row's muted event-time must stay >= WCAG AA (4.5:1) on white —
+   at 0.8 the whole-row opacity dimmed it to 3.71 (finding M-1's dimmed-state sibling). The "continues
+   / ends" label already carries the continuation cue, so the lighter dim loses no information. */
+.aethercal-agenda-event.is-continuation { opacity: 0.9; }
 .aethercal-agenda-event-time {
   flex: none;
   min-width: 76px;

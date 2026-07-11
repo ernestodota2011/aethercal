@@ -104,8 +104,13 @@ class Theme(BaseModel):
         """Neutral-premium default: grayscale surfaces, near-black today marker, slate accent."""
         return cls(
             fg="#1f2328",
-            muted="#6b7280",
-            faint="#9ca3af",
+            # Secondary/tertiary text darkened to clear WCAG AA (>=4.5:1) on the light surfaces they
+            # render on: muted (event times, day numbers) is worst-case on the event-chip fill
+            # (--ac-event-bg #eef1f4); faint (out-of-month numbers, axis, legend) is worst-case on
+            # the out-of-month cell (--ac-cell-bg-outside #fafafa). Neutral slate, no lavender/cyan,
+            # and muted stays darker than faint (secondary vs tertiary).
+            muted="#5f6672",
+            faint="#676e79",
             bg="#ffffff",
             header_fg="#4b5563",
             border="#e5e7eb",

@@ -419,7 +419,6 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                     isDropTarget && "is-drop-target",
                   )}
                   data-date={dateOnly}
-                  aria-label={formatDayCellLabel(dateOnly, locale)}
                   onDragOver={dropEnabled ? (e) => e.preventDefault() : undefined}
                   onDrop={dropEnabled ? handleDrop(dateOnly) : undefined}
                   onContextMenu={
@@ -432,8 +431,17 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                       : undefined
                   }
                 >
+                  {/* The cell's accessible name comes from CONTENT, led by this visually-hidden full
+                      date, rather than an author `aria-label` — so a screen reader still hears the
+                      full localized date (then the day's events) while axe's `label-content-name-
+                      mismatch` (WCAG 2.5.3) stays inapplicable: that rule only fires on a gridcell
+                      that carries an author-supplied name diverging from its visible text (finding
+                      M-2). The visible day number is `aria-hidden` because the date already speaks it. */}
+                  <span className="aethercal-sr-only">{formatDayCellLabel(dateOnly, locale)}</span>
                   <div className="aethercal-day-head">
-                    <span className="aethercal-day-number">{Number(dateOnly.slice(-2))}</span>
+                    <span className="aethercal-day-number" aria-hidden="true">
+                      {Number(dateOnly.slice(-2))}
+                    </span>
                   </div>
                   <div className="aethercal-day-events">
                     {visible.map((event) => {
