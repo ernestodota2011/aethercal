@@ -212,7 +212,11 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
 
   const startSelect = React.useCallback(
     (dateOnly: string) => (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!onRangeSelect || e.button !== 0 || e.target !== e.currentTarget) return;
+      // Empty space = anywhere in the column that is NOT an event or a button. Testing the target's
+      // ancestry (not target===currentTarget) means decorative children (hour lines, the select band)
+      // never block a selection, without relying on their CSS pointer-events being none.
+      if (!onRangeSelect || e.button !== 0) return;
+      if ((e.target as Element).closest("[data-event-id], button")) return;
       const colEl = e.currentTarget;
       const minute = fractionToMinuteOfDay(fractionInColumn(e.clientY, colEl), grid.config);
       gestureRef.current = {
@@ -316,7 +320,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
 
   const emptyContextMenu = React.useCallback(
     (dateOnly: string, timed: boolean) => (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!onContextMenu || e.target !== e.currentTarget) return;
+      // Same "empty space" test as select: a right-click on a decorative child (hour line) still
+      // opens the create-here menu; a right-click on an event is handled by the event's own handler.
+      if (!onContextMenu) return;
+      if ((e.target as Element).closest("[data-event-id], button")) return;
       e.preventDefault();
       if (!timed) {
         onContextMenu({ start: `${dateOnly}T00:00:00` });

@@ -355,6 +355,24 @@ describe("F2-D — range select (create) via pointer drag on empty space", () =>
     });
   });
 
+  it("starts a selection even when the pointer lands on a decorative hour line", () => {
+    const onRangeSelect = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onRangeSelect={onRangeSelect} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    const line = col.querySelector(".aethercal-tg-line") as HTMLElement;
+    fireEvent.pointerDown(line, { pointerId: 1, button: 0, clientY: 120 }); // 06:00, on an hour line
+    fireEvent.pointerMove(window, { pointerId: 1, clientY: 240 }); // 12:00
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(onRangeSelect).toHaveBeenCalledWith({
+      start: "2026-07-15T06:00:00",
+      end: "2026-07-15T12:00:00",
+      allDay: false,
+    });
+  });
+
   it("a plain click on empty space (no drag) does not create a range", () => {
     const onRangeSelect = vi.fn();
     const { container } = render(
@@ -443,6 +461,18 @@ describe("F2-D — context menu & click", () => {
     const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
     stubRect(col, 480);
     fireEvent.contextMenu(col, { clientY: 240 }); // 12:00
+    expect(onContextMenu).toHaveBeenCalledWith({ start: "2026-07-15T12:00:00" });
+  });
+
+  it("opens the create-here context menu even when right-clicking a decorative hour line", () => {
+    const onContextMenu = vi.fn();
+    const { container } = render(
+      <AetherCalendar view="day" anchor={ANCHOR} events={[]} onContextMenu={onContextMenu} />,
+    );
+    const col = container.querySelector('.aethercal-tg-col[data-date="2026-07-15"]') as HTMLElement;
+    stubRect(col, 480);
+    const line = col.querySelector(".aethercal-tg-line") as HTMLElement;
+    fireEvent.contextMenu(line, { clientY: 240 }); // 12:00
     expect(onContextMenu).toHaveBeenCalledWith({ start: "2026-07-15T12:00:00" });
   });
 

@@ -168,8 +168,9 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                 onContextMenu={
                   onContextMenu
                     ? (e) => {
-                        // Only an empty part of the cell (not a chip / "+N more" button) creates here.
-                        if (e.target !== e.currentTarget) return;
+                        // Only an empty part of the cell (not a chip / "+N more" button) creates here;
+                        // testing the target's ancestry keeps decorative children from blocking it.
+                        if ((e.target as Element).closest("[data-event-id], button")) return;
                         e.preventDefault();
                         onContextMenu({ start: `${dateOnly}T00:00:00` });
                       }

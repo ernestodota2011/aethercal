@@ -117,6 +117,38 @@ const KEY_TUPLES: Record<string, readonly string[]> = {
   ViewChangePayload: keysOf<ViewChangePayload>()(["view", "from", "to"]),
 };
 
+// The REQUIRED keys of T (a property without `?`). Optionality-off config: an optional property's
+// value includes `undefined`, a required one's does not.
+type RequiredKeys<T> = { [K in keyof T]-?: undefined extends T[K] ? never : K }[keyof T];
+
+// Exhaustive REQUIRED-key tuple: the compiler rejects a tuple that omits any required key of T. So
+// flipping a field between required and optional in TS changes RequiredKeys<T> and forces its tuple
+// to change — then the assertion below catches any divergence from the schema's own `required` set.
+const requiredKeysOf =
+  <T>() =>
+  <U extends readonly RequiredKeys<T>[]>(
+    keys: U & ([RequiredKeys<T>] extends [U[number]] ? unknown : never),
+  ): U =>
+    keys;
+
+// @ts-expect-error - omitting a required key (here `end`) must not type-check
+void requiredKeysOf<EventDropPayload>()(["id", "start"]);
+
+// Which keys each payload requires — pinned by the compiler so TS optionality can't drift.
+const REQUIRED_TUPLES: Record<string, readonly string[]> = {
+  CalendarEvent: requiredKeysOf<CalendarEvent>()(["id", "title", "start", "end"]),
+  EventDropPayload: requiredKeysOf<EventDropPayload>()(["id", "start", "end"]),
+  EventResizePayload: requiredKeysOf<EventResizePayload>()(["id", "start", "end"]),
+  RangeSelectPayload: requiredKeysOf<RangeSelectPayload>()(["start", "end", "allDay"]),
+  EventClickPayload: requiredKeysOf<EventClickPayload>()(["id"]),
+  // ContextMenuPayload is an at-least-one UNION: no field is required in every branch, so the schema
+  // has no flat `required` set (it uses `minProperties: 1` instead). It is excluded from the flat
+  // required-keys tuple; its invariant is enforced by the union type + `minProperties` (tested
+  // above), and the runtime compare below still catches any schema `required` that appears here.
+  ContextMenuPayload: [] as readonly string[],
+  ViewChangePayload: requiredKeysOf<ViewChangePayload>()(["view", "from", "to"]),
+};
+
 describe("calendar-props contract — TS payloads validate against the generated schema", () => {
   it("validates each representative payload against its $def", () => {
     expect(validate(schema.$defs.EventDropPayload, drop, schema)).toEqual([]);
@@ -162,6 +194,13 @@ describe("calendar-props contract — cross-language field-name lock", () => {
     for (const [name, keys] of Object.entries(KEY_TUPLES)) {
       const schemaKeys = Object.keys(schema.$defs[name].properties).sort();
       expect(schemaKeys, `field-name drift in ${name}`).toEqual([...keys].sort());
+    }
+  });
+
+  it("each $def's REQUIRED field set matches the TS type's required keys (optionality lock)", () => {
+    for (const [name, keys] of Object.entries(REQUIRED_TUPLES)) {
+      const schemaRequired = [...((schema.$defs[name].required as string[] | undefined) ?? [])].sort();
+      expect(schemaRequired, `optionality drift in ${name}`).toEqual([...keys].sort());
     }
   });
 
