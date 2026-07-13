@@ -38,6 +38,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import sqlalchemy as sa
 from cryptography.fernet import Fernet
 from icalendar import Calendar
 from sqlalchemy import func, select
@@ -64,6 +65,8 @@ from aethercal.server.services.bookings import (
     BookingNotActiveError,
     BookingNotFoundError,
     BookingParams,
+    DayFullError,
+    EventTypeInactiveError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     _mint_guest_links,
@@ -74,7 +77,7 @@ from aethercal.server.services.bookings import (
     reschedule_booking,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
-from aethercal.server.services.event_types import create_event_type
+from aethercal.server.services.event_types import create_event_type, deactivate_event_type
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
     OutboxEffect,
@@ -110,8 +113,14 @@ async def _schedule(session: AsyncSession, tenant: Tenant) -> Schedule:
     return row
 
 
-async def _event_type(
-    session: AsyncSession, tenant: Tenant, host: User, schedule: Schedule, *, slug: str = "intro"
+async def _event_type(  # noqa: PLR0913 - a test factory: every field is one knob a test turns
+    session: AsyncSession,
+    tenant: Tenant,
+    host: User,
+    schedule: Schedule,
+    *,
+    slug: str = "intro",
+    max_per_day: int | None = None,
 ) -> EventType:
     data = EventTypeCreate(
         host_id=host.id,
@@ -120,15 +129,18 @@ async def _event_type(
         title="Intro",
         duration_seconds=1800,
         max_advance_seconds=60 * 60 * 24 * 30,
+        max_per_day=max_per_day,
     )
     return await create_event_type(session, tenant_id=tenant.id, data=data)
 
 
-async def _seed(session: AsyncSession, tenant_factory: Any) -> tuple[Tenant, EventType]:
+async def _seed(
+    session: AsyncSession, tenant_factory: Any, *, max_per_day: int | None = None
+) -> tuple[Tenant, EventType]:
     tenant = await tenant_factory(session)
     host = await _first_user(session, tenant)
     schedule = await _schedule(session, tenant)
-    event_type = await _event_type(session, tenant, host, schedule)
+    event_type = await _event_type(session, tenant, host, schedule, max_per_day=max_per_day)
     return tenant, event_type
 
 
@@ -687,6 +699,116 @@ async def test_reschedule_a_cancelled_booking_is_refused(
             new_start=_SLOT_11,
             now=_BEFORE,
         )
+
+
+async def test_reschedule_carries_the_guests_phone_and_its_consent_stamp(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The successor is the SAME guest's SAME appointment, so it keeps their phone — and the stamp
+    that says they agreed to be messaged on it.
+
+    Dropping either one silently unsubscribes the guest from every phone channel: the WhatsApp/SMS
+    step reads ``guest_phone`` (skip ``no-phone``) and then ``guest_phone_consent_at`` (skip
+    ``no-phone-consent``), so a reschedule would quietly end the reminders — no error, no log line
+    anybody reads, and the guest simply never hears from us again.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    original = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(
+            event_type.id, _SLOT_9, guest_phone="+13055551234", guest_phone_consent=True
+        ),
+        now=_BEFORE,
+    )
+    assert original.guest_phone == "+13055551234"
+    assert original.guest_phone_consent_at == _BEFORE
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert moved.guest_phone == original.guest_phone
+    assert moved.guest_phone_consent_at == original.guest_phone_consent_at
+
+
+def _sample_guest_value(column: sa.Column[Any]) -> Any:
+    """A distinctive non-null value for a guest column, chosen from its TYPE — never a hand-list.
+
+    This is what makes the inheritance test below structural instead of decorative. A guest column
+    left unpopulated would compare ``None == None`` on both rows and pass while proving nothing, so
+    a column whose type this does not know raises rather than being skipped: adding
+    ``guest_something`` of a new type fails HERE, loudly, and the author has to say what it means.
+    """
+    if isinstance(column.type, sa.String):  # covers Text (a String subclass)
+        value = f"sample-{column.name}"
+        return value[: column.type.length] if column.type.length else value
+    if isinstance(column.type, sa.DateTime):
+        return datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
+    if isinstance(column.type, sa.Boolean):
+        return True
+    if isinstance(column.type, sa.Integer):
+        return 7
+    raise AssertionError(
+        f"{column.name}: no sample value for {column.type!r}. Teach this helper the type — do not "
+        "skip the column, or the reschedule-inheritance assertion silently stops covering it."
+    )
+
+
+async def test_reschedule_inherits_every_guest_column_the_model_declares(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The successor inherits EVERY ``guest_*`` column ``Booking`` declares — read off the metadata,
+    not off a list in this file.
+
+    The bug this pins is not "``guest_phone`` was forgotten". It is that the successor was built by
+    COPYING FIELDS BY HAND, so the set of inherited fields and the set of declared fields were two
+    lists kept in agreement by memory alone. They drifted the moment RF-24 added a column, and
+    nothing failed: the guest simply stopped getting messages.
+
+    So the assertion is derived the way ``test_models_metadata.py`` derives its invariants — from
+    ``Booking.__table__``. Add a guest column tomorrow and this test starts covering it on its own;
+    fail to carry it and this test, not a guest's missing reminder, is what tells you.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    original = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    columns = [col for col in Booking.__table__.columns if col.name.startswith("guest_")]
+    assert columns, "no guest_* columns found — the derivation is broken, not the model"
+    for column in columns:
+        setattr(original, column.name, _sample_guest_value(column))
+    await sqlite_session.flush()
+    await sqlite_session.refresh(original)
+
+    # Compare the successor against what the PREDECESSOR actually holds, not against the literals
+    # above: "inherits" means the two rows agree, and SQLite drops tzinfo on round-trip so the
+    # literals are not what came back. The not-None guard is what keeps this honest — an unpopulated
+    # column would compare None == None and pass while covering nothing.
+    stored = {column.name: getattr(original, column.name) for column in columns}
+    assert all(value is not None for value in stored.values()), (
+        f"every guest column must hold a real value before the move, else the assertion below is "
+        f"vacuous: {stored}"
+    )
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert {name: getattr(moved, name) for name in stored} == stored
 
 
 # --------------------------------------------------------------------------------------
@@ -1463,3 +1585,258 @@ async def test_the_guest_link_we_email_carries_what_the_booking_page_reads(
     # Rescheduling has to re-offer slots, so it needs the event type as well as the booking.
     assert reschedule["event_type"] == [str(event_type.id)]
     assert reschedule["token"]
+
+
+# --------------------------------------------------------------------------------------
+# max_per_day (RF-14) — the write-side gate.
+# --------------------------------------------------------------------------------------
+
+_TUE_SLOT_9 = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
+
+
+async def test_create_booking_is_refused_once_the_day_is_at_its_cap(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A business that sets ``max_per_day=1`` must not take a second booking that day.
+
+    The column was written, persisted and served by the API, and read by NOBODY — so the cap was a
+    setting that did nothing at all. The refusal gets its OWN error (``DayFullError``): "the day is
+    full" and "that time is taken" are different facts about the world, and a guest told the wrong
+    one will keep trying other times on a day that has no room at any hour.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    with pytest.raises(DayFullError):
+        await create_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            params=_params(event_type.id, _SLOT_11, guest_email="second@example.com"),
+            now=_BEFORE,
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 1
+
+
+async def test_the_cap_is_per_day_and_does_not_leak_into_the_next_one(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A full Monday must not close Tuesday — the cap is a daily allowance, not a total."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    tuesday = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _TUE_SLOT_9, guest_email="tuesday@example.com"),
+        now=_BEFORE,
+    )
+
+    assert tuesday.status == BookingStatus.CONFIRMED
+
+
+async def test_a_cancellation_gives_back_the_days_last_place(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """Otherwise one guest could book and cancel and thereby shut the whole day, with an empty diary
+    and no way for the business to reopen it."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    first = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await cancel_booking(sqlite_session, tenant_id=tenant.id, booking_id=first.id, now=_BEFORE)
+
+    replacement = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_11, guest_email="second@example.com"),
+        now=_BEFORE,
+    )
+
+    assert replacement.status == BookingStatus.CONFIRMED
+
+
+async def test_a_booking_can_be_rescheduled_within_the_day_it_alone_filled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A reschedule MOVES an appointment; it does not add one.
+
+    The predecessor is still ``confirmed`` while the new slot is validated, so counting it against
+    the cap would tell the guest the day is full — because of the very booking they are moving. With
+    ``max_per_day=1`` that would make a capped day impossible to reschedule within at all: the most
+    ordinary request there is ("same day, an hour later") would be permanently refused.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    original = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert moved.start_at == _SLOT_11
+    assert moved.status == BookingStatus.CONFIRMED
+    assert await _active_count(sqlite_session, event_type) == 1  # still one booking, moved
+
+
+async def test_rescheduling_into_an_already_full_day_is_refused(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The exclusion is narrow: it forgives the booking being MOVED, not the day it is moving INTO.
+
+    Monday is full because of somebody ELSE's booking, so Tuesday's guest cannot slide into it — the
+    predecessor's exemption must not become a way through the cap.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    tuesday = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _TUE_SLOT_9, guest_email="tuesday@example.com"),
+        now=_BEFORE,
+    )
+
+    with pytest.raises(DayFullError):
+        await reschedule_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            booking_id=tuesday.id,
+            new_start=_SLOT_11,
+            now=_BEFORE,
+        )
+
+    still = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=tuesday.id)
+    assert still is not None
+    assert still.status == BookingStatus.CONFIRMED  # a refused reschedule never touches the old row
+
+
+async def test_no_cap_declared_leaves_the_booking_path_unchanged(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """``max_per_day = NULL`` is the default for every existing event type, and must stay a true
+    absence of a cap — not a cap of zero that quietly stops the business taking bookings."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    assert event_type.max_per_day is None
+    for hour, who in ((9, "a"), (10, "b"), (11, "c")):
+        await create_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            params=_params(
+                event_type.id,
+                datetime(2026, 7, 6, hour, 0, tzinfo=UTC),
+                guest_email=f"{who}@example.com",
+            ),
+            now=_BEFORE,
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 3
+
+
+# --------------------------------------------------------------------------------------
+# active (RF-14) — "deleting" an event type must actually delete it, for guests.
+# --------------------------------------------------------------------------------------
+
+
+async def test_create_booking_on_a_deactivated_event_type_is_refused(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """``active = False`` is the product's DELETE. It must stop taking bookings.
+
+    ``deactivate_event_type`` wrote the flag and nothing ever read it, so "delete this event type"
+    removed it from nothing: the guest path went on accepting bookings for a service the business
+    had withdrawn. The booking API is about to become public, which turns this from embarrassing
+    into a hole.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    assert await deactivate_event_type(
+        sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id
+    )
+
+    with pytest.raises(EventTypeInactiveError):
+        await create_booking(
+            sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 0
+
+
+async def test_a_booking_on_a_deactivated_event_type_can_still_be_cancelled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """==The one thing the fix must not break.==
+
+    Deactivating an event type withdraws it from SALE. It cannot strand the guests who already hold
+    an appointment: a booking nobody can cancel is worse than the bug being fixed — the guest is
+    trapped, and the host keeps an hour they will never get back. So the cancel path deliberately
+    keeps looking the event type up UNFILTERED (``_lock_and_reload_booking``), and only the paths
+    that would take a NEW booking require ``active``.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await deactivate_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id)
+
+    cancelled = await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_BEFORE
+    )
+
+    assert cancelled.status == BookingStatus.CANCELLED
+
+
+async def test_a_booking_on_a_deactivated_event_type_cannot_be_rescheduled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A reschedule OPENS A NEW BOOKING row, so it is a sale — and the service is withdrawn.
+
+    Refusing it explicitly (rather than letting it fall out of an empty slot list) is the honest
+    answer: the business is no longer publishing this service on any day, so there is no time we
+    could truthfully offer. The guest keeps the right to cancel; the business can reactivate.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await deactivate_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id)
+
+    with pytest.raises(EventTypeInactiveError):
+        await reschedule_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            new_start=_SLOT_11,
+            now=_BEFORE,
+        )
+
+    still = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
+    assert still is not None
+    assert still.status == BookingStatus.CONFIRMED

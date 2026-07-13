@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
 from aethercal.server.db.models import Booking, EventType
+from aethercal.server.db.models.booking import guest_columns
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import load_active_connections
 from aethercal.server.services.event_types import get_event_type
@@ -58,7 +59,7 @@ from aethercal.server.services.outbox import (
     enqueue_effect,
     google_dedupe_key,
 )
-from aethercal.server.services.slots import SlotsResult, compute_slots
+from aethercal.server.services.slots import SlotsResult, compute_slots, day_is_at_cap
 from aethercal.server.services.webhooks import enqueue_event
 from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
 
@@ -78,12 +79,33 @@ class EventTypeNotFoundError(BookingError):
     """The event type does not exist for the tenant (→ HTTP 404)."""
 
 
+class EventTypeInactiveError(BookingError):
+    """The event type is deactivated, so it takes no new bookings (RF-14) (→ HTTP 404).
+
+    ==404, not 409, and the API renders it with the SAME code and message as
+    :class:`EventTypeNotFoundError`.== To a guest, a withdrawn service and a service that never
+    existed must look identical, or the 404s become an oracle for enumerating which of a
+    business's event types were switched off. It is a distinct class only so the OPERATOR — who
+    is looking right at the row in their admin list — can be told the useful thing ("it is
+    deactivated") instead of the baffling one ("not found").
+    """
+
+
 class BookingNotFoundError(BookingError):
     """No booking with that id exists for the tenant (→ HTTP 404)."""
 
 
 class SlotUnavailableError(BookingError):
     """The requested slot is not on offer or is already booked (→ HTTP 409)."""
+
+
+class DayFullError(BookingError):
+    """The day has already reached the event type's ``max_per_day`` (RF-14) (→ HTTP 409).
+
+    Its OWN error, not a flavour of :class:`SlotUnavailableError`, because "the day is full" and
+    "that time is taken" are different facts about the world. Told the latter, a guest reasonably
+    tries another hour — and every hour that day will refuse them, for a reason nothing ever states.
+    """
 
 
 class AvailabilityUnavailableError(BookingError):
@@ -199,6 +221,21 @@ def _to_utc(moment: datetime) -> datetime:
     return aware.astimezone(UTC)
 
 
+def _require_bookable(event_type: EventType) -> None:
+    """Refuse to SELL a deactivated event type (RF-14).
+
+    Guards the two paths that open a new booking — ``create_booking`` and ``reschedule_booking``.
+    ==It deliberately does NOT guard ``cancel_booking`` or ``mark_no_show``:== those act on an
+    appointment that already exists, and a business withdrawing a service must never leave its
+    existing guests holding a booking that nobody is allowed to cancel.
+    """
+    if not event_type.active:
+        raise EventTypeInactiveError(
+            f"event type '{event_type.slug}' is deactivated and is not taking bookings; "
+            "reactivate it to make it bookable again"
+        )
+
+
 def _require_slot_on_offer(result: SlotsResult | None, *, start: datetime, end: datetime) -> None:
     """Assert the requested ``[start, end)`` is a slot the availability engine actually offers.
 
@@ -222,12 +259,17 @@ async def _validate_slot(  # noqa: PLR0913 - the window + injected clock are the
     start: datetime,
     end: datetime,
     now: datetime,
+    exclude_booking_id: uuid.UUID | None = None,
 ) -> None:
     """Confirm ``[start, end)`` is on offer for ``event_type`` (RF-03/RF-13).
 
     The window is padded by a day on each side so a slot whose local date differs from its UTC date
     is still computed; the request path injects no ``service_factory`` (RNF-6: read the busy cache
     only, never call Google in-band).
+
+    ``exclude_booking_id`` is forwarded to the daily-cap count (RF-14) for the reschedule path: the
+    booking being moved is still ``confirmed`` here, and it must not be counted as filling the day
+    it is trying to leave. It does NOT free that booking's interval — the slot itself stays busy.
     """
     result = await compute_slots(
         session,
@@ -236,8 +278,56 @@ async def _validate_slot(  # noqa: PLR0913 - the window + injected clock are the
         window_from=(start - timedelta(days=1)).date(),
         window_to=(end + timedelta(days=1)).date(),
         now=now,
+        exclude_booking_id=exclude_booking_id,
     )
     _require_slot_on_offer(result, start=start, end=end)
+
+
+async def _require_day_capacity(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_type: EventType,
+    start: datetime,
+    exclude_booking_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse the booking when ``start``'s day has already reached ``max_per_day`` (RF-14).
+
+    .. rubric:: Why this exists when :func:`_validate_slot` would refuse anyway
+
+    ``compute_slots`` no longer OFFERS a full day's slots, so a request for one would already fall
+    out as :class:`SlotUnavailableError`. This gate runs FIRST anyway, for two reasons:
+
+    * **It tells the truth.** "That time is no longer available" sends a guest hunting for another
+      hour on a day that has no room at any hour. ``DayFullError`` names the actual reason.
+    * **It is the fail-closed backstop.** The offering side and the accepting side now agree by
+      construction (both count through ``services.slots``), but they are still two reads. If the
+      filter ever regressed, this is what keeps the cap from being silently exceeded — and a cap
+      that can be exceeded is exactly the class of bug this whole change is repairing.
+
+    .. rubric:: Concurrency
+
+    ==The daily cap has no database backstop.== The partial unique index enforces "one active
+    booking per slot"; it knows nothing about "N per day", and no index can express it. So the
+    per-host advisory lock (:func:`_serialize_host`, taken by both write paths BEFORE this runs) is
+    the whole guard, and it is sufficient: an event type has exactly one host, so every booking that
+    counts toward this cap contends on the same key. Two concurrent requests for a day's last place
+    serialize; the loser acquires the lock only after the winner's transaction has ended, and its
+    count — a READ COMMITTED read taken under the lock, exactly as the availability re-read is —
+    then SEES the winner's committed row and refuses. On SQLite the lock is a no-op, which is safe
+    for the same reason it is elsewhere here: SQLite serializes writes anyway.
+    """
+    if await day_is_at_cap(
+        session,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        moment=start,
+        exclude_booking_id=exclude_booking_id,
+    ):
+        raise DayFullError(
+            f"{start.date().isoformat()} has reached its limit of {event_type.max_per_day} "
+            "bookings for this event type"
+        )
 
 
 def _serialize_booking(booking: Booking) -> dict[str, object]:
@@ -354,11 +444,19 @@ async def create_booking(
     )
     if event_type is None:
         raise EventTypeNotFoundError("event type not found")
+    # A DEACTIVATED event type is withdrawn from sale and takes no new bookings (RF-14). The row is
+    # fetched unfiltered above and checked here, rather than through ``get_bookable_event_type``,
+    # only so the OPERATOR can be told *why* — the guest is answered with an indistinguishable 404.
+    _require_bookable(event_type)
 
     start = _to_utc(params.start)
     end = start + timedelta(seconds=event_type.duration_seconds)
 
     await _serialize_host(session, tenant_id=tenant_id, host_id=event_type.host_id)
+    # Under the lock, so the count sees every committed rival (see :func:`_require_day_capacity`).
+    # Before the slot check, so a guest whose day is FULL is told that, and not sent hunting for
+    # another hour on a day where no hour can be had.
+    await _require_day_capacity(session, tenant_id=tenant_id, event_type=event_type, start=start)
     await _validate_slot(
         session, tenant_id=tenant_id, event_type=event_type, start=start, end=end, now=now
     )
@@ -514,18 +612,63 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     otherwise each see it active and each open a replacement (different ``start_at`` slips past the
     partial index) — a double-booking hole. Serializing on the lock and re-checking the committed
     status closes it: the loser sees it already cancelled/rescheduled and is refused (not active).
+
+    .. rubric:: The successor inherits the guest — INCLUDING their phone-consent stamp
+
+    Every ``guest_*`` column is carried over, read off the model by :func:`guest_columns` rather
+    than named in a literal here (a hand-copied list already dropped two of them in silence).
+
+    ``guest_phone_consent_at`` is inherited DELIBERATELY, and it is worth arguing rather than
+    assuming, because it is a record about a real person's agreement to be messaged. It is the same
+    guest, the same phone number, and the same appointment — moved, not replaced. The consent they
+    gave was to be messaged ABOUT THIS APPOINTMENT, and a reschedule is precisely the moment that
+    matters most: it is the message that tells them the time changed and reminds them of the new
+    one. Re-asking would be absurd (nobody re-consents to a reminder because the meeting moved an
+    hour), and DROPPING it — which is what the old code did by accident — silently withdraws a
+    consent the guest never withdrew, and ends the messages they asked for.
+
+    ==Its meaning does not widen by being inherited.== It remains a stamp that the box was ticked on
+    the form, at that original instant, by whoever filled it in — never proof that the OWNER of the
+    number agreed (an unverified number is a DECLARED GAP, ``docs/phone-channels.md``). The stamp
+    carried forward is the ORIGINAL tick's, not ``now``: back-dating it would be a lie, and
+    re-stamping it would forge a fresh agreement nobody gave. A guest who never ticked the box
+    inherits ``NULL`` and stays unmessaged, exactly as before.
     """
     old, event_type = await _lock_and_reload_booking(
         session, tenant_id=tenant_id, booking_id=booking_id
     )
     if old.status != BookingStatus.CONFIRMED:
         raise BookingNotActiveError("only a confirmed booking can be rescheduled")
+    # A reschedule OPENS A NEW BOOKING (the successor row below), so it is a sale — and a
+    # deactivated event type is withdrawn from sale (RF-14). Refused explicitly, rather than left to
+    # fall out of an empty slot list, because it is the honest answer: the business publishes this
+    # service on no day at all, so there is no time we could truthfully offer instead. ==Cancelling
+    # is NOT gated on ``active``== (see :func:`cancel_booking`) — withdrawing a service must never
+    # trap the guests already holding an appointment for it.
+    _require_bookable(event_type)
 
     start = _to_utc(new_start)
     end = start + timedelta(seconds=event_type.duration_seconds)
 
+    # RF-14. ``old`` is excluded from the daily count on both gates: it is still ``confirmed`` at
+    # this point and is about to be cancelled, so counting it would let a booking be blocked by
+    # itself — a capped day could never be rescheduled WITHIN. The exemption is exactly one booking
+    # wide: a day filled by somebody else still refuses (``DayFullError``).
+    await _require_day_capacity(
+        session,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        start=start,
+        exclude_booking_id=old.id,
+    )
     await _validate_slot(
-        session, tenant_id=tenant_id, event_type=event_type, start=start, end=end, now=now
+        session,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        start=start,
+        end=end,
+        now=now,
+        exclude_booking_id=old.id,
     )
 
     new = Booking(
@@ -534,10 +677,12 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         start_at=start,
         end_at=end,
         status=BookingStatus.CONFIRMED,
-        guest_name=old.guest_name,
-        guest_email=old.guest_email,
-        guest_timezone=old.guest_timezone,
-        guest_notes=old.guest_notes,
+        # EVERY guest column, DERIVED from the model (:func:`guest_columns`) instead of named here.
+        # The literal that used to sit in this spot listed four of the six and silently dropped the
+        # other two — see that function's docstring for what it cost the guest.
+        **{name: getattr(old, name) for name in guest_columns()},
+        # ``answers`` is COPIED, not aliased: one shared dict would let a later edit of either row
+        # rewrite the other's history.
         answers=dict(old.answers),
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
@@ -964,6 +1109,8 @@ __all__ = [
     "BookingNotEndedError",
     "BookingNotFoundError",
     "BookingParams",
+    "DayFullError",
+    "EventTypeInactiveError",
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",

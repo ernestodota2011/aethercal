@@ -36,6 +36,8 @@ from aethercal.server.services.bookings import (
     BookingNotEndedError,
     BookingNotFoundError,
     BookingParams,
+    DayFullError,
+    EventTypeInactiveError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     cancel_booking,
@@ -82,7 +84,12 @@ def _map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - i
     different failures start answering with the same code — and how "the appointment has not ended
     yet" would reach an admin as "Booking could not be completed"."""
     match exc:
-        case EventTypeNotFoundError():
+        case EventTypeNotFoundError() | EventTypeInactiveError():
+            # ==Deliberately ONE arm.== A deactivated event type and one that never existed must be
+            # indistinguishable to a guest — same status, same code, same words. Give the withdrawn
+            # one its own answer and the 404s become an oracle: a stranger could enumerate exactly
+            # which of a business's event types have been switched off. The operator is told the
+            # useful version through the admin's own error map, where the audience is known.
             return _http(status.HTTP_404_NOT_FOUND, "not_found", "Event type not found")
         case BookingNotFoundError():
             return _http(status.HTTP_404_NOT_FOUND, "not_found", "Booking not found")
@@ -106,6 +113,15 @@ def _map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - i
                 status.HTTP_409_CONFLICT,
                 "not_active",
                 "Booking is not in a state that allows this operation",
+            )
+        case DayFullError():
+            # Its OWN machine code, like `not_ended` above and for the same reason: told
+            # `slot_unavailable`, a guest tries the next hour, and the next — every one of which
+            # refuses them, because it is the DAY that is full and no hour on it can be had.
+            return _http(
+                status.HTTP_409_CONFLICT,
+                "day_full",
+                "That day is fully booked; please choose another day",
             )
         case SlotUnavailableError():
             return _http(

@@ -24,6 +24,7 @@ from aethercal.server.services.event_types import (
     InvalidReferenceError,
     create_event_type,
     deactivate_event_type,
+    get_bookable_event_type,
     get_event_type,
     list_event_types,
     to_core_event_type,
@@ -379,3 +380,46 @@ async def test_to_core_event_type_maps_absent_increment_to_none(
     )
     core = to_core_event_type(row)
     assert core.increment is None
+
+
+async def test_the_admin_keeps_its_full_view_of_a_deactivated_event_type(
+    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+) -> None:
+    """The blast-radius guard on the ``active`` fix (RF-14).
+
+    Guests must not be able to book or even SEE a deactivated event type. The operator must still be
+    able to see it, inspect it, and turn it back on — otherwise "deactivate" becomes a one-way door
+    that hides the row from the only person who can undo it. So the filtering lives on the GUEST
+    lookup (:func:`get_bookable_event_type`), and these admin reads stay deliberately unfiltered.
+
+    This test exists to fail if someone later "tidies up" by moving the ``active`` filter into
+    ``get_event_type`` / ``list_event_types``, which would silently break the admin.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    payload = await _make_payload(sqlite_session, tenant)
+    row = await create_event_type(sqlite_session, tenant_id=tenant.id, data=payload)
+    await deactivate_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=row.id)
+
+    # The admin's reads still see it...
+    found = await get_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=row.id)
+    assert found is not None
+    assert found.active is False
+    listed = await list_event_types(sqlite_session, tenant_id=tenant.id)
+    assert [e.id for e in listed] == [row.id]
+
+    # ...the guest's read does not...
+    assert (
+        await get_bookable_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=row.id)
+    ) is None
+
+    # ...and the operator can turn it back on, which puts it back on sale.
+    reactivated = await update_event_type(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=row.id,
+        data=EventTypeUpdate(active=True),
+    )
+    assert reactivated is not None and reactivated.active is True
+    assert (
+        await get_bookable_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=row.id)
+    ) is not None
