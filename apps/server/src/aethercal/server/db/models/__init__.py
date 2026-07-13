@@ -1,4 +1,4 @@
-"""All ORM models. Importing this package registers every MVP table on ``Base.metadata``."""
+"""All ORM models. Importing this package registers every table on ``Base.metadata``."""
 
 from __future__ import annotations
 
@@ -13,6 +13,12 @@ from aethercal.server.db.models.outbox import Outbox
 from aethercal.server.db.models.scheduling import DateOverride, EventType, Schedule
 from aethercal.server.db.models.tenancy import ApiKey, Tenant, User
 from aethercal.server.db.models.webhooks import Webhook, WebhookDelivery
+from aethercal.server.db.models.workflows import (
+    Workflow,
+    WorkflowStep,
+    WorkflowTemplate,
+    WorkflowTrigger,
+)
 
 __all__ = [
     "ApiKey",
@@ -30,4 +36,8 @@ __all__ = [
     "User",
     "Webhook",
     "WebhookDelivery",
+    "Workflow",
+    "WorkflowStep",
+    "WorkflowTemplate",
+    "WorkflowTrigger",
 ]

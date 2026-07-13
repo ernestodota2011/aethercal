@@ -46,12 +46,25 @@ class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     last_attempt_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     next_retry_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
+    # --- Lease (R8) -------------------------------------------------------------------------
+    # A drain worker CLAIMS a row (status='claimed') in a short transaction, then runs its network
+    # I/O with NO transaction open, so a slow SMTP/Google/WhatsApp call can no longer pin a row lock
+    # and a pool connection for the length of the send. The claim is only safe if a worker that dies
+    # mid-send cannot strand the row forever — hence the LEASE: ``claimed_by`` says who holds it,
+    # ``lease_expires_at`` says until when. A recovery pass returns any row whose lease elapsed to
+    # ``pending`` WITHOUT consuming an attempt (the worker died; the effect did not fail). Both NULL
+    # for a row that is not currently claimed.
+    claimed_by: Mapped[str | None] = mapped_column(sa.String(64))
+    lease_expires_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+
     __table_args__ = (
         # One intent per (booking, effect+variant): a re-run of the same transition never enqueues a
         # duplicate, and the poller's at-least-once retries stay effectively-once.
         sa.UniqueConstraint("tenant_id", "booking_id", "dedupe_key"),
         # The poller's due-scan predicate (status + next_retry_at), mirroring the webhook queue.
         sa.Index("ix_outbox_due", "status", "next_retry_at"),
+        # The recovery pass's predicate: the claimed rows whose lease has elapsed.
+        sa.Index("ix_outbox_lease", "status", "lease_expires_at"),
     )
 
 

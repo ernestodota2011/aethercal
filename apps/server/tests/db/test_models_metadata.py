@@ -16,10 +16,12 @@ from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db import Base
 from aethercal.server.db.migrate import run_migrations
 
-# The MVP entity set (F1); nothing from F2+ (no Workflow, Payment, Membership/RBAC, multi-host).
-# ``outbox`` (the transactional-outbox queue for booking post-commit effects) landed with the F1-05
-# residual fix in migration 0003. This set is asserted exactly, so an accidental omission or a stray
-# extra table fails loudly.
+# The F1 MVP core, plus the shared foundation this cut lands: the multichannel Workflow tables
+# (migration 0005). Payments, RBAC/memberships and per-tenant credentials are deliberately NOT here
+# — they ship with the payments/tenancy batch, which carries its own migration and its own gate.
+# ``outbox`` (the transactional-outbox queue for a booking's post-commit effects, and now also the
+# durable scheduler) landed with the F1-05 residual fix in migration 0003. This set is asserted
+# EXACTLY, so an accidental omission or a stray extra table fails loudly.
 EXPECTED_TABLES = {
     "tenants",
     "users",
@@ -36,6 +38,10 @@ EXPECTED_TABLES = {
     "webhook_deliveries",
     "sent_notifications",
     "outbox",
+    # 0005 — multichannel workflows (RF-24/25).
+    "workflows",
+    "workflow_steps",
+    "workflow_templates",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.
@@ -73,12 +79,60 @@ def test_every_table_has_a_primary_key() -> None:
         assert list(table.primary_key.columns), f"{name} has no primary key"
 
 
+def _unique_index_column_sets(table_name: str) -> set[tuple[str, ...]]:
+    table = Base.metadata.tables[table_name]
+    return {tuple(col.name for col in index.columns) for index in table.indexes if index.unique}
+
+
 def test_tenant_scoping_unique_constraints() -> None:
     assert ("tenant_id", "email") in _unique_column_sets("users")
     assert ("tenant_id", "slug") in _unique_column_sets("event_types")
     assert ("tenant_id", "name") in _unique_column_sets("schedules")
     assert ("tenant_id", "schedule_id", "date") in _unique_column_sets("date_overrides")
-    assert ("tenant_id", "booking_id", "kind") in _unique_column_sets("sent_notifications")
+    assert ("tenant_id", "workflow_id", "position") in _unique_column_sets("workflow_steps")
+    assert ("tenant_id", "channel", "kind", "locale") in _unique_column_sets("workflow_templates")
+
+
+def test_the_notification_ledger_is_unique_per_kind_channel_and_step() -> None:
+    """RF-24 generalises the ledger from ``(booking, kind)`` to
+    ``(booking, kind, channel, step_id)`` — a workflow may send the same kind on two channels, and
+    two steps of one workflow may share a kind.
+
+    It MUST be expressed as the partial-index PAIR, not a single five-column ``UNIQUE``: on both
+    PostgreSQL and SQLite, NULLs inside a UNIQUE compare as DISTINCT, so a flat constraint would
+    admit unlimited duplicates for every row with ``step_id IS NULL`` — i.e. it would silently stop
+    protecting the confirmation, the cancellation and the reminder, which is every message that
+    exists today."""
+    indexes = _unique_index_column_sets("sent_notifications")
+    assert ("tenant_id", "booking_id", "kind", "channel") in indexes
+    assert ("tenant_id", "booking_id", "kind", "channel", "step_id") in indexes
+
+    by_name = {index.name: index for index in Base.metadata.tables["sent_notifications"].indexes}
+    null_step = by_name["uq_sent_notifications_kind_channel"]
+    real_step = by_name["uq_sent_notifications_kind_channel_step"]
+    # Both predicates are declared for BOTH backends, so the offline (SQLite) suite proves the same
+    # guarantee production (PostgreSQL) enforces.
+    for index, predicate in ((null_step, "step_id IS NULL"), (real_step, "step_id IS NOT NULL")):
+        for dialect in ("postgresql_where", "sqlite_where"):
+            assert str(index.dialect_kwargs[dialect]) == predicate
+
+    # The flat legacy constraint is GONE — leaving it would keep rejecting the second channel of a
+    # workflow step, which is exactly what RF-24 needs to allow.
+    assert ("tenant_id", "booking_id", "kind") not in _unique_column_sets("sent_notifications")
+
+
+def test_the_outbox_carries_its_lease_columns() -> None:
+    """R8: a worker claims a row and then does its network I/O with no transaction open. The lease
+    is what makes that safe — a worker that dies mid-send must not strand the row forever."""
+    table = Base.metadata.tables["outbox"]
+    assert table.c["claimed_by"].nullable
+    assert table.c["lease_expires_at"].nullable
+    assert "ix_outbox_lease" in {index.name for index in table.indexes}
+
+
+def test_a_workflow_may_apply_to_every_event_type() -> None:
+    """RF-24: ``workflows.event_type_id`` NULL = the rule applies to all of the tenant's types."""
+    assert Base.metadata.tables["workflows"].c["event_type_id"].nullable
 
 
 def test_tenant_slug_is_globally_unique() -> None:
@@ -88,8 +142,8 @@ def test_tenant_slug_is_globally_unique() -> None:
 
 def test_api_key_prefix_is_globally_unique() -> None:
     # API auth extracts the prefix from the presented key, looks up the row (which identifies the
-    # tenant), then verifies the hash — so the prefix must be unique across all tenants, not
-    # scoped by tenant_id.
+    # tenant), then verifies the hash — so the prefix must be unique across all tenants, not scoped
+    # by tenant_id.
     column = Base.metadata.tables["api_keys"].c["prefix"]
     assert column.unique or ("prefix",) in _unique_column_sets("api_keys")
 
@@ -125,8 +179,7 @@ def test_event_type_translation_columns_are_json_overrides_with_empty_default(
     base-locale ``title``/``description`` under English chrome. ``title``/``description`` stay the
     canonical fallback (the tenant's base locale); the ``*_translations`` columns hold only sparse
     locale overrides (e.g. ``{"en": "Discovery call"}``), defaulting to ``{}`` so no backfill is
-    needed for existing rows.
-    """
+    needed for existing rows."""
     table = Base.metadata.tables["event_types"]
     for name in ("title_translations", "description_translations"):
         column = table.c[name]
@@ -137,8 +190,8 @@ def test_event_type_translation_columns_are_json_overrides_with_empty_default(
         )
         assert column.default.arg(None) == {}, f"{name} must default to an empty dict"
 
-    # SQLite parity: the migration must create exactly the columns the model declares (no DB
-    # server required — this runs on every CI cell, same discipline as test_migration_parity.py).
+    # SQLite parity: the migration must create exactly the columns the model declares (no DB server
+    # required — this runs on every CI cell, same discipline as test_migration_parity.py).
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'event_type_translations.sqlite'}")
     run_migrations(engine)
     inspector = sa.inspect(engine)
