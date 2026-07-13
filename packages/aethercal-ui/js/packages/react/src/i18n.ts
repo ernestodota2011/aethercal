@@ -60,6 +60,8 @@ export interface CalendarMessages {
   timelineResources: string;
   /** Row label for events whose resource is missing or unknown (never silently dropped). */
   timelineUnassigned: string;
+  /** Empty state: the timeline has no rows at all (no resources, and nothing unassigned). */
+  timelineEmpty: string;
   /** How many resources a timeline group holds, shown on its header. */
   timelineGroupCount: (count: number) => string;
   /** Announced when a timeline group is expanded. */
@@ -98,6 +100,7 @@ const en: CalendarMessages = {
   viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda", timeline: "Timeline" },
   timelineResources: "Resources",
   timelineUnassigned: "Unassigned",
+  timelineEmpty: "No resources to show",
   timelineGroupCount: (n) => (n === 1 ? "1 resource" : `${n} resources`),
   groupExpanded: (group) => `${group} expanded`,
   groupCollapsed: (group) => `${group} collapsed`,
@@ -138,6 +141,7 @@ const es: CalendarMessages = {
   viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda", timeline: "Cronograma" },
   timelineResources: "Recursos",
   timelineUnassigned: "Sin asignar",
+  timelineEmpty: "No hay recursos para mostrar",
   timelineGroupCount: (n) => (n === 1 ? "1 recurso" : `${n} recursos`),
   groupExpanded: (group) => `${group} desplegado`,
   groupCollapsed: (group) => `${group} plegado`,

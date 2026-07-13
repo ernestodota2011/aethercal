@@ -239,6 +239,64 @@ describe("timeline — dragging an event onto another resource", () => {
   });
 });
 
+describe("timeline — empty state", () => {
+  it("renders an accessible empty state and NO dangling activedescendant when there is nothing to show", () => {
+    // With no resources and no events there is no cell to be active. Pointing
+    // `aria-activedescendant` at an id that does not exist strands a screen reader on a dead anchor,
+    // so the attribute must be absent — and the grid must still say something.
+    const { getByRole, container } = renderTimeline({ resources: [], events: [] });
+    const grid = getByRole("grid");
+
+    expect(grid.hasAttribute("aria-activedescendant")).toBe(false);
+    expect(getByRole("gridcell").textContent).toBe("No resources to show");
+    expect(container.querySelectorAll(".aethercal-tl-rowhead")).toHaveLength(0);
+  });
+
+  it("keeps the activedescendant pointing at a real node once rows exist", () => {
+    const { getByRole, container } = renderTimeline();
+    const id = getByRole("grid").getAttribute("aria-activedescendant")!;
+    expect(container.querySelector(`[id="${id}"]`)).toBeTruthy();
+  });
+
+  it("does not crash navigating an empty timeline by keyboard", () => {
+    const { getByRole } = renderTimeline({ resources: [], events: [] });
+    const grid = getByRole("grid");
+    for (const key of ["ArrowDown", "ArrowUp", "ArrowRight", "Enter", "Escape"]) {
+      fireEvent.keyDown(grid, { key });
+    }
+    expect(grid.hasAttribute("aria-activedescendant")).toBe(false);
+  });
+});
+
+describe("timeline — no dishonest drag affordance", () => {
+  it("is not draggable when the host wired no onEventDrop", () => {
+    // Otherwise the user drags the bar, drops it, and nothing happens — a silent no-op in the
+    // interaction layer, which is worse than having no affordance at all.
+    const { container } = renderTimeline();
+    const bar = container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+    expect(bar.getAttribute("draggable")).toBe("false");
+  });
+
+  it("is draggable once onEventDrop is wired", () => {
+    const { container } = renderTimeline({ onEventDrop: () => {} });
+    const bar = container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+    expect(bar.getAttribute("draggable")).toBe("true");
+  });
+
+  it("refuses to start a drag gesture when there is no onEventDrop", () => {
+    const { container } = renderTimeline();
+    const bar = container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+    const setData = vi.fn();
+
+    fireEvent.dragStart(bar, { dataTransfer: { setData, effectAllowed: "" } });
+
+    // The gesture never starts: nothing is written to the dataTransfer, and the grid never enters
+    // the dragging state.
+    expect(setData).not.toHaveBeenCalled();
+    expect(container.querySelector(".aethercal-timeline.is-dragging")).toBeNull();
+  });
+});
+
 describe("timeline — creating on a row", () => {
   it("names the row a drag-to-create was drawn on", () => {
     const onRangeSelect = vi.fn();

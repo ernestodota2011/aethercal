@@ -197,6 +197,8 @@ ${defaultTimelineTokenCss()}
   pointer-events: none;
   z-index: 2;
 }
+/* The empty state is a real row, but it has no resource column to align to — it spans the full width. */
+.aethercal-tl-row-empty { grid-template-columns: minmax(0, 1fr); }
 .aethercal-tl-empty { padding: 12px 10px; font-size: 12px; color: var(--ac-muted); }
 @keyframes aethercal-tl-rollback {
   0% { outline: 2px solid var(--ac-rollback); outline-offset: 1px; }

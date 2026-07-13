@@ -100,3 +100,43 @@ describe("no ARIA lies", () => {
     expect(getAllByRole("button", { name: /Consulta/ }).length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe("no dishonest drag affordance", () => {
+  const RESOURCES = [{ id: "h1", title: "Dr. Rivas" }];
+  const homed = events.map((e) => ({ ...e, resourceId: "h1" }));
+
+  it("marks NO event draggable in any view when the host wired no onEventDrop", () => {
+    // A draggable chip with nowhere to drop is a silent no-op: the user drags it, releases it, and
+    // nothing happens — no error, no change. The affordance must not exist unless the drop can land.
+    for (const view of ["month", "week", "day", "timeline"] as const) {
+      const { container, unmount } = render(
+        <AetherCalendar
+          view={view}
+          anchor={ANCHOR}
+          now={NOW}
+          events={homed}
+          resources={RESOURCES}
+        />,
+      );
+      expect(container.querySelector('[draggable="true"]'), `${view}: dishonest drag`).toBeNull();
+      unmount();
+    }
+  });
+
+  it("marks an editable event draggable in every view once onEventDrop is wired", () => {
+    for (const view of ["month", "week", "day", "timeline"] as const) {
+      const { container, unmount } = render(
+        <AetherCalendar
+          view={view}
+          anchor={ANCHOR}
+          now={NOW}
+          events={homed}
+          resources={RESOURCES}
+          onEventDrop={() => {}}
+        />,
+      );
+      expect(container.querySelector('[draggable="true"]'), `${view}: missing drag`).toBeTruthy();
+      unmount();
+    }
+  });
+});

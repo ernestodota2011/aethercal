@@ -286,10 +286,17 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
     [interaction, events, onEventDrop, days, timeline.config],
   );
 
-  const onDragStart = React.useCallback((eventId: string) => {
-    if (gestureRef.current?.kind === "resize") return;
-    dispatch({ type: "DRAG_START", eventId });
-  }, []);
+  const onDragStart = React.useCallback(
+    (eventId: string) => {
+      // No drop handler means a drag can lead nowhere. Refuse the gesture at the source rather than
+      // let the user drag a bar around and silently drop it into a void.
+      if (!onEventDrop) return false;
+      if (gestureRef.current?.kind === "resize") return false;
+      dispatch({ type: "DRAG_START", eventId });
+      return true;
+    },
+    [onEventDrop],
+  );
   const onDragEnd = React.useCallback(() => dispatch({ type: "CANCEL" }), []);
 
   // ---- resize / select (Pointer Events) --------------------------------------------------------
@@ -498,11 +505,20 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
     }
   }, [navigableEvents, activeEventId, kbGrab]);
 
-  const activeDescendantId = kbGrab
-    ? evtDomId(kbGrab.eventId)
-    : activeEventId
-      ? evtDomId(activeEventId)
-      : itemDomId(activeItem);
+  /**
+   * The node the grid's focus points at — or `undefined` when there is nothing to point at. An EMPTY
+   * timeline (no resources, and nothing unassigned) renders no items, so naming an `activeItem` id
+   * here would reference a node that does not exist and strand a screen reader on a dangling anchor.
+   * The attribute is omitted entirely instead, and the grid renders a real empty state (below).
+   */
+  const activeDescendantId: string | undefined =
+    timeline.items.length === 0
+      ? undefined
+      : kbGrab
+        ? evtDomId(kbGrab.eventId)
+        : activeEventId
+          ? evtDomId(activeEventId)
+          : itemDomId(activeItem);
 
   const resourceTitleOf = React.useCallback(
     (resourceId: string): string =>
@@ -817,7 +833,9 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
         role="grid"
         aria-label={messages.viewNames.timeline}
         aria-describedby={hintId}
-        aria-activedescendant={activeDescendantId}
+        {...(activeDescendantId !== undefined
+          ? { "aria-activedescendant": activeDescendantId }
+          : {})}
         tabIndex={0}
         data-view="timeline"
         style={rootStyle}
@@ -846,6 +864,18 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
             container — axe `scrollable-region-focusable`. The grid's arrow-key navigation still runs:
             the handler sits on the focusable grid root and catches the bubbled keydown. */}
         <div className="aethercal-tl-body" role="rowgroup" tabIndex={0}>
+          {/* Nothing to show: no resources, and no unassigned events either. Say so in a REAL row +
+              gridcell (so the grid pattern stays coherent) instead of rendering an empty body that a
+              screen reader would read as a grid with no content. `aria-activedescendant` is omitted
+              while this is up — there is genuinely no cell to be active. */}
+          {timeline.items.length === 0 ? (
+            <div className="aethercal-tl-row aethercal-tl-row-empty" role="row">
+              <div role="gridcell" className="aethercal-tl-empty">
+                {messages.timelineEmpty}
+              </div>
+            </div>
+          ) : null}
+
           {timeline.items.map((item, index) => {
             const isItemActive = !activeEventId && !kbGrab && index === activeItem;
 
@@ -972,20 +1002,24 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
                           kbGrab?.eventId === event.id && "is-grabbed",
                         )}
                         {...(eventInteractive(event) ? { role: "button" } : {})}
-                        draggable={editable}
+                        // Draggable ONLY when a drop can actually land somewhere: an editable event
+                        // whose host wired `onEventDrop`. Advertising a drag the component will
+                        // silently swallow is a promise the UI cannot keep.
+                        draggable={editable && dropEnabled}
                         data-event-id={event.id}
                         data-lane={block.lane}
                         aria-label={`${timeLabel} ${event.title}`}
                         title={event.title}
                         style={style}
                         onDragStart={(e) => {
-                          if (gestureRef.current?.kind === "resize") {
+                          // Belt and braces: a plain-JS consumer (or a stray `draggable` in the DOM)
+                          // must not be able to start a gesture that has nowhere to go.
+                          if (!onDragStart(event.id)) {
                             e.preventDefault();
                             return;
                           }
                           e.dataTransfer.setData("text/plain", event.id);
                           e.dataTransfer.effectAllowed = "move";
-                          onDragStart(event.id);
                         }}
                         onDragEnd={onDragEnd}
                         onClick={onEventClick ? () => onEventClick({ id: event.id }) : undefined}
