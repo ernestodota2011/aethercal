@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Collection, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import assert_never
 
@@ -54,6 +54,7 @@ from aethercal.server.db.models import Booking, Workflow, WorkflowStep
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.services.outbox import (
     OutboxEffect,
+    as_utc,
     enqueue_effect,
     void_pending_steps,
     workflow_step_dedupe_key,
@@ -65,6 +66,7 @@ _logger = logging.getLogger(__name__)
 # the leaf model module: the outbox classifies staleness by trigger, and the engine will import the
 # outbox to enqueue — declaring the vocabulary here would close that into an import cycle.
 __all__ = [
+    "DEFAULT_LOCALE",
     "DEFAULT_REMINDER_KIND",
     "DEFAULT_REMINDER_NAME",
     "DEFAULT_REMINDER_OFFSET_MINUTES",
@@ -72,8 +74,10 @@ __all__ = [
     "StepAction",
     "WorkflowTrigger",
     "apply_booking_transition",
+    "notify_payload",
     "seed_default_workflows",
     "step_action",
+    "step_send_time",
     "triggers_to_materialise",
     "triggers_to_void",
 ]
@@ -196,6 +200,35 @@ DEFAULT_REMINDER_NAME = "24h reminder"
 DEFAULT_REMINDER_OFFSET_MINUTES = -1440
 DEFAULT_REMINDER_KIND = "reminder"
 
+DEFAULT_LOCALE = "es"
+"""Spanish is the primary locale (RNF-1). Used when nothing else knows what the guest booked in."""
+
+
+def notify_payload(  # noqa: PLR0913 - the payload IS the contract; each field is load-bearing
+    *,
+    workflow_id: uuid.UUID,
+    step_id: uuid.UUID,
+    trigger: WorkflowTrigger,
+    channel: Channel,
+    kind: str,
+    locale: str,
+) -> dict[str, object]:
+    """The NOTIFY intent's payload — built in ONE place, read by the drain.
+
+    Every field is load-bearing downstream: ``trigger`` decides the step's staleness policy,
+    ``workflow_id`` is what lets the drain check the rule is still switched on, ``step_id`` +
+    ``channel`` are the ledger identity that makes the message exactly-once, and ``kind`` +
+    ``locale`` choose the body. Two hand-rolled copies of this dict is how a field quietly goes
+    missing from one producer's rows and the drain starts skipping them."""
+    return {
+        "trigger": trigger.value,
+        "workflow_id": str(workflow_id),
+        "step_id": str(step_id),
+        "channel": channel.value,
+        "kind": kind,
+        "locale": locale,
+    }
+
 
 async def seed_default_workflows(session: AsyncSession, *, tenant_id: uuid.UUID) -> Workflow | None:
     """Give a new tenant the default 24 h reminder rule. ``None`` if it already has one.
@@ -235,23 +268,27 @@ async def seed_default_workflows(session: AsyncSession, *, tenant_id: uuid.UUID)
     return workflow
 
 
-def _as_utc(moment: datetime) -> datetime:
-    """SQLite drops tzinfo on the round-trip; normalise before doing arithmetic on it."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
-
-
-def _send_time(trigger: WorkflowTrigger, *, booking: Booking, offset: timedelta) -> datetime | None:
+def step_send_time(
+    trigger: WorkflowTrigger, *, booking: Booking, offset: timedelta
+) -> datetime | None:
     """When a step for ``trigger`` is due. ``None`` = as soon as the next drain runs.
 
     The anchor is the trigger's own moment, and ``offset_minutes`` is SIGNED — ``before_start``
     carries ``-1440``, so the addition just works. The event-shaped triggers (``on_booking``,
-    ``on_cancel``, ``on_no_show``) fire now: they report something that has just happened.
+    ``on_cancel``, ``on_no_show``) fire now: they report something that has just happened, so the
+    offset is IGNORED for them — which is exactly why the rule CRUD refuses to store one (a tenant
+    would otherwise schedule "2 h after the cancellation" and watch it go out immediately).
+
+    Public because it is the ONE definition of a step's send time: the materialiser
+    (:func:`apply_booking_transition`) and the rule CRUD's reconcile both read it. Two copies of
+    this arithmetic is how the queue and the rule come to disagree about when a reminder goes
+    out.
     """
     match trigger:
         case WorkflowTrigger.BEFORE_START:
-            return _as_utc(booking.start_at) + offset
+            return as_utc(booking.start_at) + offset
         case WorkflowTrigger.AFTER_END:
-            return _as_utc(booking.end_at) + offset
+            return as_utc(booking.end_at) + offset
         case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
             return None
         case _ as unreachable:
@@ -286,7 +323,7 @@ async def apply_booking_transition(
     booking: Booking,
     transition: BookingTransition,
     now: datetime,
-    locale: str = "es",
+    locale: str = DEFAULT_LOCALE,
 ) -> list[uuid.UUID]:
     """Bring a booking's queued steps in line with ``transition``. Returns the ids materialised.
 
@@ -314,7 +351,7 @@ async def apply_booking_transition(
     wanted = triggers_to_materialise(transition)
     for workflow in await _active_workflows(session, booking=booking, triggers=wanted):
         trigger = WorkflowTrigger(workflow.trigger)
-        send_at = _send_time(
+        send_at = step_send_time(
             trigger, booking=booking, offset=timedelta(minutes=workflow.offset_minutes)
         )
         if send_at is not None and send_at <= now:
@@ -346,14 +383,14 @@ async def apply_booking_transition(
                 booking_id=booking.id,
                 effect=OutboxEffect.NOTIFY,
                 dedupe_key=workflow_step_dedupe_key(workflow.id, step.id, channel),
-                payload={
-                    "trigger": trigger.value,
-                    "workflow_id": str(workflow.id),
-                    "step_id": str(step.id),
-                    "channel": channel.value,
-                    "kind": step.kind,
-                    "locale": locale,
-                },
+                payload=notify_payload(
+                    workflow_id=workflow.id,
+                    step_id=step.id,
+                    trigger=trigger,
+                    channel=channel,
+                    kind=step.kind,
+                    locale=locale,
+                ),
                 next_retry_at=send_at,
             )
             if row is not None:

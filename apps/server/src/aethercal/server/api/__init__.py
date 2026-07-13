@@ -13,7 +13,15 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from aethercal.server.api import bookings, event_types, health, schedules, slots, webhooks
+from aethercal.server.api import (
+    bookings,
+    event_types,
+    health,
+    schedules,
+    slots,
+    webhooks,
+    workflows,
+)
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(health.router)
@@ -22,5 +30,8 @@ api_router.include_router(schedules.router)
 api_router.include_router(slots.router)
 api_router.include_router(bookings.router)
 api_router.include_router(webhooks.router)
+api_router.include_router(workflows.router)
+# A template is the TENANT's, not one rule's — hence its own collection, never a nested one.
+api_router.include_router(workflows.templates_router)
 
 __all__ = ["api_router"]

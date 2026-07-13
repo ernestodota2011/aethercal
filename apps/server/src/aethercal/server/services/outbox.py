@@ -64,7 +64,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, assert_never, cast
 
@@ -74,7 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel, ChannelSender
-from aethercal.server.db.models import Booking, ExternalConnection, Outbox
+from aethercal.server.db.models import Booking, ExternalConnection, Outbox, Workflow
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.smtp.compose import NotificationKind
@@ -262,13 +262,43 @@ def staleness_policy(effect: OutboxEffect, payload: Mapping[str, Any]) -> Stalen
     return rule(payload)
 
 
+DEFER_DELAY_SECONDS = 30
+"""How soon a deferred (dependency-waiting) intent is retried."""
+
+PAUSED_RULE_RECHECK = timedelta(minutes=15)
+"""How often a step PAUSED by a switched-off rule asks again whether that rule has come back.
+
+Not :data:`DEFER_DELAY_SECONDS`: a sibling intent lands in seconds, whereas a tenant re-enables a
+rule in minutes, or never. Polling a disabled rule's whole backlog every 30 s would be a hot loop
+waiting on a condition that only a human can change."""
+
+TERMINAL_MESSAGE_GRACE = timedelta(days=7)
+"""How long a TERMINAL message (a follow-up, a cancellation notice) is still worth sending after its
+moment. Unlike a reminder it remains TRUE afterwards — but a row cannot wait for ever."""
+
+
 class OutboxDeferred(Exception):
     """Raised by an effect handler to POSTPONE its intent without consuming an attempt.
 
-    The effect is not failing — it waits on a sibling intent to run first (an email waiting for its
-    booking's Google Meet link; a calendar delete waiting for the create that will produce the event
-    id it must remove). The drain reschedules it soon and leaves ``attempts`` alone, so a legitimate
-    wait never counts toward the dead-letter budget."""
+    The effect is not failing — it is WAITING. Two kinds of wait, and they are not the same:
+
+    * on a SIBLING INTENT (an email waiting for its booking's Google Meet link; a calendar delete
+      waiting for the create that will produce the event id it must remove) — seconds;
+    * on a HUMAN: the step's workflow rule is switched off, and the tenant may switch it back on —
+      minutes, or never (:data:`PAUSED_RULE_RECHECK`).
+
+    Hence ``retry_after``. The drain returns the row to ``pending`` at that distance and leaves
+    ``attempts`` alone, so a legitimate wait never counts toward the dead-letter budget.
+
+    ==This is the ONLY non-terminal way for a handler to decline to send.== The distinction from
+    :class:`OutboxSkipped` is not stylistic: a TEMPORARY condition must never produce a TERMINAL
+    outcome, or the message is destroyed by a state the tenant can simply undo."""
+
+    def __init__(self, message: str, *, retry_after: timedelta | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = (
+            timedelta(seconds=DEFER_DELAY_SECONDS) if retry_after is None else retry_after
+        )
 
 
 class OutboxSkipped(Exception):
@@ -277,11 +307,12 @@ class OutboxSkipped(Exception):
     The distinction from a failure is the whole point. A WhatsApp step on an instance with no
     WhatsApp credentials is not "broken" — it is switched off. Retried like a failure it would burn
     the entire backoff budget and dead-letter, filling the queue with noise while still delivering
-    nothing. Terminal, recorded with its reason, and it consumes no attempt."""
+    nothing. Terminal, recorded with its reason, and it consumes no attempt.
 
-
-DEFER_DELAY_SECONDS = 30
-"""How soon a deferred (dependency-waiting) intent is retried."""
+    ==Terminal means IRREVERSIBLE, so it may only carry a condition that cannot be undone.== A rule
+    that is merely switched OFF is not one of those — the tenant can switch it back on, and a step
+    retired while it was off could never be delivered afterwards. That is a wait, and it belongs in
+    :class:`OutboxDeferred`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +439,15 @@ def new_worker_id() -> str:
     return f"{socket.gethostname()[:24]}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
+def as_utc(moment: datetime) -> datetime:
+    """SQLite drops tzinfo on the round-trip; normalise before doing arithmetic on a stored instant.
+
+    Lives HERE, in the layer everything else sits on, because both the send-time arithmetic
+    (``services/workflows.py``) and the deadline arithmetic (:func:`message_deadline`) need it — and
+    two copies of "what does a naive timestamp from the database mean" is how two answers appear."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
 async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are the keyword contract
     session: AsyncSession,
     *,
@@ -517,10 +557,20 @@ async def void_pending_steps(
             .with_for_update()
         )
     ).all()
+    voided = _retire([row for row in rows if row.payload.get("trigger") in wanted])
+    await session.flush()
+    return voided
+
+
+def _retire(rows: Collection[Outbox]) -> list[uuid.UUID]:
+    """Mark every row ``voided`` — the ONE place a live step is retired. Returns the ids.
+
+    Extracted rather than repeated: :func:`void_pending_steps` (the BOOKING's life changed) and
+    :func:`reconcile_workflow_steps` (the RULE changed) both need it, and a second copy of "which
+    fields have to be cleared" is how a claimed row keeps its lease and gets silently retried later.
+    """
     voided: list[uuid.UUID] = []
     for row in rows:
-        if row.payload.get("trigger") not in wanted:
-            continue
         if row.status == _CLAIMED:
             # In flight. We cannot un-send it — we can only guarantee it is never retried, and that
             # its worker's result is discarded rather than written. Say so, out loud.
@@ -536,8 +586,164 @@ async def void_pending_steps(
         row.claimed_by = None
         row.lease_expires_at = None
         voided.append(row.id)
-    await session.flush()
     return voided
+
+
+def workflow_key_prefix(workflow_id: uuid.UUID) -> str:
+    """The dedupe-key prefix every step of ``workflow_id`` shares (see
+    :func:`workflow_step_dedupe_key`).
+
+    A UUID carries no LIKE wildcard, so the prefix match is exact — and it finds a rule's queued
+    rows without querying INSIDE the payload JSON, which SQLite and PostgreSQL spell
+    differently."""
+    return f"wf:{workflow_id}:"
+
+
+@dataclass(frozen=True, slots=True)
+class StepSchedule:
+    """What ONE workflow step's queued row ought to look like, per the rule as it stands NOW.
+
+    Produced by ``services/workflow_rules.py`` (which owns what a rule MEANS) and executed by
+    :func:`reconcile_workflow_steps` (which owns what an outbox row may DO). ``send_at`` is ``None``
+    for the event-shaped triggers — they fire on the next drain, so there is nothing to re-time."""
+
+    dedupe_key: str
+    payload: dict[str, Any]
+    send_at: datetime | None
+
+
+@dataclass
+class ReconcileReport:
+    """What a rule change did to one booking's queue."""
+
+    materialised: list[uuid.UUID] = field(default_factory=list)
+    retimed: list[uuid.UUID] = field(default_factory=list)
+    voided: list[uuid.UUID] = field(default_factory=list)
+    left: list[uuid.UUID] = field(default_factory=list)
+    """Mid-flight (``claimed``), or event-shaped: not a rule edit's business to move."""
+
+
+async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    booking_id: uuid.UUID,
+    workflow_id: uuid.UUID,
+    wanted: Collection[StepSchedule],
+    now: datetime,
+    timing_changed: bool,
+) -> ReconcileReport:
+    """Bring ONE booking's queued steps for ONE workflow in line with ``wanted``.
+
+    This is what makes an edit to a rule TRUE. Without it, changing "remind 24 h before" to "2 h
+    before" rewrites a row in ``workflows`` and changes nothing a guest can perceive: every booking
+    already on the books keeps its step queued at ``start - 24h``, because the send time lives in
+    the outbox row's ``next_retry_at``, not in the rule. The rule would say one thing and the queue
+    would do another, with no error anywhere — the silent no-op, one layer up.
+
+    It is emphatically **not an upsert**. ``ON CONFLICT ... DO UPDATE`` expresses none of the
+    outcomes below, and the UNIQUE constraint on ``(tenant_id, booking_id, dedupe_key)`` is also why
+    a naive "just re-materialise it" fails: a key that already exists — even on a ``voided`` or
+    ``delivered`` row — makes :func:`enqueue_effect` return ``None``, silently. So every row is
+    decided explicitly:
+
+    * **not in** ``wanted`` → **voided**. The step was removed from the rule; its message must not
+      still arrive next Tuesday.
+    * **in** ``wanted``, live, send time **in the future** → **re-timed in place**: the SAME row
+      (so the message stays exactly-once), carrying the rule's new instant and payload.
+    * **in** ``wanted``, but its send time is **in the past** → it depends on ``timing_changed``,
+      and the difference is a message's life:
+
+      - ``timing_changed`` (the EDIT dragged it backwards into the past — say -60 became -1440 for a
+        booking three hours out) → **voided**. That message's moment never existed; a
+        ``next_retry_at`` in the past drains IMMEDIATELY, so re-timing it there would fire the
+        "reminder" at once, after the fact.
+      - **not** ``timing_changed`` (the rule's clock did not move; the row is simply OVERDUE — it
+        was PAUSED while the tenant had the rule switched off) → **made due now**. Voiding it here
+        would destroy, on re-activation, exactly the message the re-activation exists to deliver.
+
+    * **in** ``wanted``, with **no live row** → **materialised**, but only when its send time is a
+      real future instant. An event-shaped step (``send_at is None``) is never back-filled: it
+      reports something that has already happened, and queueing it now would tell somebody who
+      booked last week that their booking is confirmed.
+
+    A ``claimed`` row is left alone: a worker is sending it right now, and re-timing a message that
+    is already in the provider's hands is meaningless.
+
+    Nothing here needs to ask whether the message is still *worth* sending — an overdue step made
+    due
+    now is re-checked against :func:`message_deadline` at the send, so a rule switched back on a
+    week
+    late still cannot fire a reminder for a meeting that has already happened.
+    """
+    by_key = {schedule.dedupe_key: schedule for schedule in wanted}
+    rows = (
+        await session.scalars(
+            select(Outbox)
+            .where(
+                Outbox.tenant_id == tenant_id,
+                Outbox.booking_id == booking_id,
+                Outbox.effect == OutboxEffect.NOTIFY.value,
+                Outbox.status.in_(_NON_TERMINAL),
+                Outbox.dedupe_key.startswith(workflow_key_prefix(workflow_id)),
+            )
+            .with_for_update()
+        )
+    ).all()
+
+    report = ReconcileReport()
+    to_void: list[Outbox] = []
+    seen: set[str] = set()
+    for row in rows:
+        seen.add(row.dedupe_key)
+        schedule = by_key.get(row.dedupe_key)
+        if schedule is None:
+            to_void.append(row)  # this step is gone from the rule
+        elif row.status == _CLAIMED or schedule.send_at is None:
+            # Mid-flight, or event-shaped (due on the next drain anyway). Nothing to move.
+            report.left.append(row.id)
+        elif schedule.send_at <= now and timing_changed:
+            _logger.info(
+                "outbox intent %s (booking %s): the rule moved its send time to %s, which is "
+                "already past — retiring it rather than firing it late",
+                row.id,
+                booking_id,
+                schedule.send_at.isoformat(),
+            )
+            to_void.append(row)
+        elif schedule.send_at <= now:
+            # OVERDUE, not mistimed: the rule's clock never moved, so this is the step that was
+            # PAUSED while the rule was switched off. Make it due NOW. Voiding it — the branch above
+            # — would destroy, at the very moment of re-activation, the message that re-activation
+            # exists to deliver. Whether it is still worth sending is the SEND's question
+            # (``message_deadline``), not this one's.
+            row.next_retry_at = now
+            report.retimed.append(row.id)
+        else:
+            row.payload = dict(schedule.payload)
+            row.next_retry_at = schedule.send_at
+            report.retimed.append(row.id)
+    report.voided.extend(_retire(to_void))
+
+    for schedule in by_key.values():
+        if schedule.dedupe_key in seen or schedule.send_at is None or schedule.send_at <= now:
+            continue
+        created = await enqueue_effect(
+            session,
+            tenant_id=tenant_id,
+            booking_id=booking_id,
+            effect=OutboxEffect.NOTIFY,
+            dedupe_key=schedule.dedupe_key,
+            payload=dict(schedule.payload),
+            next_retry_at=schedule.send_at,
+        )
+        if created is not None:
+            report.materialised.append(created.id)
+        # ``None`` = a TERMINAL row already owns this key (delivered / skipped / voided). That
+        # message has had its moment, and the UNIQUE constraint is what stops a rule edit re-sending
+        # it. Deliberately not an error: reconciling a rule is not a request to re-send anything.
+    await session.flush()
+    return report
 
 
 # --------------------------------------------------------------------------------------
@@ -745,6 +951,7 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
         # And it is BOUNDED. `PROVIDER_TIMEOUT_CEILING` is not a constant, a comment and a hopeful
         # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
         # something actually stops the send. This is that something.
+        defer_for: timedelta | None = None
         try:
             async with asyncio.timeout(provider_timeout.total_seconds()):
                 await execute(work, item_now)
@@ -767,6 +974,7 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
         except OutboxDeferred as deferred:
             _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
             outcome = _Outcome.DEFERRED
+            defer_for = deferred.retry_after
         except OutboxSkipped as skipped:
             # NOT a failure: this effect can never run, so retrying it would only burn the backoff
             # budget and dead-letter. Loud, terminal, and out of the queue.
@@ -792,6 +1000,7 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
             outcome=outcome,
             report=report,
             max_attempts=max_attempts,
+            defer_for=defer_for,
         )
 
     return report
@@ -805,6 +1014,7 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
     outcome: _Outcome,
     report: OutboxReport,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    defer_for: timedelta | None = None,
 ) -> None:
     """Record one intent's outcome in its OWN short transaction, releasing the lease.
 
@@ -831,10 +1041,14 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         row.lease_expires_at = None
 
         if outcome is _Outcome.DEFERRED:
-            # Waiting on a sibling intent: reschedule soon WITHOUT counting an attempt, so a
-            # legitimate wait never dead-letters.
+            # WAITING — on a sibling intent (seconds), or on a human who switched the rule off
+            # (minutes, or never). Rescheduled at the handler's own distance, WITHOUT counting an
+            # attempt, so a legitimate wait never dead-letters. The row stays ``pending``: the whole
+            # point is that a wait is REVERSIBLE, and the message survives it.
             row.status = _PENDING
-            row.next_retry_at = now + timedelta(seconds=DEFER_DELAY_SECONDS)
+            row.next_retry_at = now + (
+                timedelta(seconds=DEFER_DELAY_SECONDS) if defer_for is None else defer_for
+            )
             report.deferred.append(row.id)
             return
 
@@ -1451,7 +1665,7 @@ async def run_notify_effect(
       them up untouched.
     """
     async with sessionmaker() as session:
-        plan = await _prepare_notify(session, work, sender=sender, channels=channels)
+        plan = await _prepare_notify(session, work, now, sender=sender, channels=channels)
         await session.rollback()  # a pure read: release the connection before any network call
     if plan is None:
         return
@@ -1484,6 +1698,104 @@ _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
 _NO_RENDERER = "no-template-renderer"
+_RULE_GONE = "workflow-gone"
+_RULE_PAUSED = "workflow-inactive"
+_TOO_LATE = "moment-passed"
+
+
+def message_deadline(trigger: WorkflowTrigger, booking: Booking) -> datetime:
+    """The last instant at which this step's message can still do its job.
+
+    Exhaustive over the trigger (``assert_never``), because "how late is too late" is not the same
+    question for every message and a silent default would answer it wrongly for four of the five:
+
+    * ``on_booking`` / ``before_start`` → the booking's **start**. They speak about a meeting that
+    is
+      still coming. "Your booking is confirmed" or "your meeting is tomorrow", delivered after it
+      began, is not a late message — it is a WRONG one. This is the same rule the materialiser
+      already obeys when it refuses to queue a reminder whose moment has gone.
+    * ``after_end`` / ``on_cancel`` / ``on_no_show`` → the **end** plus
+      :data:`TERMINAL_MESSAGE_GRACE`. These remain TRUE after their moment (a booking really was
+      cancelled; the meeting really did happen), so lateness does not falsify them — but a row may
+      not wait for ever.
+
+    It is what BOUNDS a pause: a step whose rule is switched off waits for the rule to come back,
+    and
+    stops waiting here. Without it, "pause instead of skip" would trade a message destroyed too
+    early
+    for a row that polls until the end of time — and for a "reminder" delivered after the
+    meeting."""
+    match trigger:
+        case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.BEFORE_START:
+            return as_utc(booking.start_at)
+        case WorkflowTrigger.AFTER_END | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
+            return as_utc(booking.end_at) + TERMINAL_MESSAGE_GRACE
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+async def _gate_on_the_rule(
+    session: AsyncSession,
+    work: OutboxWork,
+    booking: Booking,
+    trigger: WorkflowTrigger,
+    now: datetime,
+) -> None:
+    """Decide whether this step may be sent NOW — and, if not, whether that is a WAIT or an END.
+
+    ==That distinction is the whole function.== ``active`` is already honoured when a booking's
+    steps
+    are QUEUED (``_active_workflows``), and that is not enough: a step is queued days before it is
+    sent, so switching a rule off this afternoon would still send tomorrow's messages, and the
+    tenant
+    who turned it off would have no way to explain them. The flag has to govern at the SEND, which
+    is
+    the only moment anybody outside can observe.
+
+    But an inactive rule is a **TEMPORARY** condition — the tenant can switch it back on — so it may
+    NOT have a terminal outcome. Retiring the step (``OutboxSkipped``) would destroy the message a
+    tenant could still want, exactly like voiding the row would; the damage simply comes in through
+    the other door. So the step is **PAUSED** (:class:`OutboxDeferred`, still ``pending``, no
+    attempt
+    consumed) and asks again every :data:`PAUSED_RULE_RECHECK`. Switch the rule back on and the very
+    same row — same dedupe key, same exactly-once identity — is delivered.
+
+    The wait is bounded by :func:`message_deadline`, not by a counter: a paused step stops waiting
+    when its message could no longer do its job. That single check also protects the send itself, so
+    a rule re-enabled a week late cannot fire a "reminder" for a meeting that already happened.
+
+    Terminal, by contrast, are the two things that cannot be undone:
+
+    * the payload names no workflow at all — no rule can vouch for it (fail-closed);
+    * the workflow is GONE (an event type deleted with ``ON DELETE CASCADE`` takes its workflows
+      with it). Its queued steps would otherwise still be delivered — messages from a rule that
+      exists nowhere. A deleted rule is not coming back.
+    """
+    if now > message_deadline(trigger, booking):
+        raise OutboxSkipped(
+            f"{_TOO_LATE}: this {trigger.value} step's moment has passed (deadline "
+            f"{message_deadline(trigger, booking).isoformat()}); a message that arrives after the "
+            "fact is noise, so it is retired rather than delivered late"
+        )
+
+    raw = work.payload.get("workflow_id")
+    if raw is None:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: this workflow step carries no workflow_id, so no rule can vouch for it"
+        )
+    workflow = await session.get(Workflow, uuid.UUID(str(raw)))
+    if workflow is None or workflow.tenant_id != work.tenant_id:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: workflow {raw} no longer exists for this tenant, so the step it queued "
+            "must not be delivered"
+        )
+    if not workflow.active:
+        raise OutboxDeferred(
+            f"{_RULE_PAUSED}: workflow {raw} ({workflow.name!r}) is switched off, so this step is "
+            "PAUSED, not retired — it waits, and is delivered if the rule is switched back on "
+            f"before {message_deadline(trigger, booking).isoformat()}",
+            retry_after=PAUSED_RULE_RECHECK,
+        )
 
 
 def _require_phone_consent(booking: Booking, channel: Channel) -> None:
@@ -1514,6 +1826,7 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
 async def _prepare_notify(
     session: AsyncSession,
     work: OutboxWork,
+    now: datetime,
     *,
     sender: EmailSender | None,
     channels: Mapping[Channel, ChannelSender],
@@ -1522,7 +1835,8 @@ async def _prepare_notify(
 
     Raises :class:`OutboxSkipped` for anything that can NEVER work — an unconfigured channel, a
     guest with no phone, a kind with no template renderer — so the step is retired instead of being
-    retried into the dead-letter."""
+    retried into the dead-letter. Raises :class:`OutboxDeferred` for anything that merely cannot run
+    YET — a rule the tenant has switched off — so the step WAITS instead of being destroyed."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
@@ -1531,10 +1845,16 @@ async def _prepare_notify(
     channel = Channel(payload["channel"])
     step_id = uuid.UUID(str(payload["step_id"]))
     raw_kind = str(payload["kind"])
+    trigger = WorkflowTrigger(str(payload["trigger"]))
 
     if await _should_skip_as_stale(session, booking, work):
         # A later transition overtook the booking, and this step's trigger is not a terminal one.
         return None
+
+    # May this step be sent NOW? The rule that queued it must still be switched on (else the step
+    # WAITS — it is not destroyed), and its own moment must not have passed (else it is retired,
+    # which is also what bounds the waiting).
+    await _gate_on_the_rule(session, work, booking, trigger, now)
 
     try:
         kind = NotificationKind(raw_kind)
@@ -1642,7 +1962,9 @@ __all__ = [
     "DEFAULT_LEASE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFER_DELAY_SECONDS",
+    "PAUSED_RULE_RECHECK",
     "PROVIDER_TIMEOUT_CEILING",
+    "TERMINAL_MESSAGE_GRACE",
     "Clock",
     "GoogleOperation",
     "OutboxDeferred",
@@ -1651,7 +1973,10 @@ __all__ = [
     "OutboxReport",
     "OutboxSkipped",
     "OutboxWork",
+    "ReconcileReport",
     "Staleness",
+    "StepSchedule",
+    "as_utc",
     "backoff_delay",
     "claim_one",
     "drain_outbox",
@@ -1659,7 +1984,9 @@ __all__ = [
     "enqueue_effect",
     "google_dedupe_key",
     "make_booking_effect_executor",
+    "message_deadline",
     "new_worker_id",
+    "reconcile_workflow_steps",
     "recover_expired_leases",
     "run_email_effect",
     "run_google_effect",
@@ -1668,5 +1995,6 @@ __all__ = [
     "staleness_policy",
     "trigger_staleness",
     "void_pending_steps",
+    "workflow_key_prefix",
     "workflow_step_dedupe_key",
 ]
