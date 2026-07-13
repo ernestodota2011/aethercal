@@ -63,6 +63,12 @@ export function CalendarNav({
   const goToRange = (nextAnchor: Date): void => {
     onRangeChange?.(getVisibleRange(view, nextAnchor, firstDayOfWeek, timelineDays));
   };
+  /**
+   * The anchor one period earlier/later. `timelineDays` is load-bearing: the timeline's period IS its
+   * window, so a 3-day timeline must step by 3 days. Dropping it here would step by the 7-day default
+   * — skipping or re-showing whole days — AND would contradict the range `goToRange` goes on to emit.
+   */
+  const step = (delta: number): Date => stepAnchor(anchor, view, delta, timelineDays);
   const title = formatPeriodTitle(view, anchor, locale, firstDayOfWeek, timelineDays);
 
   return (
@@ -72,7 +78,7 @@ export function CalendarNav({
           type="button"
           className="aethercal-nav-btn aethercal-nav-arrow"
           aria-label={messages.navPrevious}
-          onClick={() => goToRange(stepAnchor(anchor, view, -1))}
+          onClick={() => goToRange(step(-1))}
         >
           <span aria-hidden="true">‹</span>
         </button>
@@ -87,7 +93,7 @@ export function CalendarNav({
           type="button"
           className="aethercal-nav-btn aethercal-nav-arrow"
           aria-label={messages.navNext}
-          onClick={() => goToRange(stepAnchor(anchor, view, 1))}
+          onClick={() => goToRange(step(1))}
         >
           <span aria-hidden="true">›</span>
         </button>
