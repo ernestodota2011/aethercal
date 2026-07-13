@@ -229,7 +229,30 @@ async def enforce_phone_cap(
     """Raise :class:`QuotaExceeded` unless this booking's phone is under the channel's daily cap.
 
     Called in the outbox handler's READ phase, where there is a session and a booking — and BEFORE
-    the network call, so an over-cap message is never handed to the provider at all."""
+    the network call, so an over-cap message is never handed to the provider at all.
+
+    .. rubric:: The quota is DERIVED, never CONSUMED here
+
+    This function only READS. The quota IS the ``sent_notifications`` ledger, and a ledger row is
+    written in exactly one place: after ``run_notify_effect``'s ``send()`` returns. A step retired
+    before the provider was ever called — a missing template, a malformed one, a withdrawn consent —
+    writes nothing, and therefore costs nothing.
+
+    ==That is load-bearing, and it is why the check sits here rather than being "moved closer to the
+    send".== If a retired step could spend the phone's budget, a tenant's template typo would
+    SILENCE A REAL GUEST: their legitimate reminder would hit a ceiling raised by a message that was
+    never sent — and it would not even error, the reminder would simply never arrive. Pinned by
+    ``test_a_step_retired_before_sending_does_NOT_spend_the_phones_daily_quota``, which is built to
+    fail the moment the count is taken over ATTEMPTS (outbox rows) instead of SENDS (ledger rows).
+
+    .. rubric:: The residual, stated rather than left to be discovered
+
+    The check is not atomic with the send: two workers could each read ``already == cap - 1`` and
+    both send, overshooting by one per racing worker. It is bounded, and it is not reachable in the
+    deployed shape — the scheduler runs in exactly ONE process (``deploy/README.md``) — so this is a
+    spend/abuse ceiling, not a hard legal limit. Closing it properly means making the ledger insert
+    the RESERVATION (reserve-first, as the transactional email path does), which cannot be done from
+    here without holding a transaction across the network call — and R8 forbids precisely that."""
     phone = booking.guest_phone
     if not phone:
         # Nothing to key the cap on. Refuse, rather than sail through on a zero count.
