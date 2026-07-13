@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeCreate
 from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
+from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.bookings import (
     BookingParams,
     cancel_booking,
@@ -38,7 +39,18 @@ from aethercal.server.services.bookings import (
     reschedule_booking,
 )
 from aethercal.server.services.event_types import create_event_type
-from aethercal.server.services.outbox import as_utc
+from aethercal.server.services.outbox import (
+    Confirmation,
+    GoogleOperation,
+    Outbox,
+    OutboxEffect,
+    Suppressed,
+    as_utc,
+    confirmation_policy,
+    email_dedupe_key,
+    enqueue_effect,
+    google_dedupe_key,
+)
 
 _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)}
 
@@ -83,6 +95,193 @@ def _params(event_type_id: uuid.UUID, start: datetime) -> BookingParams:
         guest_email="ada@example.com",
         guest_timezone="UTC",
     )
+
+
+async def _hold(session: AsyncSession, tenant: Tenant, event_type: EventType) -> Booking:
+    """A synthetic UNPAID HOLD: ``PENDING``, never confirmed, ``confirmed_at IS NULL``.
+
+    Written straight to the table on purpose. No writer of ``PENDING`` exists yet — that is B-05b —
+    and the whole point of this wave is that the belt is already ON and PROVEN when that writer
+    arrives. A test that could only build a hold through ``create_booking`` could not test the belt
+    at all, because ``create_booking`` does not make holds today.
+    """
+    booking = Booking(
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        start_at=_SLOT_9,
+        end_at=_SLOT_9 + timedelta(minutes=30),
+        status=BookingStatus.PENDING,
+        confirmed_at=None,  # the hold has not been paid for: nobody has been told it exists
+        guest_name="Ada Lovelace",
+        guest_email="ada@example.com",
+        guest_timezone="UTC",
+    )
+    session.add(booking)
+    await session.flush()
+    return booking
+
+
+async def _outbox_of(session: AsyncSession, booking: Booking) -> list[Outbox]:
+    return list(
+        (await session.scalars(select(Outbox).where(Outbox.booking_id == booking.id))).all()
+    )
+
+
+def _payload_for(effect: OutboxEffect) -> dict[str, object]:
+    """A representative payload per effect — enough for the funnel, which does not read it."""
+    match effect:
+        case OutboxEffect.EMAIL:
+            return {"kind": "confirmation", "sequence": 0}
+        case OutboxEffect.GOOGLE:
+            return {"operation": GoogleOperation.UPSERT.value}
+        case OutboxEffect.NOTIFY:
+            return {"trigger": "on_booking", "channel": "whatsapp", "kind": "reminder"}
+
+
+def _dedupe_for(effect: OutboxEffect) -> str:
+    match effect:
+        case OutboxEffect.EMAIL:
+            return email_dedupe_key(NotificationKind.CONFIRMATION)
+        case OutboxEffect.GOOGLE:
+            return google_dedupe_key(GoogleOperation.UPSERT)
+        case OutboxEffect.NOTIFY:
+            return "wf:test:step:whatsapp"
+
+
+# --------------------------------------------------------------------------------------
+# The EFFECT funnel — criterion 20 / 20b / 20c / 20d.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("effect", list(OutboxEffect))
+@pytest.mark.asyncio
+async def test_an_unpaid_hold_queues_no_effect_of_any_kind(
+    sqlite_session: AsyncSession, tenant_factory: Any, effect: OutboxEffect
+) -> None:
+    """==Criterion 20.== A booking that was never confirmed queues NO effect. Not one, of any kind.
+
+    Parametrised over the WHOLE enum rather than the three names we happen to have today: a new
+    effect is silenced the day it is added, without anybody remembering to come back here.
+
+    ``GOOGLE`` is the one that looks harmless and is not. A calendar event carrying the guest as an
+    attendee makes **Google** send them the invitation — so an unpaid hold that reached this funnel
+    would announce itself, through a channel we do not even own.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    hold = await _hold(sqlite_session, tenant, event_type)
+
+    outcome = await enqueue_effect(
+        sqlite_session,
+        booking=hold,
+        effect=effect,
+        dedupe_key=_dedupe_for(effect),
+        payload=_payload_for(effect),
+    )
+
+    assert isinstance(outcome, Suppressed)
+    assert outcome.booking_id == hold.id
+    assert outcome.effect is effect
+    assert await _outbox_of(sqlite_session, hold) == []
+
+
+@pytest.mark.parametrize("effect", list(OutboxEffect))
+@pytest.mark.asyncio
+async def test_a_confirmed_booking_still_queues_every_effect(
+    sqlite_session: AsyncSession, tenant_factory: Any, effect: OutboxEffect
+) -> None:
+    """==Criterion 23.== The belt costs a CONFIRMED booking nothing: its whole chain is untouched.
+
+    The failure mode of a gate is not only "it let something through" — it is "it silenced
+    everything". This is the half that proves there is no regression.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_11), now=_BEFORE
+    )
+
+    outcome = await enqueue_effect(
+        sqlite_session,
+        booking=booking,
+        effect=effect,
+        dedupe_key=f"probe:{effect.value}",
+        payload=_payload_for(effect),
+    )
+
+    assert isinstance(outcome, Outbox)
+    assert outcome.booking_id == booking.id
+    assert outcome.tenant_id == booking.tenant_id
+
+
+@pytest.mark.asyncio
+async def test_suppressed_by_a_hold_is_not_the_same_answer_as_already_queued(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 20d.== "Suppressed, unpaid" and "already queued" are DIFFERENT answers.
+
+    ``None`` already means something precise here: *a terminal row owns this dedupe key* — and
+    ``reconcile_workflow_steps`` reads it that way, in writing, to decide it must not re-send a
+    message that has had its moment. Return ``None`` for a suppression too and the two collapse:
+    "we refused to announce an unpaid hold" would be recorded as "the guest already got it", and
+    ``report.materialised`` would be telling the truth about neither.
+
+    So the suppression gets its own answer, and this test is what stops anyone collapsing them.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    hold = await _hold(sqlite_session, tenant, event_type)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_11), now=_BEFORE
+    )
+    key = email_dedupe_key(NotificationKind.CONFIRMATION)
+
+    suppressed = await enqueue_effect(
+        sqlite_session,
+        booking=hold,
+        effect=OutboxEffect.EMAIL,
+        dedupe_key=key,
+        payload=_payload_for(OutboxEffect.EMAIL),
+    )
+    # The confirmed booking already has its confirmation email (create_booking queued nothing
+    # without effects, so queue one here), then ask for the very same key a second time.
+    first = await enqueue_effect(
+        sqlite_session,
+        booking=booking,
+        effect=OutboxEffect.EMAIL,
+        dedupe_key=key,
+        payload=_payload_for(OutboxEffect.EMAIL),
+    )
+    duplicate = await enqueue_effect(
+        sqlite_session,
+        booking=booking,
+        effect=OutboxEffect.EMAIL,
+        dedupe_key=key,
+        payload=_payload_for(OutboxEffect.EMAIL),
+    )
+
+    assert isinstance(first, Outbox)
+    assert duplicate is None  # "a terminal row already owns this key" — the dedupe conflict
+    assert isinstance(suppressed, Suppressed)  # "we refused to speak for an unpaid hold"
+    assert suppressed is not None  # ...and the two are NOT the same answer
+
+
+def test_every_effect_declares_whether_it_needs_a_confirmation() -> None:
+    """==Criterion 20c's foundation.== The confirmation contract is EXHAUSTIVE over the enum.
+
+    The third such table in this module (staleness and voidability are the others), and for the same
+    reason: an effect that inherits a default is an effect nobody decided about. ``REFUND`` and
+    ``EXPIRE_HOLD`` (B-05b) will be ``EXEMPT`` — they act on unpaid and cancelled bookings BY
+    DEFINITION, and a belt that silenced them would be a belt that keeps the guest's money.
+
+    So a new effect must not COMPILE without choosing. This test is the runtime half of that
+    (``assert_never`` is the type-check half): it walks the real enum, so an effect added without a
+    branch fails here even if pyright were never run.
+    """
+    for effect in OutboxEffect:
+        assert confirmation_policy(effect) in tuple(Confirmation)
+
+    # Today every effect speaks ABOUT an appointment, so every one of them needs it to be real.
+    assert confirmation_policy(OutboxEffect.EMAIL) is Confirmation.REQUIRES_CONFIRMATION
+    assert confirmation_policy(OutboxEffect.GOOGLE) is Confirmation.REQUIRES_CONFIRMATION
+    assert confirmation_policy(OutboxEffect.NOTIFY) is Confirmation.REQUIRES_CONFIRMATION
 
 
 # --------------------------------------------------------------------------------------

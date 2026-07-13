@@ -1011,8 +1011,7 @@ async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking
     minted in-txn, so the links persist atomically with the booking."""
     await enqueue_effect(
         session,
-        tenant_id=booking.tenant_id,
-        booking_id=booking.id,
+        booking=booking,
         effect=OutboxEffect.EMAIL,
         dedupe_key=email_dedupe_key(kind),
         payload={
@@ -1111,8 +1110,7 @@ async def _enqueue_google(
         )
     await enqueue_effect(
         session,
-        tenant_id=booking.tenant_id,
-        booking_id=booking.id,
+        booking=booking,
         effect=OutboxEffect.GOOGLE,
         dedupe_key=google_dedupe_key(operation),
         payload=payload,

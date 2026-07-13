@@ -50,7 +50,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.channels import Channel
-from aethercal.server.db.models import Booking, Workflow, WorkflowStep
+from aethercal.server.db.models import Booking, Outbox, Workflow, WorkflowStep
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.services.outbox import (
     OutboxEffect,
@@ -379,8 +379,7 @@ async def apply_booking_transition(
             channel = Channel(step.channel)
             row = await enqueue_effect(
                 session,
-                tenant_id=booking.tenant_id,
-                booking_id=booking.id,
+                booking=booking,
                 effect=OutboxEffect.NOTIFY,
                 dedupe_key=workflow_step_dedupe_key(workflow.id, step.id, channel),
                 payload=notify_payload(
@@ -393,6 +392,14 @@ async def apply_booking_transition(
                 ),
                 next_retry_at=send_at,
             )
-            if row is not None:
+            # ``Outbox`` = armed. ``None`` = a terminal row already owns that key. ``Suppressed`` =
+            # the FUNNEL refused it, because this booking has never been confirmed and nothing may
+            # be announced for it. Only the first is a step this transition materialised.
+            #
+            # ==This function still never reads ``booking.status``, and it must not start.== It was
+            # the tempting place to put the hold guard, and it is the wrong one: it is a CALLER, and
+            # ``_apply_create_effects`` reaches ``enqueue_effect`` without ever coming through here.
+            # A belt fastened on one caller leaves every other one bare.
+            if isinstance(row, Outbox):
                 materialised.append(row.id)
     return materialised

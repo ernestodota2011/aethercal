@@ -158,6 +158,10 @@ async def _book(
         start_at=start,
         end_at=start + timedelta(minutes=30),
         status=status,
+        # A confirmed booking — and a cancelled one, which was confirmed once — carries the instant
+        # it became so. Only an unpaid HOLD has no stamp, and the funnel refuses to speak for one
+        # (B-05a). A rule edit is about bookings that are REAL, so every fixture here is stamped.
+        confirmed_at=None if status is BookingStatus.PENDING else start - timedelta(days=30),
         guest_name="Ada",
         guest_email="ada@example.com",
         guest_timezone="UTC",

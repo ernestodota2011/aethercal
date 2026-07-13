@@ -144,6 +144,10 @@ async def _seed(session: AsyncSession, tenant_factory: Any) -> tuple[Tenant, Boo
         start_at=_SLOT,
         end_at=_SLOT + timedelta(minutes=30),
         status=BookingStatus.CONFIRMED,
+        # Confirmed means it carries the instant it became so. Leave the stamp NULL and the funnel
+        # refuses to queue anything for it (B-05a) — every transition below would then be asserting
+        # on a silence it never meant to test.
+        confirmed_at=_SLOT - timedelta(days=1),
         guest_name="Ada",
         guest_email="ada@example.com",
         guest_timezone="UTC",
@@ -158,14 +162,13 @@ async def _queue_step(
 ) -> Outbox:
     row = await enqueue_effect(
         session,
-        tenant_id=tenant.id,
-        booking_id=booking.id,
+        booking=booking,
         effect=OutboxEffect.NOTIFY,
         dedupe_key=f"wf:{uuid.uuid4()}:{uuid.uuid4()}:email",
         payload={"trigger": trigger.value},
         next_retry_at=_SLOT,
     )
-    assert row is not None
+    assert isinstance(row, Outbox)
     return row
 
 

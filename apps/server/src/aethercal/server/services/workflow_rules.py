@@ -85,9 +85,20 @@ _BUILTIN_EMAIL_KINDS: frozenset[str] = frozenset(kind.value for kind in Notifica
 else — every phone step, and any tenant-invented kind — needs a template, or it is a message that
 never arrives."""
 
-_LIVE_STATUSES = (BookingStatus.PENDING, BookingStatus.CONFIRMED)
+_LIVE_STATUSES = (BookingStatus.CONFIRMED,)
 """The bookings a rule still governs. A cancelled / no-show booking has settled its steps, and
-re-arming them from a rule edit would message somebody about a meeting that was called off."""
+re-arming them from a rule edit would message somebody about a meeting that was called off.
+
+==``PENDING`` was in here, and it was the third of the three paths that would have announced an
+unpaid hold.== A hold is a booking awaiting payment: nobody has been told it exists. Leave it
+governed and editing an unrelated rule — changing "remind 24 h before" to "2 h before" — would
+MATERIALISE that rule's steps for every live hold on the books, and the guest who never paid would
+get a reminder for an appointment nobody ever confirmed to them.
+
+The funnel (``enqueue_effect``) would refuse those steps anyway, and that redundancy is deliberate:
+one belt fails closed, and the other never asks it to. But a rule has genuinely no business
+governing a booking that is not yet real, so the scope is corrected here too rather than left wrong
+and patched downstream."""
 
 _POSITION_PARKING = 1000
 """Positions are unique per workflow, so a straight swap (0↔1) collides with the row that has not
@@ -595,8 +606,7 @@ async def _reconcile(
         ]
         await reconcile_workflow_steps(
             session,
-            tenant_id=workflow.tenant_id,
-            booking_id=booking.id,
+            booking=booking,
             workflow_id=workflow.id,
             wanted=wanted,
             now=now,

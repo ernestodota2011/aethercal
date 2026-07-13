@@ -262,6 +262,8 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(
             start_at=start,
             end_at=start + timedelta(minutes=30),
             status=BookingStatus.CONFIRMED,
+            # Confirmed ⇒ stamped. Without it the funnel refuses to queue the sync at all (B-05a).
+            confirmed_at=start - timedelta(days=1),
             guest_name="Ada",
             guest_email="ada@example.com",
             guest_timezone="UTC",
@@ -271,8 +273,7 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(
         await session.flush()
         await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking.id,
+            booking=booking,
             effect=OutboxEffect.GOOGLE,
             dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
             payload={
@@ -347,6 +348,10 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
             event_type_id=event_type.id,
             start_at=start,
             end_at=start + timedelta(minutes=30),
+            # Both rows are a REAL appointment that was confirmed and then moved — the predecessor
+            # was cancelled by the swap, not by never having been paid for, and it keeps its stamp
+            # (that is what still licenses the effects it has in flight).
+            confirmed_at=start - timedelta(days=1),
             guest_name="Ada",
             guest_email="ada@example.com",
             guest_timezone="UTC",
@@ -361,16 +366,14 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
         # The original's UPSERT (for b1) and the successor's RESCHEDULE (for b2), neither drained.
         await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=b1.id,
+            booking=b1,
             effect=OutboxEffect.GOOGLE,
             dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
             payload=_google_sync_payload(host.id, GoogleOperation.UPSERT, start),
         )
         await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=b2.id,
+            booking=b2,
             effect=OutboxEffect.GOOGLE,
             dedupe_key=google_dedupe_key(GoogleOperation.RESCHEDULE),
             payload=_google_sync_payload(host.id, GoogleOperation.RESCHEDULE, start),

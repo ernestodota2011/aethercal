@@ -144,6 +144,12 @@ async def _seed_booking(
             start_at=_SLOT,
             end_at=_SLOT + _HALF_HOUR,
             status=status,
+            # A booking that IS confirmed carries the instant it became so — and a CANCELLED one
+            # remembers it too, which is exactly what licenses its cancellation notice. Only a hold
+            # nobody paid for has no stamp, and ``enqueue_effect`` refuses to speak for one. A
+            # fixture that left this NULL would be seeding an unannounced booking and then asserting
+            # that the outbox announces it.
+            confirmed_at=None if status is BookingStatus.PENDING else NOW,
             guest_name="Ada Lovelace",
             guest_email="ada@example.com",
             guest_timezone="UTC",
@@ -164,18 +170,24 @@ async def _enqueue(  # noqa: PLR0913 - a test helper mirroring the enqueue contr
     next_retry_at: datetime | None = None,
 ) -> uuid.UUID:
     async with maker() as session, session.begin():
+        # The funnel takes the BOOKING, not an id: it has to know whether this appointment was ever
+        # confirmed before it will queue anything about it (B-05a).
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.tenant_id == tenant_id
         row = await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking_id,
+            booking=booking,
             effect=effect,
             dedupe_key=dedupe_key,
             payload=payload if payload is not None else {"kind": "confirmation"},
             next_retry_at=next_retry_at,
         )
-        # None = the row already existed (the conflict path). The re-enqueue tests look their row up
-        # by booking, so they never need an id back from the swallowed insert.
-        return row.id if row is not None else uuid.UUID(int=0)
+        # Not an ``Outbox`` = the row already existed (the conflict path, ``None``). The re-enqueue
+        # tests look their row up by booking, so they never need an id back from the swallowed
+        # insert. ``Suppressed`` cannot happen here — these fixtures seed confirmed bookings — and
+        # the ``isinstance`` is what would make it loud rather than quietly returning a null uuid.
+        return row.id if isinstance(row, Outbox) else uuid.UUID(int=0)
 
 
 async def _rows_for(maker: Sessionmaker, booking_id: uuid.UUID) -> list[Outbox]:
@@ -275,22 +287,26 @@ async def test_enqueue_is_idempotent_on_the_dedupe_key(maker: Sessionmaker) -> N
     await _enqueue(maker, tenant_id, booking_id)
 
     async with maker() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
         second = await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking_id,
+            booking=booking,
             effect=OutboxEffect.EMAIL,
             dedupe_key=_EMAIL_KEY,
             payload={"kind": "confirmation"},
         )
-    assert second is None  # the duplicate is a no-op, not a poisoning IntegrityError
+    # ``None``, and specifically NOT ``Suppressed``: the duplicate is a dedupe conflict — a terminal
+    # row already owns this key — which is a no-op rather than a poisoning IntegrityError. The two
+    # answers are kept apart on purpose (see :class:`Suppressed`).
+    assert second is None
 
     async with maker() as session:
         assert len((await session.scalars(select(Outbox))).all()) == 1
 
 
 async def test_a_rolled_back_transaction_drops_the_intent(maker: Sessionmaker) -> None:
-    tenant_id, booking_id = await _seed_booking(maker)
+    _tenant_id, booking_id = await _seed_booking(maker)
 
     async with maker() as session:
         await session.begin()
@@ -306,8 +322,7 @@ async def test_a_rolled_back_transaction_drops_the_intent(maker: Sessionmaker) -
 
         await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking_id,
+            booking=booking,
             effect=OutboxEffect.EMAIL,
             dedupe_key=_EMAIL_KEY,
             payload={"kind": "confirmation"},
@@ -323,18 +338,19 @@ async def test_a_rolled_back_transaction_drops_the_intent(maker: Sessionmaker) -
 async def test_a_future_next_retry_at_makes_the_outbox_a_scheduler(maker: Sessionmaker) -> None:
     """RF-10 rests on exactly this: a reminder is just an intent that is not DUE until ``start -
     24h``. Without it, the outbox could not have replaced the APScheduler jobstore."""
-    tenant_id, booking_id = await _seed_booking(maker)
+    _tenant_id, booking_id = await _seed_booking(maker)
     async with maker() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
         row = await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking_id,
+            booking=booking,
             effect=OutboxEffect.EMAIL,
             dedupe_key=email_dedupe_key(NotificationKind.REMINDER),
             payload={"kind": "reminder"},
             next_retry_at=NOW + timedelta(days=2),
         )
-        assert row is not None
+        assert isinstance(row, Outbox)
 
     executor = _RecordingExecutor()
     assert (await drain_outbox(_pools(maker), now=NOW, execute=executor)).attempted == 0
