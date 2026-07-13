@@ -52,30 +52,42 @@ async def _host_belongs(session: AsyncSession, tenant_id: uuid.UUID, host_id: uu
     return found is not None
 
 
-async def _schedule_belongs(
+async def _load_schedule(
     session: AsyncSession, tenant_id: uuid.UUID, schedule_id: uuid.UUID
-) -> bool:
-    """Return whether ``schedule_id`` is a ``Schedule`` owned by ``tenant_id``."""
-    found = (
+) -> Schedule | None:
+    """The tenant's ``Schedule`` by id, or ``None`` (a plain FK checks existence, not ownership)."""
+    return (
         await session.scalars(
-            select(Schedule.id).where(Schedule.id == schedule_id, Schedule.tenant_id == tenant_id)
+            select(Schedule).where(Schedule.id == schedule_id, Schedule.tenant_id == tenant_id)
         )
     ).one_or_none()
-    return found is not None
 
 
 async def _require_references(
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
-    host_id: uuid.UUID | None,
-    schedule_id: uuid.UUID | None,
+    host_id: uuid.UUID,
+    schedule_id: uuid.UUID,
 ) -> None:
-    """Validate that any provided host/schedule reference exists and belongs to the tenant."""
-    if host_id is not None and not await _host_belongs(session, tenant_id, host_id):
+    """Validate the host/schedule PAIR: both are the tenant's, and the host may use that schedule.
+
+    The ownership check (RF-30) needs both sides at once, which is why this takes the EFFECTIVE pair
+    rather than each field on its own: a schedule owned by another host (``Schedule.user_id`` set to
+    someone else) is not usable here. Without the check, Ana's event type could quietly run on
+    Bruno's weekly pattern — no error, no symptom, until Ana starts taking bookings at Bruno's
+    hours. A schedule with ``user_id IS NULL`` is shared by the business and usable by every host.
+    """
+    if not await _host_belongs(session, tenant_id, host_id):
         raise InvalidReferenceError(f"host {host_id} does not belong to this tenant")
-    if schedule_id is not None and not await _schedule_belongs(session, tenant_id, schedule_id):
+    schedule = await _load_schedule(session, tenant_id, schedule_id)
+    if schedule is None:
         raise InvalidReferenceError(f"schedule {schedule_id} does not belong to this tenant")
+    if schedule.user_id is not None and schedule.user_id != host_id:
+        raise InvalidReferenceError(
+            f"schedule {schedule_id} belongs to host {schedule.user_id}, not to host {host_id}; "
+            "use one of that host's schedules, or a shared one"
+        )
 
 
 async def create_event_type(
@@ -138,11 +150,14 @@ async def update_event_type(
         return None
 
     fields = data.model_dump(exclude_unset=True)
+    # Validate the EFFECTIVE pair (the patch merged onto the row), not just the fields that arrived.
+    # Re-hosting an event type without touching its schedule_id is exactly how a host ends up on a
+    # weekly pattern owned by someone else: each field is individually valid, the pair is not.
     await _require_references(
         session,
         tenant_id=tenant_id,
-        host_id=fields.get("host_id"),
-        schedule_id=fields.get("schedule_id"),
+        host_id=fields.get("host_id", row.host_id),
+        schedule_id=fields.get("schedule_id", row.schedule_id),
     )
     # Capture the target slug now: a failed flush expires ``row`` and reading it later would emit
     # sync IO inside the async context (MissingGreenlet).

@@ -23,7 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, time
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import DateOverride as CoreDateOverride
@@ -37,7 +37,7 @@ from aethercal.schemas.schedules import (
     ScheduleUpdate,
     TimeRangeSchema,
 )
-from aethercal.server.db.models import DateOverride, Schedule
+from aethercal.server.db.models import DateOverride, EventType, Schedule, User
 
 
 # --------------------------------------------------------------------------------------
@@ -77,6 +77,16 @@ class DuplicateDateOverrideError(ScheduleServiceError):
 
 class ScheduleValidationError(ScheduleServiceError):
     """Availability data failed core validation: bad IANA timezone or overlapping ranges."""
+
+
+class ScheduleOwnershipError(ScheduleServiceError):
+    """The schedule's owner is not a host of this tenant, or claiming it would strand a host (→ 422).
+
+    RF-30. A schedule is owned by ONE host (``user_id``) or shared by the business (``NULL``).
+    Assigning it to a stranger, or claiming a schedule that another host's event types already run
+    on, would leave that host bound to a pattern they do not own — a state that produces no error
+    and no symptom until they start taking bookings at someone else's hours.
+    """
 
 
 # --------------------------------------------------------------------------------------
@@ -186,7 +196,11 @@ def to_core_overrides(rows: Iterable[DateOverride]) -> list[CoreDateOverride]:
 def schedule_to_read(row: Schedule) -> ScheduleRead:
     """A persisted :class:`Schedule` row → its :class:`ScheduleRead` response model."""
     return ScheduleRead(
-        id=row.id, name=row.name, timezone=row.timezone, rules=_rules_from_json(row.rules)
+        id=row.id,
+        name=row.name,
+        timezone=row.timezone,
+        rules=_rules_from_json(row.rules),
+        user_id=row.user_id,
     )
 
 
@@ -232,14 +246,47 @@ async def _ensure_override_date_available(
 # --------------------------------------------------------------------------------------
 # Schedule CRUD.
 # --------------------------------------------------------------------------------------
+async def _ensure_owner_is_a_host(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID | None
+) -> None:
+    """A schedule's owner must be a user of THIS tenant (``None`` = shared, always allowed)."""
+    if user_id is None:
+        return
+    found = (
+        await session.scalars(
+            select(User.id).where(User.id == user_id, User.tenant_id == tenant_id)
+        )
+    ).one_or_none()
+    if found is None:
+        raise ScheduleOwnershipError(f"user {user_id} is not a host of this tenant")
+
+
+async def _hosts_using(
+    session: AsyncSession, *, tenant_id: uuid.UUID, schedule_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """The hosts whose event types currently run on this schedule."""
+    rows = await session.scalars(
+        select(EventType.host_id).where(
+            EventType.tenant_id == tenant_id, EventType.schedule_id == schedule_id
+        )
+    )
+    return set(rows.all())
+
+
 async def create_schedule(
     session: AsyncSession, *, tenant_id: uuid.UUID, data: ScheduleCreate
 ) -> Schedule:
-    """Create a weekly schedule for ``tenant_id`` (name unique per tenant; ranges validated)."""
+    """Create a weekly schedule for ``tenant_id`` (name unique per tenant; ranges validated).
+
+    ``data.user_id`` is the owning host (RF-30); ``None`` — the default — makes it a shared,
+    business-wide pattern. An owner from another tenant raises :class:`ScheduleOwnershipError`.
+    """
     await _ensure_name_available(session, tenant_id=tenant_id, name=data.name)
+    await _ensure_owner_is_a_host(session, tenant_id=tenant_id, user_id=data.user_id)
     core = _build_core_schedule(data.timezone, data.rules)
     row = Schedule(
         tenant_id=tenant_id,
+        user_id=data.user_id,
         name=data.name,
         timezone=core.timezone,
         rules=_rules_to_json(core),
@@ -249,11 +296,19 @@ async def create_schedule(
     return row
 
 
-async def list_schedules(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[Schedule]:
-    """All schedules owned by ``tenant_id``, ordered by name."""
-    result = await session.scalars(
-        select(Schedule).where(Schedule.tenant_id == tenant_id).order_by(Schedule.name)
-    )
+async def list_schedules(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID | None = None
+) -> list[Schedule]:
+    """The tenant's schedules, ordered by name.
+
+    With ``user_id``, only the schedules that host may actually use: their OWN patterns plus the
+    shared ones (``user_id IS NULL``) — never another host's private pattern (RF-30). This is what a
+    host selector needs. Without it, every schedule of the tenant, exactly as before.
+    """
+    stmt = select(Schedule).where(Schedule.tenant_id == tenant_id)
+    if user_id is not None:
+        stmt = stmt.where(or_(Schedule.user_id == user_id, Schedule.user_id.is_(None)))
+    result = await session.scalars(stmt.order_by(Schedule.name))
     return list(result.all())
 
 
@@ -274,8 +329,28 @@ async def get_schedule(
 async def update_schedule(
     session: AsyncSession, *, tenant_id: uuid.UUID, schedule_id: uuid.UUID, data: ScheduleUpdate
 ) -> Schedule:
-    """Patch a schedule (only the provided fields); re-validate when tz or rules change."""
+    """Patch a schedule (only the provided fields); re-validate when tz, rules or owner change.
+
+    Ownership (RF-30) is three-valued, so it is read from ``model_fields_set`` rather than from
+    ``None``: unset leaves the owner alone, ``null`` returns the schedule to the whole business, and
+    a uuid gives it to that host. Claiming a schedule that ANOTHER host's event types already run on
+    raises :class:`ScheduleOwnershipError` — silently stranding them on a pattern they do not own is
+    the accident this column exists to prevent.
+    """
     row = await get_schedule(session, tenant_id=tenant_id, schedule_id=schedule_id)
+
+    if "user_id" in data.model_fields_set:
+        await _ensure_owner_is_a_host(session, tenant_id=tenant_id, user_id=data.user_id)
+        if data.user_id is not None:
+            stranded = await _hosts_using(
+                session, tenant_id=tenant_id, schedule_id=row.id
+            ) - {data.user_id}
+            if stranded:
+                raise ScheduleOwnershipError(
+                    f"schedule {row.id} is in use by {len(stranded)} other host(s); giving it to "
+                    f"{data.user_id} would leave them on a schedule they do not own"
+                )
+        row.user_id = data.user_id
 
     if data.name is not None and data.name != row.name:
         await _ensure_name_available(
