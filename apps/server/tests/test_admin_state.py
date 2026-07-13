@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
+from reflex.event import EventHandler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -91,8 +92,62 @@ def test_authenticated_is_a_server_only_backend_var() -> None:
     assert "set__authenticated" not in dir(AdminState)
 
 
+#: Handlers that are PUBLIC by design: they are the auth surface itself.
+_PUBLIC_HANDLERS = frozenset({"login", "logout", "require_auth", "setvar"})
+
+#: Handlers that read and write NO tenant data — they only close a panel in the operator's own
+#: browser. They need no guard because there is nothing behind them to guard.
+_UI_ONLY_HANDLERS = frozenset({"clear_selection", "close_new_booking"})
+
+#: Calendar handlers whose unauthenticated no-op is proven in ``test_admin_calendar.py`` (they take
+#: gesture payloads, and two of them are async generators, so they are exercised there rather than
+#: in the parametrised sweep below).
+_GUARDED_ELSEWHERE = frozenset(
+    {
+        "on_calendar_event_drop",
+        "on_calendar_event_resize",
+        "on_calendar_range_select",
+        "on_calendar_event_click",
+        "on_calendar_range_change",
+        "on_calendar_view_change",
+        "set_calendar_view",
+        "create_booking",
+        "reschedule_selected",
+    }
+)
+
+
 def test_fresh_state_is_unauthenticated() -> None:
     assert _state()._authenticated is False
+
+
+def test_no_handler_can_skip_the_auth_census_unnoticed() -> None:
+    """==Every event handler on the state is CLASSIFIED, or this test fails.==
+
+    Reflex exposes each ``@rx.event`` over the websocket, so a client can invoke any of them
+    directly — a page's ``on_load`` guard protects nothing. The proof that a handler refuses an
+    unauthenticated caller therefore has to exist for EVERY handler, and until now the lists that
+    carry those proofs were maintained by hand: a handler added to ``state.py`` and forgotten was a
+    handler nobody had ever proven guarded, and nothing said so. The hole announced itself exactly
+    the way this project's defects always do — by being silent.
+
+    So the census is derived from the CLASS, not from a list somebody must remember to update. A new
+    handler is UNCLASSIFIED until its author decides which of the four it is, and an unclassified
+    handler fails here.
+    """
+    declared = {name for name, value in vars(AdminState).items() if isinstance(value, EventHandler)}
+    classified = (
+        {handler.__name__ for handler, _ in _GUARDED}
+        | _PUBLIC_HANDLERS
+        | _UI_ONLY_HANDLERS
+        | _GUARDED_ELSEWHERE
+    )
+    unclassified = declared - classified
+    assert unclassified == set(), (
+        f"event handlers with no auth-guard proof: {sorted(unclassified)}. Add each to _GUARDED "
+        "(and prove it refuses an unauthenticated caller), or to _UI_ONLY_HANDLERS if it touches no "
+        "tenant data at all."
+    )
 
 
 @pytest.mark.parametrize("handler", [h for h, _ in _GUARDED], ids=lambda h: h.__name__)
