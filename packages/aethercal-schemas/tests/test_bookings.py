@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from aethercal.core.model import BookingStatus
+from aethercal.core.tz import require_iana_zone as core_require_iana_zone
 from aethercal.schemas.bookings import (
     BookingCreate,
     BookingRead,
@@ -201,3 +202,30 @@ def test_booking_create_refuses_a_key_the_filesystem_chokes_on(key: str) -> None
 def test_require_iana_zone_still_accepts_a_real_zone(zone: str) -> None:
     """The refusal was widened, not the net: a real zone is still returned unchanged."""
     assert require_iana_zone(zone) == zone
+
+
+def test_the_schema_layer_re_exports_the_domain_rule_it_does_not_own_one() -> None:
+    """One owner, and this is not it — ``schemas`` imports the rule, it does not re-implement it.
+
+    The rule is domain logic about time, so it lives in ``aethercal.core.tz``, where the two core
+    models (``Event``, ``Schedule``) can also reach it — ``core`` may not import ``schemas`` (the
+    "core is pure" import contract), so the reverse arrangement was never available. This identity
+    assertion is what stops another copy from growing back here: a re-implementation, however
+    faithful on the day it is written, would fail this line.
+    """
+    assert require_iana_zone is core_require_iana_zone
+
+
+@pytest.mark.parametrize("zone", ["utc", "UTC ", "america/new_york"])
+def test_require_iana_zone_refuses_a_zone_only_a_case_insensitive_filesystem_would_accept(
+    zone: str,
+) -> None:
+    """``"utc"`` used to be a valid guest timezone on Windows/macOS and invalid on Linux.
+
+    ``ZoneInfo`` opened the file ``UTC`` for the key ``"utc"`` on a case-insensitive volume; Windows
+    even trimmed a trailing space. Production is Linux and refused both — so a booking that
+    validated on a developer's machine was a 422 in production. The rule is now set membership: the
+    filesystem gets no vote on what an IANA zone is.
+    """
+    with pytest.raises(ValueError, match="unknown timezone"):
+        require_iana_zone(zone)

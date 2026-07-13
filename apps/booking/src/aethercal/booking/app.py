@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlencode
 from uuid import UUID
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from fasthtml.common import FastHTML
 from starlette.concurrency import run_in_threadpool
@@ -55,6 +55,7 @@ from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
 from aethercal.client import AetherCalAPIError, AetherCalClient
+from aethercal.core.tz import require_iana_zone
 from aethercal.schemas.event_types import EventTypeRead, resolve_title
 
 T = TypeVar("T")
@@ -433,13 +434,25 @@ class _RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 def _valid_tz(value: str | None) -> str | None:
+    """The guest's ``tz`` if it names a real IANA zone, else ``None`` (the caller falls back).
+
+    What a real zone is is NOT decided here — it is decided once, by
+    :func:`aethercal.core.tz.require_iana_zone`, the same rule that guards the booking contract, the
+    host's profile and ``GET /slots``. This function only DEGRADES its refusal: ``tz`` is a query
+    param and a form field, so a guest (or a crawler) can send anything, and a page that cannot read
+    the visitor's zone still owes them a page — rendered in ``DEFAULT_TZ``, not a 500.
+
+    The copy that used to live here asked ``ZoneInfo(value)`` and caught
+    ``(ZoneInfoNotFoundError, ValueError)``, which is the filesystem's answer to a different
+    question: ``?tz=America`` names a DIRECTORY of the tz database, so it raised a raw ``OSError``
+    that walked straight past the ``except`` and took the public event page down with it.
+    """
     if not value:
         return None
     try:
-        ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError):
+        return require_iana_zone(value)
+    except ValueError:
         return None
-    return value
 
 
 def _parse_instant(value: str) -> datetime | None:

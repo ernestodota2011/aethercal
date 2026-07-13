@@ -76,12 +76,21 @@ CRASHED_BEFORE = [
     "A" * 300,
 ]
 
-# DELIBERATELY NOT ASSERTED: "utc", "UTC ". Whether they are zones depends on the FILESYSTEM, not on
-# the rule — ``ZoneInfo`` resolves a single-component key by opening a file, so a case-insensitive
-# (Windows, macOS) volume accepts ``"utc"``, and Windows additionally trims a trailing space and
-# accepts ``"UTC "``. Linux refuses both. Pinning either answer would just make this suite fail on
-# the other operating system. The divergence is real and worth closing, but it belongs to the rule's
-# own definition (see the report), not to this endpoint's translation of it.
+#: Keys whose answer used to depend on the FILESYSTEM instead of on the rule — the dev/prod
+#: divergence, now closed. ``ZoneInfo`` resolved a single-component key by opening a file, so a
+#: case-insensitive volume (Windows, macOS) accepted ``"utc"``, and Windows additionally trimmed a
+#: trailing space and accepted ``"UTC "``; Linux — production — refused both. This block used to be
+#: a comment saying exactly that and asserting NOTHING, because pinning either answer would have
+#: failed the suite on the other operating system.
+#:
+#: The rule no longer asks the filesystem: a zone is a MEMBER of ``available_timezones()``, so these
+#: are refused everywhere. That is a deliberate behaviour change — ``tz=utc`` now 422s on a
+#: developer's Windows box exactly as it always did in production — and it is the point: a rule with
+#: two answers is not a rule, and the machine getting the wrong one was the one serving guests.
+OS_DIVERGED = [
+    "utc",
+    "UTC ",
+]
 
 
 def test_the_422_message_is_the_exact_contract_string() -> None:
@@ -139,7 +148,24 @@ def test_a_zone_key_the_filesystem_chokes_on_is_refused_not_crashed(zone: str) -
     assert exc_info.value.detail["message"] == f"Unknown timezone: {zone!r}"
 
 
-@pytest.mark.parametrize("zone", [*REAL_ZONES, *NOT_ZONES, *CRASHED_BEFORE])
+@pytest.mark.parametrize("zone", OS_DIVERGED)
+def test_a_zone_the_developers_filesystem_would_have_accepted_is_refused_everywhere(
+    zone: str,
+) -> None:
+    """``GET /slots?tz=utc`` gets the same clean 422 on every OS now (see ``OS_DIVERGED``).
+
+    Before, this endpoint's answer depended on the case-sensitivity of the volume it happened to be
+    running on — the definition of "works on my machine".
+    """
+    with pytest.raises(HTTPException) as exc_info:
+        _require_iana_zone(zone)
+
+    assert exc_info.value.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert exc_info.value.detail["error"] == "invalid_timezone"
+    assert exc_info.value.detail["message"] == f"Unknown timezone: {zone!r}"
+
+
+@pytest.mark.parametrize("zone", [*REAL_ZONES, *NOT_ZONES, *CRASHED_BEFORE, *OS_DIVERGED])
 def test_the_endpoint_agrees_with_the_public_rule_exactly(zone: str) -> None:
     """One owner: ``/slots`` accepts a zone **iff** the public rule does.
 

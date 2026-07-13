@@ -64,12 +64,13 @@ def _unprocessable(error: str, message: str) -> HTTPException:
 def _require_iana_zone(tz: str) -> None:
     """Reject a ``tz`` that is not a real IANA zone with a clean 422.
 
-    What counts as a real zone is NOT decided here. It is decided once, by
-    :func:`aethercal.schemas.bookings.require_iana_zone` — the same rule the guest's timezone is
-    held to on the way into a booking, and the host's on the way into ``services/users.py``. This
-    endpoint used to re-implement it (its own ``ZoneInfo(...)``, its own ``except``), which is how
-    ``/slots`` and ``/bookings`` would eventually have come to disagree about what a zone is: not
-    with a bang, but the day someone fixed one copy.
+    What counts as a real zone is NOT decided here. It is decided once, in the domain, by
+    :func:`aethercal.core.tz.require_iana_zone` (re-exported by ``schemas.bookings``, which is where
+    this module imports it from) — the same rule the guest's timezone is held to on the way into a
+    booking, the host's on the way into ``services/users.py``, and the visitor's on the booking
+    page. This endpoint used to re-implement it (its own ``ZoneInfo(...)``, its own ``except``),
+    which is how ``/slots`` and ``/bookings`` would eventually have come to disagree about what a
+    zone is: not with a bang, but the day someone fixed one copy.
 
     So all that is left here is a TRANSLATION. The rule refuses in the currency of the schema layer
     (a ``ValueError``, worded for a Pydantic field); this endpoint owes its callers the currency of
