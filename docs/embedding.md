@@ -10,7 +10,7 @@ Paste this where you want the widget to appear:
 
 ```html
 <script
-  src="https://book.aetherlogik.com/embed.js"
+  src="https://book.example.com/embed.js"
   data-aethercal-slug="discovery-call"
 ></script>
 ```
@@ -34,7 +34,7 @@ A self-hosted deployment uses its own base URL for both the script and `data-bas
 |---|---|---|
 | `data-aethercal-slug` | **yes** | The event type's slug — the same slug used at `/e/{slug}` on the full site. |
 | `data-lang` | no | Force a locale (`es` or `en`). Omit it to let the guest's browser/Accept-Language decide, same as the non-embedded flow. |
-| `data-base` | no | The booking page's origin. Defaults to `https://book.aetherlogik.com` (AetherLogik's hosted instance). **Self-hosted deployments must set this** to their own `AETHERCAL_BOOKING_BASE_URL`. |
+| `data-base` | no | The booking page's origin — where the widget loads the flow from. **Set this to your own booking page** (the value of your `AETHERCAL_BOOKING_BASE_URL`). It is only optional because the loader carries a compiled-in default, which is not yours. |
 
 There is nothing else to configure — no widget ID, no async loader queue, no init call. The
 `<script>` tag itself carries the whole configuration, and the loader runs immediately when the
@@ -85,7 +85,7 @@ means that if AetherLogik (or a self-hoster) ever ships a breaking change to the
 cached copies won't pick it up on their own. The escape hatch is a version query string:
 
 ```html
-<script src="https://book.aetherlogik.com/embed.js?v=2" data-aethercal-slug="discovery-call"></script>
+<script src="https://book.example.com/embed.js?v=2" data-aethercal-slug="discovery-call"></script>
 ```
 
 Bumping `?v=` is a new URL as far as the browser cache is concerned, so it forces a fresh fetch.
