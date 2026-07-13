@@ -110,14 +110,23 @@ def _calendar() -> rx.Component:
     """The AetherCal calendar bound to the admin state (ES locale, Monday-first, neutral theme).
 
     The component's built-in navigation toolbar (F2-NAV) owns previous / today / next AND the
-    month/week/day/list view switcher, driving the controlled ``anchor`` / ``view`` state. Drag or
-    resize reschedule (optimistically), a range-select opens the create panel, and a click selects a
-    booking to manage — every gesture routed to a state handler that reuses the booking service.
+    month/week/day/list/timeline view switcher, driving the controlled ``anchor`` / ``view`` state.
+    Drag or resize reschedule (optimistically), a range-select opens the create panel, and a click
+    selects a booking to manage — every gesture routed to a state handler that reuses the booking
+    service.
+
+    ==On the RF-28 timeline, dragging a booking ACROSS rows is refused.== The component offers the
+    gesture, but the backend has no operation for it: a booking has no host of its own — the host
+    lives on its EVENT TYPE — so moving it to another host would mean changing its event type, and
+    with it its duration and its public link. That semantics has not been designed, so the drag is
+    declined with its reason rather than guessed at (``_CROSS_HOST_DRAG_MESSAGE``).
     """
     return rx.box(
         Calendar.create(
             view=AdminState.calendar_view,
             events=AdminState.calendar_events,
+            # RF-28: the timeline's rows are the tenant's HOSTS. The other four views ignore them.
+            resources=AdminState.calendar_resources,
             anchor=AdminState.calendar_anchor,
             navigation=True,
             locale="es",

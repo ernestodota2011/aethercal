@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     # component's ``rx.asset`` side effect, and ``admin.service`` would drag SQLAlchemy and the ORM
     # models into what is meant to be a leaf of pure functions.
     from aethercal.server.admin.service import ConnectionRead, HostRead
-    from aethercal.ui import CalendarEvent
+    from aethercal.ui import CalendarEvent, CalendarResource
 
 _MIN_WEEKDAY = 0
 _MAX_WEEKDAY = 6
@@ -66,12 +66,17 @@ def _wall_time_utc(moment: datetime) -> str:
     return moment.replace(microsecond=0).isoformat()
 
 
-def booking_event(booking: BookingRead) -> CalendarEvent:
+def booking_event(booking: BookingRead, *, resource_id: str | None = None) -> CalendarEvent:
     """Project a booking onto a calendar event for the admin agenda (F2-F).
 
     ``editable`` is ``True`` only for a CONFIRMED booking — the sole state the reschedule flow
     accepts — so the component offers drag/resize affordances only where a move can actually land; a
     non-confirmed booking renders as a muted, non-draggable chip.
+
+    ``resource_id`` is the HOST's id, which is what puts the chip on a row of the RF-28 timeline. It
+    is optional because the host lives on the EVENT TYPE, not on the booking: a booking whose event
+    type has since been removed has no row, and the component surfaces it in an "unassigned" row
+    rather than dropping it. The other four views have no resource dimension and ignore the key.
     """
     editable = booking.status is BookingStatus.CONFIRMED
     event: CalendarEvent = {
@@ -83,7 +88,15 @@ def booking_event(booking: BookingRead) -> CalendarEvent:
     }
     if not editable:
         event["color"] = _NON_EDITABLE_COLOR
+    if resource_id is not None:
+        event["resourceId"] = resource_id
     return event
+
+
+def host_resource(host: HostRead) -> CalendarResource:
+    """Project a host onto one ROW of the RF-28 timeline. ==In this backend the resource IS the
+    host== — the component itself is generic and would serve rooms or machines unchanged."""
+    return {"id": str(host.id), "title": host.name}
 
 
 def booking_row(booking: BookingRead) -> dict[str, str]:
@@ -105,6 +118,9 @@ def event_type_row(event_type: EventTypeRead) -> dict[str, str]:
     """
     return {
         "id": str(event_type.id),
+        # The host is carried on the ROW because it is what the timeline needs to place a booking's
+        # chip (RF-28): the booking knows its event type, and the event type knows its host.
+        "host_id": str(event_type.host_id),
         "slug": event_type.slug,
         "title": event_type.title,
         "title_en": event_type.title_translations.get("en", ""),
@@ -235,6 +251,7 @@ __all__ = [
     "booking_row",
     "connection_row",
     "event_type_row",
+    "host_resource",
     "host_row",
     "parse_weekdays",
     "schedule_row",

@@ -53,6 +53,7 @@ from aethercal.server.admin.format import (
     booking_row,
     connection_row,
     event_type_row,
+    host_resource,
     host_row,
     parse_weekdays,
     schedule_row,
@@ -62,7 +63,7 @@ from aethercal.server.admin.format import (
 )
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
-from aethercal.ui import CalendarEvent
+from aethercal.ui import CalendarEvent, CalendarResource
 
 # Internal (prefix-free) routes; the mount prefix is applied by Reflex's ``frontend_path`` basename.
 LOGIN_ROUTE = "/login"
@@ -145,8 +146,26 @@ def _translation_update(
 
 
 #: The calendar surfaces the operator can switch between (kept in sync with the TS ``CalendarView``
-#: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback.
-_VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list"})
+#: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback, and
+#: ``timeline`` is the RF-28 resource view (hosts in rows, time on the horizontal axis).
+#:
+#: A view missing from this set is IGNORED by the switcher, in silence — so a timeline the component
+#: renders perfectly and the state declines to select would ship, do nothing, and fail no test.
+_VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list", "timeline"})
+
+#: Why a booking cannot be dragged from one host's row to another (RF-28).
+#:
+#: ==The component offers the gesture; the backend has no operation for it, and that is a semantics
+#: nobody has designed — not an oversight to paper over.== ``bookings`` carries no ``host_id``: the
+#: host lives on the EVENT TYPE. So "move this booking to Bruno" means "give this booking a
+#: DIFFERENT event type" — another duration, another slug, another public page. Every
+#: available guess is wrong in a way the operator would not see, so the gesture is refused with its
+#: reason and the appointment is left exactly where it was.
+_CROSS_HOST_DRAG_MESSAGE = (
+    "Una reserva no se puede mover a otro anfitrión: el anfitrión lo determina el tipo de evento, "
+    "así que cambiarlo significaría cambiarle el tipo de cita (otra duración, otro enlace). "
+    "Reprograma la reserva en la fila de su anfitrión, o cancélala y crea la nueva."
+)
 
 #: The month view renders a FIXED 6-week (42-day) grid (``getMonthGridDays`` + ``_calendar()``'s
 #: ``first_day_of_week=1``), so its cells can show up to ~2 weeks of the adjacent months — a 28-day
@@ -169,6 +188,27 @@ _DURATION_FIXED_MESSAGE = (
 _RESYNC_MESSAGE = (
     "La reserva se reprogramó, pero no se pudo actualizar la vista. Recarga la agenda."
 )
+
+
+async def _host_of_event_type(runtime: AdminRuntime) -> dict[uuid.UUID, str]:
+    """``event_type_id → host_id``: the map that puts a booking's chip on a timeline row (RF-28).
+
+    It has to be a lookup, and that is the whole point of this requirement: a booking does NOT carry
+    a host. It carries an event type, and the event type carries the host. Which is exactly why
+    dragging a booking to another host's row has no meaning to give it.
+    """
+    rows = await service.list_event_types_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return {row.id: str(row.host_id) for row in rows}
+
+
+async def _fetch_resources(runtime: AdminRuntime) -> list[CalendarResource]:
+    """The timeline's rows: the tenant's hosts (RF-28)."""
+    rows = await service.list_hosts_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [host_resource(row) for row in rows]
 
 
 async def _fetch_booking_views(
@@ -199,8 +239,11 @@ async def _fetch_booking_views(
         event_reads = await service.list_bookings_view(
             runtime.sessionmaker, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
         )
+    hosts = await _host_of_event_type(runtime)
     events = [
-        booking_event(read) for read in event_reads if read.status is not BookingStatus.CANCELLED
+        booking_event(read, resource_id=hosts.get(read.event_type_id))
+        for read in event_reads
+        if read.status is not BookingStatus.CANCELLED
     ]
     return rows, events
 
@@ -223,7 +266,12 @@ async def _fetch_calendar_events(
         date_from=date_from,
         date_to=date_to,
     )
-    return [booking_event(read) for read in reads if read.status is not BookingStatus.CANCELLED]
+    hosts = await _host_of_event_type(runtime)
+    return [
+        booking_event(read, resource_id=hosts.get(read.event_type_id))
+        for read in reads
+        if read.status is not BookingStatus.CANCELLED
+    ]
 
 
 def _window(state: AdminState) -> dict[str, date | None]:
@@ -368,6 +416,28 @@ def _with_restored_event(
     return [(snapshot if event["id"] == snapshot["id"] else event) for event in events]
 
 
+def _is_cross_host_drag(payload: dict[str, str], snapshot: CalendarEvent) -> bool:
+    """Whether this drop landed on a DIFFERENT host's timeline row than the booking belongs to.
+
+    ``resourceId`` is present only on the timeline (RF-28); month / week / day have no resource
+    dimension and send none. ==An ABSENT resource is therefore not a DIFFERENT resource==: reading
+    the missing key as "moved to nothing" would refuse every ordinary drag in the other four views,
+    which is the same class of bug — a guard that fires on the case it was never meant for — as the
+    staleness check that marked cancellations delivered without sending them.
+
+    A booking whose event type has vanished has no row either (``resourceId`` absent from the chip);
+    it cannot be dragged ACROSS rows because it is on none, so it too falls through to the ordinary
+    reschedule.
+    """
+    target = payload.get("resourceId")
+    if target is None:
+        return False
+    current = snapshot.get("resourceId")
+    if current is None:
+        return False
+    return str(target) != str(current)
+
+
 def _parse_admin_start(raw: str) -> datetime:
     """Parse an ISO datetime from the admin/calendar; a naive value is stamped UTC (admin contract).
 
@@ -412,6 +482,11 @@ async def _optimistic_reschedule(
     snapshot = _find_calendar_event(state.calendar_events, booking_id)
     if snapshot is None:
         return  # a gesture on an event the server no longer has: nothing to move
+    if _is_cross_host_drag(payload, snapshot):
+        # RF-28. Refused BEFORE the optimistic apply, so the chip never even appears to move: an
+        # error message under a booking that visibly jumped rows is a lie the operator can see.
+        state.error = _CROSS_HOST_DRAG_MESSAGE
+        return
     new_start_raw = str(payload.get("start", ""))
     if require_start_change and _same_instant(new_start_raw, str(snapshot["start"])):
         # A pure duration change (start unchanged): not editable, and never a DB round-trip.
@@ -595,6 +670,8 @@ class AdminState(rx.State):
     # The agenda's calendar events (active bookings) + the operator-selected view. The calendar
     # component reads both; ``calendar_events`` also carries the optimistic in-flight move.
     calendar_events: list[CalendarEvent] = []  # noqa: RUF012 (reflex state var)
+    # The timeline's rows (RF-28): the tenant's hosts. Ignored by the other four views.
+    calendar_resources: list[CalendarResource] = []  # noqa: RUF012 (reflex state var)
     calendar_view: str = "month"
     # The visible-period anchor (a day within the shown period) + the period's EXCLUSIVE upper
     # bound, both set from the calendar's on_range_change / on_view_change payload.
@@ -697,7 +774,11 @@ class AdminState(rx.State):
         events_token = self.calendar_reload_seq
         rows_token = self.bookings_reload_seq
         try:
-            rows, events = await _fetch_booking_views(current_runtime(), **_window(self))
+            runtime = current_runtime()
+            rows, events = await _fetch_booking_views(runtime, **_window(self))
+            # The timeline's rows (RF-28). They change only when a host is added or removed, so they
+            # are loaded here rather than on every navigation.
+            resources = await _fetch_resources(runtime)
         except service.AdminError as exc:
             if events_token == self.calendar_reload_seq:
                 self.error = _error_text(exc)
@@ -707,6 +788,7 @@ class AdminState(rx.State):
         if events_token != self.calendar_reload_seq:
             return
         self.calendar_events = events
+        self.calendar_resources = resources
         self.error = ""
 
     @rx.event
