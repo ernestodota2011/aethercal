@@ -4,7 +4,10 @@ AetherCal ships as **one container + PostgreSQL**, configured entirely by enviro
 (RF-19 — no secrets in source). Migrations run automatically on boot, and the in-process scheduler
 (reminders, outbound-webhook delivery, calendar busy-cache refresh) runs inside the app container.
 
-## Quickstart (< 10 minutes on a clean machine)
+## Quickstart
+
+The guided version — configure, boot, and book a real test appointment — is
+[`docs/quickstart.md`](../docs/quickstart.md). What follows is the operator's reference.
 
 Requires Docker with the Compose plugin.
 
