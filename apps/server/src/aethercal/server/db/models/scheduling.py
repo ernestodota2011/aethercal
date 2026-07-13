@@ -3,8 +3,7 @@
 Availability windows are stored as JSON that maps directly onto the pure ``aethercal.core`` value
 objects (``Schedule.by_weekday`` / ``DateOverride.ranges``): the core owns the date math, and a
 service loads the whole aggregate and hands it over — so the windows never need to be queried in
-SQL, and this stays a small handful of tables instead of one row per time range.
-"""
+SQL, and this stays a small handful of tables instead of one row per time range."""
 
 from __future__ import annotations
 
@@ -23,6 +22,14 @@ class Schedule(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
 
     __tablename__ = "schedules"
 
+    # NULL = a BUSINESS-WIDE schedule (the shop's opening hours), shared by every host. A concrete
+    # id makes it that one host's personal availability. REQUIRED by RF-30: without it `schedules`
+    # is only tenant-scoped, so two hosts silently share one schedule and there is no way to say
+    # otherwise. Nullable because business-wide is the common case for the non-technical businesses
+    # this product serves — a salon has opening hours, not a calendar per stylist.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     rules: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)

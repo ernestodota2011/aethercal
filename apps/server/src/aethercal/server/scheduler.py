@@ -196,13 +196,17 @@ async def run_outbox_drain_once(
     execute: OutboxExecutor,
     now: datetime | None = None,
 ) -> OutboxReport | None:
-    """One transactional-outbox drain pass, in its own transaction. Returns the report, or ``None``
-    if the tick failed (logged) — a failure never propagates, so the scheduler keeps ticking.
+    """One transactional-outbox drain pass. Returns the report, or ``None`` if the tick failed
+    (logged) — a failure never propagates, so the scheduler keeps ticking.
+
+    The ``sessionmaker`` is handed to :func:`drain_outbox` rather than a session: the drain owns its
+    own transaction BOUNDARIES (claim, commit, run the network I/O with nothing open, then settle).
+    Opening one long transaction here and passing the session down would put every SMTP/Google call
+    back inside it — exactly the lock-across-I/O bug the claim/lease design removes (R8).
     """
     moment = now if now is not None else datetime.now(UTC)
     try:
-        async with sessionmaker() as session, session.begin():
-            return await drain_outbox(session, now=moment, execute=execute)
+        return await drain_outbox(sessionmaker, now=moment, execute=execute)
     except Exception:
         _logger.exception("outbox-drain tick failed; scheduler continues")
         return None
@@ -315,7 +319,17 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
         fernet = Fernet(app.state.fernet_key)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
         execute = make_booking_effect_executor(
-            sender=app.state.email_sender, service_factory=service_factory
+            sessionmaker=app.state.sessionmaker,
+            sender=app.state.email_sender,
+            service_factory=service_factory,
+            # The non-email channel registry. EMPTY today, and that is not a gap: a step on a
+            # channel nobody registered is SKIPPED with its reason, never failed — a channel
+            # without credentials is a disabled feature, not an error. The channels cut registers
+            # its WhatsApp/SMS senders here and touches nothing else.
+            #
+            # Email is deliberately NOT here: it goes through the full composer, which carries the
+            # .ics invite that a plain-body ChannelSender cannot.
+            channels=getattr(app.state, "channel_senders", None),
         )
         await run_outbox_drain_once(sessionmaker=app.state.sessionmaker, execute=execute)
 
@@ -326,8 +340,13 @@ def build_interval_scheduler() -> Any:  # pragma: no cover - live
     """Construct the live in-memory ``AsyncIOScheduler`` for the recurring interval jobs.
 
     Recurring maintenance jobs live in the default in-memory jobstore (their tick closures are not
-    picklable and never need to survive a restart — the loop self-heals on the next interval). The
-    persistent per-booking reminder jobs run on a SEPARATE scheduler (``ApschedulerTaskRunner``).
+    picklable and never need to survive a restart — the loop self-heals on the next interval).
+
+    This is now the ONLY scheduler. Per-booking reminders used to run on a second, PERSISTENT one
+    (an APScheduler ``SQLAlchemyJobStore``); durability for them now comes from the transactional
+    outbox, whose ``next_retry_at`` is the send time and whose ``dedupe_key`` is the single
+    idempotency barrier. Two schedulers meant two barriers that did not know about each other — and
+    a guest getting two reminders the moment a tenant defined a "24 h before" workflow rule.
     """
     return AsyncIOScheduler()
 

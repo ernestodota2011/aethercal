@@ -44,6 +44,7 @@ from aethercal.server.services.bookings import (
     SlotUnavailableError,
     cancel_booking,
     create_booking,
+    mark_no_show,
     reschedule_booking,
 )
 from aethercal.server.services.slots import compute_slots
@@ -359,3 +360,60 @@ async def test_concurrent_cancel_and_reschedule_reach_one_consistent_outcome(app
     else:
         # Cancel won: reschedule was refused, leaving no replacement.
         assert len(active) == 0
+
+
+async def test_a_no_show_booking_still_blocks_its_slot(app: FastAPI) -> None:
+    """RF-25, proven against the REAL partial unique index — not merely against the domain object.
+
+    A no-show is not a cancellation. The appointment time has already passed, so freeing the slot
+    would corrupt history and let a booking be written retroactively over it. The index predicate is
+    ``WHERE status <> 'cancelled'``, so ``no_show`` keeps occupying its slot with no index change at
+    all — and this asserts the DATABASE itself refuses the second booking, which is the only proof
+    that counts. If anyone ever "fixes" the index to also exclude ``no_show``, this goes red.
+    """
+    tenant_id, event_type_id, booking_id, _others, now = await _seed_confirmed_booking(app)
+    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+
+    async with sessionmaker() as session:
+        booked = await session.get(Booking, booking_id)
+        assert booked is not None
+        slot = booked.start_at
+
+    # The appointment happens and the guest never turns up.
+    async with sessionmaker() as session, session.begin():
+        marked = await mark_no_show(
+            session, tenant_id=tenant_id, booking_id=booking_id, now=slot + timedelta(days=1)
+        )
+        assert marked.status is BookingStatus.NO_SHOW
+
+    # The slot is NOT back on the market. A fresh booking for that exact slot is refused — the
+    # partial unique index still counts the no-show as an active occupant.
+    async with sessionmaker() as session, session.begin():
+        with pytest.raises(SlotUnavailableError):
+            await create_booking(
+                session,
+                tenant_id=tenant_id,
+                params=BookingParams(
+                    event_type_id=event_type_id,
+                    start=slot,
+                    guest_name="Second Guest",
+                    guest_email="second@example.com",
+                    guest_timezone="UTC",
+                ),
+                now=now,
+            )
+
+    # Exactly one booking row on that slot, and it is the no-show.
+    async with sessionmaker() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(Booking).where(
+                        Booking.event_type_id == event_type_id, Booking.start_at == slot
+                    )
+                )
+            ).all()
+        )
+    assert len(rows) == 1
+    assert rows[0].id == booking_id
+    assert rows[0].status is BookingStatus.NO_SHOW

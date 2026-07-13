@@ -138,7 +138,6 @@ async def test_lifespan_attaches_runtime_effects_without_a_scheduler(
         assert isinstance(app.state.http_client, httpx.AsyncClient)
         assert app.state.fernet_key == settings.fernet_key()
         assert app.state.email_sender is None
-        assert app.state.reminder_runner is None
         assert app.state.scheduler is None
 
     # The HTTP client is closed cleanly on shutdown (no leaked resources under filterwarnings).
@@ -175,34 +174,13 @@ async def test_lifespan_unwinds_every_started_resource_on_partial_boot_failure(
         async def dispose(self) -> None:
             self.disposed = True
 
-    class _FakeReminderRunner:
-        """A started-then-shut-down reminder runner (no real Postgres jobstore)."""
-
-        def __init__(self) -> None:
-            self.started = False
-            self.shut_down = False
-
-        def start(self) -> None:
-            self.started = True
-
-        def shutdown(self) -> None:
-            self.shut_down = True
-
     fake_engine = _FakeEngine()
-    reminder_runner = _FakeReminderRunner()
-
-    class _FakeRunnerFactory:
-        @staticmethod
-        def with_postgres_jobstore(_url: str) -> _FakeReminderRunner:
-            reminder_runner.start()
-            return reminder_runner
 
     def _boom_start_scheduler(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("scheduler failed to start")
 
     monkeypatch.setattr(app_module, "build_async_engine", lambda _config: fake_engine)
     monkeypatch.setattr(app_module, "build_sessionmaker", lambda _engine: object())
-    monkeypatch.setattr(app_module, "ApschedulerTaskRunner", _FakeRunnerFactory)
     monkeypatch.setattr(app_module, "build_interval_scheduler", object)
     monkeypatch.setattr(app_module, "start_scheduler", _boom_start_scheduler)
 
@@ -213,10 +191,9 @@ async def test_lifespan_unwinds_every_started_resource_on_partial_boot_failure(
         async with app.router.lifespan_context(app):
             pass  # unreachable — the failure happens during startup
 
-    # The reminder runner had started (the failure is genuinely AFTER it), yet every acquired
-    # resource's cleanup still ran: reminder runner shut down, HTTP client closed, engine disposed.
-    assert reminder_runner.started is True
-    assert reminder_runner.shut_down is True
+    # The engine and the HTTP client were BOTH acquired before the scheduler blew up, and the
+    # AsyncExitStack still unwound every one of them: client closed, engine disposed. (There is no
+    # reminder runner to unwind any more — the outbox is the durable scheduler now.)
     assert app.state.http_client.is_closed is True
     assert fake_engine.disposed is True
 

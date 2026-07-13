@@ -10,11 +10,11 @@ The lifespan does the things that must happen against a live process:
   the derived ``fernet_key``, and (when SMTP is set via env) an ``SmtpEmailSender``. A missing
   SMTP/Google config leaves the effect ``None`` and never hard-fails boot (the path degrades);
 * when ``run_scheduler`` is set (the container turns it on in exactly ONE process — see
-  ``deploy/README.md``), start the in-process scheduler: the persistent per-booking reminder runner
-  and an ``AsyncIOScheduler`` running the recurring webhook-delivery + busy-cache-refresh +
-  transactional-outbox-drain jobs;
+  ``deploy/README.md``), start the in-process scheduler: a single ``AsyncIOScheduler`` running the
+  recurring webhook-delivery + busy-cache-refresh + transactional-outbox-drain jobs (the outbox IS
+  the durable scheduler, so there is no second, persistent reminder scheduler any more);
 * on shutdown -- or on a failure part-way through startup -- unwind every resource that was
-  acquired (via an ``AsyncExitStack``): stop the scheduler(s), close the HTTP client, and dispose
+  acquired (via an ``AsyncExitStack``): stop the scheduler, close the HTTP client, and dispose
   the async engine, so a partial boot never leaks a started scheduler/client/engine.
 
 ``create_app_from_env`` is the uvicorn ``--factory`` entrypoint: it builds ``Settings`` from the
@@ -42,7 +42,6 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker, b
 from aethercal.server.db.migrate import run_migrations
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
-from aethercal.server.jobs.reminders import ApschedulerTaskRunner
 from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
@@ -70,8 +69,7 @@ def build_email_sender(environ: Mapping[str, str] | None = None) -> EmailSender 
 
     Boot never hard-fails on unconfigured SMTP: a missing ``AETHERCAL_SMTP_HOST`` / ``_FROM`` makes
     :meth:`SmtpConfig.from_env` raise, which we translate to ``None`` — the booking flow then simply
-    skips the transactional email rather than 500-ing.
-    """
+    skips the transactional email rather than 500-ing."""
     try:
         config = SmtpConfig.from_env(environ)
     except RuntimeError:
@@ -90,7 +88,7 @@ def create_app(settings: Settings) -> FastAPI:
         # failure at ANY later startup step unwinds everything already started (in reverse order)
         # instead of leaking it — a partial boot no longer skips cleanup. On the normal path the
         # stack unwinds at shutdown in the same order the old try/finally did: interval scheduler →
-        # reminder runner → HTTP client → engine.
+        # HTTP client → engine.
         async with AsyncExitStack() as stack:
             # The async engine is built eagerly in create_app (above), so its teardown is registered
             # FIRST — ahead of the boot migration, the earliest startup step that can fail. Register
@@ -115,15 +113,14 @@ def create_app(settings: Settings) -> FastAPI:
             app.state.email_sender = build_email_sender()
 
             interval_scheduler: Any = None
-            reminder_runner: ApschedulerTaskRunner | None = None
-            if settings.run_scheduler:  # pragma: no cover - live: starts real APScheduler loops
-                # Persistent per-booking reminders (survive a restart via the Postgres jobstore).
-                reminder_runner = ApschedulerTaskRunner.with_postgres_jobstore(
-                    settings.database_config().url
-                )
-                reminder_runner.start()
-                stack.callback(reminder_runner.shutdown)
-                # Recurring maintenance jobs (webhook delivery + busy-cache refresh), memory store.
+            if settings.run_scheduler:  # pragma: no cover - live: starts a real APScheduler loop
+                # ONE scheduler now. The per-booking reminder used to run on a SECOND, persistent
+                # APScheduler (a Postgres jobstore) carrying its own idempotency barrier; it is
+                # gone. A reminder is a workflow rule materialised into the transactional outbox,
+                # whose `next_retry_at` IS its send time — so the outbox is the durable scheduler
+                # and a booking has exactly one thing that can decide to remind its guest. Two
+                # schedulers with two barriers meant a tenant with a "24 h before" rule mailed the
+                # guest twice.
                 interval_scheduler = build_interval_scheduler()
                 start_scheduler(
                     interval_scheduler,
@@ -132,7 +129,6 @@ def create_app(settings: Settings) -> FastAPI:
                     outbox_tick=make_outbox_drain_tick(app),
                 )
                 stack.callback(stop_scheduler, interval_scheduler)
-            app.state.reminder_runner = reminder_runner
             app.state.scheduler = interval_scheduler
 
             yield

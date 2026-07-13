@@ -14,11 +14,19 @@ from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, 
 
 # Stored as its string value (native_enum=False → VARCHAR + CHECK), reusing the core vocabulary so
 # the DB and the domain model never disagree on the set of statuses.
+#
+# ``create_constraint=True`` is NOT decoration. SQLAlchemy 1.4+ defaults it to **False**, so this
+# column has been a bare ``VARCHAR(16)`` with no validation at all since 0001 — the database would
+# have accepted ``status = 'banana'``. The comment above claimed "VARCHAR + CHECK" and the CHECK was
+# never emitted (verified against both the live PostgreSQL 16 schema and the SQLite one). Migration
+# 0005 creates the constraint that should always have been there, over the full four-status
+# vocabulary. Found while adding ``no_show``; fixed at the root rather than worked around.
 _BOOKING_STATUS = sa.Enum(
     BookingStatus,
     name="booking_status",
     native_enum=False,
     length=16,
+    create_constraint=True,
     values_callable=lambda enum: [member.value for member in enum],
 )
 
@@ -44,6 +52,14 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
     guest_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     guest_email: Mapped[str] = mapped_column(sa.String(320), nullable=False)
+    # NULL = the guest gave no phone. Validated as E.164 at the SCHEMA layer (``BookingCreate``),
+    # not here: the column is storage, and a WhatsApp/SMS step simply skips a booking without one.
+    guest_phone: Mapped[str | None] = mapped_column(sa.String(20))
+    # When the guest agreed to be messaged on that number. NULL = they did not. ==Persist the
+    # consent, or the consent did not happen.== A checkbox whose answer is thrown away is not
+    # consent and cannot be evidenced later; a WhatsApp/SMS step must be able to ask the database
+    # "may I message this person?" and get a defensible answer.
+    guest_phone_consent_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     guest_timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     guest_notes: Mapped[str | None] = mapped_column(sa.Text)
     answers: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)
@@ -55,11 +71,26 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
         sa.String(255), server_default=sa.text("''"), default=_new_ical_uid, nullable=False
     )
     external_event_id: Mapped[str | None] = mapped_column(sa.String(255))
+    # WHERE that external event actually lives. The booking knew the event's ID but not its home, so
+    # a cancel could only GUESS the calendar. Re-designate the booking target and the delete goes to
+    # the wrong calendar, Google answers 404, and the original event is left orphaned in the host's
+    # calendar — in silence. Recording the connection + calendar at write time is what makes the
+    # delete address the same place the create wrote to.
+    #
+    # SET NULL, not CASCADE: revoking a Google connection must never delete the BOOKING. The guest
+    # still has an appointment; all that is lost is our handle on the mirrored calendar event.
+    external_connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("external_connections.id", ondelete="SET NULL")
+    )
+    external_calendar_id: Mapped[str | None] = mapped_column(sa.String(255))
     meeting_url: Mapped[str | None] = mapped_column(sa.String(1024))
     rescheduled_from_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("bookings.id", ondelete="SET NULL")
     )
     cancelled_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # When the host marked the guest a no-show (RF-25). Only ever set from ``confirmed``, and only
+    # after the appointment has ENDED. The booking keeps occupying its slot (see BookingStatus).
+    no_show_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     # The persisted iCal SEQUENCE for this booking's UID (RFC 5545, F1-08). Starts at 0 (the
     # confirmation), and every mutation that emits an updated ``.ics`` bumps it — a cancellation
     # bumps it, a reschedule carries the predecessor + 1 — so successive updates strictly increase
@@ -75,11 +106,16 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
             "event_type_id",
             "start_at",
             unique=True,
-            # The partial predicate (cancelled bookings free their slot, RF-04) is declared for
-            # BOTH PostgreSQL (production) and SQLite (the offline test backend) so ``create_all``
-            # builds a genuinely partial index everywhere. Without ``sqlite_where`` SQLite emits a
-            # FULL unique index and a cancelled row keeps occupying its slot, so the offline suite
-            # could not prove the freed-slot semantics. The initial migration stays PostgreSQL-only.
+            # The partial predicate (cancelled bookings free their slot, RF-04) is declared for BOTH
+            # PostgreSQL (production) and SQLite (the offline test backend) so ``create_all`` builds
+            # a genuinely partial index everywhere. Without ``sqlite_where`` SQLite emits a FULL
+            # unique index and a cancelled row keeps occupying its slot, so the offline suite could
+            # not prove the freed-slot semantics. The initial migration stays PostgreSQL-only.
+            #
+            # The predicate is UNCHANGED by the no-show work (RF-25), and that is deliberate rather
+            # than an oversight: the appointment already happened, so freeing its slot would corrupt
+            # history and let a booking be written retroactively over it. "Everything except
+            # cancelled occupies" is the safe default, and ``no_show`` inherits it for free.
             postgresql_where=sa.text("status <> 'cancelled'"),
             sqlite_where=sa.text("status <> 'cancelled'"),
         ),
