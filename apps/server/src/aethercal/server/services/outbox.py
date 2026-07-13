@@ -1840,15 +1840,23 @@ async def _gate_on_the_rule(
 
 
 def _require_phone_consent(booking: Booking, channel: Channel) -> None:
-    """Refuse to message a phone without BOTH a number and a recorded consent. Legal, not stylistic.
+    """Refuse to message a phone without BOTH a number and a ticked box. Legal, not cosmetic.
 
-    ``bookings.guest_phone_consent_at`` exists to PROVE the guest agreed to be messaged on that
-    number. A column that is written and then never read is decorative — and the thing it was meant
-    to prevent (an unconsented message to a real phone) happens anyway. So this is the only door
-    into the WhatsApp/SMS path, and it is closed by default:
+    ``bookings.guest_phone_consent_at`` records **when the consent box on the booking form was
+    ticked**. Be exact about what that is, and what it is not:
+
+    * it IS evidence that whoever filled in this booking ticked the box, and when;
+    * it is **NOT** proof that the OWNER of the number agreed to anything. The number is typed into
+      a PUBLIC form by whoever is booking, and nothing in this product verifies they possess it. A
+      stranger can book with someone else's number and tick the box on their behalf. Possession of
+      the number is **not verified anywhere** — a declared gap, stated plainly to the operator in
+      ``docs/phone-channels.md``.
+
+    So this gate is NECESSARY and NOT SUFFICIENT. It closes the door on the case we can actually
+    detect — nobody ticked the box — and it is the only door into the WhatsApp/SMS path:
 
     * no number at all → there is nothing to send to;
-    * a number but NO ``guest_phone_consent_at`` → the guest never agreed. Silence is not consent;
+    * a number but NO ``guest_phone_consent_at`` → the box was never ticked. Silence is not consent;
     * consent WITHDRAWN (the stamp set back to NULL) → the same gate closes again, automatically.
       Revocation needs no special code path: it IS the absence of the stamp.
 

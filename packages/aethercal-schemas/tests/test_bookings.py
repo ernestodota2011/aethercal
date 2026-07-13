@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from aethercal.core.model import BookingStatus
 from aethercal.core.tz import require_iana_zone as core_require_iana_zone
 from aethercal.schemas.bookings import (
+    _E164,  # pyright: ignore[reportPrivateUsage] - the anchor invariant is pinned on the pattern
     BookingCreate,
     BookingRead,
     BookingReschedule,
@@ -119,10 +120,57 @@ def test_normalize_phone_strips_human_formatting_to_e164(raw: str, expected: str
         "not a phone",
         "+1-305-413-1728 ext 4",  # trailing junk is not silently dropped
         "+1305413172a",  # a letter hiding among the digits
+        # UNICODE NUMERALS. Python's ``\d`` matches every Unicode decimal digit, so a pattern
+        # written with ``\d`` calls each of these a valid "E.164" number, stores it, and hands it to
+        # the WhatsApp/SMS provider — which rejects it, or interprets it as some OTHER number. A
+        # phone network speaks ASCII digits; a string that merely LOOKS like digits to a human is
+        # not a phone number.
+        #
+        # Written as escapes, not as literal glyphs: these characters are confusable by design (it
+        # is the whole point of the bug), and ruff's RUF001 rightly refuses them in source. The
+        # escape says exactly which code point is under test and keeps this file ASCII.
+        "+\u0661\u0662\u0663\u0664\u0665\u0666",  # Arabic-Indic throughout
+        "+1\u0662\u0663\u0664\u0665\u0666\u0667",  # the live vector: ASCII "+1", Unicode body
+        "+1\u0968\u0969\u096a\u096b\u096c",  # Devanagari body
+        "+1\u0662\u0663\u0664",  # a short Arabic-Indic body
+        "+1\uff11\uff12\uff13\uff14\uff15",  # fullwidth digits
     ],
 )
 def test_normalize_phone_rejects_anything_that_is_not_e164(raw: str) -> None:
     assert normalize_phone(raw) is None
+
+
+def test_the_e164_pattern_anchors_both_ends_with_no_newline_exception() -> None:
+    """A regression guard on the ANCHOR, asserted on the pattern rather than through the API.
+
+    Python's ``$`` also matches immediately BEFORE a trailing newline, so the old
+    ``_E164.match(r"^...$")`` accepted ``"+13054131728\\n"``. Today that is unreachable — the
+    punctuation strip removes the newline before the pattern ever sees it — which is exactly why
+    this is pinned HERE instead of through ``normalize_phone``: the bug is masked, not absent, and
+    narrowing that strip (say, to spaces only) would silently expose it. ``fullmatch`` closes it at
+    the root, so the anchor is correct whether or not anything upstream is protecting it.
+
+    Trailing whitespace itself stays FORGIVEN through the public API (a pasted number often carries
+    it) — that is the strip's job, not the anchor's.
+    """
+    assert _E164.fullmatch("+13054131728\n") is None
+    assert _E164.fullmatch("+13054131728") is not None
+    assert normalize_phone("+13054131728\n") == "+13054131728"  # whitespace is still forgiven
+
+
+def test_a_normalized_phone_is_always_ascii() -> None:
+    """The property behind the cases above: what reaches the database is ASCII, or it is nothing.
+
+    Asserted as a property and not only as examples, because the Unicode decimal-digit category is
+    large (Arabic-Indic, Devanagari, fullwidth, Thai, ...) and enumerating it in a parametrize list
+    is a losing game — the next unlisted script would sail straight through.
+    """
+    for raw in ("+13054131728", "+1 (305) 413-1728", "+34 600 123 456"):
+        normalized = normalize_phone(raw)
+        assert normalized is not None
+        assert normalized.isascii()
+        assert normalized.startswith("+")
+        assert normalized[1:].isdigit()
 
 
 def test_booking_create_defaults_to_no_phone_and_no_consent() -> None:

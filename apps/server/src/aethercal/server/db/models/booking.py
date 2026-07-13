@@ -55,10 +55,17 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     # NULL = the guest gave no phone. Validated as E.164 at the SCHEMA layer (``BookingCreate``),
     # not here: the column is storage, and a WhatsApp/SMS step simply skips a booking without one.
     guest_phone: Mapped[str | None] = mapped_column(sa.String(20))
-    # When the guest agreed to be messaged on that number. NULL = they did not. ==Persist the
-    # consent, or the consent did not happen.== A checkbox whose answer is thrown away is not
-    # consent and cannot be evidenced later; a WhatsApp/SMS step must be able to ask the database
-    # "may I message this person?" and get a defensible answer.
+    # WHEN THE CONSENT BOX ON THE BOOKING FORM WAS TICKED. NULL = it was not. Read that precisely:
+    # this is a stamp that the box was ticked. It is NOT verified consent.
+    #
+    # It IS evidence that whoever filled in this booking ticked the box, and when. It is NOT proof
+    # that the OWNER of the number agreed to anything: the number is typed into a PUBLIC form by
+    # whoever is booking, and nothing in this product verifies they possess it. Verifying possession
+    # (an OTP, or a confirmation link) is a DECLARED GAP — see ``docs/phone-channels.md``.
+    #
+    # Persist the tick, or it did not happen: a checkbox whose answer is thrown away is not consent
+    # and cannot be evidenced at all. A WhatsApp/SMS step asks this column "was the box ticked?",
+    # and that is the honest limit of the answer it gets back.
     guest_phone_consent_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     guest_timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     guest_notes: Mapped[str | None] = mapped_column(sa.Text)

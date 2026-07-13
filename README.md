@@ -38,10 +38,14 @@ exactly that. This section is checked against the code, not against the roadmap.
   host's calendar, but the write-back leg is not connected (see `_build_effects` in
   `apps/server/src/aethercal/server/api/bookings.py`). Cancelling and rescheduling likewise do not
   touch Google.
-- **Notification workflows run, but only over email.** The engine, its migration and the seeded
-  24-hour reminder are live — and the reminder does reach the guest. But **WhatsApp and SMS are
-  declared in the `Channel` enum with no adapter behind them**, and there is no workflow CRUD API or
-  admin screen yet: the rules are seeded, not editable.
+- **WhatsApp and SMS work — but nothing verifies that the phone number belongs to the person
+  booking.** The adapters, the consent checkbox and the mandatory daily caps are live, and both
+  channels stay **off until you configure them**. The number, however, is typed into a *public*
+  form, and a ticked consent box only proves that *somebody* ticked it — not that the **owner of
+  the number** agreed. A stranger can book with someone else's phone and make your business message
+  them, under your brand. Verifying possession of the number (an OTP, or a confirmation link) is a
+  **declared gap**, not a thing that quietly works.
+  ==Read [docs/phone-channels.md](docs/phone-channels.md) before switching a phone channel on.==
 - **No-show has no webhook.** You can mark a booking `no_show`, but the outgoing events are still
   only `booking.created`, `booking.cancelled` and `booking.rescheduled`.
 - **No payments, no multi-business isolation, no round-robin or collective bookings.**

@@ -7,6 +7,7 @@
 | [Calendar component](calendar-component.md) | `@aethercal/calendar-react` and the `aethercal-ui` Reflex wrapper |
 | [Webhooks](webhooks.md) | Signature verification and the **at-least-once** delivery contract |
 | [Embedding](embedding.md) | Drop the booking widget onto any site with one `<script>` tag |
+| [Phone channels](phone-channels.md) | WhatsApp/SMS: enabling them, the mandatory caps, and **the consent limitation to read before you switch them on** |
 
 Operator reference: [`deploy/README.md`](../deploy/README.md) — every setting, the scheduler rule,
 and hardening the admin surface.
