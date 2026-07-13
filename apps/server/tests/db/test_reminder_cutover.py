@@ -191,3 +191,99 @@ def test_the_cutover_seeds_the_reminder_rule_as_a_workflow(tmp_path: Path) -> No
     assert workflow[3] is None  # applies to every event type of the tenant
     assert step == ("email", "reminder", 0)
     engine.dispose()
+
+
+# --------------------------------------------------------------------------------------
+# The downgrade must survive data the NEW schema legitimately produces.
+# --------------------------------------------------------------------------------------
+
+
+def _seed_two_channel_sends(engine: sa.Engine) -> tuple[str, str]:
+    """One booking, one kind, TWO channels — an email AND a WhatsApp reminder.
+
+    Perfectly valid under the new ledger (it is the whole point of RF-24), and completely
+    unrepresentable under the old one. Returns (older_id, newer_id).
+    """
+    ids = _seed_pre_0005(engine)
+    command.upgrade(make_alembic_config(str(engine.url)), "head")
+
+    booking_id = ids["future_unreminded"].hex
+    older, newer = uuid.uuid4().hex, uuid.uuid4().hex
+    step_id = uuid.uuid4().hex
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO workflow_steps (id, tenant_id, workflow_id, channel, kind, position) "
+            "SELECT "
+            f"'{step_id}', tenant_id, id, 'whatsapp', 'reminder', 1 FROM workflows LIMIT 1"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO sent_notifications (id, tenant_id, booking_id, kind, channel, step_id, "
+            f"sent_at) VALUES ('{older}', '{ids['tenant'].hex}', '{booking_id}', 'reminder', "
+            f"'email', NULL, '{(now - timedelta(hours=2)).isoformat(sep=' ')}')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO sent_notifications (id, tenant_id, booking_id, kind, channel, step_id, "
+            f"sent_at) VALUES ('{newer}', '{ids['tenant'].hex}', '{booking_id}', 'reminder', "
+            f"'whatsapp', '{step_id}', '{now.isoformat(sep=' ')}')"
+        )
+    return older, newer
+
+
+def test_the_downgrade_runs_on_data_the_new_schema_legitimately_produces(tmp_path: Path) -> None:
+    """==The rollback you only discover is broken mid-incident.==
+
+    The downgrade restores the flat UNIQUE (tenant, booking, kind). But the new schema deliberately
+    allows the SAME kind on TWO channels — email + WhatsApp for one reminder. Hand those valid rows
+    to the old constraint and the CREATE UNIQUE fails, so the downgrade does not run at all.
+
+    It must reduce the data first: one row per key, the OLDEST kept.
+    """
+    engine = _engine(tmp_path)
+    older, newer = _seed_two_channel_sends(engine)
+
+    # The pre-condition the OLD schema cannot represent: two rows, same kind, different channels.
+    with engine.begin() as conn:
+        clashing = conn.exec_driver_sql(
+            "SELECT id FROM sent_notifications WHERE kind = 'reminder' "
+            f"AND id IN ('{older}', '{newer}')"
+        ).fetchall()
+    assert len(clashing) == 2
+
+    command.downgrade(make_alembic_config(str(engine.url)), _BEFORE_0005)
+
+    with engine.begin() as conn:
+        survivors = {
+            row[0]
+            for row in conn.exec_driver_sql(
+                f"SELECT id FROM sent_notifications WHERE id IN ('{older}', '{newer}')"
+            ).fetchall()
+        }
+        columns = {
+            col[1]
+            for col in conn.exec_driver_sql("PRAGMA table_info(sent_notifications)").fetchall()
+        }
+
+    # It RAN — and it kept exactly one row for that key: the OLDEST, deliberately.
+    assert survivors == {older}, "the downgrade kept the wrong row (or blew up on valid data)"
+    assert newer not in survivors  # the other channel's send is gone, on purpose
+    assert "channel" not in columns and "step_id" not in columns
+    engine.dispose()
+
+
+def test_the_downgrade_is_a_no_op_when_there_is_nothing_to_reduce(tmp_path: Path) -> None:
+    """The common case: one send per kind. Nothing is deleted, and it still runs clean."""
+    engine = _engine(tmp_path)
+    ids = _seed_pre_0005(engine)
+    command.upgrade(make_alembic_config(str(engine.url)), "head")
+
+    command.downgrade(make_alembic_config(str(engine.url)), _BEFORE_0005)
+
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT booking_id FROM sent_notifications WHERE kind = 'reminder'"
+        ).fetchall()
+    # The single pre-existing reminder survived untouched.
+    assert [row[0] for row in rows] == [ids["future_reminded"].hex]
+    engine.dispose()

@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from aethercal.core.model import BookingStatus
+from aethercal.server.channels import Channel
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.migrate import run_migrations
 from aethercal.server.db.models import (
@@ -494,3 +495,167 @@ async def test_a_step_on_an_unconfigured_channel_is_skipped_not_dead_lettered(
     assert (
         await drain_outbox(migrated, now=due + timedelta(days=1), execute=execute)
     ).attempted == 0
+
+
+# --------------------------------------------------------------------------------------
+# CONSENT. Persisting it and then not reading it is worse than not persisting it at all:
+# the column looks like a safeguard, and the unconsented message goes out anyway.
+# --------------------------------------------------------------------------------------
+
+
+async def _booking_with_whatsapp_step(
+    migrated: Sessionmaker, *, phone: str | None, consented_at: datetime | None
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A booking with a WhatsApp reminder step, and whatever phone/consent state we are testing."""
+    async with migrated() as session, session.begin():
+        tenant, event_type = await _seed(session)
+        tenant_id = tenant.id
+        whatsapp = Workflow(
+            tenant_id=tenant_id,
+            event_type_id=None,
+            name="whatsapp reminder",
+            trigger=WorkflowTrigger.BEFORE_START.value,
+            offset_minutes=-1440,
+            active=True,
+        )
+        session.add(whatsapp)
+        await session.flush()
+        session.add(
+            WorkflowStep(
+                tenant_id=tenant_id,
+                workflow_id=whatsapp.id,
+                channel="whatsapp",
+                kind="reminder",
+                position=0,
+            )
+        )
+        await session.flush()
+        booking = await create_booking(
+            session, tenant_id=tenant_id, params=_params(event_type.id, _SLOT), now=_NOW
+        )
+        booking.guest_phone = phone
+        booking.guest_phone_consent_at = consented_at
+        await session.flush()
+        return tenant_id, booking.id
+
+
+class _RecordingChannelSender:
+    """A configured WhatsApp sender, so "nobody could send it" is NEVER why a test passes."""
+
+    channel = Channel.WHATSAPP
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, *, to: str, subject: str | None, body: str) -> None:
+        self.sent.append((to, body))
+
+
+async def _drain_whatsapp(
+    migrated: Sessionmaker, booking_id: uuid.UUID, whatsapp: _RecordingChannelSender
+) -> Outbox:
+    execute = make_booking_effect_executor(
+        sessionmaker=migrated,
+        sender=_RecordingSender(),
+        service_factory=None,
+        channels={Channel.WHATSAPP: whatsapp},
+    )
+    await drain_outbox(migrated, now=_SLOT - timedelta(hours=24), execute=execute)
+    async with migrated() as session:
+        steps = await _steps(session, booking_id)
+    return next(step for step in steps if step.payload["channel"] == "whatsapp")
+
+
+async def test_a_phone_WITHOUT_consent_is_never_messaged(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """==The legal one.== We have the number, the channel IS configured, and the guest never agreed.
+    Sending anyway is not a style problem. The step is skipped with its OWN reason — not the same
+    one as "the channel is not configured", because "could not send" and "not allowed to send" are
+    different facts and an operator has to be able to tell them apart."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=None
+    )
+    whatsapp = _RecordingChannelSender()
+
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == [], "an unconsented message was sent to a real phone number"
+    assert step.status == "skipped"
+    assert step.attempts == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("no-phone-consent" in message for message in messages), (
+        "the skip reason must be distinguishable from 'channel not configured'"
+    )
+    assert not any("channel-unconfigured" in message for message in messages)
+
+
+async def test_a_phone_WITH_consent_gets_PAST_the_consent_gate(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half of the gate, and it has to be asserted or the tests above pass for free — a
+    handler that skipped EVERYTHING would satisfy them all.
+
+    With consent recorded and the channel configured, the step gets past the consent gate. It still
+    stops, but at a DIFFERENT wall: the template renderer, which is the channels cut's to build. The
+    proof is the reason: ``no-template-renderer``, never ``no-phone-consent``. When that renderer
+    lands, this step sends, and it sends because the gate opened here.
+    """
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    whatsapp = _RecordingChannelSender()
+
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert step.status == "skipped"
+    messages = [record.getMessage() for record in caplog.records]
+    # It got THROUGH consent — it stopped later, at the missing renderer.
+    assert any("no-template-renderer" in message for message in messages), (
+        "the consented step did not reach the renderer: the consent gate rejected it"
+    )
+    assert not any("no-phone-consent" in message for message in messages)
+    assert not any("no-phone:" in message for message in messages)
+
+
+async def test_WITHDRAWN_consent_closes_the_gate_again(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Revocation needs no special code path: it IS the absence of the stamp. Set the column back to
+    NULL and the same gate closes, automatically."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    async with migrated() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.guest_phone_consent_at = None  # the guest withdraws consent
+
+    whatsapp = _RecordingChannelSender()
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == [], "a message went out after consent was withdrawn"
+    assert step.status == "skipped"
+    assert any("no-phone-consent" in record.getMessage() for record in caplog.records)
+
+
+async def test_no_phone_at_all_has_its_own_distinct_reason(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ "No number" and "no consent" are also different facts, and both differ from "no channel"."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone=None, consented_at=None
+    )
+    whatsapp = _RecordingChannelSender()
+
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == []
+    assert step.status == "skipped"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("no-phone:" in message for message in messages)
+    assert not any("no-phone-consent" in message for message in messages)

@@ -1112,6 +1112,41 @@ async def run_notify_effect(
         )
 
 
+# The skip reasons, as distinct machine-greppable prefixes. "We could not send" and "we were not
+# ALLOWED to send" are completely different facts about the world, and an operator reading the log
+# during an incident — or a regulator reading it afterwards — has to be able to tell them apart.
+_NO_PHONE = "no-phone"
+_NO_CONSENT = "no-phone-consent"
+_CHANNEL_UNCONFIGURED = "channel-unconfigured"
+_NO_RENDERER = "no-template-renderer"
+
+
+def _require_phone_consent(booking: Booking, channel: Channel) -> None:
+    """Refuse to message a phone without BOTH a number and a recorded consent. Legal, not stylistic.
+
+    ``bookings.guest_phone_consent_at`` exists to PROVE the guest agreed to be messaged on that
+    number. A column that is written and then never read is decorative — and the thing it was meant
+    to prevent (an unconsented message to a real phone) happens anyway. So this is the only door
+    into the WhatsApp/SMS path, and it is closed by default:
+
+    * no number at all → there is nothing to send to;
+    * a number but NO ``guest_phone_consent_at`` → the guest never agreed. Silence is not consent;
+    * consent WITHDRAWN (the stamp set back to NULL) → the same gate closes again, automatically.
+      Revocation needs no special code path: it IS the absence of the stamp.
+
+    Each case carries its OWN reason, never merged with "the channel is not configured".
+    """
+    if not booking.guest_phone:
+        raise OutboxSkipped(
+            f"{_NO_PHONE}: the guest gave no phone number, so the {channel.value} step cannot run"
+        )
+    if booking.guest_phone_consent_at is None:
+        raise OutboxSkipped(
+            f"{_NO_CONSENT}: the guest has not consented to be messaged on their phone, so the "
+            f"{channel.value} step must not run (consent is recorded, or it did not happen)"
+        )
+
+
 async def _prepare_notify(
     session: AsyncSession,
     work: OutboxWork,
@@ -1176,20 +1211,22 @@ async def _prepare_notify(
             recipient=booking.guest_email,
         )
 
+    # THE CONSENT GATE, and it comes FIRST — before the channel registry, before the template, and
+    # before anything else. Not as a nicety of ordering: it must be impossible to reach a send plan
+    # for a phone we have no permission to message, however the checks below are later reordered.
+    _require_phone_consent(booking, channel)
+
     if channel not in channels:
         raise OutboxSkipped(
-            f"the {channel.value} channel is not configured on this instance "
+            f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this instance "
             "(a channel without credentials is a disabled feature, not an error)"
-        )
-    if not booking.guest_phone:
-        raise OutboxSkipped(
-            f"the guest gave no phone number, so the {channel.value} step cannot run"
         )
 
     # A channel that IS configured still needs a body, and the renderer that builds one from
     # ``workflow_templates`` arrives with the channels cut.
     raise OutboxSkipped(
-        f"the {channel.value} channel has no template renderer yet (workflow_templates)"
+        f"{_NO_RENDERER}: the {channel.value} channel has no template renderer yet "
+        "(workflow_templates)"
     )
 
 

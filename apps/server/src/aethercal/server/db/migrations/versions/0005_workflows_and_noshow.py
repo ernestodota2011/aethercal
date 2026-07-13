@@ -49,6 +49,13 @@ What lands here, and why:
     deletes the event where it was actually written, instead of guessing the calendar, getting a
     404, and silently orphaning the original in the host's calendar.
 
+==The ``downgrade`` LOSES DATA, deliberately.== It restores the flat
+``UNIQUE (tenant_id, booking_id, kind)``, but the new schema legitimately allows several rows with
+the same kind on different channels (an email AND a WhatsApp reminder — the whole point of RF-24).
+So before dropping the columns it collapses the ledger to ONE row per ``(tenant, booking, kind)``,
+keeping the OLDEST and deleting the rest. Without that, the downgrade simply FAILS on valid data —
+and a rollback you discover is broken during an incident is not a rollback at all.
+
 Revision ID: 0005_workflows_and_noshow
 Revises: 0004_event_type_translations
 Create Date: 2026-07-12 10:00:00.000000
@@ -437,7 +444,59 @@ def upgrade() -> None:
     _migrate_in_flight_reminders(bind)
 
 
+def _reduce_ledger_to_one_row_per_kind(bind: sa.Connection) -> None:
+    """Collapse the ledger back to ONE row per ``(tenant_id, booking_id, kind)``, keeping the OLDEST.
+
+    ==This DESTROYS data, on purpose.== Writing it down is the whole point.
+
+    The downgrade restores the flat ``UNIQUE (tenant_id, booking_id, kind)``. But the schema it is
+    undoing legitimately allows several rows with the SAME kind on DIFFERENT channels — an email AND
+    a WhatsApp reminder for one booking is exactly what RF-24 exists to make possible. Feed those
+    perfectly valid rows to the old constraint and the ``CREATE UNIQUE`` fails: the downgrade does
+    not run.
+
+    A downgrade that only works on data the new schema cannot produce is not a downgrade. It is a
+    rollback that fails the first time you actually need it — mid-incident, with the deploy already
+    half-undone. So the reduction is explicit: of the rows sharing a key, the EARLIEST ``sent_at``
+    survives (ties broken by ``id``, so the choice is deterministic rather than whatever order the
+    planner happened to return) and the rest are DELETED.
+
+    The survivor is the oldest because the ledger's job is "was this already sent?", and the first
+    send is the one that answers it. What is lost is the record of the other channels' sends — which
+    is precisely the information the old schema had no way to represent.
+    """
+    rows = bind.execute(
+        sa.text(
+            'SELECT id, tenant_id, booking_id, kind FROM sent_notifications ORDER BY sent_at, id'
+        )
+    ).fetchall()
+
+    seen: set[tuple[str, str, str]] = set()
+    doomed: list[uuid.UUID] = []
+    for row_id, tenant_id, booking_id, kind in rows:
+        key = (str(tenant_id), str(booking_id), str(kind))
+        if key in seen:
+            # A send on another channel/step. The old schema has nowhere to put it.
+            # `_as_uuid`: SQLite hands ids back as plain strings, and the typed `sa.Uuid()` bind
+            # below takes only a real UUID.
+            doomed.append(_as_uuid(row_id))
+        else:
+            seen.add(key)
+
+    if not doomed:
+        return
+    meta = sa.MetaData()
+    ledger = sa.Table('sent_notifications', meta, sa.Column('id', sa.Uuid()))
+    # Chunked: one unbounded IN (...) is a good way to meet a driver's parameter limit.
+    for start in range(0, len(doomed), 500):
+        bind.execute(sa.delete(ledger).where(ledger.c.id.in_(doomed[start : start + 500])))
+
+
 def downgrade() -> None:
+    # The ledger is reduced BEFORE the columns come off: once `channel` and `step_id` are gone the
+    # rows are indistinguishable, and the flat UNIQUE re-created below would reject them.
+    _reduce_ledger_to_one_row_per_kind(op.get_bind())
+
     op.drop_index('uq_sent_notifications_kind_channel_step', table_name='sent_notifications')
     op.drop_index('uq_sent_notifications_kind_channel', table_name='sent_notifications')
     op.drop_index(op.f('ix_sent_notifications_step_id'), table_name='sent_notifications')
