@@ -15,6 +15,7 @@ export {
   computeDroppedRange,
   formatLocalDateTime,
   getMonthGridDays,
+  getTimelineGridDays,
   getWeekGridDays,
   parseLocalDateTime,
   startOfWeek,
@@ -63,8 +64,10 @@ export {
 export {
   buildTimeGrid,
   type HourMark,
+  type LanePlacement,
   layoutDayColumn,
   nowMarkerFraction,
+  packLanes,
   resolveTimeGridConfig,
   splitAllDay,
   type ResolvedTimeGridConfig,
@@ -72,7 +75,24 @@ export {
   type TimeGridBlock,
   type TimeGridColumn,
   type TimeGridConfig,
+  type TimeSpan,
 } from "./timeGrid";
+export {
+  DEFAULT_TIMELINE_DAYS,
+  MAX_TIMELINE_DAYS,
+  MIN_TIMELINE_DAYS,
+  buildResourceTimeline,
+  resolveTimelineDays,
+  timelineNowFraction,
+  type ResourceTimeline,
+  type ResourceTimelineConfig,
+  type TimelineBlock,
+  type TimelineDayHeader,
+  type TimelineGroup,
+  type TimelineItem,
+  type TimelineRow,
+  type TimelineTick,
+} from "./timeline";
 export type {
   CalendarEvent,
   CalendarResource,

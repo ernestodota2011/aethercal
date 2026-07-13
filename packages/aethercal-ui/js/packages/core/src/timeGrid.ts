@@ -114,8 +114,12 @@ export function splitAllDay(events: readonly CalendarEvent[]): {
  * `computeDroppedRange`: it counts whole calendar days between the two local midnights and adds the
  * event's local minute-of-day, instead of subtracting timestamps (which would be off by ±60 min on
  * a 23/25-hour DST-transition day and mis-position the block vertically).
+ *
+ * Exported for the resource timeline (RF-28), which needs the same DST-safe day↔minute mapping to
+ * place a block on its HORIZONTAL axis. Shared rather than re-derived: two copies of this would be
+ * two chances to get DST wrong.
  */
-function minutesFromMidnight(iso: string, columnMidnight: Date): number {
+export function minutesFromMidnight(iso: string, columnMidnight: Date): number {
   const dt = parseLocalDateTime(iso);
   const dtMidnight = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
   const dayDelta = Math.round((dtMidnight.getTime() - columnMidnight.getTime()) / MS_PER_DAY);
@@ -123,8 +127,23 @@ function minutesFromMidnight(iso: string, columnMidnight: Date): number {
   return dayDelta * MINUTES_PER_DAY + minuteOfDay;
 }
 
-/** Half-open overlap on the raw event times ([start, end)); touching endpoints do NOT overlap. */
-function eventsOverlap(a: CalendarEvent, b: CalendarEvent): boolean {
+/** Anything with a naive-local ISO `[start, end)` — an event, or a normalized span standing in for one. */
+export interface TimeSpan {
+  start: string;
+  end: string;
+}
+
+/** One packed item: where it sits within its overlap cluster. */
+export interface LanePlacement<T> {
+  item: T;
+  /** 0-based lane within this item's overlap cluster. */
+  lane: number;
+  /** Number of lanes in the cluster; the item's rendered extent is `1 / laneCount`. */
+  laneCount: number;
+}
+
+/** Half-open overlap on the raw times ([start, end)); touching endpoints do NOT overlap. */
+function spansOverlap(a: TimeSpan, b: TimeSpan): boolean {
   const aStart = parseLocalDateTime(a.start).getTime();
   const aEnd = parseLocalDateTime(a.end).getTime();
   const bStart = parseLocalDateTime(b.start).getTime();
@@ -133,14 +152,75 @@ function eventsOverlap(a: CalendarEvent, b: CalendarEvent): boolean {
 }
 
 /**
- * Lay out a single day's timed events: pack overlapping events into lanes and compute each one's
- * vertical position within the window.
+ * Pack overlapping spans into lanes — the classic sweep used by Google Calendar / FullCalendar.
  *
- * Lane packing is the classic sweep used by Google Calendar / FullCalendar: events are grouped
- * into maximal overlap clusters (a gap where nothing is still running closes a cluster), each event
- * takes the first lane whose previous occupant has already ended, and every event in a cluster
- * shares that cluster's lane count (its rendered width is `1 / laneCount`). No lane ever holds two
- * overlapping events; a fully sequential day collapses to a single lane.
+ * Spans are grouped into maximal overlap clusters (a gap where nothing is still running closes a
+ * cluster), each takes the first lane whose previous occupant has already ended, and every span in a
+ * cluster shares that cluster's lane count. No lane ever holds two overlapping spans; a fully
+ * sequential set collapses to a single lane. Output is ordered by start ascending (ties: longest
+ * first) — the order both callers render in.
+ *
+ * Deliberately AXIS-AGNOSTIC: it answers only "what overlaps what", never "where on screen". That is
+ * why the week/day grid uses it to stack blocks HORIZONTALLY inside a day column while the resource
+ * timeline (RF-28) uses the very same sweep to stack them VERTICALLY inside a resource row. Callers
+ * must pre-filter to the spans they actually render — a span with no visible extent would otherwise
+ * steal a lane from the ones on screen.
+ */
+export function packLanes<T extends TimeSpan>(spans: readonly T[]): LanePlacement<T>[] {
+  // Sort by start ascending, then by end descending so the longest span of a tie seeds the cluster.
+  const ordered = [...spans].sort((a, b) => {
+    const sa = parseLocalDateTime(a.start).getTime();
+    const sb = parseLocalDateTime(b.start).getTime();
+    if (sa !== sb) return sa - sb;
+    return parseLocalDateTime(b.end).getTime() - parseLocalDateTime(a.end).getTime();
+  });
+
+  const placements: LanePlacement<T>[] = [];
+  // `lanes[i]` holds the last span placed in lane i for the current cluster.
+  let lanes: T[] = [];
+  // Indices into `placements` for the spans of the current cluster (to backfill laneCount).
+  let clusterIdx: number[] = [];
+  let clusterEndMs = Number.NEGATIVE_INFINITY;
+
+  const closeCluster = (): void => {
+    const laneCount = lanes.length;
+    for (const idx of clusterIdx) placements[idx]!.laneCount = laneCount;
+    lanes = [];
+    clusterIdx = [];
+    clusterEndMs = Number.NEGATIVE_INFINITY;
+  };
+
+  for (const span of ordered) {
+    const startMs = parseLocalDateTime(span.start).getTime();
+    const endMs = parseLocalDateTime(span.end).getTime();
+
+    // A span starting at/after everything running in the cluster begins a fresh cluster.
+    if (clusterIdx.length > 0 && startMs >= clusterEndMs) closeCluster();
+
+    let lane = lanes.findIndex((occupant) => !spansOverlap(occupant, span));
+    if (lane === -1) {
+      lane = lanes.length;
+      lanes.push(span);
+    } else {
+      lanes[lane] = span;
+    }
+
+    clusterIdx.push(placements.length);
+    placements.push({ item: span, lane, laneCount: 1 });
+    clusterEndMs = Math.max(clusterEndMs, endMs);
+  }
+  closeCluster();
+
+  return placements;
+}
+
+/**
+ * Lay out a single day's timed events: pack overlapping events into lanes (the shared `packLanes`
+ * sweep) and compute each one's vertical position within the visible window.
+ *
+ * Events with no visible extent in this window are dropped BEFORE packing — otherwise they would
+ * clamp to a zero-height sliver pinned at the grid edge AND steal an overlap lane from the events
+ * that ARE visible. Only relevant for a narrowed window.
  */
 export function layoutDayColumn(
   events: readonly CalendarEvent[],
@@ -151,77 +231,34 @@ export function layoutDayColumn(
   const windowStartMin = config.dayStartHour * MINUTES_PER_HOUR;
   const windowEndMin = config.dayEndHour * MINUTES_PER_HOUR;
 
-  // Sort by start ascending, then by end descending so the longest event of a tie seeds the cluster.
-  const ordered = [...events].sort((a, b) => {
-    const sa = parseLocalDateTime(a.start).getTime();
-    const sb = parseLocalDateTime(b.start).getTime();
-    if (sa !== sb) return sa - sb;
-    return parseLocalDateTime(b.end).getTime() - parseLocalDateTime(a.end).getTime();
-  });
-
-  const blocks: TimeGridBlock[] = [];
-  // `lanes[i]` holds the last event placed in lane i for the current cluster.
-  let lanes: CalendarEvent[] = [];
-  // Indices into `blocks` for the events of the current cluster (to backfill laneCount).
-  let clusterBlockIdx: number[] = [];
-  let clusterEndMs = Number.NEGATIVE_INFINITY;
-
-  const closeCluster = () => {
-    const laneCount = lanes.length;
-    for (const idx of clusterBlockIdx) blocks[idx]!.laneCount = laneCount;
-    lanes = [];
-    clusterBlockIdx = [];
-    clusterEndMs = Number.NEGATIVE_INFINITY;
-  };
-
-  for (const event of ordered) {
+  const visible = events.filter((event) => {
     const startMin = minutesFromMidnight(event.start, columnMidnight);
     const endMin = minutesFromMidnight(event.end, columnMidnight);
-    // Skip events with no visible extent in this window (entirely before or after the visible
-    // hours). Otherwise they clamp to a zero-height sliver pinned at the grid edge AND steal an
-    // overlap lane from the events that ARE visible. Only relevant for a narrowed window.
-    if (endMin <= windowStartMin || startMin >= windowEndMin) continue;
+    return !(endMin <= windowStartMin || startMin >= windowEndMin);
+  });
 
-    const startMs = parseLocalDateTime(event.start).getTime();
-    const endMs = parseLocalDateTime(event.end).getTime();
-
-    // A new event starting at/after everything running in the cluster begins a fresh cluster.
-    if (clusterBlockIdx.length > 0 && startMs >= clusterEndMs) closeCluster();
-
-    let lane = lanes.findIndex((occupant) => !eventsOverlap(occupant, event));
-    if (lane === -1) {
-      lane = lanes.length;
-      lanes.push(event);
-    } else {
-      lanes[lane] = event;
-    }
-
+  return packLanes(visible).map(({ item: event, lane, laneCount }) => {
+    const startMin = minutesFromMidnight(event.start, columnMidnight);
+    const endMin = minutesFromMidnight(event.end, columnMidnight);
     const top = clamp(startMin, windowStartMin, windowEndMin);
     const bottom = clamp(endMin, top, windowEndMin);
-    const topFraction = (top - windowStartMin) / config.windowMinutes;
-    const heightFraction = (bottom - top) / config.windowMinutes;
 
     // Where this column sits in the event's local-day span (exclusive end), so the renderer can show
     // an honest label per day — the event's start time on its start day, a continuation label on a
-    // later day — instead of the start time bleeding onto every day it crosses. Same `occupiedDayBounds`
-    // criterion the agenda view uses, so week/day and list agree on the edges.
+    // later day — instead of the start time bleeding onto every day it crosses. Same
+    // `occupiedDayBounds` criterion the agenda view uses, so week/day and list agree on the edges.
     const { startKey, lastKey } = occupiedDayBounds(event);
 
-    clusterBlockIdx.push(blocks.length);
-    blocks.push({
+    return {
       event,
       lane,
-      laneCount: 1,
-      topFraction,
-      heightFraction,
+      laneCount,
+      topFraction: (top - windowStartMin) / config.windowMinutes,
+      heightFraction: (bottom - top) / config.windowMinutes,
       isContinuation: dateOnly !== startKey,
       continuesAfter: dateOnly !== lastKey,
-    });
-    clusterEndMs = Math.max(clusterEndMs, endMs);
-  }
-  closeCluster();
-
-  return blocks;
+    };
+  });
 }
 
 /** The hour gridlines/labels for a resolved window (one per hour, from start to end-1). */

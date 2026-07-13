@@ -280,7 +280,8 @@ class Calendar(rx.NoSSRComponent):
         doc=(
             "Rows of the timeline view (RF-28), each {id, title, groupId?, color?}. Generic by "
             "design — AetherCal maps a resource to a host, but any array works. Events join a row "
-            "by their resourceId. Ignored by the other four views; empty renders no rows."
+            "by their resourceId; an event whose resourceId is missing or unknown is surfaced in "
+            "an 'unassigned' row rather than dropped. Ignored by the other four views."
         ),
     )
 
