@@ -40,7 +40,11 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.db.models.workflows import Workflow, WorkflowStep, WorkflowTrigger
-from aethercal.server.integrations.messaging.guard import DailyCaps
+from aethercal.server.integrations.messaging.guard import (
+    CAP_WINDOW,
+    DailyCaps,
+    phone_sends_in_window,
+)
 from aethercal.server.services.bookings import (
     BookingParams,
     cancel_booking,
@@ -558,19 +562,39 @@ class _RecordingChannelSender:
         self.sent.append((to, body))
 
 
-async def _drain_whatsapp(
-    migrated: Sessionmaker, booking_id: uuid.UUID, whatsapp: _RecordingChannelSender
+async def _drain_whatsapp_at(
+    migrated: Sessionmaker,
+    booking_id: uuid.UUID,
+    whatsapp: _RecordingChannelSender,
+    *,
+    now: datetime,
+    kind: str | None = None,
 ) -> Outbox:
+    """Drain at an explicit instant, so a booking on a later slot can be drained at ITS due time.
+
+    ``kind`` picks WHICH WhatsApp step to return. A tenant with several WhatsApp workflows
+    materialises several steps onto one booking, so "the first whatsapp step" is whichever one the
+    database felt like returning — which is how a test ends up asserting against the wrong row."""
     execute = make_booking_effect_executor(
         sessionmaker=migrated,
         sender=_RecordingSender(),
         service_factory=None,
         channels={Channel.WHATSAPP: whatsapp},
     )
-    await drain_outbox(migrated, now=_SLOT - timedelta(hours=24), execute=execute)
+    await drain_outbox(migrated, now=now, execute=execute)
     async with migrated() as session:
         steps = await _steps(session, booking_id)
-    return next(step for step in steps if step.payload["channel"] == "whatsapp")
+    return next(
+        step
+        for step in steps
+        if step.payload["channel"] == "whatsapp" and (kind is None or step.payload["kind"] == kind)
+    )
+
+
+async def _drain_whatsapp(
+    migrated: Sessionmaker, booking_id: uuid.UUID, whatsapp: _RecordingChannelSender
+) -> Outbox:
+    return await _drain_whatsapp_at(migrated, booking_id, whatsapp, now=_SLOT - timedelta(hours=24))
 
 
 async def test_a_phone_WITHOUT_consent_is_never_messaged(
@@ -690,3 +714,129 @@ async def test_no_phone_at_all_has_its_own_distinct_reason(
     messages = [record.getMessage() for record in caplog.records]
     assert any("no-phone:" in message for message in messages)
     assert not any("no-phone-consent" in message for message in messages)
+
+
+# --------------------------------------------------------------------------------------
+# The cap must be spent by a SEND, never by a step that was retired before sending.
+# --------------------------------------------------------------------------------------
+
+
+async def _booking_with_step_kind(
+    migrated: Sessionmaker,
+    *,
+    kind: str,
+    phone: str,
+    slot: datetime,
+    tenant_id: uuid.UUID | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A consented booking carrying ONE WhatsApp step of ``kind``. Reusable across tenants."""
+    async with migrated() as session, session.begin():
+        if tenant_id is None:
+            tenant, event_type = await _seed(session)
+            tenant_id = tenant.id
+        else:
+            event_type = (
+                await session.scalars(select(EventType).where(EventType.tenant_id == tenant_id))
+            ).first()
+            assert event_type is not None
+        workflow = Workflow(
+            tenant_id=tenant_id,
+            event_type_id=None,
+            name=f"whatsapp {kind} {uuid.uuid4().hex[:6]}",
+            trigger=WorkflowTrigger.BEFORE_START.value,
+            offset_minutes=-1440,
+            active=True,
+        )
+        session.add(workflow)
+        await session.flush()
+        session.add(
+            WorkflowStep(
+                tenant_id=tenant_id,
+                workflow_id=workflow.id,
+                channel="whatsapp",
+                kind=kind,
+                position=0,
+            )
+        )
+        await session.flush()
+        booking = await create_booking(
+            session, tenant_id=tenant_id, params=_params(event_type.id, slot), now=_NOW
+        )
+        booking.guest_phone = phone
+        booking.guest_phone_consent_at = _NOW
+        await session.flush()
+        return tenant_id, booking.id
+
+
+async def test_a_step_retired_before_sending_does_NOT_spend_the_phones_daily_quota(
+    migrated: Sessionmaker,
+) -> None:
+    """==A misconfigured template must never silence a real guest.==
+
+    The cap counts the EFFECTIVE state — the ``sent_notifications`` ledger — precisely so it is
+    spent by a message that WAS SENT. A step retired before the provider was ever called (a missing
+    template, a malformed one) sent nothing, so it must cost nothing: otherwise a tenant's typo eats
+    the guest's daily budget and their legitimate reminder hits a ceiling raised by a message that
+    does not exist. And it would not even error — the reminder simply never arrives.
+
+    Two DRAINS, not one, and deliberately: within a single pass the order of two sibling steps is
+    not guaranteed, so a one-pass test could pass by drawing the lucky order. Here the retired step
+    is definitively drained FIRST, and only then does the legitimate one run.
+
+    The assertion counts SENDS IN THE FAKE, not the absence of an exception: "it did not raise" is
+    exactly how a message that never went out looks.
+    """
+    phone = "+13055551234"
+    # A ceiling of ONE. If the retired step spent it, the legitimate message below cannot go out.
+    whatsapp = _RecordingChannelSender(caps=DailyCaps(per_phone=1, per_ip=50))
+
+    # 1. A step whose kind has NO template anywhere (no tenant row, no built-in fallback).
+    tenant_id, doomed_id = await _booking_with_step_kind(
+        migrated, kind="follow_up", phone=phone, slot=_SLOT
+    )
+    doomed = await _drain_whatsapp_at(
+        migrated,
+        doomed_id,
+        whatsapp,
+        now=_SLOT - timedelta(hours=24),
+        kind="follow_up",
+    )
+
+    assert doomed.status == "skipped", (
+        f"expected the untemplated step to be retired: {doomed.status}"
+    )
+    assert whatsapp.sent == [], "a step with no template somehow sent a message"
+
+    # The ledger — which IS the quota — must still show nothing sent to this number.
+    async with migrated() as session:
+        spent = await phone_sends_in_window(
+            session,
+            tenant_id=tenant_id,
+            phone=phone,
+            channel=Channel.WHATSAPP,
+            since=_SLOT - timedelta(hours=24) - CAP_WINDOW,
+        )
+    assert spent == 0, f"a step that never sent anything consumed {spent} of the phone's quota"
+
+    # 2. The SAME phone, same tenant, now with a legitimate reminder (the built-in template).
+    _tenant_id, real_id = await _booking_with_step_kind(
+        migrated,
+        kind="reminder",
+        phone=phone,
+        slot=_SLOT + timedelta(days=1),
+        tenant_id=tenant_id,
+    )
+    real = await _drain_whatsapp_at(
+        migrated,
+        real_id,
+        whatsapp,
+        now=_SLOT + timedelta(days=1) - timedelta(hours=24),
+        kind="reminder",
+    )
+
+    assert real.status == "delivered", (
+        f"the guest's legitimate reminder was blocked ({real.status}) by a quota that a "
+        "never-sent message had eaten"
+    )
+    assert len(whatsapp.sent) == 1, "the legitimate reminder never reached the guest"
+    assert whatsapp.sent[0][0] == phone
