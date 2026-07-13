@@ -23,7 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.core.model import Booking as CoreBooking
 from aethercal.core.model import BookingStatus, TimeInterval
 from aethercal.schemas.event_types import EventTypeCreate
-from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    Schedule,
+    Tenant,
+    User,
+    Webhook,
+    WebhookDelivery,
+)
 from aethercal.server.services.bookings import (
     BookingNotActiveError,
     BookingNotEndedError,
@@ -143,3 +151,89 @@ async def test_a_no_show_still_occupies_its_slot(
     ).occupies
     persisted = await sqlite_session.get(Booking, booking.id)
     assert persisted is not None and persisted.status is BookingStatus.NO_SHOW
+
+
+# --------------------------------------------------------------------------------------
+# The no-show WEBHOOK (RF-25). A transition nobody can observe is half a feature: the host's
+# CRM/automation learns about a cancellation and a reschedule, but a guest who simply never turned
+# up would be invisible to it.
+# --------------------------------------------------------------------------------------
+
+
+async def _subscribe(session: AsyncSession, *, tenant: Tenant, events: list[str]) -> Webhook:
+    """An active subscriber for ``events``. ``secret`` is opaque bytes here — the fan-out never
+    decrypts it (only the delivery worker does), so the test needs no Fernet key."""
+    webhook = Webhook(
+        tenant_id=tenant.id,
+        url="https://consumer.test/hook",
+        secret=b"opaque",
+        events=events,
+        active=True,
+    )
+    session.add(webhook)
+    await session.flush()
+    return webhook
+
+
+async def _deliveries(session: AsyncSession, event: str) -> list[WebhookDelivery]:
+    return list(
+        (await session.scalars(select(WebhookDelivery).where(WebhookDelivery.event == event))).all()
+    )
+
+
+async def test_marking_a_no_show_fans_out_the_booking_no_show_webhook(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant, booking = await _seed(sqlite_session, tenant_factory, status=BookingStatus.CONFIRMED)
+    await _subscribe(sqlite_session, tenant=tenant, events=["booking.no_show"])
+
+    await mark_no_show(sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_AFTER)
+
+    queued = await _deliveries(sqlite_session, "booking.no_show")
+    assert len(queued) == 1
+    data = queued[0].payload["data"]
+    assert data["id"] == str(booking.id)
+    # The envelope carries the status the transition just wrote — not the one it had on the way in.
+    assert data["status"] == BookingStatus.NO_SHOW.value
+
+
+async def test_a_repeated_no_show_does_not_fan_out_a_second_webhook(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """The idempotent no-op must be silent on the wire too, exactly like the repeated cancel.
+
+    A second delivery would tell the subscriber the guest failed to show up TWICE for one
+    appointment — and every retry of a flaky admin click would inflate the host's no-show stats."""
+    tenant, booking = await _seed(sqlite_session, tenant_factory, status=BookingStatus.CONFIRMED)
+    await _subscribe(sqlite_session, tenant=tenant, events=["booking.no_show"])
+
+    await mark_no_show(sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_AFTER)
+    await mark_no_show(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_AFTER + timedelta(hours=1)
+    )
+
+    assert len(await _deliveries(sqlite_session, "booking.no_show")) == 1
+
+
+async def test_a_subscriber_that_did_not_ask_for_no_show_receives_nothing(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    tenant, booking = await _seed(sqlite_session, tenant_factory, status=BookingStatus.CONFIRMED)
+    await _subscribe(sqlite_session, tenant=tenant, events=["booking.cancelled"])
+
+    await mark_no_show(sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_AFTER)
+
+    assert await _deliveries(sqlite_session, "booking.no_show") == []
+
+
+async def test_a_refused_no_show_fans_out_nothing(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """The appointment has not ended: no state change, and therefore no event about one."""
+    tenant, booking = await _seed(sqlite_session, tenant_factory, status=BookingStatus.CONFIRMED)
+    await _subscribe(sqlite_session, tenant=tenant, events=["booking.no_show"])
+
+    with pytest.raises(BookingNotEndedError):
+        await mark_no_show(sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_DURING)
+
+    assert await _deliveries(sqlite_session, "booking.no_show") == []

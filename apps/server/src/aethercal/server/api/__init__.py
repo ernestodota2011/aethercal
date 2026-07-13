@@ -17,6 +17,7 @@ from aethercal.server.api import (
     bookings,
     event_types,
     health,
+    metrics,
     schedules,
     slots,
     webhooks,
@@ -33,5 +34,6 @@ api_router.include_router(webhooks.router)
 api_router.include_router(workflows.router)
 # A template is the TENANT's, not one rule's — hence its own collection, never a nested one.
 api_router.include_router(workflows.templates_router)
+api_router.include_router(metrics.router)
 
 __all__ = ["api_router"]

@@ -9,17 +9,19 @@ CLI-issued key verifies through the same service the API uses.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import typer
 from cryptography.fernet import Fernet
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
-from aethercal.server.db.models import ApiKey, Tenant, User
+from aethercal.server.db.models import ApiKey, Outbox, OutboxStatus, Tenant, User
 from aethercal.server.integrations.google.oauth import get_credentials
 from aethercal.server.services.api_keys import (
     RevokeKeyOutcome,
@@ -32,12 +34,21 @@ from aethercal.server.services.calendars import (
     link_booking_calendar,
     store_google_connection,
 )
+from aethercal.server.services.privacy import PurgeReport, purge_guest
 from aethercal.server.services.workflows import seed_default_workflows
 from aethercal.server.settings import Settings
+
+_logger = logging.getLogger(__name__)
 
 app = typer.Typer(help="AetherCal admin CLI.", no_args_is_help=True)
 keys_app = typer.Typer(help="Manage API keys (C7b).", no_args_is_help=True)
 app.add_typer(keys_app, name="keys")
+outbox_app = typer.Typer(
+    help="Inspect and repair the transactional outbox (R9).", no_args_is_help=True
+)
+app.add_typer(outbox_app, name="outbox")
+guest_app = typer.Typer(help="Guest data: erasure (RNF-8).", no_args_is_help=True)
+app.add_typer(guest_app, name="guest")
 
 # Default cache location for the Google OAuth token during the loopback consent flow (matches the
 # F0-11 spike). Outside the repo, so a token never lands in version control.
@@ -172,6 +183,125 @@ async def run_connect_google(  # noqa: PLR0913 - the tenant/host pair + credenti
         return connection.id
 
 
+# --------------------------------------------------------------------------------------
+# The outbox (R9): read the dead-letter, and revive an intent — without opening psql.
+# --------------------------------------------------------------------------------------
+
+
+class ReplayOutcome(StrEnum):
+    """What a replay actually did. Three different facts, never collapsed into "ok"."""
+
+    REVIVED = "revived"
+    NOT_FOUND = "not_found"
+    NOT_DEAD = "not_dead"
+    """It exists, but it is not parked — so replaying it would have been a mistake, not a fix."""
+
+
+async def run_list_dead_intents(sessionmaker: async_sessionmaker[AsyncSession]) -> list[Outbox]:
+    """The dead-letter: intents that exhausted their attempts and will never retry on their own.
+
+    A replay command you cannot feed an id to is half a fix — finding the id was the very reason an
+    operator had to open psql in the first place. Carries no guest data: id, effect, attempts,
+    booking, and when it last tried.
+    """
+    async with sessionmaker() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(Outbox)
+                    .where(Outbox.status == OutboxStatus.DEAD.value)
+                    .order_by(Outbox.created_at)
+                )
+            ).all()
+        )
+
+
+async def run_replay_intent(
+    sessionmaker: async_sessionmaker[AsyncSession], *, intent_id: uuid.UUID
+) -> ReplayOutcome:
+    """Revive a DEAD outbox intent: back to ``pending``, due now, attempts reset.
+
+    ==Only a dead intent — and the refusal is a rowcount.== This is a command handed to a tired
+    operator in the middle of an incident, so the dangerous cases are closed by construction rather
+    than by care:
+
+    * a ``delivered`` intent is not stuck: "replaying" it re-sends a message the guest already has;
+    * a ``claimed`` one is in a worker's hands RIGHT NOW — resetting it would have two workers
+      sending the same thing;
+    * a ``failed`` one is already scheduled to retry on its own backoff;
+    * a ``skipped`` / ``voided`` one was retired on purpose.
+
+    Only ``dead`` is genuinely parked with nothing left to move it. The guard is a single
+    conditional UPDATE gated on ``status = 'dead'``, arbitrated by ``rowcount`` — not a
+    read-then-write, which a concurrent drain could slip between and then quietly stomp a live row.
+
+    ``attempts`` is reset to 0 deliberately: revived with its six attempts intact, the intent sits
+    one transient blip away from the dead-letter, so the next flicker re-parks it and the operator's
+    replay bought nothing. The reset is what makes it a real second chance. ``next_retry_at`` is
+    cleared, so it is due at the very next drain.
+    """
+    async with sessionmaker() as session, session.begin():
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(
+                update(Outbox)
+                .where(Outbox.id == intent_id, Outbox.status == OutboxStatus.DEAD.value)
+                .values(
+                    status=OutboxStatus.PENDING.value,
+                    attempts=0,
+                    next_retry_at=None,
+                    claimed_by=None,
+                    lease_expires_at=None,
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if result.rowcount == 1:
+            _logger.warning(
+                "outbox intent %s REPLAYED by an operator: dead → pending, attempts reset to 0. It "
+                "is due at the next drain",
+                intent_id,
+            )
+            return ReplayOutcome.REVIVED
+        # It matched nothing, and WHY decides what the operator is told. "There is no such intent"
+        # and "that intent is alive and I refuse to touch it" are entirely different facts; merging
+        # them into one shrug sends somebody looking for the wrong problem.
+        existing = await session.get(Outbox, intent_id)
+        return ReplayOutcome.NOT_FOUND if existing is None else ReplayOutcome.NOT_DEAD
+
+
+# --------------------------------------------------------------------------------------
+# Guest erasure (RNF-8).
+# --------------------------------------------------------------------------------------
+
+
+async def run_guest_purge(
+    sessionmaker: async_sessionmaker[AsyncSession], *, tenant_slug: str, email: str
+) -> PurgeReport:
+    """Erase a guest from ONE named tenant. ==An unresolvable tenant is a hard stop.==
+
+    ``tenant_slug`` is required, and it is not a filter this may fall back from. ==The CLI has no
+    isolation belt of its own== — it runs as the owner of the database, over every business on the
+    instance — so if the scope cannot be resolved, the safe thing is to do NOTHING, loudly. An empty
+    or unknown slug matches no tenant and raises ``LookupError``; it does not degrade into "purge
+    everywhere", which would erase that person from businesses that never received the request.
+
+    One transaction: the redactions and the deletes commit together, or not at all. A purge that
+    half committed would leave the guest's data in exactly the tables nobody thought to check.
+    """
+    async with sessionmaker() as session, session.begin():
+        tenant = (
+            await session.scalars(select(Tenant).where(Tenant.slug == tenant_slug.strip()))
+        ).one_or_none()
+        if tenant is None:
+            raise LookupError(
+                f"no tenant with slug {tenant_slug!r}: refusing to purge. A guest purge is scoped "
+                "to ONE business, and an unscoped one would erase this person from every other "
+                "business on this instance"
+            )
+        return await purge_guest(session, tenant_id=tenant.id, email=email)
+
+
 def _sessionmaker() -> async_sessionmaker[AsyncSession]:
     settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
     return build_sessionmaker(build_async_engine(settings.database_config()))
@@ -290,6 +420,95 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
         )
     )
     typer.echo(f"connection_id={connection_id}")
+
+
+@outbox_app.command("list")
+def outbox_list_command() -> None:
+    """List the dead-lettered intents: what was never delivered, and is not retrying on its own.
+
+    Prints no guest data — an id, an effect, a booking, an attempt count. Feed an id to
+    `aethercal-admin outbox replay` to give it another go.
+    """
+    rows = asyncio.run(run_list_dead_intents(_sessionmaker()))
+    if not rows:
+        typer.echo("no dead intents")
+        return
+    for row in rows:
+        last = row.last_attempt_at.isoformat() if row.last_attempt_at is not None else "never"
+        typer.echo(
+            f"{row.id}  effect={row.effect}  booking={row.booking_id}  "
+            f"attempts={row.attempts}  last_attempt_at={last}"
+        )
+
+
+@outbox_app.command("replay")
+def outbox_replay_command(
+    intent_id: Annotated[uuid.UUID, typer.Argument(help="Id of the DEAD intent to revive.")],
+) -> None:
+    """Revive a dead outbox intent (back to `pending`, due now, attempts reset).
+
+    Refuses anything that is not `dead` and exits non-zero: replaying a DELIVERED intent would mail
+    a guest a message they already have, and replaying a CLAIMED one would fight the worker sending
+    it right now. Until this command existed the only way to do either was by hand, in psql.
+    """
+    outcome = asyncio.run(run_replay_intent(_sessionmaker(), intent_id=intent_id))
+    if outcome is ReplayOutcome.NOT_FOUND:
+        typer.echo(f"no outbox intent {intent_id}", err=True)
+        raise typer.Exit(code=1)
+    if outcome is ReplayOutcome.NOT_DEAD:
+        typer.echo(
+            f"outbox intent {intent_id} is not dead, so it was NOT replayed — it is either still "
+            "live (pending/claimed/failed, and will run on its own) or already terminal "
+            "(delivered/skipped/voided). Replaying it would re-send or collide.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"replayed outbox intent {intent_id} (dead -> pending, attempts reset)")
+
+
+@guest_app.command("purge")
+def guest_purge_command(
+    tenant: Annotated[
+        str,
+        typer.Option(
+            help="Slug of the business to erase the guest FROM. Required — a purge is never "
+            "instance-wide."
+        ),
+    ],
+    email: Annotated[str, typer.Option(help="The guest's email address.")],
+) -> None:
+    """Erase a guest's personal data from ONE business (RNF-8).
+
+    ==`--tenant` is mandatory and this command fails without it.== The CLI runs as the owner of the
+    database, over every business on the instance: one person can be a guest of several of them,
+    with no relationship between those bookings, so an unscoped purge would erase them from
+    businesses that never received the request.
+
+    The bookings survive, redacted — the appointments happened, they occupied their slots, and they
+    are the host's history. What goes is the PERSON: their name, email, phone, consent, notes and
+    answers; the queued messages that would still have reached them; their guest links; the send
+    ledger; and their data inside the webhook payloads already sent to subscribers.
+    """
+    try:
+        report = asyncio.run(run_guest_purge(_sessionmaker(), tenant_slug=tenant, email=email))
+    except LookupError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if report.bookings == 0:
+        typer.echo(
+            f"no bookings for that guest in tenant {tenant!r} "
+            f"({report.webhook_deliveries} webhook payload(s) redacted). Check the tenant slug.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"purged the guest from tenant {tenant!r}: "
+        f"{report.bookings} booking(s) redacted, "
+        f"{report.outbox_intents} queued message(s), "
+        f"{report.guest_tokens} guest link(s) and "
+        f"{report.sent_notifications} ledger row(s) deleted, "
+        f"{report.webhook_deliveries} webhook payload(s) redacted"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

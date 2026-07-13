@@ -15,12 +15,38 @@ from __future__ import annotations
 
 import datetime as _dt
 import uuid
+from enum import StrEnum
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, UUIDPrimaryKey
+
+
+class OutboxStatus(StrEnum):
+    """The states an :class:`Outbox` row can be in — the row's OWN vocabulary, declared once.
+
+    It lives on the model rather than inside the drain because two things that must never disagree
+    both read it: the drain (which WRITES these states) and observability (which COUNTS them). Left
+    as private constants inside the drain, the metrics module would have had to re-type the literals
+    — and a backlog gauge that counts a status nobody writes any more reports a reassuring ``0``
+    forever. That is the silent no-op, pointed straight at the dashboard that exists to catch it.
+
+    Non-terminal: ``PENDING`` (queued; due when ``next_retry_at`` has passed), ``CLAIMED`` (a worker
+    holds its lease, mid-flight), ``FAILED`` (a transient failure, parked for a backoff retry — and
+    still completely alive). Terminal: ``DELIVERED``; ``DEAD`` (attempts exhausted, parked for a
+    human); ``SKIPPED`` (it could NEVER run — an unconfigured channel — so retrying is meaningless,
+    and it is not a failure); ``VOIDED`` (a booking transition retired it before it ran).
+    """
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    FAILED = "failed"
+    DELIVERED = "delivered"
+    DEAD = "dead"
+    SKIPPED = "skipped"
+    VOIDED = "voided"
 
 
 class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
@@ -67,4 +93,23 @@ class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     )
 
 
-__all__ = ["Outbox"]
+def due_filter(now: _dt.datetime) -> sa.ColumnElement[bool]:
+    """The predicate for "this intent is DUE": declared ONCE, because two readers must agree.
+
+    The drain selects due rows with it (``services/outbox.select_due``) and observability COUNTS
+    them with it. Written out twice, the two would drift the first time the rule changed — and the
+    failure is invisible: the drain would go on sending exactly the right rows while the backlog
+    gauge, and the alarm built on it, quietly measured something else.
+
+    Due = ``pending`` or ``failed`` (a transient failure parked for a backoff retry is alive), AND
+    its send time has arrived — ``next_retry_at`` unset (send at the next drain) or already past.
+    A ``pending`` row whose ``next_retry_at`` is in the future is NOT due, and NOT backlog: the
+    outbox doubles as the durable scheduler, so a 24 h reminder for a booking three weeks out is
+    exactly that shape, and counting it as backlog would bury the number that matters."""
+    return sa.and_(
+        Outbox.status.in_((OutboxStatus.PENDING.value, OutboxStatus.FAILED.value)),
+        sa.or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
+    )
+
+
+__all__ = ["Outbox", "OutboxStatus", "due_filter"]

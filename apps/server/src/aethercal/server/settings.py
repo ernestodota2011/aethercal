@@ -8,7 +8,7 @@ depending on process environment.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aethercal.server.crypto import derive_fernet_key
@@ -18,6 +18,14 @@ from aethercal.server.scheduler import (
     DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
     DEFAULT_WEBHOOK_INTERVAL_SECONDS,
 )
+
+METRICS_TOKEN_MIN_LENGTH = 32
+"""The shortest bearer token ``GET /metrics`` will accept as its guard (R9).
+
+It stands in front of instance-wide operational data, on a product whose repository is public and
+whose instances are exposed. A short token is not a *weaker* secret, it is a guessable one — so a
+configured token below this length fails at BOOT instead of standing quietly in front of the
+endpoint while everyone assumes it is protected."""
 
 
 class Settings(BaseSettings):
@@ -56,9 +64,55 @@ class Settings(BaseSettings):
     # the request path falls back to the incoming request's base URL.
     booking_base_url: str | None = None
 
+    # The operator's bearer token for ``GET /metrics`` (R9). ``None`` = the endpoint is DISABLED,
+    # and disabled means CLOSED (503) — never "open to anyone".
+    #
+    # Deliberately NOT the tenant API key: /metrics reports the whole instance (outbox backlog,
+    # booking counts), which is the OPERATOR's view. On a multi-business instance, letting one
+    # tenant's key open it would leak the others' volume — and this is a public repository, so an
+    # exposed instance is the normal case, not the exotic one.
+    metrics_token: str | None = None
+
     # Descriptive.
     app_name: str = "AetherCal"
     environment: str = "production"
+
+    @field_validator("metrics_token", mode="after")
+    @classmethod
+    def _validate_metrics_token(cls, value: str | None) -> str | None:
+        """Blank means UNSET; anything else must be a secret that can actually be COMPARED.
+
+        Three failure modes, three different answers, none of them silent:
+
+        * ``AETHERCAL_METRICS_TOKEN=`` (or spaces) is a blank an operator left in an env file, not a
+          password. It reads as ``None`` — the endpoint is off, and off is CLOSED. It must never
+          become a "token" that an empty header matches.
+        * a SHORT token is a hole with the light left on: the endpoint LOOKS guarded, and everybody
+          downstream assumes it is. That fails at boot, loudly, rather than being found out later.
+        * a NON-ASCII token fails in the opposite direction, which is why it is easy to miss: it is
+          long, it looks like a perfectly good secret, and ``secrets.compare_digest`` cannot compare
+          it at all — comparing non-ASCII ``str`` raises ``TypeError``. A guard nobody can ever
+          present correctly is not a guard; it is an outage lying in wait for the day somebody
+          actually needs the metrics. Homoglyphs make it worse: two tokens that render identically
+          in a terminal do not compare equal. A token is bytes-with-a-keyboard.
+        """
+        if value is None or not value.strip():
+            return None
+        if not value.isascii():
+            raise ValueError(
+                "AETHERCAL_METRICS_TOKEN must be ASCII. A non-ASCII token cannot be compared in "
+                "constant time (secrets.compare_digest refuses non-ASCII str), so it would be a "
+                "guard nobody could ever satisfy — and homoglyphs make two visually identical "
+                "tokens unequal. Generate one with: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        if len(value) < METRICS_TOKEN_MIN_LENGTH:
+            raise ValueError(
+                f"AETHERCAL_METRICS_TOKEN must be at least {METRICS_TOKEN_MIN_LENGTH} characters "
+                "(it guards instance-wide metrics on a publicly reachable endpoint). Generate one "
+                "with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        return value
 
     def database_config(self) -> DatabaseConfig:
         """Build a :class:`DatabaseConfig` (URL normalized to the psycopg driver)."""
