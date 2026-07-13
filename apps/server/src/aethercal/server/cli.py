@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -20,8 +21,9 @@ from cryptography.fernet import Fernet
 from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.server.channels import Channel
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
-from aethercal.server.db.models import ApiKey, Outbox, OutboxStatus, Tenant
+from aethercal.server.db.models import ApiKey, Booking, Outbox, OutboxStatus, Tenant
 from aethercal.server.integrations.google.oauth import get_credentials
 from aethercal.server.services.api_keys import (
     RevokeKeyOutcome,
@@ -34,6 +36,8 @@ from aethercal.server.services.calendars import (
     link_booking_calendar,
     store_google_connection,
 )
+from aethercal.server.services.notifications import record_booking_notification
+from aethercal.server.services.outbox import PROVIDER_CALL_MARKER
 from aethercal.server.services.privacy import PurgeReport, purge_guest
 from aethercal.server.services.users import (
     UserData,
@@ -450,6 +454,114 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
     typer.echo(f"connection_id={connection_id}")
 
 
+class ResolveOutcome(StrEnum):
+    """What ``outbox resolve-unknown`` did."""
+
+    RECORDED_AS_SENT = "recorded_as_sent"
+    """The operator confirmed the provider DID send it. The ledger row is written."""
+    REQUEUED = "requeued"
+    """The operator confirmed it did NOT go out. Back to ``pending``, due now."""
+    NOT_FOUND = "not_found"
+    NOT_UNKNOWN = "not_unknown"
+    """It exists, but it is not parked as ``unknown`` - so there is nothing to resolve."""
+
+
+async def run_list_unknown_intents(sessionmaker: async_sessionmaker[AsyncSession]) -> list[Outbox]:
+    """The intents we handed to a provider and never got an answer for.
+
+    Each one is a message that MAY have reached a real person. Nothing will move them on its own -
+    that is the entire point - so this is the queue a human works, provider console open."""
+    async with sessionmaker() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(Outbox)
+                    .where(Outbox.status == OutboxStatus.UNKNOWN.value)
+                    .order_by(Outbox.created_at)
+                )
+            ).all()
+        )
+
+
+async def run_resolve_unknown_intent(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    intent_id: uuid.UUID,
+    delivered: bool,
+    now: datetime | None = None,
+) -> ResolveOutcome:
+    """Close out an ``unknown`` intent with what a HUMAN saw in the provider's console.
+
+    ==This is the only thing in the system allowed to decide what happened to that message==, and
+    that is deliberate: the machine genuinely does not know, and every automatic answer it could
+    invent is a guess with a victim on the other end.
+
+    Two honest outcomes, and each repairs a different half of the damage:
+
+    * ``--delivered`` - the provider shows it went out. We write the ``sent_notifications`` row the
+      crash swallowed. That prevents a duplicate AND **repairs the daily cap**: the per-phone
+      ceiling is derived from that ledger, so until this row exists the guest's quota silently
+      under-counts a message they have already received.
+    * ``--not-delivered`` - the provider shows nothing. Back to ``pending``, attempts reset, due at
+      the next drain. The in-flight marker is cleared, so the drain does not instantly re-park it.
+
+    Gated on ``status = 'unknown'`` under ``FOR UPDATE``, like the replay: a read-then-write would
+    let a concurrent drain slip in between.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    async with sessionmaker() as session, session.begin():
+        row = (
+            await session.scalars(
+                select(Outbox)
+                .where(Outbox.id == intent_id, Outbox.status == OutboxStatus.UNKNOWN.value)
+                .with_for_update()
+            )
+        ).one_or_none()
+        if row is None:
+            existing = await session.get(Outbox, intent_id)
+            return ResolveOutcome.NOT_FOUND if existing is None else ResolveOutcome.NOT_UNKNOWN
+
+        payload = dict(row.payload)
+        # The marker was the EVIDENCE that we were mid-flight. It has done its job, either way.
+        resolved_payload = {k: v for k, v in payload.items() if k != PROVIDER_CALL_MARKER}
+
+        if not delivered:
+            row.payload = resolved_payload
+            row.status = OutboxStatus.PENDING.value
+            row.attempts = 0
+            row.next_retry_at = None
+            row.claimed_by = None
+            row.lease_expires_at = None
+            _logger.warning(
+                "outbox intent %s RESOLVED by an operator as NOT delivered: unknown -> pending, "
+                "attempts reset. It is due at the next drain",
+                intent_id,
+            )
+            return ResolveOutcome.REQUEUED
+
+        booking = await session.get(Booking, row.booking_id)
+        if booking is not None:
+            # The ledger row the crash swallowed. Writing it is what stops the duplicate - and what
+            # repairs the per-phone daily cap, which is derived from this very table.
+            await record_booking_notification(
+                session,
+                booking=booking,
+                kind=str(payload.get("kind", "")),
+                now=moment,
+                channel=Channel(str(payload["channel"])),
+                step_id=uuid.UUID(str(payload["step_id"])),
+            )
+        row.payload = resolved_payload
+        row.status = OutboxStatus.DELIVERED.value
+        row.next_retry_at = None
+        _logger.warning(
+            "outbox intent %s RESOLVED by an operator as DELIVERED: the ledger row was written, so "
+            "it is not re-sent and the recipient's daily cap counts it again",
+            intent_id,
+        )
+        return ResolveOutcome.RECORDED_AS_SENT
+
+
 @outbox_app.command("list")
 def outbox_list_command() -> None:
     """List the dead-lettered intents: what was never delivered, and is not retrying on its own.
@@ -492,6 +604,82 @@ def outbox_replay_command(
         )
         raise typer.Exit(code=1)
     typer.echo(f"replayed outbox intent {intent_id} (dead -> pending, attempts reset)")
+
+
+@outbox_app.command("list-unknown")
+def outbox_list_unknown_command() -> None:
+    """List the intents we handed to a provider and never got an answer for.
+
+    Each is a message that MAY be on a real person's phone. Nothing moves them on its own. Open the
+    provider's console, find out what happened, then run `aethercal-admin outbox resolve-unknown`.
+    """
+    rows = asyncio.run(run_list_unknown_intents(_sessionmaker()))
+    if not rows:
+        typer.echo("no unknown intents")
+        return
+    for row in rows:
+        started = row.payload.get(PROVIDER_CALL_MARKER, "?")
+        channel = row.payload.get("channel", "?")
+        typer.echo(
+            f"{row.id}  effect={row.effect}  channel={channel}  booking={row.booking_id}  "
+            f"handed_to_provider_at={started}"
+        )
+
+
+@outbox_app.command("resolve-unknown")
+def outbox_resolve_unknown_command(
+    intent_id: Annotated[uuid.UUID, typer.Argument(help="Id of the UNKNOWN intent to resolve.")],
+    delivered: Annotated[
+        bool | None,
+        typer.Option(
+            "--delivered/--not-delivered",
+            help="What the PROVIDER's console shows: did this message actually go out?",
+        ),
+    ] = None,
+) -> None:
+    """Close out an `unknown` intent with what you saw in the provider's console.
+
+    The system parked it because it genuinely does not know: it handed the message to the provider
+    and never learned the outcome. It refuses to guess, because both guesses have a victim - a retry
+    can message a real person twice (and under-count the daily cap protecting them, since that cap
+    is derived from the ledger), and a write-off silently loses a message they never got.
+
+    So you look, and you tell it:
+
+      --delivered      it went out. The ledger row is written, so it is not re-sent AND the
+                       recipient's daily cap counts it again.
+      --not-delivered  it did not. Back to pending, due at the next drain.
+
+    There is no default, on purpose. Guessing is the one thing this command exists to prevent.
+    """
+    if delivered is None:
+        typer.echo(
+            "say what the provider showed you: --delivered or --not-delivered. There is no "
+            "default - the whole reason this intent is parked is that nobody knows, and a wrong "
+            "guess either messages a real person twice or silently drops a message they never got.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    outcome = asyncio.run(
+        run_resolve_unknown_intent(_sessionmaker(), intent_id=intent_id, delivered=delivered)
+    )
+    if outcome is ResolveOutcome.NOT_FOUND:
+        typer.echo(f"no outbox intent {intent_id}", err=True)
+        raise typer.Exit(code=1)
+    if outcome is ResolveOutcome.NOT_UNKNOWN:
+        typer.echo(
+            f"outbox intent {intent_id} is not parked as unknown, so there is nothing to resolve.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if outcome is ResolveOutcome.RECORDED_AS_SENT:
+        typer.echo(
+            f"outbox intent {intent_id} recorded as SENT: the ledger row is written, so it will "
+            "not be re-sent and the recipient's daily cap counts it."
+        )
+        return
+    typer.echo(f"outbox intent {intent_id} requeued (unknown -> pending, attempts reset)")
 
 
 @guest_app.command("purge")

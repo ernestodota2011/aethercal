@@ -29,6 +29,7 @@ from aethercal.server.integrations.messaging.guard import (
     DailyCaps,
     PermanentSendError,
     PhoneChannelSender,
+    SendOutcomeUnknown,
 )
 from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
@@ -216,3 +217,102 @@ async def test_the_auth_token_never_reaches_the_exception_message(sender: Twilio
         await sender.send(to="+13055550123", subject=None, body="hi")
 
     assert _AUTH_TOKEN not in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------------------
+# The default is RETRY. A needless retry costs a duplicate; a needless retirement costs
+# THE MESSAGE — and a silently missing message is exactly the one nobody notices.
+# --------------------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [408, 425, 429], ids=["timeout", "too-early", "rate-limited"])
+async def test_a_transient_4xx_retries_instead_of_retiring_the_step(
+    sender: TwilioSmsSender, status: int
+) -> None:
+    """==408 / 425 / 429 are the most common failures a messaging provider produces.==
+
+    The old rule retired every 4xx it had not special-cased, so a traffic spike (429), a slow
+    provider (408) or an explicit "come back in a moment" (425) killed the step FOREVER: the
+    guest's reminder was never sent, and nothing errored — just a ``skipped`` row carrying a reason
+    nobody reads.
+    """
+    respx.post(_SEND_URL).mock(return_value=httpx.Response(status, text="slow down"))
+
+    with pytest.raises(ChannelUnavailable):
+        await sender.send(to="+13055550123", subject=None, body="hi")
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [409, 418, 451, 499])
+async def test_an_UNCLASSIFIED_status_retries_rather_than_retiring(
+    sender: TwilioSmsSender, status: int
+) -> None:
+    """The status nobody thought of. It must RETRY, not die.
+
+    This is the test that makes the allow-list an allow-list: a provider that invents a status
+    tomorrow, or a proxy that injects one, must not be able to silently destroy a message."""
+    respx.post(_SEND_URL).mock(return_value=httpx.Response(status, text="who knows"))
+
+    with pytest.raises(ChannelUnavailable):
+        await sender.send(to="+13055550123", subject=None, body="hi")
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+async def test_a_provably_permanent_status_still_retires_the_step(
+    sender: TwilioSmsSender, status: int
+) -> None:
+    """The other half: an invalid number or bad credentials must NOT burn six backoff attempts."""
+    respx.post(_SEND_URL).mock(return_value=httpx.Response(status, text="invalid number"))
+
+    with pytest.raises(PermanentSendError, match="provider-rejected"):
+        await sender.send(to="+13055550123", subject=None, body="hi")
+
+
+# --------------------------------------------------------------------------------------
+# The third outcome: we wrote the request and lost the answer.
+# --------------------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("the answer never came"),
+        httpx.RemoteProtocolError("the connection dropped mid-response"),
+        httpx.ReadError("reset by peer"),
+    ],
+    ids=["read-timeout", "protocol-error", "read-error"],
+)
+async def test_a_LOST_ANSWER_is_unknown_and_is_neither_retried_nor_retired(
+    sender: TwilioSmsSender, error: httpx.HTTPError
+) -> None:
+    """==The request LEFT this machine and the answer was lost.== The provider may have sent it.
+
+    Retrying could message a real person twice — and worse, under-count the daily cap that
+    protects them, since the cap is derived from the ledger. Retiring writes off a message the guest
+    may never have received. Both are guesses, and neither is acceptable: this escalates."""
+    respx.post(_SEND_URL).mock(side_effect=error)
+
+    with pytest.raises(SendOutcomeUnknown, match="UNKNOWN"):
+        await sender.send(to="+13055550123", subject=None, body="hi")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError("refused"), httpx.ConnectTimeout("no route")],
+    ids=["connect-refused", "connect-timeout"],
+)
+async def test_a_failure_to_CONNECT_is_a_plain_retry_not_an_unknown(
+    sender: TwilioSmsSender, error: httpx.HTTPError
+) -> None:
+    """The other side of the same coin: we never connected, so the request was never transmitted.
+
+    Nothing was delivered, so a retry is provably safe — and treating this as "unknown" would park a
+    step (and page a human) every time the network hiccups."""
+    respx.post(_SEND_URL).mock(side_effect=error)
+
+    with pytest.raises(ChannelUnavailable):
+        await sender.send(to="+13055550123", subject=None, body="hi")

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel
+from aethercal.server.cli import ResolveOutcome, run_resolve_unknown_intent
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.migrate import run_migrations
 from aethercal.server.db.models import (
@@ -42,7 +43,9 @@ from aethercal.server.db.models import (
 from aethercal.server.db.models.workflows import Workflow, WorkflowStep, WorkflowTrigger
 from aethercal.server.integrations.messaging.guard import (
     CAP_WINDOW,
+    ChannelUnavailable,
     DailyCaps,
+    SendOutcomeUnknown,
     phone_sends_in_window,
 )
 from aethercal.server.services.bookings import (
@@ -54,6 +57,7 @@ from aethercal.server.services.bookings import (
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.outbox import (
+    PROVIDER_CALL_MARKER,
     OutboxEffect,
     drain_outbox,
     make_booking_effect_executor,
@@ -554,11 +558,19 @@ class _RecordingChannelSender:
 
     channel = Channel.WHATSAPP
 
-    def __init__(self, caps: DailyCaps | None = None) -> None:
+    def __init__(self, caps: DailyCaps | None = None, *, error: Exception | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
         self.caps = caps or DailyCaps(per_phone=100, per_ip=100)
+        self._error = error
+        self.calls = 0
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
+        # ``calls`` counts every ATTEMPT; ``sent`` only the ones that got through. A test about
+        # duplicate sends has to tell those apart - "it did not raise" is exactly what a message
+        # delivered twice looks like from out here.
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
         self.sent.append((to, body))
 
 
@@ -840,3 +852,194 @@ async def test_a_step_retired_before_sending_does_NOT_spend_the_phones_daily_quo
     )
     assert len(whatsapp.sent) == 1, "the legitimate reminder never reached the guest"
     assert whatsapp.sent[0][0] == phone
+
+
+# --------------------------------------------------------------------------------------
+# The UNKNOWN outcome: we handed it to the provider and never learned what happened.
+#
+# The window between "the provider accepted" and "the ledger committed" is not free. A crash inside
+# it leaves a message that may already be on a real person's phone with nothing recording it - so a
+# blind retry sends it TWICE, and (because the per-phone cap is derived from that same unwritten
+# ledger row) it also UNDER-COUNTS the ceiling that exists to stop exactly that. They compound.
+# --------------------------------------------------------------------------------------
+
+
+async def _whatsapp_step(migrated: Sessionmaker, booking_id: uuid.UUID) -> Outbox:
+    """THE WhatsApp step. A booking also carries the seeded EMAIL reminder, so ``steps[0]`` is
+    whichever row the database felt like handing back - and a test that pins the wrong one proves
+    nothing while looking green."""
+    async with migrated() as session:
+        steps = await _steps(session, booking_id)
+        return next(step for step in steps if step.payload["channel"] == "whatsapp")
+
+
+async def _payload_of(migrated: Sessionmaker, booking_id: uuid.UUID) -> dict[str, object]:
+    return dict((await _whatsapp_step(migrated, booking_id)).payload)
+
+
+async def test_a_LOST_ANSWER_parks_the_step_as_unknown_and_never_resends_it(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """==The provider took the request and the answer was lost.==
+
+    Not ``failed`` (a retry could message a real person twice) and not ``skipped`` (they may never
+    have got it). The third thing: parked, loud, waiting for a human - and above all NOT re-sent on
+    the next drain.
+    """
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    whatsapp = _RecordingChannelSender(error=SendOutcomeUnknown("the answer never came"))
+
+    with caplog.at_level("ERROR"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert step.status == "unknown", f"a lost answer must not be filed as {step.status!r}"
+    assert step.next_retry_at is None, "an unknown outcome must NOT be scheduled for a retry"
+    assert whatsapp.calls == 1
+    assert any("OUTCOME UNKNOWN" in record.getMessage() for record in caplog.records)
+
+    # ==The whole point.== A later drain must not quietly re-send a message the guest may have.
+    again = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert again.status == "unknown"
+    assert whatsapp.calls == 1, "the guest was messaged again by a drain that knew nothing new"
+
+
+async def test_a_CRASH_between_the_provider_and_the_ledger_is_not_resent_blind(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The worker died in the window. This is the exact state it leaves behind: the in-flight marker
+    committed, and no ledger row - because the commit that would have written it never happened.
+
+    A drain that finds this and re-sends IS the bug. It parks instead."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    target = await _whatsapp_step(migrated, booking_id)
+    async with migrated() as session, session.begin():
+        step = await session.get(Outbox, target.id)
+        assert step is not None
+        step.payload = {**step.payload, PROVIDER_CALL_MARKER: _NOW.isoformat()}
+
+    whatsapp = _RecordingChannelSender()
+    with caplog.at_level("ERROR"):
+        settled = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert settled.status == "unknown"
+    assert whatsapp.calls == 0, "a message that may already be on the guest's phone was re-sent"
+    assert any("unknown-outcome" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_TRANSIENT_failure_clears_the_marker_and_still_retries_normally(
+    migrated: Sessionmaker,
+) -> None:
+    """The other side of the coin, and the one that would rot the whole feature if it broke.
+
+    A provider having a bad minute (a 5xx, a refused connection) is a KNOWN non-delivery: nothing is
+    in flight. If THAT left the marker standing, every ordinary blip would park a step and page a
+    human, and reminders would quietly stop going out. It must retry, exactly as it always did."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    failing = _RecordingChannelSender(error=ChannelUnavailable("the provider is having a moment"))
+
+    step = await _drain_whatsapp(migrated, booking_id, failing)
+
+    assert step.status == "failed", "a transient failure must stay retryable"
+    assert step.next_retry_at is not None, "it must be scheduled for a backoff retry"
+    payload = await _payload_of(migrated, booking_id)
+    assert PROVIDER_CALL_MARKER not in payload, (
+        "a KNOWN non-delivery left the in-flight marker standing: the retry would be parked as "
+        "unknown, and the guest would never be messaged at all"
+    )
+
+
+async def test_resolving_an_unknown_as_DELIVERED_writes_the_ledger_and_repairs_the_cap(
+    migrated: Sessionmaker,
+) -> None:
+    """==The half that is easy to forget.==
+
+    The operator checks the provider: the message DID go out. Writing the ledger row stops it being
+    re-sent - and it also REPAIRS THE DAILY CAP, because that cap is derived from this very table.
+    Until the row exists, the guest's quota under-counts a message they already received, so the
+    ceiling protecting them from being messaged on repeat is silently too high."""
+    tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    whatsapp = _RecordingChannelSender(error=SendOutcomeUnknown("the answer never came"))
+    step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+    assert step.status == "unknown"
+
+    async with migrated() as session:
+        spent_before = await phone_sends_in_window(
+            session,
+            tenant_id=tenant_id,
+            phone="+13055551234",
+            channel=Channel.WHATSAPP,
+            since=_NOW - CAP_WINDOW,
+        )
+    assert spent_before == 0, "the crash left the cap under-counting, as expected"
+
+    outcome = await run_resolve_unknown_intent(
+        migrated, intent_id=step.id, delivered=True, now=_NOW
+    )
+
+    assert outcome is ResolveOutcome.RECORDED_AS_SENT
+    async with migrated() as session:
+        resolved = await session.get(Outbox, step.id)
+        assert resolved is not None
+        assert resolved.status == "delivered"
+        assert PROVIDER_CALL_MARKER not in resolved.payload
+        spent_after = await phone_sends_in_window(
+            session,
+            tenant_id=tenant_id,
+            phone="+13055551234",
+            channel=Channel.WHATSAPP,
+            since=_NOW - CAP_WINDOW,
+        )
+    assert spent_after == 1, "the cap still under-counts a message the guest actually received"
+
+    again = await _drain_whatsapp(migrated, booking_id, whatsapp)
+    assert again.status == "delivered"
+    assert whatsapp.calls == 1, "a resolved-as-delivered step was sent again"
+
+
+async def test_resolving_an_unknown_as_NOT_DELIVERED_sends_it_for_real(
+    migrated: Sessionmaker,
+) -> None:
+    """The operator checks the provider: nothing went out. The guest is owed their message."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    lost = _RecordingChannelSender(error=SendOutcomeUnknown("the answer never came"))
+    step = await _drain_whatsapp(migrated, booking_id, lost)
+    assert step.status == "unknown"
+
+    outcome = await run_resolve_unknown_intent(
+        migrated, intent_id=step.id, delivered=False, now=_NOW
+    )
+    assert outcome is ResolveOutcome.REQUEUED
+
+    working = _RecordingChannelSender()
+    settled = await _drain_whatsapp(migrated, booking_id, working)
+
+    assert settled.status == "delivered"
+    assert len(working.sent) == 1, "the guest never got the message they were owed"
+
+
+async def test_resolve_refuses_an_intent_that_is_not_parked_as_unknown(
+    migrated: Sessionmaker,
+) -> None:
+    """Resolving a DELIVERED intent as "not delivered" would re-send a message the guest has."""
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    step = await _drain_whatsapp(migrated, booking_id, _RecordingChannelSender())
+    assert step.status == "delivered"
+
+    outcome = await run_resolve_unknown_intent(
+        migrated, intent_id=step.id, delivered=False, now=_NOW
+    )
+
+    assert outcome is ResolveOutcome.NOT_UNKNOWN
