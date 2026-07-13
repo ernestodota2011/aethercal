@@ -226,6 +226,37 @@ describe("buildResourceTimeline — lane packing within a row", () => {
     expect(row?.blocks.every((b) => b.lane === 0)).toBe(true);
   });
 
+  it("does NOT stack two events whose only overlap falls outside the visible window", () => {
+    // The axis concatenates only each day's VISIBLE hours, so overlap must be judged in AXIS
+    // coordinates, not wall-clock time. Under a 09:00–18:00 window these two genuinely overlap in
+    // real time (through the night: D1 20:00 → D2 08:00) — but that overlap lands on hours the axis
+    // does not draw. On screen they merely sit end to end, so they belong in the SAME lane at FULL
+    // width. Packing them by real time would halve two bars that never touch.
+    const config = { dayStartHour: 9, dayEndHour: 18 };
+    const events = [
+      ev("evening", `${D1}T17:00:00`, `${D2}T08:00:00`, { resourceId: "h1" }),
+      ev("morning", `${D1}T20:00:00`, `${D2}T10:00:00`, { resourceId: "h1" }),
+    ];
+    const row = rowFor(buildResourceTimeline(HOSTS, events, [D1, D2], config), "h1");
+
+    expect(row?.blocks).toHaveLength(2);
+    expect(row?.laneCount).toBe(1);
+    expect(row?.blocks.map((b) => b.lane)).toEqual([0, 0]);
+    for (const block of row?.blocks ?? []) expect(block.laneCount).toBe(1); // full width, not halved
+  });
+
+  it("DOES stack two events that overlap inside the visible window", () => {
+    // The converse of the case above — whatever the axis actually shows as overlapping gets stacked.
+    const config = { dayStartHour: 9, dayEndHour: 18 };
+    const events = [
+      ev("a", `${D1}T10:00:00`, `${D1}T12:00:00`, { resourceId: "h1" }),
+      ev("b", `${D1}T11:00:00`, `${D1}T13:00:00`, { resourceId: "h1" }),
+    ];
+    const row = rowFor(buildResourceTimeline(HOSTS, events, [D1, D2], config), "h1");
+    expect(row?.laneCount).toBe(2);
+    expect(new Set(row?.blocks.map((b) => b.lane))).toEqual(new Set([0, 1]));
+  });
+
   it("packs each row independently — a busy resource never widens a quiet one", () => {
     const events = [
       ev("a", `${D1}T09:00:00`, `${D1}T11:00:00`, { resourceId: "h1" }),

@@ -68,6 +68,7 @@ export {
   layoutDayColumn,
   nowMarkerFraction,
   packLanes,
+  packLanesBy,
   resolveTimeGridConfig,
   splitAllDay,
   type ResolvedTimeGridConfig,

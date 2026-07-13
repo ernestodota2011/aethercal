@@ -4,8 +4,9 @@
  * The fifth calendar surface, and the transpose of the week/day grid: where `timeGrid` gives each
  * DAY a column and stacks overlapping events sideways within it, this gives each RESOURCE a row and
  * stacks its overlapping events downwards within it. Both share the one lane-packing sweep
- * (`packLanes`) and the one DST-safe day↔minute mapping (`minutesFromMidnight`) — the sweep is
- * axis-agnostic, so the timeline reuses it rather than re-deriving it.
+ * (`packLanesBy`) and the one DST-safe day↔minute mapping (`minutesFromMidnight`) — the sweep takes
+ * the caller's own coordinate, so the timeline reuses it rather than re-deriving it, and packs on
+ * AXIS minutes (what is on screen) rather than wall-clock time (what is not).
  *
  * Headless and framework-agnostic (no React, no DOM, no CSS — the RF-23 boundary): it only arranges
  * what is already on screen in the browser's local wall-time. Authoritative, timezone-correct
@@ -40,7 +41,7 @@ import {
   type ResolvedTimeGridConfig,
   type TimeGridConfig,
   minutesFromMidnight,
-  packLanes,
+  packLanesBy,
   resolveTimeGridConfig,
 } from "./timeGrid";
 import type { CalendarEvent, CalendarResource, GridPoint } from "./types";
@@ -164,7 +165,7 @@ function timelineSpan(event: CalendarEvent): { start: string; end: string } {
   return { start: `${startKey}T00:00:00`, end: `${addCalendarDays(lastKey, 1)}T00:00:00` };
 }
 
-/** An event plus the span it is laid out on — the unit `packLanes` sorts and packs. */
+/** An event plus the span it is laid out on — the unit the geometry segments and packs. */
 interface RowItem {
   event: CalendarEvent;
   start: string;
@@ -238,7 +239,22 @@ function coalesceSegments(segments: readonly Segment[]): Segment[] {
   return merged;
 }
 
-/** Lay out one resource row: pack its events into lanes, then place each one on the axis. */
+/** An item together with the runs it actually occupies ON THE AXIS (already coalesced). */
+interface PlacedItem {
+  item: RowItem;
+  runs: Segment[];
+}
+
+/**
+ * Lay out one resource row: pack its events into lanes, then place each one on the axis.
+ *
+ * Lane packing runs on AXIS MINUTES, never on wall-clock time. That distinction is load-bearing: the
+ * axis concatenates only each day's VISIBLE hours, so two events whose sole overlap falls in the
+ * hidden night (an evening booking and an early-morning one, under a 09:00–18:00 window) do not
+ * overlap ON SCREEN — packing them by real time would split them into two lanes and halve the width
+ * of bars that never touch. The converse holds too: whatever the axis shows as overlapping is what
+ * gets stacked. What you see is what gets packed.
+ */
 function layoutRow(
   items: readonly RowItem[],
   days: readonly string[],
@@ -247,21 +263,32 @@ function layoutRow(
   const totalMinutes = days.length * config.windowMinutes;
   if (totalMinutes <= 0) return [];
 
-  // Drop items with no visible extent BEFORE packing — an off-window event must never steal a lane
-  // from the ones actually on screen (the same rule `layoutDayColumn` follows).
-  const placements: LanePlacement<RowItem>[] = packLanes(
-    items.filter((item) => segmentsFor(item, days, config).length > 0),
-  );
+  // Resolve each item's visible runs ONCE, and drop the ones with no visible extent BEFORE packing —
+  // an off-window event must never steal a lane from the ones actually on screen.
+  const placed: PlacedItem[] = [];
+  for (const item of items) {
+    const runs = coalesceSegments(segmentsFor(item, days, config));
+    if (runs.length > 0) placed.push({ item, runs });
+  }
 
-  return placements.flatMap(({ item, lane, laneCount }) =>
-    coalesceSegments(segmentsFor(item, days, config)).map(
+  // An item's extent on the axis: its first run's start to its last run's end. A contiguous `days`
+  // range always coalesces an event into exactly ONE run, so this is simply that run. (A caller that
+  // passes a non-contiguous day range gets the hull of its runs — conservative: it may report an
+  // overlap across the gap, never miss one.)
+  const placements: LanePlacement<PlacedItem>[] = packLanesBy(placed, (entry) => [
+    entry.runs[0]!.startMin,
+    entry.runs[entry.runs.length - 1]!.endMin,
+  ]);
+
+  return placements.flatMap(({ item: entry, lane, laneCount }) =>
+    entry.runs.map(
       (run): TimelineBlock => ({
-        event: item.event,
+        event: entry.item.event,
         lane,
         laneCount,
         leftFraction: run.startMin / totalMinutes,
         widthFraction: (run.endMin - run.startMin) / totalMinutes,
-        allDay: item.event.allDay === true,
+        allDay: entry.item.event.allDay === true,
         continuesBefore: run.clippedStart,
         continuesAfter: run.clippedEnd,
       }),

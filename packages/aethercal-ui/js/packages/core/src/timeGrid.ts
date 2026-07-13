@@ -142,76 +142,89 @@ export interface LanePlacement<T> {
   laneCount: number;
 }
 
-/** Half-open overlap on the raw times ([start, end)); touching endpoints do NOT overlap. */
-function spansOverlap(a: TimeSpan, b: TimeSpan): boolean {
-  const aStart = parseLocalDateTime(a.start).getTime();
-  const aEnd = parseLocalDateTime(a.end).getTime();
-  const bStart = parseLocalDateTime(b.start).getTime();
-  const bEnd = parseLocalDateTime(b.end).getTime();
-  return aStart < bEnd && bStart < aEnd;
-}
-
 /**
- * Pack overlapping spans into lanes — the classic sweep used by Google Calendar / FullCalendar.
+ * Pack overlapping items into lanes — the classic sweep used by Google Calendar / FullCalendar.
  *
- * Spans are grouped into maximal overlap clusters (a gap where nothing is still running closes a
- * cluster), each takes the first lane whose previous occupant has already ended, and every span in a
- * cluster shares that cluster's lane count. No lane ever holds two overlapping spans; a fully
+ * Items are grouped into maximal overlap clusters (a gap where nothing is still running closes a
+ * cluster), each takes the first lane whose previous occupant has already ended, and every item in a
+ * cluster shares that cluster's lane count. No lane ever holds two overlapping items; a fully
  * sequential set collapses to a single lane. Output is ordered by start ascending (ties: longest
- * first) — the order both callers render in.
+ * first) — the order every caller renders in.
  *
- * Deliberately AXIS-AGNOSTIC: it answers only "what overlaps what", never "where on screen". That is
- * why the week/day grid uses it to stack blocks HORIZONTALLY inside a day column while the resource
- * timeline (RF-28) uses the very same sweep to stack them VERTICALLY inside a resource row. Callers
- * must pre-filter to the spans they actually render — a span with no visible extent would otherwise
- * steal a lane from the ones on screen.
+ * `bounds` is what makes the sweep genuinely AXIS-AGNOSTIC: it answers "what overlaps what" in
+ * WHATEVER coordinate the caller's axis actually uses. The day column measures overlap in absolute
+ * wall-clock milliseconds, because its axis is one continuous day. The resource timeline (RF-28)
+ * measures it in AXIS MINUTES, because its axis concatenates only the visible hours of each day — so
+ * two events whose sole overlap falls in the hidden night must NOT be treated as overlapping, and
+ * feeding this real timestamps would wrongly halve their width.
+ *
+ * Callers must pre-filter to the items they actually render: one with no visible extent would
+ * otherwise steal a lane from the ones on screen.
  */
-export function packLanes<T extends TimeSpan>(spans: readonly T[]): LanePlacement<T>[] {
-  // Sort by start ascending, then by end descending so the longest span of a tie seeds the cluster.
-  const ordered = [...spans].sort((a, b) => {
-    const sa = parseLocalDateTime(a.start).getTime();
-    const sb = parseLocalDateTime(b.start).getTime();
-    if (sa !== sb) return sa - sb;
-    return parseLocalDateTime(b.end).getTime() - parseLocalDateTime(a.end).getTime();
+export function packLanesBy<T>(
+  items: readonly T[],
+  bounds: (item: T) => readonly [start: number, end: number],
+): LanePlacement<T>[] {
+  const measured = items.map((item) => {
+    const [start, end] = bounds(item);
+    return { item, start, end };
   });
 
+  // Sort by start ascending, then by end descending so the longest item of a tie seeds the cluster.
+  measured.sort((a, b) => (a.start !== b.start ? a.start - b.start : b.end - a.end));
+
   const placements: LanePlacement<T>[] = [];
-  // `lanes[i]` holds the last span placed in lane i for the current cluster.
-  let lanes: T[] = [];
-  // Indices into `placements` for the spans of the current cluster (to backfill laneCount).
+  // `lanes[i]` holds the extent of the last item placed in lane i for the current cluster.
+  let lanes: { start: number; end: number }[] = [];
+  // Indices into `placements` for the items of the current cluster (to backfill laneCount).
   let clusterIdx: number[] = [];
-  let clusterEndMs = Number.NEGATIVE_INFINITY;
+  let clusterEnd = Number.NEGATIVE_INFINITY;
 
   const closeCluster = (): void => {
     const laneCount = lanes.length;
     for (const idx of clusterIdx) placements[idx]!.laneCount = laneCount;
     lanes = [];
     clusterIdx = [];
-    clusterEndMs = Number.NEGATIVE_INFINITY;
+    clusterEnd = Number.NEGATIVE_INFINITY;
   };
 
-  for (const span of ordered) {
-    const startMs = parseLocalDateTime(span.start).getTime();
-    const endMs = parseLocalDateTime(span.end).getTime();
+  for (const entry of measured) {
+    // An item starting at/after everything running in the cluster begins a fresh cluster.
+    if (clusterIdx.length > 0 && entry.start >= clusterEnd) closeCluster();
 
-    // A span starting at/after everything running in the cluster begins a fresh cluster.
-    if (clusterIdx.length > 0 && startMs >= clusterEndMs) closeCluster();
-
-    let lane = lanes.findIndex((occupant) => !spansOverlap(occupant, span));
+    // Half-open overlap ([start, end)): touching endpoints do NOT overlap.
+    let lane = lanes.findIndex(
+      (occupant) => !(occupant.start < entry.end && entry.start < occupant.end),
+    );
     if (lane === -1) {
       lane = lanes.length;
-      lanes.push(span);
+      lanes.push({ start: entry.start, end: entry.end });
     } else {
-      lanes[lane] = span;
+      lanes[lane] = { start: entry.start, end: entry.end };
     }
 
     clusterIdx.push(placements.length);
-    placements.push({ item: span, lane, laneCount: 1 });
-    clusterEndMs = Math.max(clusterEndMs, endMs);
+    placements.push({ item: entry.item, lane, laneCount: 1 });
+    clusterEnd = Math.max(clusterEnd, entry.end);
   }
   closeCluster();
 
   return placements;
+}
+
+/**
+ * Pack spans that overlap in ABSOLUTE wall-clock time — the day-column case, where the axis is one
+ * continuous day, so real time and screen position are the same thing.
+ *
+ * The resource timeline must NOT use this. Its axis concatenates only the VISIBLE hours of each day,
+ * so two events whose sole overlap falls in the hidden night do not overlap ON SCREEN at all; it
+ * packs on AXIS coordinates through `packLanesBy` instead.
+ */
+export function packLanes<T extends TimeSpan>(spans: readonly T[]): LanePlacement<T>[] {
+  return packLanesBy(spans, (span) => [
+    parseLocalDateTime(span.start).getTime(),
+    parseLocalDateTime(span.end).getTime(),
+  ]);
 }
 
 /**
