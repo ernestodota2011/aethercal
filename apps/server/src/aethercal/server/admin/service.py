@@ -274,6 +274,36 @@ async def reschedule_booking_action(
         return BookingRead.model_validate(booking)
 
 
+async def mark_no_show_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    booking_id: uuid.UUID,
+    now: datetime | None = None,
+) -> BookingRead:
+    """Mark a finished appointment as a no-show (RF-25). Idempotent.
+
+    ==It does NOT free the slot.== The appointment time has passed: releasing it would corrupt the
+    history and let a booking be written retroactively over it. ``Booking.occupies`` is "not
+    cancelled", so ``no_show`` keeps its slot automatically — and the partial index that enforces it
+    needed no change at all.
+
+    Refused unless the booking is CONFIRMED and has ENDED. Both refusals reach the operator in the
+    service's own words (see :data:`_BOOKING_ERROR_MESSAGES`): a no-show allowed before the end
+    would be a cancellation by another name that does not give the time back.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            booking = await bookings_service.mark_no_show(
+                session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
+            )
+        except bookings_service.BookingError as exc:
+            raise _booking_action_error(exc) from exc
+        await session.refresh(booking)
+        return BookingRead.model_validate(booking)
+
+
 async def create_booking_action(
     maker: Sessionmaker,
     *,
@@ -673,6 +703,7 @@ __all__ = [
     "list_schedules_view",
     "list_templates_view",
     "list_workflows_view",
+    "mark_no_show_action",
     "reschedule_booking_action",
     "resolve_admin_context",
     "set_workflow_active_action",

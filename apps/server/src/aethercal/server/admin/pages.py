@@ -164,11 +164,23 @@ def _manage_panel() -> rx.Component:
                         color_scheme="red",
                         variant="soft",
                     ),
+                    # RF-25. Offered rather than hidden behind a rule computed on the client: only
+                    # the database knows, at the instant of the click, whether this booking is still
+                    # confirmed and whether it has ended. A refusal comes back in the service's own
+                    # words, which tells the operator more than a silently disabled button.
+                    rx.button(
+                        "Marcar no-show",
+                        on_click=AdminState.mark_no_show(AdminState.selected_booking_id),
+                        color_scheme="amber",
+                        variant="soft",
+                    ),
                     rx.button("Cerrar", on_click=AdminState.clear_selection, variant="soft"),
                     spacing="3",
                 ),
                 rx.text(
-                    "También puedes arrastrar la reserva en el calendario para moverla.",
+                    "También puedes arrastrar la reserva en el calendario para moverla. "
+                    "Un no-show solo se puede marcar después de que la cita haya terminado, y NO "
+                    "libera el horario: la hora ya pasó.",
                     size="1",
                     color_scheme="gray",
                 ),

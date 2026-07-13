@@ -690,6 +690,35 @@ class AdminState(rx.State):
         _settle_mutation(self, await _commit_calendar_view(self))
 
     @rx.event
+    async def mark_no_show(self, booking_id: str) -> None:
+        """Mark the selected booking a no-show (RF-25) and refresh the agenda.
+
+        The button is always offered rather than hidden by a rule computed here: whether a booking
+        MAY be marked depends on its status and on whether it has ended, and the only authority on
+        both is the database at the moment of the click — a chip on the client can be minutes stale.
+        A refusal now arrives in the service's own words ("only a confirmed booking can be marked a
+        no-show", "a booking can only be marked a no-show after it has ended"), so the loud refusal
+        tells the operator more than a silently disabled button ever would.
+
+        The booking KEEPS ITS SLOT, so unlike a cancellation it stays on the calendar — as a muted,
+        non-draggable chip, because ``booking_event`` makes only a CONFIRMED booking editable.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.mark_no_show_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                booking_id=uuid.UUID(booking_id),
+            )
+        except (ValueError, service.AdminError, SQLAlchemyError) as exc:
+            self.error = _error_text(exc)
+            return
+        self.selected_booking_id = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
+
+    @rx.event
     async def reschedule(self, form_data: dict[str, str]) -> None:
         """Reschedule a booking to a new start (the manual, keyboard-friendly fallback form).
 

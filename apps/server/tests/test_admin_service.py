@@ -553,3 +553,134 @@ def test_a_booking_that_has_not_ended_is_told_exactly_that() -> None:
     )
     assert "ended" in refusal.message
     assert "could not be updated" not in refusal.message
+
+
+# --------------------------------------------------------------------------------------
+# No-show (RF-25). The slot is NOT freed — that is the whole point of the transition.
+# --------------------------------------------------------------------------------------
+
+_AFTER_SLOT_9 = datetime(2026, 7, 6, 10, 0, tzinfo=UTC)  # the 09:00 30-min booking is over
+
+
+async def _confirmed_booking(sessionmaker: Sessionmaker) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Tenant + event type + one CONFIRMED booking at 09:00 (it ends at 09:30)."""
+    tenant_id, _ = await _seed_tenant(sessionmaker)
+    schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
+    event_type_id = await _make_event_type(
+        sessionmaker, tenant_slug="acme", schedule_id=schedule_id
+    )
+    booking_id = await _book(
+        sessionmaker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT_9
+    )
+    return tenant_id, event_type_id, booking_id
+
+
+async def test_marking_a_no_show_writes_the_status_and_the_timestamp(
+    sessionmaker: Sessionmaker,
+) -> None:
+    _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
+
+    await service.mark_no_show_action(
+        sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+    )
+
+    async with sessionmaker() as session:
+        row = await session.get(Booking, booking_id)
+        assert row is not None
+        assert row.status is BookingStatus.NO_SHOW
+        assert row.no_show_at is not None
+
+
+async def test_a_no_show_does_not_free_the_slot(sessionmaker: Sessionmaker) -> None:
+    """==The effective state, not the apparent one.==
+
+    A no-show is not a cancellation by another name. The appointment time has PASSED: releasing it
+    would corrupt history and let a booking be written retroactively over it. So the proof is not
+    that the status says ``no_show`` — it is that the slot is still TAKEN afterwards.
+    """
+    tenant_id, event_type_id, booking_id = await _confirmed_booking(sessionmaker)
+    await service.mark_no_show_action(
+        sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+    )
+
+    # Book the very same slot again. It must be refused — the no-show still occupies it.
+    async with sessionmaker() as session, session.begin():
+        with pytest.raises(bookings_service.BookingError):
+            await create_booking(
+                session,
+                tenant_id=tenant_id,
+                params=BookingParams(
+                    event_type_id=event_type_id,
+                    start=_SLOT_9,
+                    guest_name="Someone else",
+                    guest_email="other@example.com",
+                    guest_timezone="UTC",
+                ),
+                now=_BEFORE,
+            )
+
+
+async def test_marking_a_no_show_before_the_appointment_ended_is_refused(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """A no-show is a statement about an event that already happened. Allowed beforehand it would be
+    a cancellation that does not free the slot: the guest's booking destroyed, and the time gone."""
+    _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
+
+    with pytest.raises(AdminActionError) as refusal:
+        await service.mark_no_show_action(
+            sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_BEFORE
+        )
+    assert "ended" in refusal.value.message
+
+    async with sessionmaker() as session:
+        row = await session.get(Booking, booking_id)
+        assert row is not None
+        assert row.status is BookingStatus.CONFIRMED  # untouched
+
+
+async def test_marking_a_cancelled_booking_a_no_show_says_no_show(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """The refusal names the operation the operator actually asked for (the debt fixed earlier)."""
+    _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
+    await cancel_booking_action(
+        sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_BEFORE
+    )
+
+    with pytest.raises(AdminActionError) as refusal:
+        await service.mark_no_show_action(
+            sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+        )
+    assert "no-show" in refusal.value.message
+    assert "reschedul" not in refusal.value.message.lower()
+
+
+async def test_marking_a_no_show_twice_is_idempotent(sessionmaker: Sessionmaker) -> None:
+    _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
+    await service.mark_no_show_action(
+        sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+    )
+    again = await service.mark_no_show_action(
+        sessionmaker, tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+    )
+    assert again.status is BookingStatus.NO_SHOW
+
+
+async def test_a_no_show_of_another_tenants_booking_is_refused(sessionmaker: Sessionmaker) -> None:
+    await _seed_tenant(sessionmaker, slug="alpha", email="a@example.com")
+    beta_id, _ = await _seed_tenant(sessionmaker, slug="beta", email="b@example.com")
+    beta_schedule = await _schedule_id(sessionmaker, tenant_slug="beta")
+    beta_event = await _make_event_type(sessionmaker, tenant_slug="beta", schedule_id=beta_schedule)
+    beta_booking = await _book(
+        sessionmaker, tenant_id=beta_id, event_type_id=beta_event, start=_SLOT_9
+    )
+
+    with pytest.raises(AdminActionError):
+        await service.mark_no_show_action(
+            sessionmaker, tenant_slug="alpha", booking_id=beta_booking, now=_AFTER_SLOT_9
+        )
+    async with sessionmaker() as session:
+        row = await session.get(Booking, beta_booking)
+        assert row is not None
+        assert row.status is BookingStatus.CONFIRMED

@@ -36,6 +36,7 @@ Sessionmaker = async_sessionmaker[AsyncSession]
 _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.load_bookings.fn, ()),
     (AdminState.cancel.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.mark_no_show.fn, ("00000000-0000-0000-0000-000000000000",)),
     (AdminState.reschedule.fn, ({"booking_id": "x", "new_start": "x"},)),
     (AdminState.load_event_types.fn, ()),
     (AdminState.create_event_type.fn, ({},)),
