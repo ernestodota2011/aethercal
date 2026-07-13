@@ -1,5 +1,6 @@
 import {
   type CalendarEvent,
+  type CalendarResource,
   type CalendarView,
   type ContextMenuPayload,
   type EventClickPayload,
@@ -9,8 +10,10 @@ import {
   type RangeSelectPayload,
   type ViewChangePayload,
   formatLocalDateTime,
+  getTimelineGridDays,
   getWeekGridDays,
   parseLocalDateTime,
+  resolveTimelineDays,
   toDateOnly,
 } from "@aethercal/calendar-core";
 import * as React from "react";
@@ -21,11 +24,25 @@ import { MonthView } from "./MonthView";
 import { ensureCalendarStyles } from "./styles";
 import { type ThemeInput, resolveThemeVars } from "./theme";
 import { TimeGridView } from "./TimeGridView";
+import { TimelineView } from "./TimelineView";
 
 export interface AetherCalendarProps {
-  /** Which surface to render. All four (month/week/day/list) are implemented. */
+  /** Which surface to render. All five (month/week/day/list/timeline) are implemented. */
   view?: CalendarView;
   events?: readonly CalendarEvent[];
+  /**
+   * The rows of the `timeline` view (RF-28). Generic by design — AetherCal maps a resource to a
+   * host, but any array works. An event joins a row via its `resourceId`; one whose resourceId is
+   * missing or unknown is surfaced in an "unassigned" row rather than dropped. Ignored by the other
+   * four views.
+   */
+  resources?: readonly CalendarResource[];
+  /** Days the timeline's horizontal axis spans, starting at the anchor (1..31). Defaults to 7. */
+  timelineDays?: number;
+  /** Timeline groups collapsed on first render. Collapse is then the view's own state. */
+  defaultCollapsedGroupIds?: readonly string[];
+  /** Notified when a timeline group is expanded/collapsed, for a host that wants to persist it. */
+  onToggleGroup?: (groupId: string, collapsed: boolean) => void;
   /** Any day within the range to show (Date or "YYYY-MM-DD[...]"). Defaults to today. */
   anchor?: Date | string;
   /** BCP-47 locale that drives labels/formatting (weekday/date/time via Intl + the message pack). */
@@ -130,6 +147,10 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
   const {
     view = "month",
     events,
+    resources,
+    timelineDays,
+    defaultCollapsedGroupIds,
+    onToggleGroup,
     anchor,
     locale = "en",
     theme,
@@ -198,7 +219,8 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
   const [autoNow, setAutoNow] = React.useState(() => new Date());
   React.useEffect(() => {
     if (now !== undefined) return;
-    if (view !== "week" && view !== "day") return;
+    // The timeline draws a "now" line too, so it ticks alongside the week/day grid.
+    if (view !== "week" && view !== "day" && view !== "timeline") return;
     const id = setInterval(() => setAutoNow(new Date()), 60_000);
     return () => clearInterval(id);
   }, [now, view]);
@@ -218,6 +240,8 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     Number.isInteger(maxEventsPerDay) && maxEventsPerDay >= 0 ? maxEventsPerDay : 3;
   const safeWeekdayLabels =
     weekdayLabels && weekdayLabels.length === 7 ? weekdayLabels : undefined;
+  // The core clamps a hostile day count into 1..31 rather than building a degenerate axis.
+  const safeTimelineDays = resolveTimelineDays(timelineDays);
 
   const timeGridConfig = React.useMemo(
     () => ({
@@ -251,6 +275,30 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
           maxEventsPerDay={safeMaxEventsPerDay}
           {...(safeWeekdayLabels ? { weekdayLabels: safeWeekdayLabels } : {})}
           {...(onEventDrop ? { onEventDrop } : {})}
+          {...(onRangeSelect ? { onRangeSelect } : {})}
+          {...(onEventClick ? { onEventClick } : {})}
+          {...(onContextMenu ? { onContextMenu } : {})}
+          {...(pendingIds ? { pendingIds } : {})}
+          {...(rolledBackIds ? { rolledBackIds } : {})}
+        />
+      );
+    }
+
+    if (view === "timeline") {
+      return (
+        <TimelineView
+          days={getTimelineGridDays(anchorDate, safeTimelineDays)}
+          resources={resources ?? []}
+          events={events ?? []}
+          locale={locale}
+          messages={messages}
+          themeVars={themeVars}
+          config={timeGridConfig}
+          now={nowDate}
+          {...(defaultCollapsedGroupIds ? { defaultCollapsedGroupIds } : {})}
+          {...(onToggleGroup ? { onToggleGroup } : {})}
+          {...(onEventDrop ? { onEventDrop } : {})}
+          {...(onEventResize ? { onEventResize } : {})}
           {...(onRangeSelect ? { onRangeSelect } : {})}
           {...(onEventClick ? { onEventClick } : {})}
           {...(onContextMenu ? { onContextMenu } : {})}
@@ -313,6 +361,7 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
         now={nowDate}
         locale={locale}
         firstDayOfWeek={safeFirstDayOfWeek}
+        timelineDays={safeTimelineDays}
         messages={messages}
         showViews={navigationViews}
         {...(onRangeChange ? { onRangeChange } : {})}

@@ -6,6 +6,7 @@ import {
   buildResourceTimeline,
   resolveTimelineDays,
   timelineNowFraction,
+  timelinePointAt,
 } from "./timeline";
 import type { CalendarEvent, CalendarResource } from "./types";
 
@@ -344,6 +345,48 @@ describe("timelineNowFraction", () => {
     const now = new Date(2026, 6, 14, 6, 0, 0); // 06:00, before an 8..18 window
     const config = resolveTimeGridConfig({ dayStartHour: 8, dayEndHour: 18 });
     expect(timelineNowFraction(now, WEEK, config)).toBeNull();
+  });
+});
+
+describe("timelinePointAt — the inverse of the axis mapping", () => {
+  it("maps a fraction back to the day and snapped minute it represents", () => {
+    // Halfway across a 3-day full-day axis is midnight of day 2 + 12h => D2 12:00.
+    expect(timelinePointAt(0.5, WEEK)).toEqual({ dateOnly: D2, minuteOfDay: 720 });
+  });
+
+  it("round-trips a block's leftFraction back to its own start", () => {
+    const events = [ev("a", `${D2}T09:30:00`, `${D2}T10:00:00`, { resourceId: "h1" })];
+    const block = rowFor(buildResourceTimeline(HOSTS, events, WEEK), "h1")?.blocks[0];
+    expect(timelinePointAt(block?.leftFraction ?? 0, WEEK)).toEqual({
+      dateOnly: D2,
+      minuteOfDay: 570, // 09:30
+    });
+  });
+
+  it("honours the visible hour window", () => {
+    const config = { dayStartHour: 8, dayEndHour: 18 };
+    // Fraction 0 is the window start (08:00), never midnight.
+    expect(timelinePointAt(0, WEEK, config)).toEqual({ dateOnly: D1, minuteOfDay: 480 });
+    expect(timelinePointAt(1 / 3, WEEK, config)).toEqual({ dateOnly: D2, minuteOfDay: 480 });
+  });
+
+  it("snaps to the requested granularity", () => {
+    // 09:07 on a single-day axis snaps to 09:00 at a 15-minute step.
+    const raw = (9 * 60 + 7) / (24 * 60);
+    expect(timelinePointAt(raw, [D1])?.minuteOfDay).toBe(540);
+  });
+
+  it("keeps a fraction of exactly 1 on the LAST day rather than inventing a phantom one", () => {
+    expect(timelinePointAt(1, WEEK)).toEqual({ dateOnly: D3, minuteOfDay: 1440 });
+  });
+
+  it("clamps a fraction from outside [0, 1] instead of walking off the axis", () => {
+    expect(timelinePointAt(-2, WEEK)?.dateOnly).toBe(D1);
+    expect(timelinePointAt(9, WEEK)?.dateOnly).toBe(D3);
+  });
+
+  it("returns null for a degenerate axis rather than inventing a point", () => {
+    expect(timelinePointAt(0.5, [])).toBeNull();
   });
 });
 

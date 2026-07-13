@@ -26,6 +26,8 @@ export {
 export { CALENDAR_CSS, ensureCalendarStyles } from "./styles";
 export { TimeGridView, type TimeGridViewProps } from "./TimeGridView";
 export { TIME_GRID_CSS, ensureTimeGridStyles } from "./timeGridStyles";
+export { TimelineView, type TimelineViewProps } from "./TimelineView";
+export { TIMELINE_CSS, ensureTimelineStyles } from "./timelineStyles";
 export {
   PRESETS,
   PRESET_NAMES,
@@ -34,6 +36,7 @@ export {
   type ThemeTokens,
   defaultBaseTokenCss,
   defaultTimeGridTokenCss,
+  defaultTimelineTokenCss,
   isThemePreset,
   resolveThemeVars,
 } from "./theme";
@@ -44,6 +47,7 @@ export {
 } from "./i18n";
 export type {
   CalendarEvent,
+  CalendarResource,
   CalendarView,
   ContextMenuPayload,
   Edge,

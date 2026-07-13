@@ -84,6 +84,7 @@ export {
   buildResourceTimeline,
   resolveTimelineDays,
   timelineNowFraction,
+  timelinePointAt,
   type ResourceTimeline,
   type ResourceTimelineConfig,
   type TimelineBlock,

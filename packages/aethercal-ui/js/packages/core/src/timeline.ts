@@ -34,6 +34,7 @@ import {
   parseLocalDateTime,
   toDateOnly,
 } from "./dateMath";
+import { DEFAULT_SNAP_MINUTES } from "./interactions";
 import {
   type LanePlacement,
   type ResolvedTimeGridConfig,
@@ -42,7 +43,7 @@ import {
   packLanes,
   resolveTimeGridConfig,
 } from "./timeGrid";
-import type { CalendarEvent, CalendarResource } from "./types";
+import type { CalendarEvent, CalendarResource, GridPoint } from "./types";
 
 const MINUTES_PER_HOUR = 60;
 
@@ -402,6 +403,45 @@ export function buildResourceTimeline(
   }
 
   return { days: [...days], items, dayHeaders, ticks, config: resolved };
+}
+
+/**
+ * Map a fraction [0, 1] ACROSS the timeline axis back to the day + snapped minute it represents —
+ * the inverse of the `leftFraction` the geometry emits, and the horizontal counterpart of the time
+ * grid's `fractionToMinuteOfDay`. The React layer turns a pointer's x into a fraction and calls this;
+ * it never does axis maths itself (RF-23).
+ *
+ * Returns `null` for a degenerate axis (no days / zero-width window) rather than inventing a point.
+ */
+export function timelinePointAt(
+  fraction: number,
+  days: readonly string[],
+  config: TimelineConfigInput = {},
+  snapMinutes: number = DEFAULT_SNAP_MINUTES,
+): GridPoint | null {
+  const resolved = resolveWindow(config);
+  if (days.length === 0 || resolved.windowMinutes <= 0) return null;
+
+  const totalMinutes = days.length * resolved.windowMinutes;
+  const axisMinutes = clamp(fraction, 0, 1) * totalMinutes;
+  // Clamp the day index so a fraction of exactly 1 lands on the LAST day's end, not a phantom day.
+  const index = Math.min(
+    Math.floor(axisMinutes / resolved.windowMinutes),
+    days.length - 1,
+  );
+  const withinDay = axisMinutes - index * resolved.windowMinutes;
+
+  const windowStartMin = resolved.dayStartHour * MINUTES_PER_HOUR;
+  const windowEndMin = resolved.dayEndHour * MINUTES_PER_HOUR;
+  const step = snapMinutes > 0 ? snapMinutes : DEFAULT_SNAP_MINUTES;
+  // Snap relative to the WINDOW START (not midnight), so a step that does not divide the start hour
+  // still lands fraction 0 exactly on the window's first slot.
+  const snapped = windowStartMin + Math.round(withinDay / step) * step;
+
+  return {
+    dateOnly: days[index]!,
+    minuteOfDay: clamp(snapped, windowStartMin, windowEndMin),
+  };
 }
 
 /**

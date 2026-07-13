@@ -23,8 +23,8 @@ import type * as React from "react";
 import type { CalendarMessages } from "./i18n";
 import { formatPeriodTitle } from "./labels";
 
-/** The four surfaces, in the order the switcher lists them. */
-const VIEW_ORDER: readonly CalendarView[] = ["month", "week", "day", "list"];
+/** The five surfaces, in the order the switcher lists them. */
+const VIEW_ORDER: readonly CalendarView[] = ["month", "week", "day", "list", "timeline"];
 
 export interface CalendarNavProps {
   view: CalendarView;
@@ -34,6 +34,11 @@ export interface CalendarNavProps {
   now: Date;
   locale: string;
   firstDayOfWeek: FirstDayOfWeek;
+  /**
+   * Days the timeline window spans (RF-28). The toolbar has to know: otherwise prev/next would step
+   * by the wrong period and the title would name a range the grid is not showing.
+   */
+  timelineDays?: number;
   messages: CalendarMessages;
   /** Whether to render the view switcher (emits `onViewChange`). Defaults to true. */
   showViews?: boolean;
@@ -49,15 +54,16 @@ export function CalendarNav({
   now,
   locale,
   firstDayOfWeek,
+  timelineDays,
   messages,
   showViews = true,
   onRangeChange,
   onViewChange,
 }: CalendarNavProps): React.JSX.Element {
   const goToRange = (nextAnchor: Date): void => {
-    onRangeChange?.(getVisibleRange(view, nextAnchor, firstDayOfWeek));
+    onRangeChange?.(getVisibleRange(view, nextAnchor, firstDayOfWeek, timelineDays));
   };
-  const title = formatPeriodTitle(view, anchor, locale, firstDayOfWeek);
+  const title = formatPeriodTitle(view, anchor, locale, firstDayOfWeek, timelineDays);
 
   return (
     <div className="aethercal-nav" role="toolbar" aria-label={messages.navToolbar}>
@@ -97,7 +103,9 @@ export function CalendarNav({
               type="button"
               className="aethercal-nav-btn aethercal-nav-view"
               aria-pressed={candidate === view}
-              onClick={() => onViewChange?.(getVisibleRange(candidate, anchor, firstDayOfWeek))}
+              onClick={() =>
+                onViewChange?.(getVisibleRange(candidate, anchor, firstDayOfWeek, timelineDays))
+              }
             >
               {messages.viewNames[candidate]}
             </button>
