@@ -57,7 +57,7 @@ from aethercal.server.services.outbox import (
     _Outcome,
     _settle,
     backoff_delay,
-    claim_batch,
+    claim_one,
     drain_outbox,
     email_dedupe_key,
     enqueue_effect,
@@ -373,8 +373,11 @@ async def test_the_row_is_claimed_and_committed_before_the_effect_runs(maker: Se
 
     assert observed["status"] == "claimed"
     assert observed["claimed_by"] == "worker-1"
-    # SQLite drops tzinfo on the round-trip; normalise before comparing the instant.
-    assert observed["lease_expires_at"].replace(tzinfo=UTC) == NOW + _LEASE
+    # A WINDOW, not an equality. The lease is stamped when the ITEM starts (now + real elapsed +
+    # lease), not when the batch was planned — asserting equality here would mean the clock was
+    # frozen, which is exactly the bug per-item claiming removes. SQLite drops tzinfo: normalise.
+    stamped = observed["lease_expires_at"].replace(tzinfo=UTC)
+    assert NOW + _LEASE <= stamped <= NOW + _LEASE + timedelta(seconds=30)
     assert (await _row(maker, intent_id)).status == "delivered"
 
 
@@ -396,8 +399,14 @@ async def test_a_transient_failure_retries_after_backoff_then_delivers(maker: Se
     assert early.attempted == 0
     assert executor.calls == [intent_id]
 
-    # Due at next_retry_at: the second attempt succeeds and the intent is delivered.
-    later = await drain_outbox(maker, now=NOW + backoff_delay(1), execute=executor)
+    # Due once past next_retry_at: the second attempt succeeds and the intent is delivered. The
+    # minute of slack matters: the drain's clock is a REAL one now (a lease is a wall-clock
+    # deadline), so the retry stamped in the previous pass lands a few milliseconds past the logical
+    # instant. Sitting exactly ON the boundary would make this flaky for a reason that has nothing
+    # to do with backoff.
+    later = await drain_outbox(
+        maker, now=NOW + backoff_delay(1) + timedelta(minutes=1), execute=executor
+    )
     assert later.delivered == [intent_id]
     row = await _row(maker, intent_id)
     assert row.status == "delivered"
@@ -594,7 +603,8 @@ async def test_a_notify_step_never_falls_through_into_the_google_handler(
         dedupe_key="wf:1:2:whatsapp",
         payload={
             "trigger": WorkflowTrigger.BEFORE_START.value,
-            "channel": "whatsapp",  # nothing on this instance can send it
+            # Nothing on this instance can send WhatsApp.
+            "channel": "whatsapp",
             "step_id": str(uuid.uuid4()),
             "kind": "reminder",
         },
@@ -697,8 +707,8 @@ async def test_a_worker_that_lost_its_lease_DISCARDS_its_result_instead_of_stomp
 
     # Worker A claims the row (and then "hangs" in its send for longer than the TTL).
     async with maker() as session, session.begin():
-        claimed = await claim_batch(session, now=NOW, worker_id="A", lease=_LEASE)
-    work_a = claimed[0]
+        work_a = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work_a is not None
     assert work_a.claimed_by == "A"
 
     # The lease elapses; the recovery pass returns the row, and worker B claims it.
@@ -706,8 +716,10 @@ async def test_a_worker_that_lost_its_lease_DISCARDS_its_result_instead_of_stomp
     async with maker() as session, session.begin():
         assert await recover_expired_leases(session, now=later) == [intent_id]
     async with maker() as session, session.begin():
-        reclaimed = await claim_batch(session, now=later, worker_id="B", lease=_LEASE)
-    assert [w.id for w in reclaimed] == [intent_id]
+        work_b = await claim_one(
+            session, intent_id=intent_id, now=later, worker_id="B", lease=_LEASE
+        )
+    assert work_b is not None
 
     # NOW worker A comes back from its send and tries to settle. It must not be able to.
     report = OutboxReport()
@@ -730,10 +742,11 @@ async def test_the_lease_holder_settles_normally(maker: Sessionmaker) -> None:
     tenant_id, booking_id = await _seed_booking(maker)
     intent_id = await _enqueue(maker, tenant_id, booking_id)
     async with maker() as session, session.begin():
-        claimed = await claim_batch(session, now=NOW, worker_id="A", lease=_LEASE)
+        work = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work is not None
 
     report = OutboxReport()
-    await _settle(maker, claimed[0], now=NOW, outcome=_Outcome.DELIVERED, report=report)
+    await _settle(maker, work, now=NOW, outcome=_Outcome.DELIVERED, report=report)
 
     assert report.delivered == [intent_id]
     assert report.lost == []
@@ -748,3 +761,94 @@ def test_the_provider_timeout_ceiling_is_strictly_under_the_lease() -> None:
     already did the work — and the guest can be messaged twice. Bounding every provider call below
     the TTL is what makes that unreachable rather than merely unlikely."""
     assert PROVIDER_TIMEOUT_CEILING < DEFAULT_LEASE
+
+
+# --------------------------------------------------------------------------------------
+# The lease protects a DEAD worker. It must also survive a SLOW one with a long batch — which is the
+# normal case, and which the batch-claim design got wrong.
+# --------------------------------------------------------------------------------------
+
+
+class _MovableClock:
+    """A hand-cranked wall clock, so "the batch outlived the lease" is deterministic."""
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+
+async def test_a_slow_batch_never_sends_anything_twice(maker: Sessionmaker) -> None:
+    """The duplicate-send bug, reproduced against the clock.
+
+    Claim the whole batch up front and every row gets the SAME lease deadline. Then work through it
+    serially: by the time the third item's turn arrives, its lease — granted before the first item
+    even started — has already expired. The recovery pass hands it to another worker, that worker
+    sends it, and this one sends it again. A duplicate email to a real guest, and the lease never
+    stopped it: the lease was built for a worker that DIED, not for one that is merely slow.
+
+    Here worker A is slow (each send burns 60% of the lease) and worker B drains the same queue in
+    the middle of A's batch. What is asserted is not "no exception" — it is that **every intent was
+    executed exactly once**, counted in the fake."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    lease = timedelta(minutes=1)
+    ids = [await _enqueue(maker, tenant_id, booking_id, dedupe_key=f"email:{i}") for i in range(3)]
+    clock = _MovableClock(NOW)
+    executed: list[uuid.UUID] = []
+    b_has_run = False
+
+    async def _slow_execute(work: OutboxWork, _now: datetime) -> None:
+        nonlocal b_has_run
+        executed.append(work.id)
+        clock.advance(lease * 0.6)  # a slow send: it eats most of THIS item's lease
+        if len(executed) == 2 and not b_has_run:
+            # A is mid-flight on its SECOND item. Under the batch-claim design, items 2 and 3 were
+            # stamped with a lease that has now expired while they queued — so B would recover them
+            # and re-send them under A's feet.
+            b_has_run = True
+            await drain_outbox(
+                maker,
+                now=clock(),
+                execute=_slow_execute,
+                worker_id="B",
+                lease=lease,
+                clock=clock,
+            )
+
+    await drain_outbox(
+        maker, now=clock(), execute=_slow_execute, worker_id="A", lease=lease, clock=clock
+    )
+
+    # EVERY intent ran exactly once. Not "no exception" — a real count of real sends.
+    assert sorted(executed) == sorted(ids), f"an intent ran twice, or not at all: {executed}"
+    assert len(executed) == len(set(executed)) == 3
+    for intent_id in ids:
+        assert (await _row(maker, intent_id)).status == "delivered"
+
+
+async def test_an_item_is_only_claimed_when_its_turn_comes(maker: Sessionmaker) -> None:
+    """The mechanism behind the test above: planning is not claiming. While the first item is being
+    sent, the rest are still ``pending`` and free for another worker to take — instead of sitting
+    ``claimed`` on a lease that is quietly running out while they wait."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    first = await _enqueue(maker, tenant_id, booking_id, dedupe_key="email:a")
+    second = await _enqueue(maker, tenant_id, booking_id, dedupe_key="email:b")
+    observed: dict[uuid.UUID, str] = {}
+
+    async def _look_at_the_others(work: OutboxWork, _now: datetime) -> None:
+        if work.id == first:
+            async with maker() as session:
+                other = await session.get(Outbox, second)
+                assert other is not None
+                observed[second] = other.status
+
+    await drain_outbox(maker, now=NOW, execute=_look_at_the_others, worker_id="A", batch_size=2)
+
+    assert observed[second] == "pending", (
+        "the second item was claimed while the first was still sending — its lease burns down "
+        "while it waits its turn"
+    )

@@ -59,14 +59,15 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, assert_never
+from typing import Any, assert_never, cast
 
-from sqlalchemy import case, or_, select
+from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -145,8 +146,7 @@ _SKIPPED = "skipped"
 A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
 reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
 noise in the backlog, and the message still does not arrive. The step is retired with its reason
-instead, loudly in the log and visibly in the row.
-"""
+instead, loudly in the log and visibly in the row. """
 _VOIDED = "voided"
 """Retired before it ever ran: the booking's life changed under it (see
 :func:`void_pending_steps`)."""
@@ -266,8 +266,7 @@ class OutboxSkipped(Exception):
     The distinction from a failure is the whole point. A WhatsApp step on an instance with no
     WhatsApp credentials is not "broken" — it is switched off. Retried like a failure it would burn
     the entire backoff budget and dead-letter, filling the queue with noise while still delivering
-    nothing. Terminal, recorded with its reason, and it consumes no attempt.
-    """
+    nothing. Terminal, recorded with its reason, and it consumes no attempt."""
 
 
 DEFER_DELAY_SECONDS = 30
@@ -306,6 +305,21 @@ OutboxExecutor = Callable[[OutboxWork, datetime], Awaitable[None]]
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
+Clock = Callable[[], datetime]
+"""Reads the wall clock. A lease is a wall-clock deadline, so the drain needs REAL elapsed time."""
+
+
+def _elapsed_clock(now: datetime) -> Clock:
+    """A clock anchored at ``now`` and advanced by the real time that has elapsed since.
+
+    NOT ``lambda: now``. A frozen clock would stamp every item's lease with the same deadline no
+    matter how long the batch actually took — which is precisely the bug that per-item claiming
+    exists to remove. ``monotonic`` because this measures a DURATION, and the wall clock can step
+    backwards (NTP, DST) while a duration cannot.
+    """
+    started = time.monotonic()
+    return lambda: now + timedelta(seconds=time.monotonic() - started)
+
 
 @dataclass
 class OutboxReport:
@@ -317,11 +331,15 @@ class OutboxReport:
     deferred: list[uuid.UUID] = field(default_factory=list)
     recovered: list[uuid.UUID] = field(default_factory=list)
     """Rows a dead worker had claimed, returned to ``pending`` by this pass's lease recovery."""
+    unclaimed: list[uuid.UUID] = field(default_factory=list)
+    """Planned, but claimed by somebody else (or voided) before we reached them.
+
+    Not ours, and not errors.
+    """
     skipped: list[uuid.UUID] = field(default_factory=list)
     """Steps that could never run (an unconfigured channel, a kind with no template).
 
-    NOT failures.
-    """
+    NOT failures. """
     lost: list[uuid.UUID] = field(default_factory=list)
     """Rows whose lease expired mid-send, so this worker's result was DISCARDED at settle time.
 
@@ -427,42 +445,78 @@ async def void_pending_steps(
     booking_id: uuid.UUID,
     triggers: Collection[WorkflowTrigger],
 ) -> list[uuid.UUID]:
-    """Retire this booking's still-``pending`` workflow steps for ``triggers``. Returns their ids.
+    """Retire this booking's LIVE workflow steps for ``triggers``. Returns the ids voided.
 
     This — not an upsert — is how a booking's queued steps are corrected when its life changes.
     ``reschedule_booking`` does NOT mutate a booking: it opens a NEW row (the successor inherits the
-    ``ical_uid``; the predecessor is marked cancelled). Outbox uniqueness keys on ``booking_id``,
-    so a successor's steps can never collide with the predecessor's — an ``ON CONFLICT ... DO
-    UPDATE`` that tried to "move" the step would match ZERO rows, raise nothing, and pass every
-    test. That is the silent no-op this whole design exists to kill, so the predecessor's steps are
-    voided explicitly instead.
+    ``ical_uid``; the predecessor is marked cancelled). Outbox uniqueness keys on ``booking_id``, so
+    a successor's steps can never collide with the predecessor's — an ``ON CONFLICT ... DO UPDATE``
+    that tried to "move" a step would match ZERO rows, raise nothing, and pass every test. That is
+    the silent no-op this whole design exists to kill, so the predecessor's steps are voided
+    explicitly instead.
 
-    Voiding covers the **staleness-EXEMPT** steps too, which is the entire point: an ``after_end``
+    Voiding covers the staleness-EXEMPT steps too, which is the entire point: an ``after_end``
     follow-up is exempt (the appointment is over — "the chain moved on" is not a reason to suppress
-    it), so if the predecessor's copy is left ``pending`` it WILL be delivered, at the hour of a
-    meeting that never happened.
+    it), so a predecessor's copy left alive WILL be delivered, at the hour of a meeting that never
+    happened.
 
-    Only ``pending`` rows are touched: a ``delivered`` row is history, and a ``claimed`` one belongs
-    to a worker mid-send."""
+    .. rubric:: "Live" means ``pending`` AND ``failed`` AND ``claimed``
+
+    Retiring only ``pending`` rows is a bug with a real victim. A step whose provider was down sits
+    in ``failed`` with a ``next_retry_at`` in the future, and it is **completely alive**: cancel the
+    booking and that step retries an hour later, messaging a guest about an appointment that no
+    longer exists. Reschedule, and the predecessor's failed steps fire at the OLD time. So the void
+    covers every non-terminal state:
+
+    * ``pending`` / ``failed`` → voided outright. They had not started; now they never will.
+    * ``claimed`` → voided as well. This is the case whose policy has to be WRITTEN DOWN, because a
+      claimed step may be in the provider's hands right now, and there is no such thing as
+      un-sending. The policy: ==**we do not try to recall it; we guarantee it is never RETRIED; and
+      we refuse to let its worker write the outcome.**== Marking it ``voided`` does all three — the
+      row becomes terminal, and the worker's settle (gated on ``status='claimed' AND
+      claimed_by=<me>``, see :func:`_settle`) no longer matches, so its result is discarded and
+      logged. The message may still reach the guest: that is the honest, unavoidable residual of an
+      at-least-once queue, and it is RECORDED rather than pretended away.
+
+    ``FOR UPDATE`` makes this atomic against :func:`claim_one`. A concurrent drain about to claim
+    one of these rows blocks on the lock until the booking transition commits, and its conditional
+    UPDATE
+    then finds ``status='voided'`` and matches nothing. A step cannot slip from ``pending`` into a
+    worker's hands *while* the cancellation that retires it is committing."""
     wanted = {trigger.value for trigger in triggers}
     if not wanted:
         return []
     rows = (
         await session.scalars(
-            select(Outbox).where(
+            select(Outbox)
+            .where(
                 Outbox.tenant_id == tenant_id,
                 Outbox.booking_id == booking_id,
                 Outbox.effect == OutboxEffect.NOTIFY.value,
-                Outbox.status == _PENDING,
+                Outbox.status.in_(_NON_TERMINAL),
             )
+            .with_for_update()
         )
     ).all()
     voided: list[uuid.UUID] = []
     for row in rows:
-        if row.payload.get("trigger") in wanted:
-            row.status = _VOIDED
-            row.next_retry_at = None
-            voided.append(row.id)
+        if row.payload.get("trigger") not in wanted:
+            continue
+        if row.status == _CLAIMED:
+            # In flight. We cannot un-send it — we can only guarantee it is never retried, and that
+            # its worker's result is discarded rather than written. Say so, out loud.
+            _logger.warning(
+                "outbox intent %s (booking %s) was VOIDED while a worker held it: the send may "
+                "already have reached the provider and cannot be recalled. It will NOT be retried, "
+                "and the worker's result will be discarded",
+                row.id,
+                row.booking_id,
+            )
+        row.status = _VOIDED
+        row.next_retry_at = None
+        row.claimed_by = None
+        row.lease_expires_at = None
+        voided.append(row.id)
     await session.flush()
     return voided
 
@@ -509,60 +563,98 @@ async def recover_expired_leases(
     return [row.id for row in rows]
 
 
-async def claim_batch(
+async def select_due(
+    session: AsyncSession, *, now: datetime, limit: int = DEFAULT_DRAIN_BATCH_SIZE
+) -> list[uuid.UUID]:
+    """The ids of the intents that are due, in the order they must run. It claims NOTHING.
+
+    "Due" = ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now``. Deliberately no
+    lock and no claim: this is a *plan*, and a plan made now can already be stale by the time the
+    tenth item of it actually runs. :func:`claim_one` is what arbitrates, item by item, at the
+    moment each one begins."""
+    return list(
+        (
+            await session.scalars(
+                select(Outbox.id)
+                .where(
+                    Outbox.status.in_((_PENDING, _FAILED)),
+                    or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
+                )
+                .order_by(
+                    Outbox.created_at,
+                    # Within one instant (intents enqueued in the same transaction share a stamp),
+                    # run the Google sync BEFORE the email — so the confirmation/reschedule notice
+                    # carries the Meet link the sync just wrote onto the booking: a deterministic
+                    # causal order, not the non-deterministic tie-break created_at alone would
+                    # leave.
+                    case((Outbox.effect == OutboxEffect.GOOGLE.value, 0), else_=1),
+                )
+                .limit(limit)
+            )
+        ).all()
+    )
+
+
+async def claim_one(
     session: AsyncSession,
     *,
+    intent_id: uuid.UUID,
     now: datetime,
     worker_id: str,
     lease: timedelta = DEFAULT_LEASE,
-    batch_size: int = DEFAULT_DRAIN_BATCH_SIZE,
-) -> list[OutboxWork]:
-    """Claim the due intents for ``worker_id`` and return them DETACHED. The caller commits.
+) -> OutboxWork | None:
+    """Claim ONE intent, at the instant it is about to run. ``None`` = somebody else got there.
 
-    "Due" = ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now``. ``FOR UPDATE SKIP
-    LOCKED`` means two workers racing this statement claim DISJOINT batches instead of blocking each
-    other (a no-op on SQLite, which serialises writers anyway). Once the caller commits, the row
-    locks are gone and ``status='claimed'`` — not a held lock — is what keeps a second worker off
-    them."""
-    due = (
-        await session.scalars(
-            select(Outbox)
+    ==Claimed per ITEM, on purpose. This is the fix for a real duplicate-send bug.==
+
+    The obvious design claims the whole batch up front and then works through it serially. But a
+    lease is a WALL-CLOCK deadline: stamp all fifty rows with ``now + 5 min``, then spend six
+    minutes on the first forty, and rows 41-50 have leases that expired **while they were still
+    waiting their turn**. The recovery pass hands them to a second worker, the second worker sends
+    them, and this worker then sends them again. A duplicate email to a real guest — and the lease
+    never protected against it, because the lease was built for a worker that DIED, not for one that
+    is merely slow
+    with a long batch. Slow-with-a-long-batch is the NORMAL case.
+
+    Claiming each item as it begins makes the lease cover exactly what it was meant to cover: the
+    execution of THIS item. Together with ``PROVIDER_TIMEOUT_CEILING`` < ``DEFAULT_LEASE``, an
+    item's own send can no longer outlive its own claim.
+
+    The claim is a conditional UPDATE, so of N workers racing for one row exactly one wins; the
+    losers get ``None`` and move on. Due-ness is re-checked HERE, never trusted from the plan."""
+    # A CursorResult, because only that carries `rowcount` — and `rowcount` IS the arbitration here:
+    # it is how we learn whether WE won the claim or somebody else did.
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            update(Outbox)
             .where(
+                Outbox.id == intent_id,
                 Outbox.status.in_((_PENDING, _FAILED)),
                 or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
             )
-            .order_by(
-                Outbox.created_at,
-                # Within one instant (intents enqueued in the same transaction share a stamp), run
-                # the Google sync BEFORE the email — so the confirmation/reschedule notice carries
-                # the Meet link the sync just wrote onto the booking: a deterministic causal order,
-                # not the non-deterministic tie-break the created_at stamp alone would leave.
-                case((Outbox.effect == OutboxEffect.GOOGLE.value, 0), else_=1),
-            )
-            .limit(batch_size)
-            .with_for_update(skip_locked=True)
-        )
-    ).all()
+            .values(status=_CLAIMED, claimed_by=worker_id, lease_expires_at=now + lease)
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if result.rowcount != 1:
+        # Another worker claimed it, or a booking transition VOIDED it, between the plan and now.
+        return None
 
-    claimed: list[OutboxWork] = []
-    for row in due:
-        row.status = _CLAIMED
-        row.claimed_by = worker_id
-        row.lease_expires_at = now + lease
-        claimed.append(
-            OutboxWork(
-                id=row.id,
-                tenant_id=row.tenant_id,
-                booking_id=row.booking_id,
-                effect=OutboxEffect(row.effect),
-                dedupe_key=row.dedupe_key,
-                payload=dict(row.payload),
-                attempts=row.attempts,
-                claimed_by=worker_id,
-            )
-        )
-    await session.flush()
-    return claimed
+    row = await session.get(Outbox, intent_id)
+    if row is None:  # pragma: no cover - defensive: we just updated it
+        return None
+    await session.refresh(row)
+    return OutboxWork(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        booking_id=row.booking_id,
+        effect=OutboxEffect(row.effect),
+        dedupe_key=row.dedupe_key,
+        payload=dict(row.payload),
+        attempts=row.attempts,
+        claimed_by=worker_id,
+    )
 
 
 class _Outcome(StrEnum):
@@ -581,30 +673,51 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
     batch_size: int = DEFAULT_DRAIN_BATCH_SIZE,
     worker_id: str | None = None,
     lease: timedelta = DEFAULT_LEASE,
+    clock: Clock | None = None,
 ) -> OutboxReport:
-    """Run one drain pass: recover → claim → execute (no transaction) → settle. Returns the report.
+    """One drain pass: recover → plan → (claim → execute → settle) per item. Returns the report.
 
     Takes a ``sessionmaker``, not a session, because the whole design turns on owning the
     transaction
     BOUNDARIES: the claim commits before any network call and the settle opens a fresh transaction
     after it. A caller that handed us one long-lived session would reintroduce the very bug this
-    replaces."""
+    replaces.
+
+    The batch is PLANNED up front but CLAIMED item by item, each at the moment it begins — see
+    :func:`claim_one`. Claiming the whole batch at once stamps every row with the same lease
+    deadline, and the rows at the back of a slow batch have their leases expire while still waiting
+    their turn. That is a duplicate send, and not a theoretical one.
+
+    ``clock`` reads the wall clock. It defaults to ``now`` advanced by the REAL time elapsed since
+    the pass began, because a lease is a wall-clock deadline — a frozen clock would put the deadline
+    right back where the bug was."""
+    tick = clock or _elapsed_clock(now)
     worker = worker_id or new_worker_id()
     report = OutboxReport()
 
     async with sessionmaker() as session, session.begin():
-        report.recovered.extend(await recover_expired_leases(session, now=now, limit=batch_size))
+        report.recovered.extend(await recover_expired_leases(session, now=tick(), limit=batch_size))
 
-    async with sessionmaker() as session, session.begin():
-        claimed = await claim_batch(
-            session, now=now, worker_id=worker, lease=lease, batch_size=batch_size
-        )
+    async with sessionmaker() as session:
+        planned = await select_due(session, now=tick(), limit=batch_size)
 
-    for work in claimed:
+    for intent_id in planned:
+        # The lease starts HERE, for THIS item — not back when the batch was planned.
+        item_now = tick()
+        async with sessionmaker() as session, session.begin():
+            work = await claim_one(
+                session, intent_id=intent_id, now=item_now, worker_id=worker, lease=lease
+            )
+        if work is None:
+            # Somebody else claimed it while we worked through the earlier items, or a booking
+            # transition voided it. Either way it is not ours: leave it alone.
+            report.unclaimed.append(intent_id)
+            continue
+
         # THE NETWORK I/O. No session, no transaction and no row lock is open across this line —
         # that is the entire point of R8. Each handler opens its own short transactions around it.
         try:
-            await execute(work, now)
+            await execute(work, item_now)
         except OutboxDeferred as deferred:
             _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
             outcome = _Outcome.DEFERRED
@@ -627,7 +740,12 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
         else:
             outcome = _Outcome.DELIVERED
         await _settle(
-            sessionmaker, work, now=now, outcome=outcome, report=report, max_attempts=max_attempts
+            sessionmaker,
+            work,
+            now=tick(),
+            outcome=outcome,
+            report=report,
+            max_attempts=max_attempts,
         )
 
     return report
@@ -655,16 +773,7 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         row = await _lock_if_still_ours(session, work)
         if row is None:
             report.lost.append(work.id)
-            _logger.error(
-                "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (held by %s). The "
-                "result is discarded, not applied — another worker owns this row now. The send may "
-                "have happened, so it can be delivered twice: shorten the provider timeout or "
-                "lengthen the lease (see DEFAULT_LEASE)",
-                work.id,
-                work.effect,
-                work.booking_id,
-                work.claimed_by,
-            )
+            await _log_lost_claim(session, work)
             return
         row.claimed_by = None
         row.lease_expires_at = None
@@ -704,6 +813,39 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             return
 
         assert_never(outcome)
+
+
+async def _log_lost_claim(session: AsyncSession, work: OutboxWork) -> None:
+    """Say WHY our result is being discarded. The two reasons are different facts, not one.
+
+    Both end in "we do not write" — but one is our own fault (our send outran our own lease) and the
+    other is the system working exactly as designed (a cancellation retired the step under us).
+    Merging them into one line would bury a real duplicate-send signal inside routine noise."""
+    current = await session.get(Outbox, work.id)
+    status = current.status if current is not None else "gone"
+
+    if status == _VOIDED:
+        _logger.warning(
+            "outbox intent %s (%s) for booking %s: VOIDED mid-flight by a booking transition "
+            "(cancel / reschedule / no-show). Our result is discarded and the step will not be "
+            "retried. The send may already have reached the provider — it cannot be recalled",
+            work.id,
+            work.effect,
+            work.booking_id,
+        )
+        return
+
+    _logger.error(
+        "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (we held it as %s; it is now "
+        "%s). The result is discarded, not applied — somebody else owns this row. The send may "
+        "have happened, so it can be delivered twice: a provider call outran the lease. Shorten "
+        "PROVIDER_TIMEOUT_CEILING or lengthen DEFAULT_LEASE",
+        work.id,
+        work.effect,
+        work.booking_id,
+        work.claimed_by,
+        status,
+    )
 
 
 async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
@@ -1134,8 +1276,7 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
     * consent WITHDRAWN (the stamp set back to NULL) → the same gate closes again, automatically.
       Revocation needs no special code path: it IS the absence of the stamp.
 
-    Each case carries its OWN reason, never merged with "the channel is not configured".
-    """
+    Each case carries its OWN reason, never merged with "the channel is not configured"."""
     if not booking.guest_phone:
         raise OutboxSkipped(
             f"{_NO_PHONE}: the guest gave no phone number, so the {channel.value} step cannot run"
@@ -1158,8 +1299,7 @@ async def _prepare_notify(
 
     Raises :class:`OutboxSkipped` for anything that can NEVER work — an unconfigured channel, a
     guest with no phone, a kind with no template renderer — so the step is retired instead of being
-    retried into the dead-letter.
-    """
+    retried into the dead-letter."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
@@ -1251,8 +1391,7 @@ def make_booking_effect_executor(
 
     ``channels`` is the registry of non-email senders. It is EMPTY today, and that is not a gap: an
     absent channel makes its steps SKIP with a reason, never fail. The channels cut registers its
-    WhatsApp/SMS senders here and needs to touch nothing else.
-    """
+    WhatsApp/SMS senders here and needs to touch nothing else."""
     registry = dict(channels or {})
 
     async def _execute(work: OutboxWork, now: datetime) -> None:
@@ -1281,6 +1420,7 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFER_DELAY_SECONDS",
     "PROVIDER_TIMEOUT_CEILING",
+    "Clock",
     "GoogleOperation",
     "OutboxDeferred",
     "OutboxEffect",
@@ -1290,7 +1430,7 @@ __all__ = [
     "OutboxWork",
     "Staleness",
     "backoff_delay",
-    "claim_batch",
+    "claim_one",
     "drain_outbox",
     "email_dedupe_key",
     "enqueue_effect",
@@ -1301,6 +1441,7 @@ __all__ = [
     "run_email_effect",
     "run_google_effect",
     "run_notify_effect",
+    "select_due",
     "staleness_policy",
     "trigger_staleness",
     "void_pending_steps",

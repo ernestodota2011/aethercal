@@ -1291,8 +1291,12 @@ async def test_email_defers_without_consuming_attempts_until_google_delivers_the
     assert booking.meeting_url is None
 
     # Pass 2 (past the Google backoff + the defer delay): Google succeeds, then the email sends the
-    # notice WITH the link — and the deferral never counted toward the dead-letter budget.
-    later = _BEFORE + backoff_delay(1)
+    # notice WITH the link — and the deferral never counted toward the dead-letter budget. A minute
+    # of slack past the backoff. The drain's clock is now a REAL one (a lease is a wall-clock
+    # deadline), so a retry stamped during the previous pass lands a few milliseconds after the
+    # logical instant — sitting exactly ON the boundary would make this flaky for a reason that has
+    # nothing to do with what it is testing.
+    later = _BEFORE + backoff_delay(1) + timedelta(minutes=1)
     await _drain(sqlite_session, sqlite_maker, execute, now=later)
     await sqlite_session.refresh(email)
     await sqlite_session.refresh(booking)

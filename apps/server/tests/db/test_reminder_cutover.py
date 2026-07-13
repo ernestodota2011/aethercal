@@ -238,8 +238,7 @@ def test_the_downgrade_runs_on_data_the_new_schema_legitimately_produces(tmp_pat
     allows the SAME kind on TWO channels — email + WhatsApp for one reminder. Hand those valid rows
     to the old constraint and the CREATE UNIQUE fails, so the downgrade does not run at all.
 
-    It must reduce the data first: one row per key, the OLDEST kept.
-    """
+    It must reduce the data first: one row per key, the OLDEST kept."""
     engine = _engine(tmp_path)
     older, newer = _seed_two_channel_sends(engine)
 
