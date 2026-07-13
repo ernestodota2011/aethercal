@@ -467,6 +467,15 @@ async def create_booking(
         start_at=start,
         end_at=end,
         status=BookingStatus.CONFIRMED,
+        # The stamp moves WITH the status, in the same statement — never in a later one. It is what
+        # licenses every outbound this booking will ever produce (B-05a), so a confirmed booking
+        # that reached the database without it would be one nothing ever speaks for: no email, no
+        # reminder, no webhook, no calendar event — and no error to say so.
+        #
+        # Today every booking is born confirmed, on every path (the public page, the admin and the
+        # API key alike). When holds arrive (B-05b) this line becomes the ARBITER's: the payment
+        # that wins the conditional UPDATE stamps it, and nothing else may.
+        confirmed_at=now,
         guest_name=params.guest_name,
         guest_email=params.guest_email,
         guest_timezone=params.guest_timezone,
@@ -684,6 +693,15 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         # ``answers`` is COPIED, not aliased: one shared dict would let a later edit of either row
         # rewrite the other's history.
         answers=dict(old.answers),
+        # INHERITED, never re-minted. The successor is the SAME appointment, moved — so it carries
+        # the instant that appointment was first confirmed, and a reschedule does not change that
+        # fact. Re-stamping it with ``now`` would forge a new confirmation; leaving it NULL would be
+        # far worse — the belt would treat the moved booking as an unannounced hold and SILENCE it,
+        # so the very email telling the guest their time changed would never be sent.
+        #
+        # A predecessor is always confirmed here (the guard above refuses anything else), so this is
+        # never NULL in practice. It is the same chain B-05b re-points the payment onto.
+        confirmed_at=old.confirmed_at,
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
         # increase (RFC 5545, F1-08); the drained reschedule email snapshots this value.
