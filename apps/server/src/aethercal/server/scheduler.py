@@ -322,6 +322,14 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
             sessionmaker=app.state.sessionmaker,
             sender=app.state.email_sender,
             service_factory=service_factory,
+            # The non-email channel registry. EMPTY today, and that is not a gap: a step on a
+            # channel nobody registered is SKIPPED with its reason, never failed — a channel
+            # without credentials is a disabled feature, not an error. The channels cut registers
+            # its WhatsApp/SMS senders here and touches nothing else.
+            #
+            # Email is deliberately NOT here: it goes through the full composer, which carries the
+            # .ics invite that a plain-body ChannelSender cannot.
+            channels=getattr(app.state, "channel_senders", None),
         )
         await run_outbox_drain_once(sessionmaker=app.state.sessionmaker, execute=execute)
 

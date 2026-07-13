@@ -51,6 +51,7 @@ from aethercal.server.services.outbox import (
     GoogleOperation,
     OutboxEffect,
     OutboxReport,
+    OutboxSkipped,
     OutboxWork,
     Staleness,
     _Outcome,
@@ -182,6 +183,16 @@ class _RecordingExecutor:
         self.calls.append(work.id)
         if len(self.calls) <= self._fail_first:
             raise RuntimeError("transient effect failure")
+
+
+class _RecordingEmailSender:
+    """A fake ``EmailSender`` — the exact seam ``SmtpEmailSender`` implements."""
+
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def send(self, message: Any) -> None:
+        self.sent.append(message)
 
 
 class _FakeExecute:
@@ -559,30 +570,45 @@ def test_the_informational_effects_are_subject_to_the_staleness_guard() -> None:
 # --------------------------------------------------------------------------------------
 
 
-async def test_an_unimplemented_effect_raises_instead_of_becoming_a_google_call(
+async def test_a_notify_step_never_falls_through_into_the_google_handler(
     maker: Sessionmaker,
 ) -> None:
     """The old dispatcher was ``if EMAIL … else GOOGLE`` — the ``else`` ASSUMED Google, so every new
-    effect would have been executed as a Google Calendar call. Now it raises explicitly."""
+    effect would have been executed as a Google Calendar call.
+
+    NOTIFY now has a real handler, so what this guards is the shape: a workflow step reaches the
+    step handler and NOTHING reaches the calendar client. (Exhaustiveness itself is enforced at
+    type-check time by ``assert_never`` — pyright fails the build if an effect has no branch.)
+    """
+    tenant_id, booking_id = await _seed_booking(maker)
     google = _FakeGoogleService(insert_result={"id": "evt-1", "hangoutLink": "https://meet/x"})
+    sender = _RecordingEmailSender()
     execute = make_booking_effect_executor(
-        sessionmaker=maker, sender=None, service_factory=lambda _c: google
+        sessionmaker=maker, sender=sender, service_factory=lambda _c: google
     )
     work = OutboxWork(
         id=uuid.uuid4(),
-        tenant_id=uuid.uuid4(),
-        booking_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        booking_id=booking_id,
         effect=OutboxEffect.NOTIFY,
-        dedupe_key="wf:1:2:email",
-        payload={},
+        dedupe_key="wf:1:2:whatsapp",
+        payload={
+            "trigger": WorkflowTrigger.BEFORE_START.value,
+            "channel": "whatsapp",  # nothing on this instance can send it
+            "step_id": str(uuid.uuid4()),
+            "kind": "reminder",
+        },
         attempts=0,
         claimed_by="test-worker",
     )
 
-    with pytest.raises(NotImplementedError, match="notify"):
+    # An unconfigured channel is a DISABLED FEATURE: skipped with a reason, never a failure and
+    # never a dead-letter.
+    with pytest.raises(OutboxSkipped, match="whatsapp"):
         await execute(work, NOW)
 
     assert google.events_obj.deleted == []  # nothing leaked into the calendar client
+    assert sender.sent == []  # nor into the email sender
 
 
 # --------------------------------------------------------------------------------------

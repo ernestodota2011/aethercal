@@ -71,7 +71,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.channels import Channel
+from aethercal.server.channels import Channel, ChannelSender
 from aethercal.server.db.models import Booking, ExternalConnection, Outbox
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
@@ -139,6 +139,14 @@ _CLAIMED = "claimed"
 _FAILED = "failed"
 _DELIVERED = "delivered"
 _DEAD = "dead"
+_SKIPPED = "skipped"
+"""Terminal, and NOT a failure: the step could never run, so retrying it is pointless.
+
+A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
+reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
+noise in the backlog, and the message still does not arrive. The step is retired with its reason
+instead, loudly in the log and visibly in the row.
+"""
 _VOIDED = "voided"
 """Retired before it ever ran: the booking's life changed under it (see
 :func:`void_pending_steps`)."""
@@ -252,6 +260,16 @@ class OutboxDeferred(Exception):
     wait never counts toward the dead-letter budget."""
 
 
+class OutboxSkipped(Exception):
+    """Raised by a handler when its effect can NEVER run, so retrying it is meaningless.
+
+    The distinction from a failure is the whole point. A WhatsApp step on an instance with no
+    WhatsApp credentials is not "broken" — it is switched off. Retried like a failure it would burn
+    the entire backoff budget and dead-letter, filling the queue with noise while still delivering
+    nothing. Terminal, recorded with its reason, and it consumes no attempt.
+    """
+
+
 DEFER_DELAY_SECONDS = 30
 """How soon a deferred (dependency-waiting) intent is retried."""
 
@@ -299,6 +317,11 @@ class OutboxReport:
     deferred: list[uuid.UUID] = field(default_factory=list)
     recovered: list[uuid.UUID] = field(default_factory=list)
     """Rows a dead worker had claimed, returned to ``pending`` by this pass's lease recovery."""
+    skipped: list[uuid.UUID] = field(default_factory=list)
+    """Steps that could never run (an unconfigured channel, a kind with no template).
+
+    NOT failures.
+    """
     lost: list[uuid.UUID] = field(default_factory=list)
     """Rows whose lease expired mid-send, so this worker's result was DISCARDED at settle time.
 
@@ -546,6 +569,7 @@ class _Outcome(StrEnum):
     DELIVERED = "delivered"
     FAILED = "failed"
     DEFERRED = "deferred"
+    SKIPPED = "skipped"
 
 
 async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well-defined pass
@@ -584,6 +608,17 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
         except OutboxDeferred as deferred:
             _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
             outcome = _Outcome.DEFERRED
+        except OutboxSkipped as skipped:
+            # NOT a failure: this effect can never run, so retrying it would only burn the backoff
+            # budget and dead-letter. Loud, terminal, and out of the queue.
+            _logger.warning(
+                "outbox intent %s (%s) for booking %s SKIPPED: %s",
+                work.id,
+                work.effect,
+                work.booking_id,
+                skipped,
+            )
+            outcome = _Outcome.SKIPPED
         except Exception:
             _logger.exception(
                 "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
@@ -640,6 +675,13 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             row.status = _PENDING
             row.next_retry_at = now + timedelta(seconds=DEFER_DELAY_SECONDS)
             report.deferred.append(row.id)
+            return
+
+        if outcome is _Outcome.SKIPPED:
+            # Terminal, and it costs no attempt: nothing was tried, so nothing failed.
+            row.status = _SKIPPED
+            row.next_retry_at = None
+            report.skipped.append(row.id)
             return
 
         row.attempts += 1
@@ -1003,6 +1045,155 @@ def _meet_request_from_payload(payload: Mapping[str, Any]) -> MeetEventRequest:
 
 
 # --------------------------------------------------------------------------------------
+# The NOTIFY effect — one workflow step, on one channel.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _NotifyPlan:
+    """What the step's send needs, snapshotted so the I/O touches no session."""
+
+    booking_id: uuid.UUID
+    kind: NotificationKind
+    channel: Channel
+    step_id: uuid.UUID
+    message: Any  # an EmailMessage for the email channel; a plain body for the others.
+    recipient: str
+
+
+async def run_notify_effect(
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    sender: EmailSender | None,
+    channels: Mapping[Channel, ChannelSender],
+) -> None:
+    """Execute one workflow step: send its message on its channel (RF-24).
+
+    The same three phases as every other handler — read, send with NO transaction open, record — so
+    the network call holds no row lock and no pool connection.
+
+    Two channel families, deliberately:
+
+    * **email** goes through the existing composer, not through the plain-body
+      :class:`ChannelSender`. That is what carries the ``.ics`` invite, and it is what keeps the
+      ledger key identical to the one the retired scheduler wrote — which is exactly what stops a
+      live booking being reminded twice.
+    * **whatsapp / sms** go through their :class:`ChannelSender`. An unconfigured channel is a
+      DISABLED FEATURE, not an error: the step is SKIPPED with its reason (:class:`OutboxSkipped`),
+      never failed. The channels cut registers its senders in ``channels`` and this dispatch picks
+      them up untouched.
+    """
+    async with sessionmaker() as session:
+        plan = await _prepare_notify(session, work, sender=sender, channels=channels)
+        await session.rollback()  # a pure read: release the connection before any network call
+    if plan is None:
+        return
+
+    if plan.channel is Channel.EMAIL:
+        if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
+            raise RuntimeError("an email step reached the send with no configured SMTP sender")
+        await sender.send(plan.message)
+    else:  # pragma: no cover - unreachable until the channels cut registers a sender
+        await channels[plan.channel].send(to=plan.recipient, subject=None, body=str(plan.message))
+
+    async with sessionmaker() as session, session.begin():
+        booking = await session.get(Booking, plan.booking_id)
+        if booking is None:  # pragma: no cover - defensive: cascade-deleted mid-send
+            return
+        await record_booking_notification(
+            session,
+            booking=booking,
+            kind=plan.kind,
+            now=now,
+            channel=plan.channel,
+            step_id=plan.step_id,
+        )
+
+
+async def _prepare_notify(
+    session: AsyncSession,
+    work: OutboxWork,
+    *,
+    sender: EmailSender | None,
+    channels: Mapping[Channel, ChannelSender],
+) -> _NotifyPlan | None:
+    """The step's READ phase: decide, then compose. ``None`` = nothing to send (stale, or already).
+
+    Raises :class:`OutboxSkipped` for anything that can NEVER work — an unconfigured channel, a
+    guest with no phone, a kind with no template renderer — so the step is retired instead of being
+    retried into the dead-letter.
+    """
+    booking = await session.get(Booking, work.booking_id)
+    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+
+    payload = work.payload
+    channel = Channel(payload["channel"])
+    step_id = uuid.UUID(str(payload["step_id"]))
+    raw_kind = str(payload["kind"])
+
+    if await _should_skip_as_stale(session, booking, work):
+        # A later transition overtook the booking, and this step's trigger is not a terminal one.
+        return None
+
+    try:
+        kind = NotificationKind(raw_kind)
+    except ValueError as exc:
+        # A tenant-authored kind (a follow-up, say) has no built-in composer: its body comes from a
+        # ``workflow_templates`` row, and that renderer arrives with the channels/templates cut.
+        # Until then it is a switched-off feature, not a failure.
+        raise OutboxSkipped(
+            f"workflow step kind {raw_kind!r} has no template renderer yet"
+        ) from exc
+
+    if await notification_already_sent(
+        session, booking=booking, kind=kind, channel=channel, step_id=step_id
+    ):
+        # Already on the ledger. For a reminder this is precisely what the migration's re-keying
+        # buys: a booking the retired scheduler already reminded is never reminded a second time.
+        return None
+
+    if channel is Channel.EMAIL:
+        if sender is None:
+            raise OutboxSkipped("the email channel has no configured SMTP sender")
+        message = await compose_booking_notification(
+            session,
+            kind=kind,
+            booking=booking,
+            # A workflow step carries no guest links — the same shape the retired reminder job used.
+            cancel_url=None,
+            reschedule_url=None,
+            locale=str(payload.get("locale", "es")),
+        )
+        return _NotifyPlan(
+            booking_id=booking.id,
+            kind=kind,
+            channel=channel,
+            step_id=step_id,
+            message=message,
+            recipient=booking.guest_email,
+        )
+
+    if channel not in channels:
+        raise OutboxSkipped(
+            f"the {channel.value} channel is not configured on this instance "
+            "(a channel without credentials is a disabled feature, not an error)"
+        )
+    if not booking.guest_phone:
+        raise OutboxSkipped(
+            f"the guest gave no phone number, so the {channel.value} step cannot run"
+        )
+
+    # A channel that IS configured still needs a body, and the renderer that builds one from
+    # ``workflow_templates`` arrives with the channels cut.
+    raise OutboxSkipped(
+        f"the {channel.value} channel has no template renderer yet (workflow_templates)"
+    )
+
+
+# --------------------------------------------------------------------------------------
 # The dispatcher the scheduler tick injects as ``execute``.
 # --------------------------------------------------------------------------------------
 
@@ -1012,16 +1203,20 @@ def make_booking_effect_executor(
     sessionmaker: Sessionmaker,
     sender: EmailSender | None,
     service_factory: ServiceFactory | None,
+    channels: Mapping[Channel, ChannelSender] | None = None,
 ) -> OutboxExecutor:
     """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
 
     The dispatch is **exhaustive over** :class:`OutboxEffect`, enforced by ``assert_never``: pyright
     fails the build if an effect is added without a branch here. It used to be ``if EMAIL … else
     GOOGLE``, where the ``else`` silently *assumed* Google — so every new effect would have been
-    executed as a Google Calendar call. The not-yet-implemented effects raise
-    :class:`NotImplementedError` loudly (the intent retries, then dead-letters, and the gap is
-    visible); none of them can ever fall through into another provider's handler.
+    executed as a Google Calendar call.
+
+    ``channels`` is the registry of non-email senders. It is EMPTY today, and that is not a gap: an
+    absent channel makes its steps SKIP with a reason, never fail. The channels cut registers its
+    WhatsApp/SMS senders here and needs to touch nothing else.
     """
+    registry = dict(channels or {})
 
     async def _execute(work: OutboxWork, now: datetime) -> None:
         effect = work.effect
@@ -1034,11 +1229,7 @@ def make_booking_effect_executor(
                 raise RuntimeError("outbox Google intent has no configured service factory")
             await run_google_effect(sessionmaker, work, now, service_factory=service_factory)
         elif effect is OutboxEffect.NOTIFY:
-            raise NotImplementedError(
-                "outbox effect 'notify' (one workflow step on one channel) has no handler yet; it "
-                "arrives with the workflow-engine cut. This intent retries — it does NOT silently "
-                "become some other provider's call."
-            )
+            await run_notify_effect(sessionmaker, work, now, sender=sender, channels=registry)
         else:
             assert_never(effect)
 
@@ -1058,6 +1249,7 @@ __all__ = [
     "OutboxEffect",
     "OutboxExecutor",
     "OutboxReport",
+    "OutboxSkipped",
     "OutboxWork",
     "Staleness",
     "backoff_delay",
@@ -1071,6 +1263,7 @@ __all__ = [
     "recover_expired_leases",
     "run_email_effect",
     "run_google_effect",
+    "run_notify_effect",
     "staleness_policy",
     "trigger_staleness",
     "void_pending_steps",

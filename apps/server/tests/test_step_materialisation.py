@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ from aethercal.server.db.models import (
     ExternalCalendarLink,
     Outbox,
     Schedule,
+    SentNotification,
     Tenant,
     User,
 )
@@ -45,7 +47,11 @@ from aethercal.server.services.bookings import (
     reschedule_booking,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
-from aethercal.server.services.outbox import OutboxEffect
+from aethercal.server.services.outbox import (
+    OutboxEffect,
+    drain_outbox,
+    make_booking_effect_executor,
+)
 from aethercal.server.services.workflows import seed_default_workflows
 
 _ALWAYS_OPEN = {str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)}
@@ -346,3 +352,145 @@ async def test_a_connection_cannot_have_two_booking_targets(migrated: Sessionmak
             )
         )
         await session.flush()
+
+
+# --------------------------------------------------------------------------------------
+# END TO END. Not "the step was queued" — the guest actually receives the email.
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSender:
+    """A fake :class:`EmailSender` — the exact seam ``SmtpEmailSender`` implements."""
+
+    def __init__(self) -> None:
+        self.sent: list[EmailMessage] = []
+
+    async def send(self, message: EmailMessage) -> None:
+        self.sent.append(message)
+
+
+async def test_book_then_drain_actually_sends_the_reminder_email(migrated: Sessionmaker) -> None:
+    """The whole point, end to end: create a booking, drain the outbox, and the REMINDER EMAIL GOES
+    OUT — with its ledger row.
+
+    Queueing a step is worthless if nothing can execute it. Materialising reminders as ``notify``
+    while the executor raised ``NotImplementedError`` was WORSE than the regression it replaced:
+    every reminder would fail six times with backoff and dead-letter — noise in the backlog, and the
+    guest still gets no email.
+    """
+    sender = _RecordingSender()
+
+    async with migrated() as session, session.begin():
+        tenant, event_type = await _seed(session)
+        booking = await create_booking(
+            session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT), now=_NOW
+        )
+        booking_id = booking.id
+
+    execute = make_booking_effect_executor(
+        sessionmaker=migrated, sender=sender, service_factory=None
+    )
+
+    # Not due yet: the reminder is scheduled for start - 24 h.
+    assert (await drain_outbox(migrated, now=_NOW, execute=execute)).attempted == 0
+    assert sender.sent == []
+
+    # At its send time, it drains — and the email is really sent.
+    due = _SLOT - timedelta(hours=24)
+    report = await drain_outbox(migrated, now=due, execute=execute)
+
+    assert len(report.delivered) == 1, f"the reminder did not deliver: {report}"
+    assert report.dead == [] and report.failed == []
+    assert len(sender.sent) == 1, "the guest received NO reminder email"
+    message = sender.sent[0]
+    assert "ada@example.com" in str(message["To"])
+    # It went through the real composer, so it carries the .ics invite — which is the whole reason
+    # the email channel does NOT go through the plain-body ChannelSender wrapper.
+    assert any(part.get_content_type() == "text/calendar" for part in message.walk()), (
+        "the reminder lost its .ics invite"
+    )
+
+    async with migrated() as session:
+        ledger = list((await session.scalars(select(SentNotification))).all())
+        step = (await _steps(session, booking_id))[0]
+
+    assert step.status == "delivered"
+    # The ledger row is what stops a second send — keyed on (kind, channel, step).
+    assert len(ledger) == 1
+    assert ledger[0].booking_id == booking_id
+    assert ledger[0].kind == "reminder"
+    assert ledger[0].channel == "email"
+    assert ledger[0].step_id == uuid.UUID(str(step.payload["step_id"]))
+
+    # A re-drain sends nothing: the ledger, not luck, is what makes it exactly-once.
+    again = await drain_outbox(migrated, now=due + timedelta(hours=1), execute=execute)
+    assert again.attempted == 0
+    assert len(sender.sent) == 1
+
+
+async def test_a_step_on_an_unconfigured_channel_is_skipped_not_dead_lettered(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A channel with no credentials is a DISABLED FEATURE, not an error.
+
+    Failing it would burn six attempts of backoff and dead-letter — the queue fills with noise and
+    the message still does not arrive. It is retired with its reason instead, in ONE attempt.
+    """
+    async with migrated() as session, session.begin():
+        tenant, event_type = await _seed(session)
+        tenant_id = tenant.id
+        whatsapp = Workflow(
+            tenant_id=tenant_id,
+            event_type_id=None,
+            name="whatsapp reminder",
+            trigger=WorkflowTrigger.BEFORE_START.value,
+            offset_minutes=-1440,
+            active=True,
+        )
+        session.add(whatsapp)
+        await session.flush()
+        session.add(
+            WorkflowStep(
+                tenant_id=tenant_id,
+                workflow_id=whatsapp.id,
+                channel="whatsapp",  # nothing on this instance can send it
+                kind="reminder",
+                position=0,
+            )
+        )
+        await session.flush()
+        booking = await create_booking(
+            session, tenant_id=tenant_id, params=_params(event_type.id, _SLOT), now=_NOW
+        )
+        booking_id = booking.id
+
+    sender = _RecordingSender()
+    execute = make_booking_effect_executor(
+        sessionmaker=migrated, sender=sender, service_factory=None
+    )
+    due = _SLOT - timedelta(hours=24)
+    with caplog.at_level("WARNING"):
+        report = await drain_outbox(migrated, now=due, execute=execute)
+
+    # The email step delivered; the WhatsApp step was SKIPPED — not failed, not dead.
+    assert len(report.delivered) == 1
+    assert len(report.skipped) == 1
+    assert report.failed == [] and report.dead == []
+    assert len(sender.sent) == 1  # the email still went out
+
+    async with migrated() as session:
+        by_channel = {step.payload["channel"]: step for step in await _steps(session, booking_id)}
+    assert by_channel["email"].status == "delivered"
+    assert by_channel["whatsapp"].status == "skipped"
+    assert by_channel["whatsapp"].attempts == 0, "a disabled channel burned a retry attempt"
+    assert by_channel["whatsapp"].next_retry_at is None, "a disabled channel is still scheduled"
+
+    assert any(
+        "SKIPPED" in record.getMessage() and "whatsapp" in record.getMessage()
+        for record in caplog.records
+    ), "the skip was silent — an absent message is exactly what nobody notices"
+
+    # And it stays out of the queue: a later drain never touches it again.
+    assert (
+        await drain_outbox(migrated, now=due + timedelta(days=1), execute=execute)
+    ).attempted == 0
