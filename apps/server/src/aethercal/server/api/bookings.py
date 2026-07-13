@@ -118,15 +118,15 @@ def _build_effects(request: Request) -> BookingEffects:
 
     The guest-token signer + booking base URL are always present. The email notice is enqueued to
     the durable outbox unconditionally (the drain worker owns the live SMTP sender), so no sender is
-    passed here. The 24 h reminder runner is read from ``app.state`` when wired (F1-10). Google
-    sync (F1-07) is not wired yet (resolving the host's ``ExternalConnection`` is the last step), so
+    passed here. There is no reminder runner any more: the 24 h reminder is a workflow rule
+    materialised into that same outbox, so nothing is scheduled from the request path. Google sync
+    (F1-07) is not wired yet (resolving the host's ``ExternalConnection`` is the last step), so
     ``connection`` stays ``None`` — a booking never attempts Google in this path.
     """
     settings = _settings(request)
     return BookingEffects(
         signer=GuestTokenSigner(settings.app_secret),
         booking_base_url=_booking_base_url(request, settings),
-        reminder_runner=getattr(request.app.state, "reminder_runner", None),
     )
 
 

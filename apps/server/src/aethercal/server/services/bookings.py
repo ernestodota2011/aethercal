@@ -25,8 +25,7 @@ Anti-double-booking (RF-04) is enforced in TWO independent layers, both required
    surface it as a clean :class:`SlotUnavailableError` → the router maps it to 409.
 
 Together they guarantee that of two concurrent requests for the same slot exactly one confirms; the
-Postgres-only ``test_booking_concurrency.py`` proves it end-to-end.
-"""
+Postgres-only ``test_booking_concurrency.py`` proves it end-to-end."""
 
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.core.model import BookingStatus, TimeInterval
 from aethercal.server.db.models import Booking, EventType, ExternalConnection
 from aethercal.server.integrations.smtp.compose import NotificationKind
-from aethercal.server.jobs.reminders import TaskRunner, schedule_reminder
 from aethercal.server.services.event_types import get_event_type
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
@@ -62,9 +60,6 @@ from aethercal.server.services.slots import SlotsResult, compute_slots
 from aethercal.server.services.webhooks import enqueue_event
 
 _logger = logging.getLogger(__name__)
-
-# How far before the start the 24 h reminder fires (RF-10).
-_REMINDER_LEAD = timedelta(hours=24)
 
 
 # --------------------------------------------------------------------------------------
@@ -96,6 +91,10 @@ class BookingNotActiveError(BookingError):
     """The booking is not in a reschedulable state (e.g. already cancelled) (→ HTTP 409)."""
 
 
+class BookingNotEndedError(BookingError):
+    """The appointment has not finished yet, so it cannot be marked a no-show (→ HTTP 409)."""
+
+
 # --------------------------------------------------------------------------------------
 # Inputs — the request data and the injected side-effect dependencies.
 # --------------------------------------------------------------------------------------
@@ -125,13 +124,17 @@ class BookingEffects:
     outbox and the drain worker supplies the client, so a momentarily-absent SMTP/Google never drops
     a domain-required effect. ``connection`` names the host's calendar link (its id rides in the
     Google intent; the live client is built later by the executor's ``service_factory``); ``None``
-    means the host has no external calendar, so nothing to sync. ``reminder_runner`` schedules the
-    24 h reminder inline (self-healing at fire time), skipped when absent.
+    means the host has no external calendar, so nothing to sync.
+
+    There is no ``reminder_runner`` any more. The 24 h reminder used to be scheduled here onto a
+    SECOND scheduler (APScheduler, with a Postgres jobstore) that carried its own idempotency
+    barrier. That is now a tenant-editable **workflow rule** materialised into this same outbox, so
+    a booking has exactly ONE thing that can decide to send it a reminder — the alternative was a
+    guest receiving two, since the ledger key and the outbox dedupe key never knew about each other.
     """
 
     signer: GuestTokenSigner
     booking_base_url: str
-    reminder_runner: TaskRunner | None = None
     connection: ExternalConnection | None = None
 
 
@@ -145,8 +148,7 @@ def _host_lock_key(tenant_id: uuid.UUID, host_id: uuid.UUID) -> int:
 
     ``pg_advisory_xact_lock`` takes a signed ``bigint``; an 8-byte BLAKE2b digest read as a signed
     integer fits exactly and is deterministic across processes, so every booker for a given host
-    contends on the same key.
-    """
+    contends on the same key."""
     digest = hashlib.blake2b(f"{tenant_id}:{host_id}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=True)
 
@@ -159,8 +161,7 @@ async def _serialize_host(
     Takes a transaction-scoped advisory lock so two concurrent create/reschedule transactions for
     the same host run one-after-another (each sees the other's committed rows on re-read), released
     automatically at transaction end. On SQLite (the offline test backend) this is a harmless no-op:
-    SQLite serializes writes anyway.
-    """
+    SQLite serializes writes anyway."""
     if session.get_bind().dialect.name != "postgresql":
         return
     await session.execute(
@@ -225,8 +226,7 @@ def _serialize_booking(booking: Booking) -> dict[str, object]:
     """A JSON-serializable snapshot of a booking for the webhook envelope (RF-17).
 
     Every value is a primitive/str/None so ``enqueue_event`` can canonicalize it for signing; the
-    internal ``external_event_id`` is intentionally omitted from the public event.
-    """
+    internal ``external_event_id`` is intentionally omitted from the public event."""
     return {
         "id": str(booking.id),
         "tenant_id": str(booking.tenant_id),
@@ -361,8 +361,7 @@ async def _insert_active(session: AsyncSession, booking: Booking, *, start: date
     The SAVEPOINT (like ``services/event_types.py``'s duplicate-slug handling) rolls back only the
     offending INSERT so a partial-index violation (a concurrent active booking on the exact same
     slot, RF-04 layer 2) surfaces as :class:`SlotUnavailableError` without poisoning the caller's
-    transaction.
-    """
+    transaction."""
     try:
         async with session.begin_nested():
             session.add(booking)
@@ -516,8 +515,7 @@ async def _swap_booking(
 
     ``old`` is cancelled first (freeing its slot for the partial index) then ``new`` is inserted; a
     conflict on the new slot rolls BOTH back, so a refused reschedule never leaves the original
-    cancelled without its replacement.
-    """
+    cancelled without its replacement."""
     try:
         async with session.begin_nested():
             old.status = BookingStatus.CANCELLED
@@ -527,6 +525,48 @@ async def _swap_booking(
             await session.flush()
     except IntegrityError as exc:
         raise SlotUnavailableError(f"slot {start.isoformat()} is already booked") from exc
+
+
+# --------------------------------------------------------------------------------------
+# mark_no_show (RF-25)
+# --------------------------------------------------------------------------------------
+
+
+async def mark_no_show(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    booking_id: uuid.UUID,
+    now: datetime,
+) -> Booking:
+    """Mark a finished appointment as a no-show (RF-25). Idempotent.
+
+    Only from ``confirmed``, and only once the appointment has ENDED — "no-show" is a statement
+    about an event that already happened, so allowing it beforehand would let a host
+    cancel-by-another-name
+    (and, since a no-show keeps its slot, quietly destroy the guest's booking without freeing it).
+
+    ==The slot stays occupied.== The status change is deliberately NOT a release: the
+    time has passed, so freeing it would corrupt history and let a booking be written retroactively
+    over it. This is exactly why the ``WHERE status <> 'cancelled'`` partial index needed no change.
+
+    Raises :class:`BookingNotFoundError` (404), :class:`BookingNotActiveError` (409, not confirmed)
+    or :class:`BookingNotEndedError` (409, the appointment is still running or in the future).
+    """
+    booking, _event_type = await _lock_and_reload_booking(
+        session, tenant_id=tenant_id, booking_id=booking_id
+    )
+    if booking.status == BookingStatus.NO_SHOW:
+        return booking  # already marked under the lock → no-op (idempotent)
+    if booking.status != BookingStatus.CONFIRMED:
+        raise BookingNotActiveError("only a confirmed booking can be marked a no-show")
+    if _to_utc(booking.end_at) > now:
+        raise BookingNotEndedError("a booking can only be marked a no-show after it has ended")
+
+    booking.status = BookingStatus.NO_SHOW
+    booking.no_show_at = now
+    await session.flush()
+    return booking
 
 
 # --------------------------------------------------------------------------------------
@@ -552,8 +592,7 @@ async def list_bookings(
     """List the tenant's bookings, optionally filtered by ``status`` and a start-date window.
 
     ``date_from`` / ``date_to`` are inclusive calendar dates matched against ``start_at`` (UTC).
-    Ordered by start then id for a stable page.
-    """
+    Ordered by start then id for a stable page."""
     stmt = select(Booking).where(Booking.tenant_id == tenant_id)
     if status is not None:
         stmt = stmt.where(Booking.status == status)
@@ -575,10 +614,10 @@ async def list_bookings(
 # (:func:`enqueue_effect`), so it commits atomically with the booking — or rolls back with it, never
 # firing for a booking that never persisted (the ordering bug the old best-effort inline wrapping
 # could not close). A scheduler-driven poller (``services.outbox.drain_outbox``) executes the intent
-# afterwards, at-least-once with idempotency (retries + dead-letter). The guest
-# tokens are still minted in-txn here (they are DB rows, atomic with the booking, and the email
-# payload needs their URLs); the 24 h reminder stays inline because its job re-checks the booking is
-# still confirmed at fire time (self-healing against a rolled-back booking).
+# afterwards, at-least-once with idempotency (retries + dead-letter). The guest tokens are still
+# minted in-txn here (they are DB rows, atomic with the booking, and the email payload needs their
+# URLs); the 24 h reminder stays inline because its job re-checks the booking is still confirmed at
+# fire time (self-healing against a rolled-back booking).
 
 
 def _guest_link(base_url: str, action: str, token: str) -> str:
@@ -629,8 +668,7 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
 ) -> None:
     """Wire create-time effects: mint tokens in-txn, enqueue Google + email intents, schedule the
     reminder. The email/Google effects are drained post-commit (durable outbox); a rolled-back
-    booking drops their intents.
-    """
+    booking drops their intents."""
     cancel_url, reschedule_url = await _mint_guest_links(
         session, booking=booking, effects=effects, now=now
     )
@@ -649,7 +687,6 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
         reschedule_url=reschedule_url,
         locale=locale,
     )
-    _schedule_reminder(effects, booking=booking)
 
 
 async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is part of the contract
@@ -682,25 +719,6 @@ async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is par
         cancel_url=cancel_url,
         reschedule_url=reschedule_url,
     )
-    _schedule_reminder(effects, booking=new)
-
-
-def _schedule_reminder(effects: BookingEffects, *, booking: Booking) -> None:
-    """Schedule the 24 h reminder for ``booking`` if a runner is wired (F1-10); else skip.
-
-    Best-effort (RF-10): a scheduler that raises must NEVER roll the committed booking back, so the
-    scheduling call is guarded — on failure it is logged and the booking stands.
-    """
-    if effects.reminder_runner is None:
-        return
-    try:
-        schedule_reminder(
-            effects.reminder_runner,
-            booking=booking,
-            send_at=_to_utc(booking.start_at) - _REMINDER_LEAD,
-        )
-    except Exception:
-        _logger.exception("booking %s: reminder scheduling failed (best-effort, kept)", booking.id)
 
 
 async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking + link context
@@ -720,8 +738,7 @@ async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking
     retries — then dead-letters, surfacing the misconfiguration — if SMTP is momentarily absent.
     Gating the enqueue on the live sender would silently drop the notice, defeating durability. The
     intent carries the kind + guest links + locale + the SEQUENCE snapshot; the guest tokens were
-    minted in-txn, so the links persist atomically with the booking.
-    """
+    minted in-txn, so the links persist atomically with the booking."""
     await enqueue_effect(
         session,
         tenant_id=booking.tenant_id,
@@ -756,8 +773,7 @@ async def _enqueue_google(  # noqa: PLR0913 - the sync operation + its event con
     building the Google client is exclusively the executor's job (its ``service_factory``), so the
     producer stays decoupled from momentary Google availability. ``None`` means the host has no
     external calendar, so there is genuinely nothing to sync. The intent stores the primitives the
-    drain worker rebuilds the event request from; a DELETE needs only the ``external_event_id``.
-    """
+    drain worker rebuilds the event request from; a DELETE needs only the ``external_event_id``."""
     if effects.connection is None:
         return
     payload: dict[str, object] = {
@@ -790,6 +806,7 @@ __all__ = [
     "BookingEffects",
     "BookingError",
     "BookingNotActiveError",
+    "BookingNotEndedError",
     "BookingNotFoundError",
     "BookingParams",
     "EventTypeNotFoundError",
@@ -798,5 +815,6 @@ __all__ = [
     "create_booking",
     "get_booking",
     "list_bookings",
+    "mark_no_show",
     "reschedule_booking",
 ]
