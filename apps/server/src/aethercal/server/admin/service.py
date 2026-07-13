@@ -236,6 +236,11 @@ _BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str | None] =
         "Host availability is temporarily unavailable; please try again"
     ),
     bookings_service.SlotUnavailableError: "That time is no longer available",
+    # RF-14, and ``None`` for the same reason as the two below: only the SERVICE knows which day was
+    # full and what the cap was, and it already words that for a human. Distinct from
+    # ``SlotUnavailableError`` on purpose — an operator told "that time is no longer available" will
+    # go on trying hours on a day whose allowance is already spent.
+    bookings_service.DayFullError: None,
     # ``None`` = the SERVICE's own message IS the operator-facing one. These two are refusals of the
     # booking STATE MACHINE, and the same type is raised by SEVERAL operations: ``mark_no_show``
     # raises ``BookingNotActiveError`` exactly as ``reschedule_booking`` does. One hard-coded

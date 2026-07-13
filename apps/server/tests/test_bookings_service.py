@@ -65,6 +65,7 @@ from aethercal.server.services.bookings import (
     BookingNotActiveError,
     BookingNotFoundError,
     BookingParams,
+    DayFullError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     _mint_guest_links,
@@ -111,8 +112,14 @@ async def _schedule(session: AsyncSession, tenant: Tenant) -> Schedule:
     return row
 
 
-async def _event_type(
-    session: AsyncSession, tenant: Tenant, host: User, schedule: Schedule, *, slug: str = "intro"
+async def _event_type(  # noqa: PLR0913 - a test factory: every field is one knob a test turns
+    session: AsyncSession,
+    tenant: Tenant,
+    host: User,
+    schedule: Schedule,
+    *,
+    slug: str = "intro",
+    max_per_day: int | None = None,
 ) -> EventType:
     data = EventTypeCreate(
         host_id=host.id,
@@ -121,15 +128,18 @@ async def _event_type(
         title="Intro",
         duration_seconds=1800,
         max_advance_seconds=60 * 60 * 24 * 30,
+        max_per_day=max_per_day,
     )
     return await create_event_type(session, tenant_id=tenant.id, data=data)
 
 
-async def _seed(session: AsyncSession, tenant_factory: Any) -> tuple[Tenant, EventType]:
+async def _seed(
+    session: AsyncSession, tenant_factory: Any, *, max_per_day: int | None = None
+) -> tuple[Tenant, EventType]:
     tenant = await tenant_factory(session)
     host = await _first_user(session, tenant)
     schedule = await _schedule(session, tenant)
-    event_type = await _event_type(session, tenant, host, schedule)
+    event_type = await _event_type(session, tenant, host, schedule, max_per_day=max_per_day)
     return tenant, event_type
 
 
@@ -1574,3 +1584,171 @@ async def test_the_guest_link_we_email_carries_what_the_booking_page_reads(
     # Rescheduling has to re-offer slots, so it needs the event type as well as the booking.
     assert reschedule["event_type"] == [str(event_type.id)]
     assert reschedule["token"]
+
+
+# --------------------------------------------------------------------------------------
+# max_per_day (RF-14) — the write-side gate.
+# --------------------------------------------------------------------------------------
+
+_TUE_SLOT_9 = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
+
+
+async def test_create_booking_is_refused_once_the_day_is_at_its_cap(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A business that sets ``max_per_day=1`` must not take a second booking that day.
+
+    The column was written, persisted and served by the API, and read by NOBODY — so the cap was a
+    setting that did nothing at all. The refusal gets its OWN error (``DayFullError``): "the day is
+    full" and "that time is taken" are different facts about the world, and a guest told the wrong
+    one will keep trying other times on a day that has no room at any hour.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    with pytest.raises(DayFullError):
+        await create_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            params=_params(event_type.id, _SLOT_11, guest_email="second@example.com"),
+            now=_BEFORE,
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 1
+
+
+async def test_the_cap_is_per_day_and_does_not_leak_into_the_next_one(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A full Monday must not close Tuesday — the cap is a daily allowance, not a total."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    tuesday = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _TUE_SLOT_9, guest_email="tuesday@example.com"),
+        now=_BEFORE,
+    )
+
+    assert tuesday.status == BookingStatus.CONFIRMED
+
+
+async def test_a_cancellation_gives_back_the_days_last_place(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """Otherwise one guest could book and cancel and thereby shut the whole day, with an empty diary
+    and no way for the business to reopen it."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    first = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await cancel_booking(sqlite_session, tenant_id=tenant.id, booking_id=first.id, now=_BEFORE)
+
+    replacement = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_11, guest_email="second@example.com"),
+        now=_BEFORE,
+    )
+
+    assert replacement.status == BookingStatus.CONFIRMED
+
+
+async def test_a_booking_can_be_rescheduled_within_the_day_it_alone_filled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A reschedule MOVES an appointment; it does not add one.
+
+    The predecessor is still ``confirmed`` while the new slot is validated, so counting it against
+    the cap would tell the guest the day is full — because of the very booking they are moving. With
+    ``max_per_day=1`` that would make a capped day impossible to reschedule within at all: the most
+    ordinary request there is ("same day, an hour later") would be permanently refused.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    original = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert moved.start_at == _SLOT_11
+    assert moved.status == BookingStatus.CONFIRMED
+    assert await _active_count(sqlite_session, event_type) == 1  # still one booking, moved
+
+
+async def test_rescheduling_into_an_already_full_day_is_refused(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The exclusion is narrow: it forgives the booking being MOVED, not the day it is moving INTO.
+
+    Monday is full because of somebody ELSE's booking, so Tuesday's guest cannot slide into it — the
+    predecessor's exemption must not become a way through the cap.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory, max_per_day=1)
+    await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    tuesday = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _TUE_SLOT_9, guest_email="tuesday@example.com"),
+        now=_BEFORE,
+    )
+
+    with pytest.raises(DayFullError):
+        await reschedule_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            booking_id=tuesday.id,
+            new_start=_SLOT_11,
+            now=_BEFORE,
+        )
+
+    still = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=tuesday.id)
+    assert still is not None
+    assert still.status == BookingStatus.CONFIRMED  # a refused reschedule never touches the old row
+
+
+async def test_no_cap_declared_leaves_the_booking_path_unchanged(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """``max_per_day = NULL`` is the default for every existing event type, and must stay a true
+    absence of a cap — not a cap of zero that quietly stops the business taking bookings."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    assert event_type.max_per_day is None
+    for hour, who in ((9, "a"), (10, "b"), (11, "c")):
+        await create_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            params=_params(
+                event_type.id,
+                datetime(2026, 7, 6, hour, 0, tzinfo=UTC),
+                guest_email=f"{who}@example.com",
+            ),
+            now=_BEFORE,
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 3

@@ -36,6 +36,7 @@ from aethercal.server.services.bookings import (
     BookingNotEndedError,
     BookingNotFoundError,
     BookingParams,
+    DayFullError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     cancel_booking,
@@ -106,6 +107,15 @@ def _map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - i
                 status.HTTP_409_CONFLICT,
                 "not_active",
                 "Booking is not in a state that allows this operation",
+            )
+        case DayFullError():
+            # Its OWN machine code, like `not_ended` above and for the same reason: told
+            # `slot_unavailable`, a guest tries the next hour, and the next — every one of which
+            # refuses them, because it is the DAY that is full and no hour on it can be had.
+            return _http(
+                status.HTTP_409_CONFLICT,
+                "day_full",
+                "That day is fully booked; please choose another day",
             )
         case SlotUnavailableError():
             return _http(
