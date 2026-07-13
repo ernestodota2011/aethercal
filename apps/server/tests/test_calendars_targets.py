@@ -488,7 +488,7 @@ async def test_delete_removes_the_event_from_the_calendar_it_lives_in(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     google = FakeGoogle()
 
     await delete_event_for_booking(
@@ -505,7 +505,7 @@ async def test_deleting_an_event_google_no_longer_has_is_a_success_not_a_retry_l
     that as a failure would make a retried cancel (or the delete half of a reschedule that crashed
     after it) fail forever and dead-letter — the effect DID happen, the event IS gone."""
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     google = FakeGoogle(delete_error=_GoneError(410))
 
     await delete_event_for_booking(
@@ -517,7 +517,7 @@ async def test_a_real_delete_failure_still_raises(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     google = FakeGoogle(delete_error=RuntimeError("google is down"))
 
     with pytest.raises(CalendarSyncError):

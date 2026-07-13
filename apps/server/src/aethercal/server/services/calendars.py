@@ -654,9 +654,9 @@ async def create_event_for_booking(
 
     PRIMITIVES, not a ``CalendarTarget``, and that is load-bearing: this runs with NO session open
     (the outbox releases its connection before any network call, R8), so an ORM object reaching here
-    would be detached — and touching one of its attributes, even just to name it in an error message,
-    raises ``DetachedInstanceError`` INSTEAD of the :class:`CalendarSyncError` the retry logic reads.
-    A resolver builds the target while a session is alive; only its primitives cross this line.
+    would be detached — and touching one of its attributes, even just to name it in an error,
+    raises ``DetachedInstanceError`` INSTEAD of the :class:`CalendarSyncError` the retry logic
+    reads. A resolver builds the target while a session lives; only primitives cross this line.
 
     Does not touch the database -- the caller writes the returned ``external_event_id`` /
     ``meeting_url``, and the calendar they landed in, onto the ``Booking`` row inside its own
@@ -665,9 +665,7 @@ async def create_event_for_booking(
     try:
         created = insert_event_with_meet(service, calendar_id, request)
     except Exception as exc:
-        raise CalendarSyncError(
-            f"failed to create Google event in calendar {calendar_id}"
-        ) from exc
+        raise CalendarSyncError(f"failed to create Google event in calendar {calendar_id}") from exc
     return str(created["id"]), _extract_meet_url(created)
 
 
@@ -744,8 +742,7 @@ async def reschedule_event_for_booking(  # noqa: PLR0913 - source/target + their
         created = insert_event_with_meet(target_service, target_calendar_id, request)
     except Exception as exc:
         raise CalendarSyncError(
-            f"failed to re-create Google event {external_event_id} in calendar "
-            f"{target_calendar_id}"
+            f"failed to re-create Google event {external_event_id} in calendar {target_calendar_id}"
         ) from exc
     return str(created["id"]), _extract_meet_url(created)
 

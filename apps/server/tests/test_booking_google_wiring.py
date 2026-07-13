@@ -27,6 +27,11 @@ from cryptography.fernet import Fernet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+# The calendar-id-aware fake lives with the calendar-target tests; reused here so "which calendar
+# was actually called" stays observable end to end (pytest's rootdir import mode puts the tests
+# directory on sys.path, the same way the other modules in this suite share helpers).
+from test_calendars_targets import FakeGoogle
+
 from aethercal.core.model import BookingStatus
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import (
@@ -56,17 +61,13 @@ from aethercal.server.services.calendars import (
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
     OutboxEffect,
+    OutboxExecutor,
     OutboxReport,
     OutboxWork,
     drain_outbox,
     make_booking_effect_executor,
     run_google_effect,
 )
-
-# The calendar-id-aware fake lives with the calendar-target tests; reused here so "which calendar
-# was actually called" stays observable end to end (pytest's rootdir import mode puts the tests
-# directory on sys.path, the same way the other modules in this suite share helpers).
-from test_calendars_targets import FakeGoogle
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)  # a Friday
 SLOT_9 = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)  # the following Monday, 09:00 UTC
@@ -118,7 +119,6 @@ async def _connect(
     *,
     fernet: Fernet,
     account_email: str = "agency@agency.test",
-    covered: bool = True,
 ) -> ExternalConnection:
     """Connect a Google account to the host, with a fresh EMPTY busy coverage window.
 
@@ -132,10 +132,9 @@ async def _connect(
         credential=GoogleCredential(account_email=account_email, token_json='{"token": "at"}'),
         fernet=fernet,
     )
-    if covered:
-        connection.busy_synced_from = NOW
-        connection.busy_synced_to = NOW + timedelta(days=30)
-        connection.busy_synced_at = NOW
+    connection.busy_synced_from = NOW
+    connection.busy_synced_to = NOW + timedelta(days=30)
+    connection.busy_synced_at = NOW
     await session.flush()
     return connection
 

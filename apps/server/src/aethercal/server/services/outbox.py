@@ -1092,8 +1092,8 @@ class _GooglePlan:
 
     They diverge the moment an operator re-designates the booking calendar between the confirmation
     and the cancellation. Aiming the delete at ``target`` would hit a calendar the event was never
-    written to: Google answers 404, the (correct) idempotent delete counts that as a success, and the
-    real event sits in the host's original calendar forever while the system reports it deleted.
+    written to: Google answers 404, the (correct) idempotent delete counts that as a success, and
+    the real event sits in the host's original calendar forever while the system reports it gone.
     """
 
     booking_id: uuid.UUID
@@ -1300,8 +1300,8 @@ async def _event_home(
     * **No recorded calendar** — reachable only for a booking whose event predates these columns.
       There is no other information to act on, so it falls back to the host's current target —
       EXPLICITLY, with a warning naming the booking, because it IS a guess: if the host has since
-      moved their booking calendar, the legacy event is not there. An operator can act on a log line;
-      they cannot act on a guess made quietly.
+      moved their booking calendar, the legacy event is not there. An operator can act on a log
+      line; they cannot act on a guess made quietly.
     * **The recorded connection row is gone** — the calendar the event lives in is unreachable by
       definition, and guessing another would report success while the event lives on. Raise.
     """

@@ -689,7 +689,7 @@ async def test_create_event_for_booking_returns_id_and_meeting_url(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_result=_INSERT_RESULT)
 
@@ -705,7 +705,7 @@ async def test_create_event_for_booking_google_failure_raises_calendar_sync_erro
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_error=RuntimeError("insert failed"))
 
@@ -719,7 +719,7 @@ async def test_delete_event_for_booking_calls_google(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     service = FakeGoogleService()
 
     await delete_event_for_booking(
@@ -733,7 +733,7 @@ async def test_delete_event_for_booking_google_failure_raises_calendar_sync_erro
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     service = FakeGoogleService(delete_error=RuntimeError("delete failed"))
 
     with pytest.raises(CalendarSyncError):
@@ -746,7 +746,7 @@ async def test_reschedule_event_for_booking_replaces_the_event(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_result=_INSERT_RESULT)
 
@@ -768,7 +768,7 @@ async def test_reschedule_event_for_booking_google_failure_raises_calendar_sync_
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_error=RuntimeError("insert failed"))
 
