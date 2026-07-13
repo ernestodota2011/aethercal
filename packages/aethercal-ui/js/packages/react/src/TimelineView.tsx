@@ -209,6 +209,13 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
 
   return (
     <>
+      {/* The outer element is a plain styling wrapper — deliberately NOT the grid, and NOT focusable.
+          `role="grid"` promises a SINGLE tab stop navigated by arrow keys + aria-activedescendant, so
+          the component must expose exactly ONE focusable node. The rows scroll (a timeline can hold
+          many resources), and a scrollable region has to be reachable by keyboard (axe
+          `scrollable-region-focusable`) — so the scroll container IS the grid, rather than adding a
+          second tab stop beside it. The header row lives inside it (sticky), which also keeps the
+          columnheaders where ARIA requires them: inside the grid they head. */}
       <div
         className={cx(
           "aethercal-calendar",
@@ -217,28 +224,27 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
           interaction.status === "resizing" && "is-resizing",
           interaction.status === "selecting" && "is-selecting",
         )}
-        role="grid"
-        aria-label={messages.viewNames.timeline}
-        aria-describedby={hintId}
-        {...(activeDescendantId !== undefined
-          ? { "aria-activedescendant": activeDescendantId }
-          : {})}
-        tabIndex={0}
         data-view="timeline"
         style={rootStyle}
-        onKeyDown={keyboard.handleKeyDown}
       >
-        <TimelineHeader
-          dayHeaders={timeline.dayHeaders}
-          nowDateKey={nowDateKey}
-          locale={locale}
-          resourcesLabel={messages.timelineResources}
-        />
+        <div
+          className="aethercal-tl-body"
+          role="grid"
+          aria-label={messages.viewNames.timeline}
+          aria-describedby={hintId}
+          {...(activeDescendantId !== undefined
+            ? { "aria-activedescendant": activeDescendantId }
+            : {})}
+          tabIndex={0}
+          onKeyDown={keyboard.handleKeyDown}
+        >
+          <TimelineHeader
+            dayHeaders={timeline.dayHeaders}
+            nowDateKey={nowDateKey}
+            locale={locale}
+            resourcesLabel={messages.timelineResources}
+          />
 
-        {/* The rows scroll (a timeline can hold many resources), so the body is a focusable scroll
-            container — axe `scrollable-region-focusable`. The grid's arrow-key navigation still runs:
-            the handler sits on the focusable grid root and catches the bubbled keydown. */}
-        <div className="aethercal-tl-body" role="rowgroup" tabIndex={0}>
           {/* Nothing to show: no resources, and no unassigned events either. Say so in a REAL row +
               gridcell (so the grid pattern stays coherent) instead of rendering an empty body that a
               screen reader would read as a grid with no content. `aria-activedescendant` is omitted

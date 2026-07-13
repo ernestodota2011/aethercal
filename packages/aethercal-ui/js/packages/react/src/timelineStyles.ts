@@ -27,7 +27,16 @@ ${defaultTimelineTokenCss()}
   display: grid;
   grid-template-columns: var(--ac-tl-rowhead-width) minmax(0, 1fr);
 }
-.aethercal-tl-head { border-bottom: 1px solid var(--ac-border); }
+/* The header row lives INSIDE the scroll container, because that container is the ARIA grid (a single
+   tab stop — and columnheaders must sit inside the grid they head). Sticky keeps it in view while the
+   rows scroll under it. */
+.aethercal-tl-head {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  background: var(--ac-bg);
+  border-bottom: 1px solid var(--ac-border);
+}
 .aethercal-tl-corner { border-right: 1px solid var(--ac-border); }
 .aethercal-tl-days { position: relative; height: 32px; }
 .aethercal-tl-dayhead {

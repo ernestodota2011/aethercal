@@ -76,6 +76,33 @@ describe("timeline — ARIA structure", () => {
     expect(container.querySelector(".aethercal-tl-body")?.getAttribute("tabindex")).toBe("0");
   });
 
+  it("exposes EXACTLY ONE tab stop — the grid pattern it declares", () => {
+    // `role="grid"` promises a single tab stop navigated by arrow keys + aria-activedescendant. A
+    // second focusable node inside it means the user tabs *within* something that claims to be one
+    // stop — a regression of the very pattern the component announces. The scroll container IS the
+    // grid, so being focusable (axe `scrollable-region-focusable`) costs no extra stop.
+    const { container, getByRole } = renderTimeline({
+      onEventDrop: () => {},
+      onEventResize: () => {},
+      onRangeSelect: () => {},
+    });
+    const focusable = container.querySelectorAll('[tabindex="0"]');
+    expect(focusable).toHaveLength(1);
+    expect(focusable[0]).toBe(getByRole("grid"));
+  });
+
+  it("keeps a single tab stop when groups are present (their toggles are not stops)", () => {
+    const { container } = renderTimeline({
+      resources: [
+        { id: "a1", title: "Room A1", groupId: "Clinic A" },
+        { id: "b1", title: "Room B1", groupId: "Clinic B" },
+      ],
+      events: [],
+      onEventDrop: () => {},
+    });
+    expect(container.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+  });
+
   it("never exposes a status role (the live region is aria-live, not role=status)", () => {
     const { queryByRole } = renderTimeline();
     expect(queryByRole("status")).toBeNull();
