@@ -83,11 +83,10 @@ async def _seed(maker: Sessionmaker, *, slug: str = "acme") -> tuple[uuid.UUID, 
         tenant = Tenant(slug=slug, name=slug.title())
         session.add(tenant)
         await session.flush()
-        session.add(
-            User(tenant_id=tenant.id, email=f"{slug}@example.com", name="Host", timezone="UTC")
-        )
+        host = User(tenant_id=tenant.id, email=f"{slug}@example.com", name="Host", timezone="UTC")
+        session.add(host)
         await session.flush()
-        tenant_id = tenant.id
+        tenant_id, host_id = tenant.id, host.id
 
     schedule = await create_schedule_action(
         maker,
@@ -98,6 +97,7 @@ async def _seed(maker: Sessionmaker, *, slug: str = "acme") -> tuple[uuid.UUID, 
         maker,
         tenant_slug=slug,
         form=EventTypeForm(
+            host_id=host_id,  # RF-30: the host is an explicit choice, never the tenant's first user
             slug="intro",
             title="Intro",
             schedule_id=schedule.id,

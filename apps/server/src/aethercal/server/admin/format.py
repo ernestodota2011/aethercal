@@ -18,13 +18,25 @@ from aethercal.schemas.schedules import Rules, ScheduleRead, TimeRangeSchema
 from aethercal.schemas.workflows import WorkflowRead, WorkflowTemplateRead
 
 if TYPE_CHECKING:
-    # Imported for the return type only; the runtime value is a plain dict, so this module keeps its
-    # "pure, no reflex/db dependency" property (importing ``aethercal.ui`` at runtime triggers the
-    # component's ``rx.asset`` side effect — kept out of this leaf helper module on purpose).
+    # Imported for the ANNOTATIONS only; the runtime values are plain objects, so this module keeps
+    # its "pure, no reflex/db dependency" property. ``aethercal.ui`` would otherwise trigger the
+    # component's ``rx.asset`` side effect, and ``admin.service`` would drag SQLAlchemy and the ORM
+    # models into what is meant to be a leaf of pure functions.
+    from aethercal.server.admin.service import ConnectionRead, HostRead
     from aethercal.ui import CalendarEvent
 
 _MIN_WEEKDAY = 0
 _MAX_WEEKDAY = 6
+
+SHARED_SCHEDULE = "(business)"
+"""What a schedule's owner cell reads when ``user_id`` is NULL: the pattern is the BUSINESS's, and
+every host may use it (RF-30). It is also the sentinel the owner ``select`` submits, so the handler
+can tell "shared" (a value) from "leave the owner alone" (an absence)."""
+
+DEFAULT_CALENDAR = "(the account's default)"
+"""Where a connection's bookings go when no calendar has been designated. Spelled out, because "no
+target" is not "no calendar" — it means the connected account's OWN default calendar, which for a
+personal account is exactly the one the bookings should not be landing in."""
 
 ALL_EVENT_TYPES = "(all)"
 """What a rule's ``scope`` cell reads when ``event_type_id`` is NULL — it governs EVERY event type.
@@ -103,12 +115,44 @@ def event_type_row(event_type: EventTypeRead) -> dict[str, str]:
 
 
 def schedule_row(schedule: ScheduleRead) -> dict[str, str]:
-    """Flatten a schedule into string cells, listing its open weekdays as a sorted CSV."""
+    """Flatten a schedule into string cells, listing its open weekdays as a sorted CSV.
+
+    ``owner`` is the host whose pattern this is, or :data:`SHARED_SCHEDULE` when it belongs to the
+    BUSINESS and every host may use it (RF-30). Rendered as a word rather than a blank, because
+    "shared with everyone" is a decision and an empty cell reads as one nobody made — and it is the
+    difference between a pattern two hosts share on purpose and two hosts sharing one by accident.
+    """
     return {
         "id": str(schedule.id),
         "name": schedule.name,
         "timezone": schedule.timezone,
         "weekdays": ",".join(str(day) for day in sorted(schedule.rules)),
+        "owner": str(schedule.user_id) if schedule.user_id else SHARED_SCHEDULE,
+    }
+
+
+def host_row(host: HostRead) -> dict[str, str]:
+    """Flatten a host into the string cells its table renders — and the host selector's options."""
+    return {
+        "id": str(host.id),
+        "name": host.name,
+        "email": host.email,
+        "timezone": host.timezone,
+    }
+
+
+def connection_row(connection: ConnectionRead) -> dict[str, str]:
+    """Flatten one of a host's connected calendar accounts.
+
+    ``calendar`` says where this connection's bookings are WRITTEN. :data:`DEFAULT_CALENDAR` is not
+    a blank: it is what happens when nothing has been designated — the account's own default
+    calendar — and the operator needs to see that it is the current answer, because it is the one
+    thing they are meant to change (bookings belong in a dedicated calendar, not a personal one).
+    """
+    return {
+        "id": str(connection.id),
+        "account": connection.account_email,
+        "calendar": connection.booking_calendar_id or DEFAULT_CALENDAR,
     }
 
 
@@ -185,9 +229,13 @@ def weekly_rules(weekdays: list[int], start: str, end: str) -> Rules:
 
 __all__ = [
     "ALL_EVENT_TYPES",
+    "DEFAULT_CALENDAR",
+    "SHARED_SCHEDULE",
     "booking_event",
     "booking_row",
+    "connection_row",
     "event_type_row",
+    "host_row",
     "parse_weekdays",
     "schedule_row",
     "template_row",

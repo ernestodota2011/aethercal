@@ -46,6 +46,12 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.create_schedule.fn, ({},)),
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_hosts.fn, ()),
+    (AdminState.create_host.fn, ({},)),
+    (AdminState.update_host.fn, ({},)),
+    (AdminState.delete_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.select_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.designate_calendar.fn, ({},)),
     (AdminState.load_workflows.fn, ()),
     (AdminState.create_workflow.fn, ({},)),
     (AdminState.update_workflow.fn, ({},)),
@@ -92,6 +98,18 @@ async def seeded_maker() -> AsyncIterator[Sessionmaker]:
 
 def _state() -> AdminState:
     return AdminState(_reflex_internal_init=True)
+
+
+async def _seeded_host_id(state: AdminState) -> str:
+    """The tenant's ONE host, as a form value.
+
+    RF-30 made the host an EXPLICIT field on the event-type form. It used to be injected by the
+    service — the tenant's first user — which is precisely why a business's second host could never
+    be given an event type. So every create now states which host it means, these tests included.
+    """
+    await AdminState.load_hosts.fn(state)
+    assert len(state.hosts) == 1, "these tests seed a single-host tenant"
+    return state.hosts[0]["id"]
 
 
 def test_authenticated_is_a_server_only_backend_var() -> None:
@@ -335,6 +353,7 @@ async def test_create_event_type_saves_the_en_translations(seeded_maker: Session
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -359,6 +378,7 @@ async def test_create_event_type_with_blank_en_fields_does_not_store_the_key(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -382,6 +402,7 @@ async def test_update_event_type_sets_the_en_translation_and_reload_populates_it
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -412,6 +433,7 @@ async def test_update_event_type_absent_en_field_leaves_the_existing_translation
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -436,6 +458,7 @@ async def _event_with_en_translations(seeded_maker: Sessionmaker) -> tuple[Admin
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -532,6 +555,7 @@ async def test_update_event_type_blank_canonical_title_is_omitted_not_cleared(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -561,6 +585,7 @@ async def test_update_event_type_with_only_id_is_a_true_no_op(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",

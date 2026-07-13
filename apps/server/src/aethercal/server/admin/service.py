@@ -9,7 +9,7 @@ surface, and lets the whole layer be unit-tested offline against an aiosqlite se
 Two error families cross the boundary:
 
 * :class:`AdminSetupError` — the admin is misconfigured for this tenant (no tenant, an ambiguous
-  choice with several tenants, an unknown slug, or a tenant with no host user).
+  choice with several tenants, or an unknown slug).
 * :class:`AdminActionError` — a requested action was refused by the underlying service (unknown
   booking, slot taken, duplicate slug/name, invalid input, ...). Its ``message`` is operator-facing.
 
@@ -26,6 +26,7 @@ from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
@@ -41,8 +42,16 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateUpdate,
     WorkflowUpdate,
 )
-from aethercal.server.db.models import Tenant, User
+from aethercal.server.db.models import (
+    EventType,
+    ExternalCalendarLink,
+    ExternalConnection,
+    Schedule,
+    Tenant,
+    User,
+)
 from aethercal.server.services import bookings as bookings_service
+from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
 from aethercal.server.services import schedules as schedules_service
 from aethercal.server.services import workflow_rules as workflow_rules_service
@@ -78,10 +87,52 @@ class AdminActionError(AdminError):
 
 @dataclass(frozen=True, slots=True)
 class AdminContext:
-    """The resolved single-user operating context: which tenant, acting as which host user."""
+    """The resolved operating context: WHICH TENANT the admin is administering. That is all.
+
+    ==It used to carry a ``host_user_id`` too, and that field was the whole of the RF-30 defect.==
+    It was resolved by taking the tenant's FIRST user and injected as the host of every event type
+    the admin created — while the form had no host field at all. A business with two hosts therefore
+    watched every event type it authored land on whichever host happened to exist first, silently.
+
+    The field is gone rather than fixed, because there is no correct value for it: the host is a
+    CHOICE, and a choice belongs on the form (:class:`EventTypeForm`), not in a context that guesses
+    it. Leaving a "default host" here would just keep the trap loaded for the next caller.
+    """
 
     tenant_id: uuid.UUID
-    host_user_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class HostForm:
+    """The admin-controlled fields of a host (a ``users`` row): who they are and where they work."""
+
+    name: str
+    email: str
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostRead:
+    """A host as the panel lists them (a flat read model — the ORM row never leaves the session)."""
+
+    id: uuid.UUID
+    name: str
+    email: str
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionRead:
+    """One of a host's connected calendar accounts, and where its bookings are written.
+
+    ``booking_calendar_id`` is ``None`` when nothing has been designated: the account's default
+    calendar is then used, which is the zero-config path. ==It is NOT the same as "no connection"==
+    — a host with no connected account has no row here at all.
+    """
+
+    id: uuid.UUID
+    account_email: str
+    booking_calendar_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,8 +154,15 @@ class BookingForm:
 
 @dataclass(frozen=True, slots=True)
 class EventTypeForm:
-    """The admin-controlled fields of an event type; ``host_id`` is injected from the context."""
+    """The admin-controlled fields of an event type.
 
+    ``host_id`` is EXPLICIT (RF-30). It used to be injected from the context — the tenant's first
+    user — which is why a second host was unreachable from this panel. It is now whichever host the
+    operator picked, and the event-type service checks that the host is theirs and that the schedule
+    is one that host may actually use.
+    """
+
+    host_id: uuid.UUID
     slug: str
     title: str
     schedule_id: uuid.UUID
@@ -150,16 +208,15 @@ async def _resolve_tenant(session: AsyncSession, tenant_slug: str | None) -> Ten
 
 
 async def resolve_admin_context(session: AsyncSession, *, tenant_slug: str | None) -> AdminContext:
-    """Resolve the tenant + its host user for the single-user admin (RF-18)."""
+    """Resolve the tenant the admin is administering (RF-18).
+
+    It no longer resolves a host. It used to end in ``.first()`` over the tenant's users and hand
+    that back as "the" host, which silently decided RF-30 for the operator every time they created
+    an event type. The host is now a field on the form, checked against the tenant by the
+    event-type service — so there is nothing left here to guess.
+    """
     tenant = await _resolve_tenant(session, tenant_slug)
-    host = (
-        await session.scalars(
-            select(User).where(User.tenant_id == tenant.id).order_by(User.created_at, User.id)
-        )
-    ).first()
-    if host is None:
-        raise AdminSetupError(f"tenant {tenant.slug!r} has no user to act as host")
-    return AdminContext(tenant_id=tenant.id, host_user_id=host.id)
+    return AdminContext(tenant_id=tenant.id)
 
 
 def _now(now: datetime | None) -> datetime:
@@ -369,7 +426,7 @@ async def create_event_type_action(
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
         try:
             data = EventTypeCreate(
-                host_id=ctx.host_user_id,
+                host_id=form.host_id,
                 schedule_id=form.schedule_id,
                 slug=form.slug,
                 title=form.title,
@@ -490,6 +547,208 @@ async def delete_schedule_action(
             )
         except schedules_service.ScheduleServiceError as exc:
             raise AdminActionError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------------------
+# Hosts, and where a host's bookings are written (RF-30).
+# --------------------------------------------------------------------------------------
+#
+# Hosts are ``users`` rows, and there is no ``services/users.py`` to delegate to — the CLI creates
+# the first one inline in ``create-tenant``, and nothing else has ever needed to. So the CRUD is
+# written here, against the model, exactly as ``_resolve_tenant`` already is. (A domain service
+# would be the better home the moment a second caller wants it; see the handover note.)
+#
+# Every id below arrives from a FORM, which makes each one a cross-tenant write surface until it is
+# checked. They are all resolved tenant-scoped, and an id that is not this tenant's is simply "not
+# found" — never a row that gets written.
+
+
+def _host_read(row: User) -> HostRead:
+    return HostRead(id=row.id, name=row.name, email=row.email, timezone=row.timezone)
+
+
+async def _load_host(session: AsyncSession, *, tenant_id: uuid.UUID, host_id: uuid.UUID) -> User:
+    """The tenant's host by id, or an :class:`AdminActionError`. Tenant-scoped, always."""
+    host = (
+        await session.scalars(select(User).where(User.id == host_id, User.tenant_id == tenant_id))
+    ).one_or_none()
+    if host is None:
+        raise AdminActionError("Host not found")
+    return host
+
+
+async def list_hosts_view(maker: Sessionmaker, *, tenant_slug: str | None) -> list[HostRead]:
+    """The tenant's hosts, oldest first — the choices the host selector offers."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rows = (
+            await session.scalars(
+                select(User)
+                .where(User.tenant_id == ctx.tenant_id)
+                .order_by(User.created_at, User.id)
+            )
+        ).all()
+        return [_host_read(row) for row in rows]
+
+
+async def create_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, form: HostForm
+) -> HostRead:
+    """Add a host to the business. ``(tenant_id, email)`` is unique: two hosts on one address is one
+    host with a typo, and it would make the pair ambiguous everywhere it is used to find them."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        row = User(
+            tenant_id=ctx.tenant_id, name=form.name, email=form.email, timezone=form.timezone
+        )
+        try:
+            async with session.begin_nested():
+                session.add(row)
+                await session.flush()
+        except IntegrityError as exc:
+            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
+        return _host_read(row)
+
+
+async def update_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
+) -> HostRead:
+    """Edit a host's name / email / timezone."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+        host.name = form.name
+        host.email = form.email
+        host.timezone = form.timezone
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
+        return _host_read(host)
+
+
+async def delete_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+) -> None:
+    """Remove a host — REFUSED while anything of the business still points at them.
+
+    Both silent outcomes are catastrophic and neither raises anything on its own: let it CASCADE and
+    the business's booking page loses event types nobody asked to remove (and their bookings with
+    them); let it ORPHAN and the page keeps offering slots for a host who no longer exists. So the
+    refusal names what is holding them, and the operator decides.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+
+        hosted = (
+            await session.scalars(
+                select(EventType.slug).where(
+                    EventType.tenant_id == ctx.tenant_id, EventType.host_id == host.id
+                )
+            )
+        ).all()
+        if hosted:
+            names = ", ".join(f"'{slug}'" for slug in hosted)
+            raise AdminActionError(
+                f"host '{host.name}' still hosts the event type(s) {names}: deleting them would "
+                "either take those event types (and their bookings) with them, or leave the "
+                "booking page offering slots for a host who no longer exists. Re-assign or "
+                "deactivate them first"
+            )
+        owned = (
+            await session.scalars(
+                select(Schedule.name).where(
+                    Schedule.tenant_id == ctx.tenant_id, Schedule.user_id == host.id
+                )
+            )
+        ).all()
+        if owned:
+            names = ", ".join(f"'{name}'" for name in owned)
+            raise AdminActionError(
+                f"host '{host.name}' still owns the schedule(s) {names}. Delete them, or hand them "
+                "to the business (clear their owner), first"
+            )
+
+        await session.delete(host)
+        await session.flush()
+
+
+async def list_connections_view(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+) -> list[ConnectionRead]:
+    """A host's connected calendar accounts, and the calendar each writes bookings into.
+
+    ==Every one of them, not the first.== ``load_active_connections`` is deliberately plural: its
+    predecessor ended in ``.first()``, so a host with two connected accounts had one silently
+    ignored — and an ignored calendar is an ignored busy set, which is a double-booking waiting to
+    happen. The operator cannot designate a calendar on a connection the panel never shows them.
+    """
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+        connections = await calendars_service.load_active_connections(
+            session, tenant_id=ctx.tenant_id, user_id=host.id
+        )
+        reads: list[ConnectionRead] = []
+        for connection in connections:
+            links = (
+                await session.scalars(
+                    select(ExternalCalendarLink).where(
+                        ExternalCalendarLink.tenant_id == ctx.tenant_id,
+                        ExternalCalendarLink.connection_id == connection.id,
+                        ExternalCalendarLink.is_booking_target.is_(True),
+                    )
+                )
+            ).all()
+            target = links[0].external_calendar_id if links else None
+            reads.append(
+                ConnectionRead(
+                    id=connection.id,
+                    account_email=connection.account_email,
+                    booking_calendar_id=target,
+                )
+            )
+        return reads
+
+
+async def designate_calendar_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    connection_id: uuid.UUID,
+    calendar_id: str,
+) -> None:
+    """Point a connection's bookings at ONE named calendar — the admin's ``--calendar-id`` (RF-11).
+
+    This is the write side of the table that used to be dead: ``_DEFAULT_CALENDAR_ID = "primary"``
+    was a hard-coded constant, so nobody ever read or wrote ``external_calendar_links`` and a host
+    could not send bookings anywhere but the connected account's primary calendar. Using a
+    dedicated, secondary calendar is the rule for a real account — and it was not expressible.
+
+    The service does the rest: it retires the host's other targets (one target per HOST, not per
+    connection — two would dead-letter every booking on an ambiguity nobody chose), serialises the
+    choice on the host's row, and invalidates the busy cache only when the calendars actually read
+    have changed.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        # Tenant-scoped BEFORE it is handed to the service: the id came off a form, and the service
+        # takes the connection row itself, so an unscoped load here would let one business re-point
+        # another's calendar and write its meetings into theirs.
+        connection = (
+            await session.scalars(
+                select(ExternalConnection).where(
+                    ExternalConnection.id == connection_id,
+                    ExternalConnection.tenant_id == ctx.tenant_id,
+                )
+            )
+        ).one_or_none()
+        if connection is None:
+            raise AdminActionError("Calendar connection not found")
+        await calendars_service.link_booking_calendar(
+            session, connection=connection, calendar_id=calendar_id
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -688,18 +947,26 @@ __all__ = [
     "AdminError",
     "AdminSetupError",
     "BookingForm",
+    "ConnectionRead",
     "EventTypeForm",
+    "HostForm",
+    "HostRead",
     "cancel_booking_action",
     "create_booking_action",
     "create_event_type_action",
+    "create_host_action",
     "create_schedule_action",
     "create_template_action",
     "create_workflow_action",
     "deactivate_event_type_action",
+    "delete_host_action",
     "delete_schedule_action",
     "delete_template_action",
+    "designate_calendar_action",
     "list_bookings_view",
+    "list_connections_view",
     "list_event_types_view",
+    "list_hosts_view",
     "list_schedules_view",
     "list_templates_view",
     "list_workflows_view",
@@ -708,6 +975,7 @@ __all__ = [
     "resolve_admin_context",
     "set_workflow_active_action",
     "update_event_type_action",
+    "update_host_action",
     "update_schedule_action",
     "update_template_action",
     "update_workflow_action",

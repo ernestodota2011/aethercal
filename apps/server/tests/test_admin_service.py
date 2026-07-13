@@ -42,6 +42,7 @@ from aethercal.server.admin.service import (
     delete_schedule_action,
     list_bookings_view,
     list_event_types_view,
+    list_hosts_view,
     list_schedules_view,
     reschedule_booking_action,
     resolve_admin_context,
@@ -81,7 +82,10 @@ async def sessionmaker() -> AsyncIterator[Sessionmaker]:
 async def _seed_tenant(
     maker: Sessionmaker, *, slug: str = "acme", email: str = "host@example.com"
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    """Create a tenant + its single host user; return ``(tenant_id, host_user_id)``."""
+    """Create a tenant + one host user; return ``(tenant_id, host_id)``.
+
+    The host id is now RETURNED rather than guessed by the service: RF-30 made it a form field, so
+    every caller states which host it means (see ``test_admin_hosts.py``)."""
     async with maker() as session, session.begin():
         tenant = Tenant(slug=slug, name=slug.title())
         session.add(tenant)
@@ -101,6 +105,17 @@ async def _schedule_id(maker: Sessionmaker, *, tenant_slug: str, name: str = "We
     return created.id
 
 
+async def _only_host(maker: Sessionmaker, *, tenant_slug: str | None) -> uuid.UUID:
+    """The tenant's ONE host. These suites seed exactly one, and say so.
+
+    RF-30 made the host an explicit field, so a helper may no longer leave it to the service to
+    guess. It is stated here instead — and the multi-host behaviour it used to hide has its own
+    suite (``test_admin_hosts.py``)."""
+    hosts = await list_hosts_view(maker, tenant_slug=tenant_slug)
+    assert len(hosts) == 1, "this helper assumes a single-host tenant"
+    return hosts[0].id
+
+
 async def _make_event_type(
     maker: Sessionmaker,
     *,
@@ -112,6 +127,7 @@ async def _make_event_type(
         maker,
         tenant_slug=tenant_slug,
         form=EventTypeForm(
+            host_id=await _only_host(maker, tenant_slug=tenant_slug),
             slug=slug,
             title="Intro",
             schedule_id=schedule_id,
@@ -147,12 +163,17 @@ async def _book(
 # --------------------------------------------------------------------------------------
 
 
-async def test_resolve_context_finds_the_single_tenant_and_host(sessionmaker: Sessionmaker) -> None:
-    tenant_id, host_id = await _seed_tenant(sessionmaker)
+async def test_resolve_context_finds_the_single_tenant(sessionmaker: Sessionmaker) -> None:
+    """The context resolves the TENANT and nothing else.
+
+    It used to resolve a host too — the tenant's ``.first()`` user — and inject it as the host of
+    every event type the admin created. That field was the whole of the RF-30 defect, so it is gone
+    rather than fixed: the host is a choice, and it belongs on the form."""
+    tenant_id, _host_id = await _seed_tenant(sessionmaker)
     async with sessionmaker() as session:
         ctx = await resolve_admin_context(session, tenant_slug=None)
     assert ctx.tenant_id == tenant_id
-    assert ctx.host_user_id == host_id
+    assert not hasattr(ctx, "host_user_id")
 
 
 async def test_resolve_context_by_slug_picks_the_named_tenant(sessionmaker: Sessionmaker) -> None:
@@ -284,6 +305,7 @@ async def test_event_type_create_list_update_deactivate(sessionmaker: Sessionmak
         sessionmaker,
         tenant_slug=None,
         form=EventTypeForm(
+            host_id=await _only_host(sessionmaker, tenant_slug=None),
             slug="intro",
             title="Intro Call",
             schedule_id=schedule_id,
@@ -320,6 +342,7 @@ async def test_duplicate_event_type_slug_is_an_action_error(sessionmaker: Sessio
             sessionmaker,
             tenant_slug=None,
             form=EventTypeForm(
+                host_id=await _only_host(sessionmaker, tenant_slug=None),
                 slug="dup",
                 title="Second",
                 schedule_id=schedule_id,
@@ -337,6 +360,7 @@ async def test_invalid_event_type_bounds_are_an_action_error(sessionmaker: Sessi
             sessionmaker,
             tenant_slug=None,
             form=EventTypeForm(
+                host_id=await _only_host(sessionmaker, tenant_slug=None),
                 slug="bad",
                 title="Bad",
                 schedule_id=schedule_id,
@@ -366,6 +390,7 @@ async def test_create_event_type_action_persists_the_en_translations(
         sessionmaker,
         tenant_slug=None,
         form=EventTypeForm(
+            host_id=await _only_host(sessionmaker, tenant_slug=None),
             slug="intro",
             title="Introducción",
             schedule_id=schedule_id,

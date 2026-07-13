@@ -20,12 +20,13 @@ from aethercal.schemas.workflows import (
     TEMPLATE_VARIABLES,
     WORKFLOW_TRIGGER_NAMES,
 )
-from aethercal.server.admin.format import ALL_EVENT_TYPES
+from aethercal.server.admin.format import ALL_EVENT_TYPES, SHARED_SCHEDULE
 from aethercal.server.admin.state import AdminState
 from aethercal.ui import Calendar
 
 _NAV = (
     ("Agenda", "/"),
+    ("Hosts", "/hosts"),
     ("Event types", "/event-types"),
     ("Schedules", "/schedules"),
     ("Rules", "/workflows"),
@@ -269,6 +270,194 @@ def bookings_page() -> rx.Component:
 
 
 # --------------------------------------------------------------------------------------
+# Hosts, the host selector, and where a host's bookings are written (RF-30).
+# --------------------------------------------------------------------------------------
+
+
+def _host_option(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.select.item(row["name"], value=row["id"])
+
+
+def _host_select(*, required: bool) -> rx.Component:
+    """The host an event type belongs to. ==The field whose absence WAS the RF-30 defect.==
+
+    With no host field, the service took the tenant's first user — so a business's second host could
+    never be given an event type, and nothing ever said so. It is required: there is no sensible
+    default, and a default is precisely what went wrong.
+    """
+    return rx.select.root(
+        rx.select.trigger(placeholder="Host"),
+        rx.select.content(rx.foreach(AdminState.hosts, _host_option)),
+        name="host_id",
+        required=required,
+    )
+
+
+def _owner_select() -> rx.Component:
+    """Who owns a weekly pattern: one host, or the BUSINESS (every host may use it).
+
+    ``(business)`` is an explicit option rather than the blank one. A schedule shared by two hosts
+    on purpose and a schedule two hosts share because nobody was ever asked look identical in the
+    database — the difference is only ever made here.
+    """
+    return rx.select.root(
+        rx.select.trigger(placeholder="Owner (blank = the whole business)"),
+        rx.select.content(
+            rx.select.item(SHARED_SCHEDULE, value=SHARED_SCHEDULE),
+            rx.foreach(AdminState.hosts, _host_option),
+        ),
+        name="owner_id",
+    )
+
+
+def _host_table_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(row["name"]),
+        rx.table.cell(row["email"]),
+        rx.table.cell(row["timezone"]),
+        rx.table.cell(
+            rx.button(
+                "Calendars",
+                on_click=AdminState.select_host(row["id"]),
+                variant="soft",
+                size="1",
+            )
+        ),
+        rx.table.cell(
+            rx.button(
+                "Delete",
+                on_click=AdminState.delete_host(row["id"]),
+                color_scheme="red",
+                variant="soft",
+                size="1",
+            )
+        ),
+        rx.table.cell(rx.code(row["id"])),
+    )
+
+
+def _connection_table_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(row["account"]),
+        rx.table.cell(row["calendar"]),
+        rx.table.cell(rx.code(row["id"])),
+    )
+
+
+def _connections_panel() -> rx.Component:
+    """A host's connected calendar accounts, and the calendar each one writes bookings into.
+
+    EVERY connection, not the first: the read path unions them all, and a connection the panel never
+    showed is a calendar whose busy times nobody could designate — an ignored busy set is a
+    double-booking waiting to happen.
+    """
+    return rx.cond(
+        AdminState.selected_host_id != "",
+        rx.card(
+            rx.vstack(
+                rx.heading("Connected calendars", size="4"),
+                rx.text(
+                    "Send this host's bookings to a DEDICATED calendar — never the primary "
+                    "calendar "
+                    "of a personal account. One target per host: designating a new one retires the "
+                    "old.",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                rx.table.root(
+                    rx.table.header(
+                        rx.table.row(
+                            rx.table.column_header_cell("Account"),
+                            rx.table.column_header_cell("Bookings are written to"),
+                            rx.table.column_header_cell("Connection id"),
+                        )
+                    ),
+                    rx.table.body(rx.foreach(AdminState.connections, _connection_table_row)),
+                    width="100%",
+                ),
+                rx.form(
+                    rx.vstack(
+                        rx.input(name="connection_id", placeholder="Connection id", required=True),
+                        rx.input(
+                            name="calendar_id",
+                            placeholder="Calendar id (e.g. bookings@group.calendar.google.com)",
+                            required=True,
+                        ),
+                        rx.button("Designate", type="submit"),
+                        spacing="3",
+                        width="100%",
+                        max_width="28em",
+                    ),
+                    on_submit=AdminState.designate_calendar,
+                    reset_on_submit=True,
+                ),
+                spacing="3",
+                width="100%",
+            ),
+        ),
+    )
+
+
+def hosts_page() -> rx.Component:
+    """Hosts (RF-30): who takes the bookings, and where their calendar events are written."""
+    return _shell(
+        "Hosts",
+        _error(AdminState.error),
+        rx.text(
+            "Every event type belongs to one host, and their availability is what its slots are "
+            "computed from. A host who still hosts an event type, or owns a schedule, cannot be "
+            "deleted.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell("Name"),
+                    rx.table.column_header_cell("Email"),
+                    rx.table.column_header_cell("Timezone"),
+                    rx.table.column_header_cell("Calendars"),
+                    rx.table.column_header_cell("Actions"),
+                    rx.table.column_header_cell("Id"),
+                )
+            ),
+            rx.table.body(rx.foreach(AdminState.hosts, _host_table_row)),
+            width="100%",
+        ),
+        _connections_panel(),
+        rx.heading("Add a host", size="4"),
+        rx.form(
+            rx.vstack(
+                rx.input(name="name", placeholder="Name", required=True),
+                rx.input(name="email", placeholder="Email", required=True),
+                rx.input(name="timezone", placeholder="IANA timezone (default UTC)"),
+                rx.button("Add", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="24em",
+            ),
+            on_submit=AdminState.create_host,
+            reset_on_submit=True,
+        ),
+        rx.heading("Update a host", size="4"),
+        rx.form(
+            rx.vstack(
+                rx.input(name="id", placeholder="Host id", required=True),
+                rx.input(name="name", placeholder="Name", required=True),
+                rx.input(name="email", placeholder="Email", required=True),
+                rx.input(name="timezone", placeholder="IANA timezone (default UTC)"),
+                rx.button("Update", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="24em",
+            ),
+            on_submit=AdminState.update_host,
+            reset_on_submit=True,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Event types.
 # --------------------------------------------------------------------------------------
 
@@ -320,6 +509,10 @@ def event_types_page() -> rx.Component:
         rx.heading("Create an event type", size="4"),
         rx.form(
             rx.vstack(
+                # RF-30. The form had NO host field, and the service filled the gap with the
+                # tenant's first user — so a business's second host could never be given an event
+                # type, silently. The choice is the operator's, and it is required.
+                _host_select(required=True),
                 rx.input(name="slug", placeholder="slug (e.g. intro-call)", required=True),
                 rx.input(name="title", placeholder="Title", required=True),
                 rx.input(name="title_en", placeholder="Title (English, optional)"),
@@ -379,6 +572,9 @@ def _schedule_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
         rx.table.cell(row["name"]),
         rx.table.cell(row["timezone"]),
         rx.table.cell(row["weekdays"]),
+        # RF-30: whose pattern this is. "(business)" means every host may use it — a decision, and
+        # not the same thing as two hosts sharing a schedule because nobody was ever asked.
+        rx.table.cell(row["owner"]),
         rx.table.cell(row["id"]),
         rx.table.cell(
             rx.button(
@@ -403,6 +599,7 @@ def schedules_page() -> rx.Component:
                     rx.table.column_header_cell("Name"),
                     rx.table.column_header_cell("Timezone"),
                     rx.table.column_header_cell("Weekdays"),
+                    rx.table.column_header_cell("Owner"),
                     rx.table.column_header_cell("Id"),
                     rx.table.column_header_cell("Actions"),
                 )
@@ -418,6 +615,7 @@ def schedules_page() -> rx.Component:
                 rx.input(
                     name="weekdays", placeholder="Weekdays CSV, 0=Mon..6=Sun (e.g. 0,1,2,3,4)"
                 ),
+                _owner_select(),
                 rx.input(name="start", type="time", placeholder="Start", required=True),
                 rx.input(name="end", type="time", placeholder="End", required=True),
                 rx.button("Create", type="submit"),
@@ -698,6 +896,7 @@ def workflows_page() -> rx.Component:
 __all__ = [
     "bookings_page",
     "event_types_page",
+    "hosts_page",
     "login_page",
     "schedules_page",
     "workflows_page",

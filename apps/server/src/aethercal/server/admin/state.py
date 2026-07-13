@@ -48,9 +48,12 @@ from aethercal.server.admin import service
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.format import (
     ALL_EVENT_TYPES,
+    SHARED_SCHEDULE,
     booking_event,
     booking_row,
+    connection_row,
     event_type_row,
+    host_row,
     parse_weekdays,
     schedule_row,
     template_row,
@@ -450,6 +453,33 @@ async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
     return [event_type_row(row) for row in rows]
 
 
+async def _fetch_hosts(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_hosts_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [host_row(row) for row in rows]
+
+
+async def _fetch_connections(runtime: AdminRuntime, host_id: uuid.UUID) -> list[dict[str, str]]:
+    rows = await service.list_connections_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, host_id=host_id
+    )
+    return [connection_row(row) for row in rows]
+
+
+def _owner_id(form_data: dict[str, str]) -> uuid.UUID | None:
+    """The host who owns a weekly pattern; the sentinel (or blank) → ``None`` = the BUSINESS.
+
+    ``None`` is a real value here, not an absence: a shared pattern is one every host may use. The
+    alternative — leaving the field off the form entirely, as it was — is how two hosts come to
+    share a schedule without anybody deciding they should (RF-30).
+    """
+    raw = _clean(form_data, "owner_id")
+    if not raw or raw == SHARED_SCHEDULE:
+        return None
+    return uuid.UUID(raw)
+
+
 async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
     rows = await service.list_workflows_view(
         runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
@@ -552,6 +582,14 @@ class AdminState(rx.State):
     # -- notification rules (RF-24) --------------------------------------------------
     workflows: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     templates: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- hosts + their connected calendars (RF-30) -----------------------------------
+    # ``hosts`` feeds the host SELECTOR on the event-type form (whose absence was the RF-30 defect)
+    # and the schedule-owner select, as well as the hosts table itself.
+    hosts: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # The connections of the host the operator is currently inspecting (they are per-host, so they
+    # are loaded on demand rather than for everybody).
+    connections: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    selected_host_id: str = ""
 
     # -- calendar (F2-F) ------------------------------------------------------------
     # The agenda's calendar events (active bookings) + the operator-selected view. The calendar
@@ -899,7 +937,12 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_event_types(self) -> None:
-        """Load event types + schedules (the create form needs the schedule choices)."""
+        """Load event types + schedules + HOSTS.
+
+        The hosts are what the RF-30 host selector is built from. Without them the form has no host
+        field, and the service used to fill the gap by taking the tenant's first user — which is the
+        whole reason a second host could never be given an event type.
+        """
         if not self._authenticated:
             return
         self.error = ""
@@ -907,6 +950,7 @@ class AdminState(rx.State):
             runtime = current_runtime()
             self.event_types = await _fetch_event_types(runtime)
             self.schedules = await _fetch_schedules(runtime)
+            self.hosts = await _fetch_hosts(runtime)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -918,6 +962,9 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             form = service.EventTypeForm(
+                # RF-30: the host the operator PICKED. This used to be injected from the context —
+                # the tenant's first user — so a second host could never be given an event type.
+                host_id=uuid.UUID(_clean(form_data, "host_id")),
                 slug=_clean(form_data, "slug"),
                 title=_clean(form_data, "title"),
                 schedule_id=_schedule_id(self.schedules, _clean(form_data, "schedule")),
@@ -1006,12 +1053,14 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_schedules(self) -> None:
-        """Load the tenant's schedules (``on_load``)."""
+        """Load the tenant's schedules + hosts (the owner select needs the hosts — RF-30)."""
         if not self._authenticated:
             return
         self.error = ""
         try:
-            self.schedules = await _fetch_schedules(current_runtime())
+            runtime = current_runtime()
+            self.schedules = await _fetch_schedules(runtime)
+            self.hosts = await _fetch_hosts(runtime)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -1025,6 +1074,10 @@ class AdminState(rx.State):
             data = ScheduleCreate(
                 name=_clean(form_data, "name"),
                 timezone=_clean(form_data, "timezone"),
+                # RF-30: whose pattern this is. Blank / the sentinel = the BUSINESS's, usable by
+                # every host. The field's absence is how two hosts came to share a schedule without
+                # anybody deciding they should.
+                user_id=_owner_id(form_data),
                 rules=weekly_rules(
                     parse_weekdays(_clean(form_data, "weekdays")),
                     _clean(form_data, "start"),
@@ -1074,6 +1127,121 @@ class AdminState(rx.State):
                 schedule_id=uuid.UUID(schedule_id),
             )
             self.schedules = await _fetch_schedules(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    # -- hosts + their connected calendars (RF-30) -----------------------------------
+
+    @rx.event
+    async def load_hosts(self) -> None:
+        """Load the tenant's hosts (``on_load`` of the hosts page)."""
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            self.hosts = await _fetch_hosts(current_runtime())
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_host(self, form_data: dict[str, str]) -> None:
+        """Add a host to the business."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.create_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                form=service.HostForm(
+                    name=_clean(form_data, "name"),
+                    email=_clean(form_data, "email"),
+                    timezone=_clean(form_data, "timezone") or "UTC",
+                ),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_host(self, form_data: dict[str, str]) -> None:
+        """Edit a host's name / email / timezone (all three are sent, not patched)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.update_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                host_id=uuid.UUID(_clean(form_data, "id")),
+                form=service.HostForm(
+                    name=_clean(form_data, "name"),
+                    email=_clean(form_data, "email"),
+                    timezone=_clean(form_data, "timezone") or "UTC",
+                ),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def delete_host(self, host_id: str) -> None:
+        """Remove a host — refused while an event type or a schedule of theirs still exists."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.delete_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                host_id=uuid.UUID(host_id),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            if self.selected_host_id == host_id:
+                self.selected_host_id = ""
+                self.connections = []
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def select_host(self, host_id: str) -> None:
+        """Show a host's connected calendar accounts (so their write target can be designated)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            self.connections = await _fetch_connections(runtime, uuid.UUID(host_id))
+            self.selected_host_id = host_id
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def designate_calendar(self, form_data: dict[str, str]) -> None:
+        """Send this connection's bookings to a NAMED calendar (the admin's ``--calendar-id``).
+
+        Until now ``"primary"`` was a hard-coded constant, so a host's bookings could only land in
+        the connected account's own primary calendar — a personal one, for anybody who connects a
+        real account.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.designate_calendar_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                connection_id=uuid.UUID(_clean(form_data, "connection_id")),
+                calendar_id=_clean(form_data, "calendar_id"),
+            )
+            if self.selected_host_id:
+                self.connections = await _fetch_connections(
+                    runtime, uuid.UUID(self.selected_host_id)
+                )
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)

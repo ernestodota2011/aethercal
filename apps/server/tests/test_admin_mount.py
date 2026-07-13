@@ -90,6 +90,7 @@ def test_build_admin_app_registers_every_page() -> None:
     assert set(app._unevaluated_pages) == {
         "index",
         "login",
+        "hosts",
         "event-types",
         "schedules",
         "workflows",
