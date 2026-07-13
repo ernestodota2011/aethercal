@@ -18,11 +18,11 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.schemas.bookings import require_iana_zone
 from aethercal.schemas.slots import SlotRead, SlotsResponse
 from aethercal.server.api.auth import AuthContext, require_api_key
 from aethercal.server.deps import get_session
@@ -62,10 +62,25 @@ def _unprocessable(error: str, message: str) -> HTTPException:
 
 
 def _require_iana_zone(tz: str) -> None:
-    """Reject a ``tz`` that is not a real IANA zone with a clean 422."""
+    """Reject a ``tz`` that is not a real IANA zone with a clean 422.
+
+    What counts as a real zone is NOT decided here. It is decided once, by
+    :func:`aethercal.schemas.bookings.require_iana_zone` — the same rule the guest's timezone is
+    held to on the way into a booking, and the host's on the way into ``services/users.py``. This
+    endpoint used to re-implement it (its own ``ZoneInfo(...)``, its own ``except``), which is how
+    ``/slots`` and ``/bookings`` would eventually have come to disagree about what a zone is: not
+    with a bang, but the day someone fixed one copy.
+
+    So all that is left here is a TRANSLATION. The rule refuses in the currency of the schema layer
+    (a ``ValueError``, worded for a Pydantic field); this endpoint owes its callers the currency of
+    the HTTP contract (a 422 with ``{"error", "message"}``). ==The message text is deliberately NOT
+    the rule's==: it is a published API string that the booking page and the SDK read, so it is
+    reproduced verbatim and pinned by ``test_slots_timezone_rule.py``. Reusing a rule is not licence
+    to reword a contract.
+    """
     try:
-        ZoneInfo(tz)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+        require_iana_zone(tz)
+    except ValueError as exc:
         raise _unprocessable(_INVALID_TIMEZONE, f"Unknown timezone: {tz!r}") from exc
 
 
