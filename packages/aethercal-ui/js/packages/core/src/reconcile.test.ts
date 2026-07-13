@@ -176,6 +176,78 @@ describe("reconcileReducer — causal ordering (discard stale responses)", () =>
   });
 });
 
+describe("reconcileReducer — optimistic resource moves (RF-28)", () => {
+  const homed = evt({ id: "e1", revision: 5, resourceId: "h1" });
+
+  it("renders a cross-row drag in the TARGET row while it is still pending", () => {
+    // Without this the bar would snap straight back to the old resource row the moment you dropped
+    // it, and only jump across once the server answered — the exact flicker optimistic UI exists to
+    // prevent.
+    const state = submit(initialReconcileState, { resourceId: "h2" });
+    const { events, pendingIds } = applyOverrides([homed], state);
+    expect(events[0]?.resourceId).toBe("h2");
+    expect(pendingIds.has("e1")).toBe(true);
+  });
+
+  it("leaves the event's own resource alone when the mutation carries none", () => {
+    // A month/week/day drop has no resource dimension; it must not blank the event's row.
+    const state = submit(initialReconcileState);
+    expect(applyOverrides([homed], state).events[0]?.resourceId).toBe("h1");
+  });
+
+  it("keeps the event in the target row once the server confirms the move", () => {
+    const state = reconcileReducer(submit(initialReconcileState, { resourceId: "h2" }), {
+      type: "RESOLVE",
+      id: "e1",
+      clientMutationId: "cm-1",
+      start: "2026-07-16T10:00:00",
+      end: "2026-07-16T11:00:00",
+      revision: 6,
+      resourceId: "h2",
+    });
+    expect(applyOverrides([homed], state).events[0]?.resourceId).toBe("h2");
+  });
+
+  it("holds the submitted row when the server accepts but does not restate it", () => {
+    // The server said yes; a response that simply omits the resource must not be read as "moved back".
+    const state = reconcileReducer(submit(initialReconcileState, { resourceId: "h2" }), {
+      type: "RESOLVE",
+      id: "e1",
+      clientMutationId: "cm-1",
+      start: "2026-07-16T10:00:00",
+      end: "2026-07-16T11:00:00",
+      revision: 6,
+    });
+    expect(applyOverrides([homed], state).events[0]?.resourceId).toBe("h2");
+  });
+
+  it("returns the event to its authoritative row when the move is rejected", () => {
+    const state = reconcileReducer(submit(initialReconcileState, { resourceId: "h2" }), {
+      type: "REJECT",
+      id: "e1",
+      clientMutationId: "cm-1",
+    });
+    const { events, rolledBackIds } = applyOverrides([homed], state);
+    expect(events[0]?.resourceId).toBe("h1");
+    expect(rolledBackIds.has("e1")).toBe(true);
+  });
+
+  it("yields to the authoritative event once its revision catches up", () => {
+    const state = reconcileReducer(submit(initialReconcileState, { resourceId: "h2" }), {
+      type: "RESOLVE",
+      id: "e1",
+      clientMutationId: "cm-1",
+      start: "2026-07-16T10:00:00",
+      end: "2026-07-16T11:00:00",
+      revision: 6,
+      resourceId: "h2",
+    });
+    // The server's own copy has landed (revision 6) and is the truth from here on.
+    const authoritative = evt({ id: "e1", revision: 6, resourceId: "h2" });
+    expect(applyOverrides([authoritative], state).events[0]).toEqual(authoritative);
+  });
+});
+
 describe("applyOverrides — no overrides", () => {
   it("returns the events untouched when there is no in-flight mutation", () => {
     const events = [base, evt({ id: "e2", revision: 1 })];
