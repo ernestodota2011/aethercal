@@ -19,8 +19,23 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-WebhookEventName = Literal["booking.created", "booking.cancelled", "booking.rescheduled"]
-"""The events an AetherCal webhook can fan out. Kept in lockstep with the booking lifecycle."""
+WebhookEventName = Literal[
+    "booking.created",
+    "booking.cancelled",
+    "booking.rescheduled",
+    "booking.no_show",
+]
+"""The events an AetherCal webhook can fan out. Kept in lockstep with the booking lifecycle.
+
+This ``Literal`` is the SINGLE source: :data:`WEBHOOK_EVENTS`, the subscription validator
+(:data:`_EventList`), :class:`WebhookRead`, :class:`WebhookEnvelope` and the OpenAPI schema all
+derive from it, so an event is added here and nowhere else.
+
+``booking.no_show`` (RF-25) closes a real observability hole: a subscriber's CRM learned about a
+cancellation and about a reschedule, but a guest who simply never turned up was invisible to it.
+Widening the vocabulary needs NO data migration — ``Webhook.events`` is a JSON column, and nobody
+starts receiving the new event by accident, because an existing subscriber cannot have subscribed to
+an event that did not exist."""
 
 WEBHOOK_EVENTS: tuple[WebhookEventName, ...] = get_args(WebhookEventName)
 """The allowed event names as a tuple, for iteration/validation by callers."""

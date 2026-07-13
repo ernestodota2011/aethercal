@@ -579,6 +579,10 @@ async def mark_no_show(
     time has passed, so freeing it would corrupt history and let a booking be written retroactively
     over it. This is exactly why the ``WHERE status <> 'cancelled'`` partial index needed no change.
 
+    Fans out ``booking.no_show`` (RF-25) in the same transaction, so a subscriber's CRM finally sees
+    the one lifecycle outcome it was blind to: it learned about a cancellation and a reschedule, but
+    a guest who simply never turned up was invisible to it.
+
     Raises :class:`BookingNotFoundError` (404), :class:`BookingNotActiveError` (409, not confirmed)
     or :class:`BookingNotEndedError` (409, the appointment is still running or in the future).
     """
@@ -595,6 +599,20 @@ async def mark_no_show(
     booking.status = BookingStatus.NO_SHOW
     booking.no_show_at = now
     await session.flush()
+    # Fan the event out (RF-25) in the SAME transaction as the status change — exactly like the
+    # cancel and the reschedule. The flush above is what makes `_serialize_booking` carry the status
+    # this transition just wrote instead of the `confirmed` it came in with.
+    #
+    # Queued only on the REAL transition: the idempotent early return above never reaches this line,
+    # so a retried admin click cannot tell a subscriber the guest failed to show up TWICE for one
+    # appointment — nor inflate the host's no-show rate with a duplicate.
+    await enqueue_event(
+        session,
+        tenant_id=tenant_id,
+        event="booking.no_show",
+        data=_serialize_booking(booking),
+        now=now,
+    )
     # Materialise the `on_no_show` step and VOID the pending `after_end` follow-up — otherwise the
     # guest who did not show up receives "thanks for meeting with us".
     await apply_booking_transition(

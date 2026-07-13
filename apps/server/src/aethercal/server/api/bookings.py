@@ -33,6 +33,7 @@ from aethercal.server.services.bookings import (
     BookingEffects,
     BookingError,
     BookingNotActiveError,
+    BookingNotEndedError,
     BookingNotFoundError,
     BookingParams,
     EventTypeNotFoundError,
@@ -41,6 +42,7 @@ from aethercal.server.services.bookings import (
     create_booking,
     get_booking,
     list_bookings,
+    mark_no_show,
     reschedule_booking,
 )
 from aethercal.server.services.guest_tokens import (
@@ -72,8 +74,13 @@ def _http(code: int, error: str, message: str) -> HTTPException:
     return HTTPException(status_code=code, detail={"error": error, "message": message})
 
 
-def _map_booking_error(exc: BookingError) -> HTTPException:
-    """Translate a service domain error to its clean HTTP status (fixed, non-leaking messages)."""
+def _map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - it IS the table
+    """Translate a service domain error to its clean HTTP status (fixed, non-leaking messages).
+
+    One return per domain error is the contract, not a smell: every arm is a distinct machine code
+    the API promises its callers. Collapsing arms to satisfy a return-count lint is exactly how two
+    different failures start answering with the same code — and how "the appointment has not ended
+    yet" would reach an admin as "Booking could not be completed"."""
     match exc:
         case EventTypeNotFoundError():
             return _http(status.HTTP_404_NOT_FOUND, "not_found", "Event type not found")
@@ -85,8 +92,21 @@ def _map_booking_error(exc: BookingError) -> HTTPException:
                 "availability_unavailable",
                 "Host availability is temporarily unavailable; please try again",
             )
+        case BookingNotEndedError():
+            # Its OWN machine code, and BEFORE the generic conflict. Folding "the appointment has
+            # not happened yet" into `conflict` is how an admin ends up reading "Booking could not
+            # be completed" after clicking *no-show* on a meeting that is still running.
+            return _http(status.HTTP_409_CONFLICT, "not_ended", "The appointment has not ended yet")
         case BookingNotActiveError():
-            return _http(status.HTTP_409_CONFLICT, "not_active", "Booking cannot be rescheduled")
+            # Operation-neutral wording: this error is now raised by cancel/reschedule AND by
+            # no-show, so "Booking cannot be rescheduled" is simply false when the caller asked for
+            # something else. The machine CODE (`not_active`) is unchanged — the booking page
+            # localises off the code, never off this string.
+            return _http(
+                status.HTTP_409_CONFLICT,
+                "not_active",
+                "Booking is not in a state that allows this operation",
+            )
         case SlotUnavailableError():
             return _http(
                 status.HTTP_409_CONFLICT, "slot_unavailable", "That time is no longer available"
@@ -242,6 +262,28 @@ async def cancel(
             booking_id=booking_id,
             now=_now(),
             effects=_build_effects(request),
+        )
+    except BookingError as exc:
+        raise _map_booking_error(exc) from exc
+    return await _read_model(session, booking)
+
+
+@router.post("/{booking_id}/no-show", response_model=BookingRead)
+async def no_show(booking_id: uuid.UUID, session: SessionDep, ctx: AuthDep) -> BookingRead:
+    """Mark a finished appointment as a no-show (RF-25). Idempotent; fans out ``booking.no_show``.
+
+    ==API key ONLY — deliberately no guest-token door.== Cancelling is the guest's own right, which
+    is why that route accepts a signed link; declaring that they failed to turn up is the HOST's
+    judgement ABOUT them. A guest-reachable no-show would let anyone holding an emailed link write
+    that judgement into the record themselves.
+
+    409 ``not_ended`` while the appointment is still running or in the future, 409 ``not_active`` if
+    it is not confirmed, 404 if the tenant has no such booking. The slot stays OCCUPIED: the time
+    has passed, and freeing it would let a booking be written retroactively over it.
+    """
+    try:
+        booking = await mark_no_show(
+            session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now()
         )
     except BookingError as exc:
         raise _map_booking_error(exc) from exc
