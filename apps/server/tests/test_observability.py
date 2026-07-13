@@ -231,7 +231,13 @@ async def test_a_claimed_row_whose_lease_expired_is_reported(sqlite_session: Asy
 async def test_the_no_show_rate_is_taken_over_the_appointments_that_should_have_happened(
     sqlite_session: AsyncSession,
 ) -> None:
-    """A cancelled booking was never expected to be attended, so it is not in the denominator."""
+    """A cancelled booking was never expected to be attended, so it is not in the denominator.
+
+    Neither is one that has not happened YET — which is exactly what this test used to seed, and
+    then assert a rate over. Every booking below was stamped in the FUTURE and the gauge still came
+    out at 0.25, because the denominator was ``no_show + confirmed`` with no clock in it at all. The
+    appointments are held in the PAST now, and the test finally says what its own name claimed.
+    """
     tenant, event_type = await _tenant_with_event_type(sqlite_session)
     statuses = [
         BookingStatus.CONFIRMED,
@@ -242,14 +248,51 @@ async def test_the_no_show_rate_is_taken_over_the_appointments_that_should_have_
     ]
     for index, status in enumerate(statuses):
         await _booking(
-            sqlite_session, tenant, event_type, status=status, start=_NOW + timedelta(days=index)
+            sqlite_session,
+            tenant,
+            event_type,
+            status=status,
+            start=_NOW - timedelta(days=index + 1),  # all of them are OVER
         )
 
     snapshot = await collect_metrics(sqlite_session, now=_NOW)
 
     assert snapshot.bookings_by_status["no_show"] == 1
     assert snapshot.bookings_by_status["cancelled"] == 1
-    assert snapshot.no_show_ratio == 0.25  # 1 / (1 no-show + 3 confirmed)
+    assert snapshot.no_show_ratio == 0.25  # 1 / (1 no-show + 3 confirmed that were HELD)
+
+
+async def test_an_appointment_that_has_not_happened_is_not_in_the_no_show_rate(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The gauge fell every time a booking was taken.==
+
+    ``confirmed`` is every booking still in the diary, so an instance with one real no-show and a
+    week of upcoming appointments reported a no-show rate near ZERO — and an alarm built on that
+    gauge would have fired least exactly when the diary was busiest. A rate that improves on its own
+    when business is good is not a measurement.
+    """
+    tenant, event_type = await _tenant_with_event_type(sqlite_session)
+    await _booking(
+        sqlite_session,
+        tenant,
+        event_type,
+        status=BookingStatus.NO_SHOW,
+        start=_NOW - timedelta(days=1),
+    )
+    for day in range(1, 10):  # nine appointments still to come
+        await _booking(
+            sqlite_session,
+            tenant,
+            event_type,
+            status=BookingStatus.CONFIRMED,
+            start=_NOW + timedelta(days=day),
+        )
+
+    snapshot = await collect_metrics(sqlite_session, now=_NOW)
+
+    assert snapshot.bookings_by_status["confirmed"] == 9  # they ARE on the books...
+    assert snapshot.no_show_ratio == 1.0  # ...and not one of them has been attended yet
 
 
 async def test_the_no_show_rate_of_an_empty_instance_is_zero_not_a_crash(

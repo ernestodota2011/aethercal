@@ -54,6 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.db.models import Booking, Outbox, OutboxStatus, WebhookDelivery
+from aethercal.server.db.models.booking import held_filter
 from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.webhooks.delivery import DELIVERY_FAILURE_REASONS
 
@@ -248,14 +249,30 @@ async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSna
             continue
         webhooks_by_reason[reason] = count
 
-    attended = bookings[BookingStatus.NO_SHOW.value] + bookings[BookingStatus.CONFIRMED.value]
+    # The appointments that already SHOULD have happened — never "no_show + confirmed", which is
+    # what this counted before. ``confirmed`` is every booking still in the diary, so an instance
+    # with one real no-show and ninety-nine appointments next week reported a 1 % rate; worse, the
+    # FELL every time a booking was taken, so an alarm built on it would fire least exactly when the
+    # diary was busiest. The predicate has ONE owner now (``held_filter``), because this module and
+    # the admin's health panel both publish this number and had already drifted into the same error.
+    held = held_filter(now)
+    expected = (
+        await session.scalar(sa.select(sa.func.count()).select_from(Booking).where(held))
+    ) or 0
+    absent = (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Booking)
+            .where(held, Booking.status == BookingStatus.NO_SHOW.value)
+        )
+    ) or 0
     return MetricsSnapshot(
         outbox_by_status=by_status,
         outbox_due=outbox_due,
         outbox_oldest_due_age_seconds=_age_seconds(oldest_due, now=now),
         outbox_expired_leases=expired_leases,
         bookings_by_status=bookings,
-        no_show_ratio=(bookings[BookingStatus.NO_SHOW.value] / attended) if attended else 0.0,
+        no_show_ratio=(absent / expected) if expected else 0.0,
         webhook_deliveries_by_status=webhooks_by_status,
         webhook_deliveries_by_reason=webhooks_by_reason,
     )

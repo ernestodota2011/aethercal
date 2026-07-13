@@ -49,6 +49,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.db.models.booking import held_filter
 from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services import calendars as calendars_service
@@ -599,11 +600,27 @@ class AdminMetrics:
     instance; unbounded growth from the moment nothing drains — which is the failure nobody sees,
     because the bookings keep confirming and only the messages stop."""
     bookings_by_status: dict[str, int]
+    appointments_expected: int
+    """The appointments that ALREADY SHOULD HAVE HAPPENED — the denominator of the no-show rate, and
+    the reason it is not simply "no-show + confirmed" (see ``held_filter``, which owns the rule).
+
+    ``CONFIRMED`` is every booking still IN THE DIARY, including every one nobody has attended yet
+    because it has not happened. Counting those made the rate FALL every time a booking was taken:
+    a business with one real no-show and ninety-nine appointments next week read **1 %** when the
+    truth was **100 %**, and a reminder rule that did not work would have looked like a success on
+    any week the diary filled up.
+
+    Published ALONGSIDE the ratio rather than hidden inside it, so the panel can say what the
+    percentage is a percentage of. A rate with no visible denominator is a number an operator has to
+    take on trust — and this is the one they trusted."""
     no_show_ratio: float
-    """No-shows over the appointments that were SUPPOSED to happen (no-show + confirmed).
+    """No-shows over :attr:`appointments_expected`.
 
     ==Cancelled bookings are not in the denominator.== Nobody was ever expected to attend them, and
-    counting them would make a host's no-show rate improve simply because more people cancelled."""
+    counting them would make a host's rate improve simply because more people cancelled.
+
+    A confirmed booking whose hour has PASSED counts as attended: nobody marked the guest absent,
+    and silence from a host who was in the room is the only evidence there is."""
 
 
 def _age_seconds(moment: datetime | None, *, now: datetime) -> float:
@@ -670,13 +687,36 @@ async def metrics_view(
         ):
             bookings[BookingStatus(status).value] = count
 
-        expected = bookings[BookingStatus.NO_SHOW.value] + bookings[BookingStatus.CONFIRMED.value]
+        # The appointments that already SHOULD have happened — NOT "no_show + confirmed", which is
+        # what this counted before and what put every booking still in the diary into the
+        # denominator. ``held_filter`` owns the rule (this panel and the operator's Prometheus gauge
+        # both publish this rate, and separately they had already drifted into the same error).
+        held = held_filter(moment)
+        expected = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(Booking.tenant_id == ctx.tenant_id, held)
+            )
+        ) or 0
+        absent = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(
+                    Booking.tenant_id == ctx.tenant_id,
+                    held,
+                    Booking.status == BookingStatus.NO_SHOW.value,
+                )
+            )
+        ) or 0
         return AdminMetrics(
             outbox_by_status=by_status,
             outbox_due=outbox_due,
             outbox_oldest_due_age_seconds=_age_seconds(oldest_due, now=moment),
             bookings_by_status=bookings,
-            no_show_ratio=(bookings[BookingStatus.NO_SHOW.value] / expected) if expected else 0.0,
+            appointments_expected=expected,
+            no_show_ratio=(absent / expected) if expected else 0.0,
         )
 
 

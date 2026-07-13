@@ -277,3 +277,106 @@ async def test_the_no_show_rate_is_this_businesss_own(maker: Sessionmaker) -> No
 
     assert alpha.no_show_ratio == 0.0  # beta's no-show is beta's business
     assert alpha.bookings_by_status[BookingStatus.NO_SHOW.value] == 0
+
+
+# --------------------------------------------------------------------------------------
+# The denominator is the appointments that ALREADY SHOULD HAVE HAPPENED.
+# --------------------------------------------------------------------------------------
+
+#: The next day, 09:00 — inside the weekly pattern, and comfortably AFTER ``_NOW``. A booking here
+#: has not happened yet, so nobody can have failed to show up to it.
+_TOMORROW = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
+
+
+async def test_a_future_booking_is_not_an_appointment_somebody_attended(
+    maker: Sessionmaker,
+) -> None:
+    """==The rate must not count appointments that have not happened yet.==
+
+    ``CONFIRMED`` includes every booking still in the diary. Put those in the denominator and one
+    real no-show among a week of upcoming appointments reads as a rate near zero — the host is told
+    their reminders are working, on the strength of meetings nobody has attended yet.
+    """
+    tenant_id, event_type_id = await _business(maker, slug="acme")
+    past = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
+    await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_TOMORROW)
+    await mark_no_show_action(maker, tenant_slug="acme", booking_id=past, now=_NOW)
+
+    metrics = await metrics_view(maker, tenant_slug="acme", now=_NOW)
+
+    # One appointment was meant to happen. Nobody came to it.
+    assert metrics.appointments_expected == 1
+    assert metrics.no_show_ratio == 1.0
+
+
+async def test_the_rate_does_not_improve_just_because_the_diary_filled_up(
+    maker: Sessionmaker,
+) -> None:
+    """==A metric that gets better on its own when business is good measures nothing.==
+
+    This is the failure that makes the bug worse than a wrong number. With future bookings in the
+    denominator, the no-show rate FALLS every time a new appointment is taken — so a reminder rule
+    that does not work looks like a success on any week the diary fills. And deciding whether the
+    reminders work is exactly what this batch built the number for.
+    """
+    tenant_id, event_type_id = await _business(maker, slug="acme")
+    past = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
+    await mark_no_show_action(maker, tenant_slug="acme", booking_id=past, now=_NOW)
+    before = await metrics_view(maker, tenant_slug="acme", now=_NOW)
+
+    # The diary fills up: nine more appointments tomorrow, not one of them yet held.
+    for index in range(9):
+        await _book(
+            maker,
+            tenant_id=tenant_id,
+            event_type_id=event_type_id,
+            start=_TOMORROW + timedelta(minutes=30 * index),
+        )
+
+    after = await metrics_view(maker, tenant_slug="acme", now=_NOW)
+
+    assert before.no_show_ratio == 1.0
+    assert after.no_show_ratio == 1.0, (
+        "the rate moved because bookings arrived, not because anyone attended"
+    )
+    assert after.bookings_by_status[BookingStatus.CONFIRMED.value] == 9  # they ARE on the books...
+    assert after.appointments_expected == 1  # ...and not one of them has happened yet
+
+
+async def test_a_confirmed_appointment_that_has_ended_counts_as_attended(
+    maker: Sessionmaker,
+) -> None:
+    """The other half of the rule: a confirmed booking whose hour has PASSED is one the guest turned
+    up to (nobody marked them absent), so it belongs in the denominator and pulls the rate down."""
+    tenant_id, event_type_id = await _business(maker, slug="acme")
+    absent = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
+    await _book(
+        maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT + timedelta(hours=1)
+    )
+    await mark_no_show_action(maker, tenant_slug="acme", booking_id=absent, now=_NOW)
+
+    metrics = await metrics_view(maker, tenant_slug="acme", now=_NOW)
+
+    assert metrics.appointments_expected == 2  # both were meant to happen; both did, in time
+    assert metrics.no_show_ratio == 0.5
+
+
+async def test_an_appointment_still_running_has_not_happened_yet(maker: Sessionmaker) -> None:
+    """The boundary is the END, not the start: a meeting that is under way RIGHT NOW cannot yet be
+    a no-show, and counting it would let a busy morning flatter the rate."""
+    tenant_id, event_type_id = await _business(maker, slug="acme")
+    # 11:30 → 12:00. Read the clock at 11:45 and this appointment is happening as we look at it.
+    mid_appointment = datetime(2026, 7, 6, 11, 45, tzinfo=UTC)
+    await _book(
+        maker,
+        tenant_id=tenant_id,
+        event_type_id=event_type_id,
+        start=datetime(2026, 7, 6, 11, 30, tzinfo=UTC),
+    )
+    absent = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
+    await mark_no_show_action(maker, tenant_slug="acme", booking_id=absent, now=mid_appointment)
+
+    metrics = await metrics_view(maker, tenant_slug="acme", now=mid_appointment)
+
+    assert metrics.appointments_expected == 1  # only the 09:00 one is over
+    assert metrics.no_show_ratio == 1.0

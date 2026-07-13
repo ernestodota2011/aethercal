@@ -122,6 +122,39 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
 
 
+def held_filter(now: _dt.datetime) -> sa.ColumnElement[bool]:
+    """The appointments that ALREADY SHOULD HAVE HAPPENED — the denominator of the no-show rate.
+
+    Declared ONCE, on the model, for exactly the reason
+    :func:`~aethercal.server.db.models.outbox.due_filter` is: ==two readers must agree.== The
+    operator's Prometheus gauge (``observability.collect_metrics``) and the tenant's health panel
+    (``admin.metrics_view``) both publish this rate, and written out separately they were already
+    wrong in the same way — each counted ``no_show + confirmed``, with no clock in the predicate at
+    all.
+
+    .. rubric:: Why ``confirmed`` alone is the wrong denominator
+
+    ``CONFIRMED`` is every booking still IN THE DIARY, including every one nobody has attended yet
+    because it has not happened. Count those and a business with one real no-show and ninety-nine
+    appointments next week reads **1 %** when the truth is **100 %**.
+
+    And it is worse than a wrong number: ==the rate FALLS every time a booking is taken.== A metric
+    that improves on its own when business is good is not measuring anything — and this is the
+    number the notification engine is meant to be judged by, so a reminder rule that does not work
+    would look like a success on any week the diary filled up.
+
+    The boundary is therefore the END of the appointment, not its start: a meeting under way right
+    now cannot yet be a no-show. A ``confirmed`` booking whose hour has passed counts as ATTENDED —
+    nobody marked the guest absent, and silence from a host who was in the room is the only evidence
+    there is. ``cancelled`` and ``pending`` are absent by construction: nobody was ever expected to
+    attend them.
+    """
+    return sa.and_(
+        Booking.status.in_((BookingStatus.NO_SHOW.value, BookingStatus.CONFIRMED.value)),
+        Booking.end_at <= now,
+    )
+
+
 class GuestToken(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     """A signed, expiring, single-use token letting a guest cancel/reschedule without an account
     (RF-09). Only the hash is stored; ``used_at`` records logical single use."""
