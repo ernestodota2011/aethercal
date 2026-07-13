@@ -85,7 +85,10 @@ const EVENT_RESOURCE: Readonly<Record<string, string>> = {
   "m-b": "beto",
   "m-c": "dani",
   "m-d": "cami",
-  // "m-e" is deliberately left out — it demonstrates the unassigned row.
+  "m-launch": "beto",
+  "m-holiday": "sala",
+  // "m-e" is deliberately left out — the only one — so the unassigned row has exactly what the
+  // docstring above promises: one orphan, not three.
 };
 
 export function buildSampleEvents(today: Date): CalendarEvent[] {
