@@ -40,6 +40,7 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.db.models.workflows import Workflow, WorkflowStep, WorkflowTrigger
+from aethercal.server.integrations.messaging.guard import DailyCaps
 from aethercal.server.services.bookings import (
     BookingParams,
     cancel_booking,
@@ -540,12 +541,18 @@ async def _booking_with_whatsapp_step(
 
 
 class _RecordingChannelSender:
-    """A configured WhatsApp sender, so "nobody could send it" is NEVER why a test passes."""
+    """A configured WhatsApp sender, so "nobody could send it" is NEVER why a test passes.
+
+    It carries ``caps`` because a PHONE sender without them is unrepresentable: the registry's value
+    type is ``PhoneChannelSender``, which is how "fail-closed" is expressed as a type rather than as
+    a comment. A generous ceiling here, so the CAP is never the accidental reason a test goes green
+    — the tests that mean to exercise the cap set it themselves."""
 
     channel = Channel.WHATSAPP
 
-    def __init__(self) -> None:
+    def __init__(self, caps: DailyCaps | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.caps = caps or DailyCaps(per_phone=100, per_ip=100)
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
         self.sent.append((to, body))
@@ -591,17 +598,20 @@ async def test_a_phone_WITHOUT_consent_is_never_messaged(
     assert not any("channel-unconfigured" in message for message in messages)
 
 
-async def test_a_phone_WITH_consent_gets_PAST_the_consent_gate(
+async def test_a_phone_WITH_consent_is_ACTUALLY_MESSAGED(
     migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The other half of the gate, and it has to be asserted or the tests above pass for free — a
-    handler that skipped EVERYTHING would satisfy them all.
+    handler that skipped EVERYTHING would satisfy every one of them.
 
-    With consent recorded and the channel configured, the step gets past the consent gate. It still
-    stops, but at a DIFFERENT wall: the template renderer, which is the channels cut's to build. The
-    proof is the reason: ``no-template-renderer``, never ``no-phone-consent``. When that renderer
-    lands, this step sends, and it sends because the gate opened here.
-    """
+    This test used to stop at ``no-template-renderer``: consent opened the gate, and the step then
+    hit the missing renderer. ==That renderer has landed, so the promise this test was holding open
+    is now due:== with consent recorded and the channel configured, the guest is REALLY messaged.
+    The body is rendered from the built-in template, the step settles ``delivered``, and the ledger
+    row that makes it exactly-once is written with its (kind, channel, step) identity.
+
+    A version of this test that still accepted ``skipped`` would be the silent no-op in its purest
+    form: green, and hiding the fact that no message ever goes out."""
     _tenant_id, booking_id = await _booking_with_whatsapp_step(
         migrated, phone="+13055551234", consented_at=_NOW
     )
@@ -610,14 +620,35 @@ async def test_a_phone_WITH_consent_gets_PAST_the_consent_gate(
     with caplog.at_level("WARNING"):
         step = await _drain_whatsapp(migrated, booking_id, whatsapp)
 
-    assert step.status == "skipped"
+    assert step.status == "delivered", f"the consented guest was never messaged: {step.status}"
+    assert len(whatsapp.sent) == 1, "no WhatsApp message reached the sender"
+    recipient, body = whatsapp.sent[0]
+    assert recipient == "+13055551234"
+    # A REAL body, rendered from the built-in reminder template — not an empty string, and not a
+    # template with its holes still in it.
+    assert body.strip(), "an EMPTY body was sent to a real phone number"
+    assert "{{" not in body, f"an unsubstituted placeholder shipped to a guest: {body!r}"
+
     messages = [record.getMessage() for record in caplog.records]
-    # It got THROUGH consent — it stopped later, at the missing renderer.
-    assert any("no-template-renderer" in message for message in messages), (
-        "the consented step did not reach the renderer: the consent gate rejected it"
-    )
     assert not any("no-phone-consent" in message for message in messages)
-    assert not any("no-phone:" in message for message in messages)
+    assert not any("no-template" in message for message in messages)
+
+    # The ledger row is what stops a second send — keyed on (kind, channel, step).
+    async with migrated() as session:
+        ledger = list(
+            (
+                await session.scalars(
+                    select(SentNotification).where(SentNotification.channel == "whatsapp")
+                )
+            ).all()
+        )
+    assert len(ledger) == 1
+    assert ledger[0].step_id == uuid.UUID(str(step.payload["step_id"]))
+
+    # A re-drain sends nothing: the ledger, not luck, is what makes it exactly-once.
+    again = await _drain_whatsapp(migrated, booking_id, whatsapp)
+    assert again.status == "delivered"
+    assert len(whatsapp.sent) == 1, "the guest was messaged twice"
 
 
 async def test_WITHDRAWN_consent_closes_the_gate_again(

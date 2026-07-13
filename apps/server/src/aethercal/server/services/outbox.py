@@ -73,10 +73,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.channels import Channel, ChannelSender
+from aethercal.server.channels import Channel
 from aethercal.server.db.models import Booking, ExternalConnection, Outbox, Workflow
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
+from aethercal.server.integrations.messaging.guard import (
+    PhoneChannelSender,
+    SendRefused,
+    enforce_phone_cap,
+)
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.integrations.smtp.sender import EmailSender
 from aethercal.server.services.calendars import (
@@ -92,6 +97,12 @@ from aethercal.server.services.notifications import (
     compose_booking_notification,
     notification_already_sent,
     record_booking_notification,
+)
+from aethercal.server.services.templates import (
+    TemplateError,
+    build_template_context,
+    load_template,
+    render_template,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1633,10 +1644,12 @@ class _NotifyPlan:
     """What the step's send needs, snapshotted so the I/O touches no session."""
 
     booking_id: uuid.UUID
-    kind: NotificationKind
+    kind: str
+    """The ledger key. A ``str``, not a :class:`NotificationKind`: ``workflow_steps.kind`` is
+    free-text BY DESIGN, so a tenant may define a ``follow_up`` step and give it a template."""
     channel: Channel
     step_id: uuid.UUID
-    message: Any  # an EmailMessage for the email channel; a plain body for the others.
+    message: Any  # an EmailMessage for the email channel; a rendered plain body for the others.
     recipient: str
 
 
@@ -1646,7 +1659,7 @@ async def run_notify_effect(
     now: datetime,
     *,
     sender: EmailSender | None,
-    channels: Mapping[Channel, ChannelSender],
+    channels: Mapping[Channel, PhoneChannelSender],
 ) -> None:
     """Execute one workflow step: send its message on its channel (RF-24).
 
@@ -1655,14 +1668,19 @@ async def run_notify_effect(
 
     Two channel families, deliberately:
 
-    * **email** goes through the existing composer, not through the plain-body
-      :class:`ChannelSender`. That is what carries the ``.ics`` invite, and it is what keeps the
-      ledger key identical to the one the retired scheduler wrote — which is exactly what stops a
-      live booking being reminded twice.
-    * **whatsapp / sms** go through their :class:`ChannelSender`. An unconfigured channel is a
-      DISABLED FEATURE, not an error: the step is SKIPPED with its reason (:class:`OutboxSkipped`),
-      never failed. The channels cut registers its senders in ``channels`` and this dispatch picks
-      them up untouched.
+    * **email** goes through the existing composer, not through the plain-body sender. That is what
+      carries the ``.ics`` invite, and it is what keeps the ledger key identical to the one the
+      retired scheduler wrote — which is exactly what stops a live booking being reminded twice.
+    * **whatsapp / sms** go through their :class:`PhoneChannelSender`, with the body RENDERED from
+      the tenant's ``workflow_templates`` row (or the built-in fallback). An unconfigured channel is
+      a DISABLED FEATURE, not an error: the step is SKIPPED with its reason, never failed.
+
+    A send that the provider will NEVER accept (:class:`SendRefused` — a malformed number, an
+    over-cap recipient) is turned into an :class:`OutboxSkipped`: terminal, no attempt consumed, out
+    of the queue. A transient one (:class:`ChannelUnavailable`, a 5xx, a timeout) is left to
+    propagate, so the drain fails it and retries with backoff. Collapsing the two would either fill
+    the dead-letter with numbers that can never work, or throw away a message the provider would
+    have accepted a minute later.
     """
     async with sessionmaker() as session:
         plan = await _prepare_notify(session, work, now, sender=sender, channels=channels)
@@ -1670,12 +1688,19 @@ async def run_notify_effect(
     if plan is None:
         return
 
-    if plan.channel is Channel.EMAIL:
-        if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
-            raise RuntimeError("an email step reached the send with no configured SMTP sender")
-        await sender.send(plan.message)
-    else:  # pragma: no cover - unreachable until the channels cut registers a sender
-        await channels[plan.channel].send(to=plan.recipient, subject=None, body=str(plan.message))
+    try:
+        if plan.channel is Channel.EMAIL:
+            if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
+                raise RuntimeError("an email step reached the send with no configured SMTP sender")
+            await sender.send(plan.message)
+        else:
+            await channels[plan.channel].send(
+                to=plan.recipient, subject=None, body=str(plan.message)
+            )
+    except SendRefused as refused:
+        # The provider will never take this one. Retrying burns six attempts of backoff and
+        # dead-letters, and the message still does not arrive.
+        raise OutboxSkipped(str(refused)) from refused
 
     async with sessionmaker() as session, session.begin():
         booking = await session.get(Booking, plan.booking_id)
@@ -1697,7 +1722,10 @@ async def run_notify_effect(
 _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
-_NO_RENDERER = "no-template-renderer"
+_NO_TEMPLATE = "no-template"
+"""The kind has no body: no tenant ``workflow_templates`` row, and no built-in fallback for it."""
+_BAD_TEMPLATE = "bad-template"
+"""The body exists but will not render (an unknown variable, an expression). The TENANT fixes it."""
 _RULE_GONE = "workflow-gone"
 _RULE_PAUSED = "workflow-inactive"
 _TOO_LATE = "moment-passed"
@@ -1829,14 +1857,16 @@ async def _prepare_notify(
     now: datetime,
     *,
     sender: EmailSender | None,
-    channels: Mapping[Channel, ChannelSender],
+    channels: Mapping[Channel, PhoneChannelSender],
 ) -> _NotifyPlan | None:
-    """The step's READ phase: decide, then compose. ``None`` = nothing to send (stale, or already).
+    """The step's READ phase: decide, then compose/render. ``None`` = nothing to send.
 
     Raises :class:`OutboxSkipped` for anything that can NEVER work — an unconfigured channel, a
-    guest with no phone, a kind with no template renderer — so the step is retired instead of being
-    retried into the dead-letter. Raises :class:`OutboxDeferred` for anything that merely cannot run
-    YET — a rule the tenant has switched off — so the step WAITS instead of being destroyed."""
+    guest with no phone or no consent, a recipient over the channel's daily cap, a kind with no
+    template, a step whose moment has passed — so the step is retired with its reason instead of
+    being retried into the dead-letter. Raises :class:`OutboxDeferred` for anything that merely
+    cannot run YET — a rule the tenant has switched off — so the step WAITS instead of being
+    destroyed."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
@@ -1844,7 +1874,8 @@ async def _prepare_notify(
     payload = work.payload
     channel = Channel(payload["channel"])
     step_id = uuid.UUID(str(payload["step_id"]))
-    raw_kind = str(payload["kind"])
+    kind = str(payload["kind"])
+    locale = str(payload.get("locale", "es"))
     trigger = WorkflowTrigger(str(payload["trigger"]))
 
     if await _should_skip_as_stale(session, booking, work):
@@ -1853,18 +1884,10 @@ async def _prepare_notify(
 
     # May this step be sent NOW? The rule that queued it must still be switched on (else the step
     # WAITS — it is not destroyed), and its own moment must not have passed (else it is retired,
-    # which is also what bounds the waiting).
+    # which is also what bounds the waiting). It gates BOTH channel families, and it runs before any
+    # body is composed or rendered: a step from a switched-off rule must not reach a provider, and a
+    # step whose moment has gone must not be built at all.
     await _gate_on_the_rule(session, work, booking, trigger, now)
-
-    try:
-        kind = NotificationKind(raw_kind)
-    except ValueError as exc:
-        # A tenant-authored kind (a follow-up, say) has no built-in composer: its body comes from a
-        # ``workflow_templates`` row, and that renderer arrives with the channels/templates cut.
-        # Until then it is a switched-off feature, not a failure.
-        raise OutboxSkipped(
-            f"workflow step kind {raw_kind!r} has no template renderer yet"
-        ) from exc
 
     if await notification_already_sent(
         session, booking=booking, kind=kind, channel=channel, step_id=step_id
@@ -1874,42 +1897,117 @@ async def _prepare_notify(
         return None
 
     if channel is Channel.EMAIL:
-        if sender is None:
-            raise OutboxSkipped("the email channel has no configured SMTP sender")
-        message = await compose_booking_notification(
-            session,
-            kind=kind,
-            booking=booking,
-            # A workflow step carries no guest links — the same shape the retired reminder job used.
-            cancel_url=None,
-            reschedule_url=None,
-            locale=str(payload.get("locale", "es")),
-        )
-        return _NotifyPlan(
-            booking_id=booking.id,
-            kind=kind,
-            channel=channel,
-            step_id=step_id,
-            message=message,
-            recipient=booking.guest_email,
+        return await _prepare_notify_email(
+            session, booking=booking, kind=kind, step_id=step_id, locale=locale, sender=sender
         )
 
-    # THE CONSENT GATE, and it comes FIRST — before the channel registry, before the template, and
-    # before anything else. Not as a nicety of ordering: it must be impossible to reach a send plan
-    # for a phone we have no permission to message, however the checks below are later reordered.
+    # THE CONSENT GATE, and it comes FIRST — before the channel registry, before the cap, before the
+    # template. Not as a nicety of ordering: it must be impossible to reach a send plan for a phone
+    # we have no permission to message, however the checks below are later reordered.
     _require_phone_consent(booking, channel)
 
-    if channel not in channels:
+    phone_sender = channels.get(channel)
+    if phone_sender is None:
         raise OutboxSkipped(
             f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this instance "
             "(a channel without credentials is a disabled feature, not an error)"
         )
 
-    # A channel that IS configured still needs a body, and the renderer that builds one from
-    # ``workflow_templates`` arrives with the channels cut.
-    raise OutboxSkipped(
-        f"{_NO_RENDERER}: the {channel.value} channel has no template renderer yet "
-        "(workflow_templates)"
+    # THE CAP, before the render and long before the network call: an over-cap message is never
+    # built and never handed to a provider. The sender carries its own ceilings — a phone sender
+    # WITHOUT caps is unrepresentable (see PhoneChannelSender) — so there is no path through here
+    # that reaches a provider with no ceiling in force.
+    try:
+        await enforce_phone_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+    except SendRefused as refused:
+        raise OutboxSkipped(str(refused)) from refused
+
+    template = await load_template(
+        session, tenant_id=booking.tenant_id, channel=channel, kind=kind, locale=locale
+    )
+    if template is None:
+        # A tenant-authored kind with no body anywhere — no template row, and no built-in for it.
+        # An empty message is worse than no message, so the step is retired, and it says why.
+        raise OutboxSkipped(
+            f"{_NO_TEMPLATE}: the {channel.value} step of kind {kind!r} has no template for locale "
+            f"{locale!r}, and there is no built-in fallback for that kind"
+        )
+
+    context = await build_template_context(session, booking=booking, locale=locale)
+    try:
+        rendered = render_template(
+            template.body, subject=template.subject, context=context, channel=channel
+        )
+    except TemplateError as exc:
+        # A malformed template will not render on the tenth attempt either. Retire it and NAME it,
+        # so the tenant learns their template is broken rather than watching messages quietly fail
+        # to arrive.
+        raise OutboxSkipped(
+            f"{_BAD_TEMPLATE}: the {template.source} {channel.value} template for kind {kind!r} "
+            f"cannot be rendered: {exc}"
+        ) from exc
+
+    phone = booking.guest_phone
+    if phone is None:  # pragma: no cover - _require_phone_consent proved this above
+        raise OutboxSkipped(f"{_NO_PHONE}: the booking lost its phone number mid-flight")
+
+    return _NotifyPlan(
+        booking_id=booking.id,
+        kind=kind,
+        channel=channel,
+        step_id=step_id,
+        message=rendered.body,
+        recipient=phone,
+    )
+
+
+async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    kind: str,
+    step_id: uuid.UUID,
+    locale: str,
+    sender: EmailSender | None,
+) -> _NotifyPlan | None:
+    """The EMAIL branch: the built-in composer, which is what carries the ``.ics`` invite.
+
+    An email step keeps going through :func:`compose_booking_notification` rather than the
+    plain-body template path, for two reasons that are not stylistic: it is what attaches the
+    calendar invite, and it keeps the ledger key identical to the retired reminder scheduler's —
+    which is the thing that stops a live booking being reminded a second time.
+
+    So an email step's ``kind`` must be one of the four built-in ones. A tenant's own kind has no
+    composer here, and is retired with that reason rather than mailing something empty."""
+    if sender is None:
+        raise OutboxSkipped("the email channel has no configured SMTP sender")
+    try:
+        composer_kind = NotificationKind(kind)
+    except ValueError as exc:
+        raise OutboxSkipped(
+            f"{_NO_TEMPLATE}: the email step of kind {kind!r} has no built-in composer (the four "
+            "built-in kinds are the ones carrying the .ics invite); a custom kind is supported on "
+            "the phone channels, which render from workflow_templates"
+        ) from exc
+
+    message = await compose_booking_notification(
+        session,
+        kind=composer_kind,
+        booking=booking,
+        # A workflow step carries no guest links — the same shape the retired reminder job used.
+        cancel_url=None,
+        reschedule_url=None,
+        locale=locale,
+    )
+    return _NotifyPlan(
+        booking_id=booking.id,
+        kind=kind,
+        channel=Channel.EMAIL,
+        step_id=step_id,
+        message=message,
+        recipient=booking.guest_email,
     )
 
 
@@ -1923,7 +2021,7 @@ def make_booking_effect_executor(
     sessionmaker: Sessionmaker,
     sender: EmailSender | None,
     service_factory: ServiceFactory | None,
-    channels: Mapping[Channel, ChannelSender] | None = None,
+    channels: Mapping[Channel, PhoneChannelSender] | None = None,
 ) -> OutboxExecutor:
     """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
 
@@ -1932,9 +2030,13 @@ def make_booking_effect_executor(
     GOOGLE``, where the ``else`` silently *assumed* Google — so every new effect would have been
     executed as a Google Calendar call.
 
-    ``channels`` is the registry of non-email senders. It is EMPTY today, and that is not a gap: an
-    absent channel makes its steps SKIP with a reason, never fail. The channels cut registers its
-    WhatsApp/SMS senders here and needs to touch nothing else."""
+    ``channels`` is the registry of PHONE senders (email is deliberately not in it — it goes
+    through the composer, which carries the ``.ics``). Its value type is
+    :class:`PhoneChannelSender`, not a bare sender, and that is load-bearing rather than
+    decorative: such a sender carries the daily caps it must not exceed, so ==an uncapped
+    WhatsApp/SMS sender cannot be registered here at all==. Fail-closed as a TYPE, not as a comment.
+
+    An absent channel is not a gap: its steps SKIP with a reason, never fail."""
     registry = dict(channels or {})
 
     async def _execute(work: OutboxWork, now: datetime) -> None:

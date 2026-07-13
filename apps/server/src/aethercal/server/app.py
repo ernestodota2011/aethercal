@@ -38,10 +38,16 @@ from aethercal.schemas import ErrorResponse
 from aethercal.server.admin.mount import mount_admin
 from aethercal.server.api import api_router
 from aethercal.server.api.auth import AuthenticationError
+from aethercal.server.channels import Channel
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker, build_sync_engine
 from aethercal.server.db.migrate import run_migrations
+from aethercal.server.integrations.messaging.guard import PhoneChannelSender
+from aethercal.server.integrations.sms.config import TwilioConfig
+from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
+from aethercal.server.integrations.whatsapp.config import EvolutionConfig
+from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
@@ -100,6 +106,38 @@ def scheduler_intervals(settings: Settings) -> SchedulerIntervals:
     )
 
 
+def build_channel_senders(
+    http_client: httpx.AsyncClient, environ: Mapping[str, str] | None = None
+) -> dict[Channel, PhoneChannelSender]:
+    """The registry of PHONE channels (WhatsApp, SMS) this instance is configured for (RF-24).
+
+    ==Unlike :func:`build_email_sender` above, a misconfiguration here is NOT swallowed into
+    ``None``.== That asymmetry is deliberate, and it is the whole safety argument.
+
+    An unconfigured SMTP degrades to "no email goes out" — visible, and harmless. A phone channel
+    has a third state that email does not: **configured to send, but with no ceiling.** Its
+    recipient comes from the public booking form, so an uncapped channel can message strangers on
+    the operator's own WhatsApp/Twilio account, and the only symptom would be the bill plus a spam
+    complaint against a number they cannot get back.
+
+    So a half-configured phone channel (credentials without caps, or half a set of credentials)
+    raises out of ``from_env`` and **fails the boot, loudly**. Entirely unconfigured is still simply
+    off: the channel is absent from this registry, and its workflow steps SKIP with a reason.
+    """
+    environment = os.environ if environ is None else environ
+    senders: dict[Channel, PhoneChannelSender] = {}
+
+    whatsapp = EvolutionConfig.from_env(environment)
+    if whatsapp is not None:
+        senders[Channel.WHATSAPP] = EvolutionWhatsAppSender(whatsapp, http_client)
+
+    sms = TwilioConfig.from_env(environment)
+    if sms is not None:
+        senders[Channel.SMS] = TwilioSmsSender(sms, http_client)
+
+    return senders
+
+
 def create_app(settings: Settings) -> FastAPI:
     """Build the AetherCal API application from ``settings``."""
     engine = build_async_engine(settings.database_config())
@@ -134,6 +172,9 @@ def create_app(settings: Settings) -> FastAPI:
             app.state.http_client = http_client
             app.state.fernet_key = settings.fernet_key()
             app.state.email_sender = build_email_sender()
+            # A half-configured phone channel RAISES here and fails the boot on purpose — see
+            # build_channel_senders. "Sending, but uncapped" must never be a state this reaches.
+            app.state.channel_senders = build_channel_senders(http_client)
 
             interval_scheduler: Any = None
             if settings.run_scheduler:  # pragma: no cover - live: starts a real APScheduler loop

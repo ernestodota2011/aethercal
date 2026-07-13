@@ -25,7 +25,8 @@ use them instead of reaching into the maps directly.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Any
+from collections.abc import Mapping
+from typing import Annotated, Any, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -142,13 +143,44 @@ class EventTypeRead(BaseModel):
     active: bool
 
 
-def resolve_title(event: EventTypeRead, locale: str) -> str:
-    """Return the title for ``locale``: the per-locale override, or the canonical fallback.
+@overload
+def resolve_translation(canonical: str, translations: Mapping[str, str], locale: str) -> str: ...
 
-    An override that is present but an empty string is treated as "no override" and falls back to
-    ``event.title`` too — a blank string is never a meaningful title to show a booker.
+
+@overload
+def resolve_translation(
+    canonical: str | None, translations: Mapping[str, str], locale: str
+) -> str | None: ...
+
+
+def resolve_translation(
+    canonical: str | None, translations: Mapping[str, str], locale: str
+) -> str | None:
+    """==THE rule==: a non-blank per-locale override wins; otherwise the canonical text.
+
+    This exists as a primitive over *values* — rather than only as a resolver over
+    :class:`EventTypeRead` — because the same question ("which title do we show this person?") is
+    asked from two places holding two different shapes: the booking page holds an
+    ``EventTypeRead``, and the email composer holds the SQLAlchemy ORM row.
+
+    When the only resolver took an ``EventTypeRead``, the composer wrote its own second answer —
+    a bare ``event_type.title`` — and that answer ignored the translations for an entire release:
+    every English mail carried a Spanish title, and the ``.ics`` SUMMARY carried it into the guest's
+    calendar permanently. One rule, reachable from both shapes, is the fix for that class of bug.
+
+    (A ``Protocol`` would be the tidier way to say "any event-type-ish thing", but a protocol
+    member is matched against the DECLARED class attribute, and SQLAlchemy declares ``Mapped[str]``
+    — so the ORM row, the very shape this needs to admit, would not satisfy it. Values it is.)
+
+    A present-but-empty override is treated as *no* override: a blank string is never a meaningful
+    thing to show a booker, and it is exactly what an admin form submits for "I left this alone".
     """
-    return event.title_translations.get(locale) or event.title
+    return translations.get(locale) or canonical
+
+
+def resolve_title(event: EventTypeRead, locale: str) -> str:
+    """Return the title for ``locale``: the per-locale override, or the canonical fallback."""
+    return resolve_translation(event.title, event.title_translations, locale)
 
 
 def resolve_description(event: EventTypeRead, locale: str) -> str | None:
@@ -157,7 +189,7 @@ def resolve_description(event: EventTypeRead, locale: str) -> str | None:
     Unlike ``resolve_title``, the canonical fallback (``event.description``) may itself be ``None``
     — an EventType with no description in any locale legitimately has none to show.
     """
-    return event.description_translations.get(locale) or event.description
+    return resolve_translation(event.description, event.description_translations, locale)
 
 
 __all__ = [
@@ -167,4 +199,5 @@ __all__ = [
     "EventTypeUpdate",
     "resolve_description",
     "resolve_title",
+    "resolve_translation",
 ]

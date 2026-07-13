@@ -21,10 +21,23 @@ ADVISORY_LOCK_KEY = 0x4165_7468_4361_6C31
 
 
 def make_alembic_config(url: str) -> Config:
-    """Build an Alembic ``Config`` pointing at this package's migrations and the given URL."""
+    """Build an Alembic ``Config`` pointing at this package's migrations and the given URL.
+
+    ==The ``%`` is ESCAPED, and that is not cosmetic.== ``Config.set_main_option`` writes through
+    :mod:`configparser`, for which ``%`` is the interpolation sigil — while
+    ``URL.render_as_string`` (what :func:`run_migrations` hands it) percent-encodes every reserved
+    character in the **password**. So a self-hoster whose Postgres password contains a ``%``, an
+    ``@``, a ``/`` or a ``:`` — which is to say, most generated passwords — got::
+
+        ValueError: invalid interpolation syntax in '...' at position 119
+
+    at boot, out of a traceback that never once mentions the password, and their database never came
+    up. Doubling the ``%`` is configparser's own escape, and ``get_main_option`` un-escapes it, so
+    every caller reads back exactly the URL it passed in.
+    """
     config = Config()
     config.set_main_option("script_location", str(_MIGRATIONS_DIR))
-    config.set_main_option("sqlalchemy.url", url)
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
     return config
 
 
