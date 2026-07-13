@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.crypto import derive_fernet_key
+from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import Booking, EventType, Outbox, Schedule, Tenant, User
 from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.smtp.compose import NotificationKind
@@ -41,21 +42,6 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
-
-
-def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
-    """Both of the drain's pools over ONE PostgreSQL sessionmaker.
-
-    ==This test is about ATOMICITY, not isolation, and it keeps its own harness.== It drives two
-    CONCURRENT drains over a schema built from ``Base.metadata`` (so no policies) on the ordinary
-    test role (so no BYPASSRLS): what it proves is that the claim's conditional UPDATE lets exactly
-    one worker win a row — a fact about PostgreSQL's row locks, orthogonal to the belt.
-
-    The isolation belt has a harness of its own — ``tests/rls/`` — with three real roles, a schema
-    built by the real migrations, and the seeding deliberately kept off the app engine.
-    """
-    return WorkerPools.for_offline_tests(maker)
-
 
 pytestmark = pytest.mark.db
 
@@ -124,10 +110,15 @@ def _params(event_type_id: uuid.UUID, start: datetime) -> BookingParams:
     )
 
 
-async def _seed(app: FastAPI) -> tuple[uuid.UUID, uuid.UUID, datetime, datetime]:
-    """Commit a tenant + host + open schedule + event type; return ids, an offered slot, and now."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session, session.begin():
+async def _seed(
+    owner_maker: async_sessionmaker[AsyncSession],
+) -> tuple[uuid.UUID, uuid.UUID, datetime, datetime]:
+    """Commit a tenant + host + open schedule + event type; return ids, an offered slot, and now.
+
+    ==On the OWNER engine== — arrangement. Under ``FORCE`` + ``WITH CHECK`` the app role cannot
+    write a business it has not bound, and it has nothing to bind before the business exists.
+    """
+    async with owner_maker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Outbox Tenant")
         session.add(tenant)
         await session.flush()
@@ -172,50 +163,59 @@ async def _outbox_count(
         ) or 0
 
 
-async def test_a_rolled_back_booking_leaves_no_outbox_intent(app: FastAPI) -> None:
-    tenant_id, event_type_id, start, now = await _seed(app)
+async def test_a_rolled_back_booking_leaves_no_outbox_intent(
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    tenant_id, event_type_id, start, now = await _seed(owner_maker)
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
 
-    # Create the booking + enqueue its email intent in one transaction, then ROLL BACK.
-    async with sessionmaker() as session:
-        booking = await create_booking(
-            session,
-            tenant_id=tenant_id,
-            params=_params(event_type_id, start),
-            now=now,
-            effects=_effects(),
-        )
-        booking_id = booking.id
-        # Both the booking and its intent are visible inside the uncommitted transaction.
-        pending = await session.scalar(
-            select(func.count()).select_from(Outbox).where(Outbox.booking_id == booking_id)
-        )
-        assert pending == 1
-        await session.rollback()
+    # Create the booking + enqueue its email intent in one transaction, then ROLL BACK. The
+    # booking path is the SYSTEM UNDER TEST, so it runs on the app engine, under RLS, with the
+    # business bound the way the product binds it.
+    with tenant_scope(tenant_id):
+        async with sessionmaker() as session:
+            booking = await create_booking(
+                session,
+                tenant_id=tenant_id,
+                params=_params(event_type_id, start),
+                now=now,
+                effects=_effects(),
+            )
+            booking_id = booking.id
+            # Both the booking and its intent are visible inside the uncommitted transaction.
+            pending = await session.scalar(
+                select(func.count()).select_from(Outbox).where(Outbox.booking_id == booking_id)
+            )
+            assert pending == 1
+            await session.rollback()
 
-    # After the rollback neither the booking nor its outbox intent persisted — the effect can never
-    # fire for a booking that never committed.
-    async with sessionmaker() as session:
+    # After the rollback neither the booking nor its outbox intent persisted — the effect can
+    # never fire for a booking that never committed. Observed on the OWNER engine, which sees
+    # every business: "it is not there" must not be able to mean "a policy is hiding it".
+    async with owner_maker() as session:
         assert await session.get(Booking, booking_id) is None
-    assert await _outbox_count(sessionmaker, booking_id) == 0
+    assert await _outbox_count(owner_maker, booking_id) == 0
 
 
-async def test_a_committed_booking_persists_its_outbox_intent(app: FastAPI) -> None:
-    tenant_id, event_type_id, start, now = await _seed(app)
+async def test_a_committed_booking_persists_its_outbox_intent(
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    tenant_id, event_type_id, start, now = await _seed(owner_maker)
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
 
-    async with sessionmaker() as session, session.begin():
-        booking = await create_booking(
-            session,
-            tenant_id=tenant_id,
-            params=_params(event_type_id, start),
-            now=now,
-            effects=_effects(),
-        )
-        booking_id = booking.id
+    with tenant_scope(tenant_id):
+        async with sessionmaker() as session, session.begin():
+            booking = await create_booking(
+                session,
+                tenant_id=tenant_id,
+                params=_params(event_type_id, start),
+                now=now,
+                effects=_effects(),
+            )
+            booking_id = booking.id
 
     # The intent committed atomically with the booking and is now waiting for the drainer.
-    async with sessionmaker() as session:
+    async with owner_maker() as session:
         rows = list(
             (await session.scalars(select(Outbox).where(Outbox.booking_id == booking_id))).all()
         )
@@ -225,16 +225,25 @@ async def test_a_committed_booking_persists_its_outbox_intent(app: FastAPI) -> N
     assert rows[0].status == "pending"
 
 
-async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app: FastAPI) -> None:
+async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(
+    owner_maker: async_sessionmaker[AsyncSession], worker_pools: WorkerPools
+) -> None:
     """Two workers draining the same booking's Google sync concurrently must run it exactly ONCE:
     ``FOR UPDATE SKIP LOCKED`` hands the single row to one worker only, and the per-``ical_uid``
-    advisory lock + reconciliation run on real PostgreSQL without deadlock or a double event."""
-    tenant_id, _event_type_id, start, now = await _seed(app)
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    advisory lock + reconciliation run on real PostgreSQL without deadlock or a double event.
+
+    ==The two drains now run on the REAL worker's two pools.== This file used to collapse them
+    onto one app-role sessionmaker over a policy-free schema, and against the real thing that is
+    not a simplification but a different program: ``claim_one`` is an UPDATE on a row whose
+    business can only be learned by READING it, so with no bypass it matches ZERO rows — both
+    drains would claim nothing, no event would be created, and "exactly one event" would be an
+    assertion about a system that did nothing at all.
+    """
+    tenant_id, _event_type_id, start, now = await _seed(owner_maker)
 
     # A confirmed booking with a linked calendar + a single queued Google upsert (built directly so
-    # the test targets the concurrent-drain path, not slot validation).
-    async with sessionmaker() as session, session.begin():
+    # the test targets the concurrent-drain path, not slot validation). Arrangement → OWNER.
+    async with owner_maker() as session, session.begin():
         host = (await session.scalars(select(User).where(User.tenant_id == tenant_id))).one()
         event_type = (
             await session.scalars(select(EventType).where(EventType.tenant_id == tenant_id))
@@ -279,17 +288,20 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
         booking_id = booking.id
 
     google = _FakeGoogle()
+    # Built over the APP-role pool, exactly as `make_outbox_drain_tick` builds it in the worker.
     execute = make_booking_effect_executor(
-        sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
+        sessionmaker=worker_pools.exec_maker,
+        sender=_RecordingSender(),
+        service_factory=lambda _c: google,
     )
     await asyncio.gather(
-        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
-        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
+        run_outbox_drain_once(pools=worker_pools, execute=execute, now=now),
+        run_outbox_drain_once(pools=worker_pools, execute=execute, now=now),
     )
 
     # Exactly one event created (never two), and the booking points at it.
     assert len(google.events_obj.created) == 1
-    async with sessionmaker() as session:
+    async with owner_maker() as session:
         final = await session.get(Booking, booking_id)
     assert final is not None and final.external_event_id == google.events_obj.created[0]
 
@@ -309,16 +321,15 @@ def _google_sync_payload(
 
 
 async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_event(
-    app: FastAPI,
+    owner_maker: async_sessionmaker[AsyncSession], worker_pools: WorkerPools
 ) -> None:
     """Two workers, inverted order: a chain's RESCHEDULE (successor) and the original's UPSERT drain
     concurrently. The replaced predecessor's UPSERT must be SKIPPED — exactly one event exists, for
     the chain's current booking, and the old one is never recreated (per-``ical_uid`` advisory lock
     + chain-current reconciliation)."""
-    tenant_id, _event_type_id, start, now = await _seed(app)
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    tenant_id, _event_type_id, start, now = await _seed(owner_maker)
 
-    async with sessionmaker() as session, session.begin():
+    async with owner_maker() as session, session.begin():
         host = (await session.scalars(select(User).where(User.tenant_id == tenant_id))).one()
         event_type = (
             await session.scalars(select(EventType).where(EventType.tenant_id == tenant_id))
@@ -368,16 +379,18 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
 
     google = _FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
+        sessionmaker=worker_pools.exec_maker,
+        sender=_RecordingSender(),
+        service_factory=lambda _c: google,
     )
     await asyncio.gather(
-        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
-        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
+        run_outbox_drain_once(pools=worker_pools, execute=execute, now=now),
+        run_outbox_drain_once(pools=worker_pools, execute=execute, now=now),
     )
 
     # Exactly one event — for the current booking b2 — and the replaced one is never recreated.
     assert len(google.events_obj.created) == 1
-    async with sessionmaker() as session:
+    async with owner_maker() as session:
         b1_final = await session.get(Booking, b1_id)
         b2_final = await session.get(Booking, b2_id)
     assert b1_final is not None and b1_final.external_event_id is None

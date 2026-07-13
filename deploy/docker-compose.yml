@@ -37,8 +37,19 @@ services:
     volumes:
       - aethercal-pgdata:/var/lib/postgresql/data
     healthcheck:
-      # `app` depends_on this being healthy, so migrations never race an unready database.
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      # `migrate` depends_on this being healthy, so the schema never races an unready database.
+      #
+      # ==`-h 127.0.0.1` is load-bearing, and it is the kind of thing somebody deletes as noise.==
+      # While the image INITIALISES a fresh volume it runs a temporary server with
+      # `listen_addresses=''` — reachable over the unix socket and over nothing else. A bare
+      # `pg_isready` talks to that socket and reports READY, while every TCP client (which is all of
+      # ours) is still refused — and any `docker-entrypoint-initdb.d/` script has not necessarily run
+      # yet. Dependents would start against a database whose roles do not exist, and `migrate` would
+      # fail to connect as an owner that had not been created.
+      #
+      # Over TCP it asks the question we actually mean: not "is a postmaster alive somewhere" but
+      # "can the process that is about to connect, connect".
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 12

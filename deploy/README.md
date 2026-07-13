@@ -1,8 +1,11 @@
 # Deploying AetherCal (self-host)
 
-AetherCal ships as **one container + PostgreSQL**, configured entirely by environment variables
-(RF-19 — no secrets in source). Migrations run automatically on boot, and the in-process scheduler
-(reminders, outbound-webhook delivery, calendar busy-cache refresh) runs inside the app container.
+AetherCal ships as **one image, four processes + PostgreSQL**, configured entirely by environment
+variables (RF-19 — no secrets in source): a one-shot `migrate`, the `app` (API + admin), the `worker`
+(outbox drain, outbound-webhook delivery, calendar busy-cache refresh, `/metrics`), and the public
+`booking` page. The split is not cosmetic — see
+[The three database roles](#the-three-database-roles--create-them-before-the-first-boot) and
+[The worker](#the-worker-exactly-one-process).
 
 ## Quickstart
 
@@ -15,15 +18,33 @@ Requires Docker with the Compose plugin.
 cd deploy
 cp .env.example .env
 
-# Set the two required secrets (edit .env, or generate the app secret):
+# 1. Fill in .env:
 #   AETHERCAL_APP_SECRET   — python -c "import secrets; print(secrets.token_urlsafe(48))"
-#   POSTGRES_PASSWORD      — pick a strong password, and put the SAME value into the password
-#                            field of AETHERCAL_DATABASE_URL (…://aethercal:<pw>@postgres:5432/…)
+#   POSTGRES_PASSWORD      — the BOOTSTRAP superuser of the postgres container. The application
+#                            never connects as it; it is the identity you provision the roles with.
+#   the THREE role passwords, each pasted into its own URL:
+#     AETHERCAL_DATABASE_URL         → aethercal_app     (the API + admin, under RLS)
+#     AETHERCAL_OWNER_DATABASE_URL   → aethercal_owner   (Alembic + the CLI)
+#     AETHERCAL_WORKER_DATABASE_URL  → aethercal_worker  (the worker's scan pool)
 
-docker compose up --build       # builds the image, starts Postgres, then the app
+# 2. Start PostgreSQL alone and CREATE THE THREE ROLES. A human runbook step, once — and it cannot
+#    be automated away: `CREATE ROLE ... BYPASSRLS` needs SUPERUSER, so Alembic (which runs as the
+#    owner) cannot mint them, and an init script in the postgres image only ever fires on an EMPTY
+#    volume — i.e. perfectly in CI, and never on the instance that actually matters.
+docker compose up -d postgres
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v db="$POSTGRES_DB" -v pw_owner=... -v pw_app=... -v pw_worker=... \
+    < sql/provision_roles.sql
+
+# 3. Everything else. `migrate` runs to completion as the owner; `app` and `worker` wait on it.
+docker compose up --build -d
 ```
 
-On startup the app waits for Postgres to be healthy, runs the Alembic migrations, then serves.
+Migrations no longer run on the app's boot — `AETHERCAL_AUTO_MIGRATE` is a retired tripwire that now
+**fails the boot**. The one-shot `migrate` service runs `aethercal-admin db upgrade` as
+`aethercal_owner`, and both `app` and `worker` wait for it to complete. The app then **refuses to
+serve a schema behind head**, so "running against a stale schema" is not a state it can reach.
+
 Verify it is up:
 
 ```bash

@@ -29,9 +29,16 @@ async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
 
 
 @pytest_asyncio.fixture
-async def other_auth_headers(app: FastAPI, tenant_factory) -> dict[str, str]:
-    """Bearer header for a SECOND tenant, to prove cross-tenant isolation."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+async def other_auth_headers(
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession], tenant_factory
+) -> dict[str, str]:
+    """Bearer header for a SECOND tenant, to prove cross-tenant isolation.
+
+    ==A SECOND business is the fixture that cannot exist on the app engine==, and that is the
+    whole argument for seeding on the owner: ``bind_tenant`` refuses to re-bind a scope, and the
+    ``WITH CHECK`` refuses an unbound write. Only a role that bypasses RLS can arrange two.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         created = await tenant_factory(session)
         _, full_key = await issue_api_key(session, tenant_id=created.id, name="other-key")

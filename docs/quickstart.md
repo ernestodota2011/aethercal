@@ -1,7 +1,7 @@
 # Quickstart — self-host AetherCal and book a test appointment
 
-From a clean machine to a real, confirmed booking. AetherCal runs as **one container plus
-PostgreSQL**, configured entirely by environment variables.
+From a clean machine to a real, confirmed booking. AetherCal runs as **one image, four processes
+plus PostgreSQL**, configured entirely by environment variables.
 
 Nearly all the elapsed time is the first `docker compose up --build`, which compiles the image;
 every step after it takes seconds.
@@ -18,7 +18,7 @@ cd aethercal/deploy
 cp .env.example .env
 ```
 
-Two values are required. Generate the app secret:
+Generate the app secret:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -27,26 +27,58 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 Edit `.env`:
 
 - `AETHERCAL_APP_SECRET` — paste the value you just generated.
-- `POSTGRES_PASSWORD` — pick a strong password, and put the **same** value into the password field
-  of `AETHERCAL_DATABASE_URL` (`postgresql://aethercal:<password>@postgres:5432/aethercal`).
+- `POSTGRES_PASSWORD` — the **bootstrap superuser** of the PostgreSQL container. AetherCal never
+  connects as it: it is the identity you create the three roles with, in step 2.
+- **The three role passwords.** AetherCal runs as three different PostgreSQL users, each with its own
+  URL in `.env`: `AETHERCAL_DATABASE_URL` (`aethercal_app` — the API and admin, subject to row-level
+  security), `AETHERCAL_OWNER_DATABASE_URL` (`aethercal_owner` — the migrations and the CLI) and
+  `AETHERCAL_WORKER_DATABASE_URL` (`aethercal_worker` — the background worker). Choose a password for
+  each and paste it into its URL.
+
+> **Why three?** One business's data is kept away from another's **by the database**, not by everyone
+> remembering to filter their queries. That only works if the process serving requests is *not* the
+> one that owns the tables — an owner sails straight through its own policies. Hence three users and
+> three URLs. There is deliberately no fallback between them: a URL pointing at the wrong user would
+> not raise an error, it would silently read nothing — so each process asks the database who it is at
+> boot and refuses to start on the wrong answer.
 
 Everything else has a working default. SMTP and Google are optional: leave them blank and the app
 still boots — bookings work, they just skip the confirmation email and the calendar busy-check.
 
-## 2. Start
+## 2. Create the three database roles
+
+Once, before the first full boot. Start PostgreSQL on its own and run the shipped script:
+
+```bash
+docker compose up -d postgres
+
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v db="$POSTGRES_DB" \
+  -v pw_owner='<the owner password from .env>' \
+  -v pw_app='<the app password from .env>' \
+  -v pw_worker='<the worker password from .env>' \
+  < sql/provision_roles.sql
+```
+
+This is a human step rather than a migration, for a dull reason with a sharp edge: creating a user
+allowed to bypass the security policies requires a superuser, and the migrations do not run as one.
+
+## 3. Start
 
 ```bash
 docker compose up --build
 ```
 
-The app waits for PostgreSQL to be healthy, runs the migrations, then serves. In another terminal:
+Four processes come up out of the one image: a one-shot `migrate` (which brings the schema to head,
+as the owner), then the `app`, the `worker` — reminders and outbound webhooks; **it is the process
+that actually sends** — and the public `booking` page. In another terminal:
 
 ```bash
 curl http://localhost:8000/api/v1/health
 # {"status":"ok"}
 ```
 
-## 3. Create a tenant and an API key
+## 4. Create a tenant and an API key
 
 ```bash
 docker compose exec app aethercal-admin create-tenant \
@@ -66,7 +98,7 @@ export AETHERCAL_URL="http://localhost:8000/api/v1"
 export HOST_ID="54639215-..."                          # the user_id from create-tenant
 ```
 
-## 4. Define when you are available
+## 5. Define when you are available
 
 A **schedule** is a weekly pattern. The weekday keys are `0` = Monday … `6` = Sunday.
 
@@ -88,7 +120,7 @@ curl -X POST "$AETHERCAL_URL/schedules/" \
 
 Keep the returned `id` as `SCHEDULE_ID`.
 
-## 5. Define what can be booked
+## 6. Define what can be booked
 
 An **event type** is a bookable meeting: a duration, a host, and a schedule.
 
@@ -108,7 +140,7 @@ curl -X POST "$AETHERCAL_URL/event-types/" \
 Keep the returned `id` as `EVENT_TYPE_ID`. (`max_advance_seconds` is how far ahead guests may
 book — 30 days here.)
 
-## 6. Ask for the free slots
+## 7. Ask for the free slots
 
 ```bash
 curl -G "$AETHERCAL_URL/slots/" \
@@ -135,7 +167,7 @@ Slot bounds are **UTC**; `tz` is the display zone you asked in (9:00 in New York
 `unavailable` when a connected calendar could not be reached — and then AetherCal deliberately
 offers **no** slots for that host rather than risk a double-booking.
 
-## 7. Book it
+## 8. Book it
 
 ```bash
 curl -X POST "$AETHERCAL_URL/bookings/" \
@@ -161,7 +193,7 @@ curl -X POST "$AETHERCAL_URL/bookings/" \
 That is a real appointment. POST the same slot again and AetherCal answers **`409 Conflict`** — the
 conflict is decided by the database, not by a race in the application.
 
-## 8. The booking page
+## 9. The booking page
 
 The public booking page runs as its own service in the same compose file, on
 <http://localhost:5001>. Put the API key into `AETHERCAL_API_KEY` in `.env` (that is the server-side
@@ -187,9 +219,22 @@ To put it on your own site instead, see [embedding](embedding.md).
 **`AETHERCAL_DATABASE_URL is not set`.** The container is running without your `.env`. Run
 `docker compose up` from the `deploy/` directory, where that file lives.
 
-**The app cannot reach PostgreSQL.** The password inside `AETHERCAL_DATABASE_URL` must be
-byte-for-byte the `POSTGRES_PASSWORD` in the same file. They are two separate variables and nothing
-checks that they agree.
+**A process refuses to start, naming a role.** A message like *"AETHERCAL_DATABASE_URL connects as
+PostgreSQL role 'x', but this engine must run as 'aethercal_app'"* means a URL points at the wrong
+user. That refusal is the feature: under row-level security the wrong user does not raise, it simply
+reads nothing — so each process asks the database who it is, and stops.
+
+**`migrate` exits non-zero, or the app never starts.** The one-shot `migrate` runs as
+`aethercal_owner`; if that role does not exist, step 2 was skipped or ran against a different
+database. `docker compose logs migrate` says which.
+
+**The app cannot reach PostgreSQL.** Each of the three URLs carries its own password, and each must
+match byte-for-byte the one you passed to `provision_roles.sql` in step 2. They are separate
+variables and nothing checks that they agree.
+
+**Bookings work, but no email or webhook ever arrives.** Those are sent by the `worker` process, not
+by the API. `docker compose ps worker` — if it is not running, nothing will ever be delivered, and
+the API will keep looking perfectly healthy while it does not happen.
 
 **A slot you expected is missing.** The usual causes: the day is outside the schedule's weekly
 rules; the slot falls inside `min_notice_seconds`; it is beyond `max_advance_seconds`; or the host

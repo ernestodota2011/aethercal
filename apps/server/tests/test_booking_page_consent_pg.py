@@ -59,23 +59,6 @@ from aethercal.server.services.outbox import (
 )
 from aethercal.server.services.slots import compute_slots
 
-
-def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
-    """Both of the drain's pools over ONE offline sessionmaker.
-
-    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
-    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
-    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
-    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
-    app role to EXECUTE each item under row-level security, bound to that item's own business.
-
-    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
-    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
-    reached from the shipped source.
-    """
-    return WorkerPools.for_offline_tests(maker)
-
-
 pytestmark = pytest.mark.db
 
 BOOKINGS = "/bookings/"
@@ -125,13 +108,16 @@ async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
     return client
 
 
-async def _seed(app: FastAPI, *, phone_rule_active: bool | None) -> dict[str, Any]:
+async def _seed(owner_maker: Sessionmaker, *, phone_rule_active: bool | None) -> dict[str, Any]:
     """A tenant with one event type and (optionally) an ACTIVE/paused WhatsApp reminder rule.
 
     ``phone_rule_active=None`` seeds NO phone rule at all — the self-hoster who only ever sends
     e-mail, and whose guests must therefore never be asked for a phone number.
+
+    ==On the OWNER engine== — arrangement, and under ``FORCE`` + ``WITH CHECK`` impossible from
+    the app role anyway: nothing has bound a business yet to write these rows under.
     """
-    sessionmaker: Sessionmaker = app.state.sessionmaker
+    sessionmaker: Sessionmaker = owner_maker
     async with sessionmaker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Seeded Tenant")
         session.add(tenant)
@@ -218,27 +204,43 @@ def _payload(seeded: dict[str, Any], **over: Any) -> dict[str, Any]:
     return body
 
 
-async def _stored(app: FastAPI, booking_id: str) -> Booking:
-    """The booking as PostgreSQL actually holds it — the effective state, not the API's own echo."""
-    sessionmaker: Sessionmaker = app.state.sessionmaker
+async def _stored(owner_maker: Sessionmaker, booking_id: str) -> Booking:
+    """The booking as PostgreSQL actually holds it — the effective state, not the API's own echo.
+
+    Observed on the OWNER engine: it sees EVERY business, so a row the request filed under the
+    wrong one is a visible failure here rather than an invisible one.
+    """
+    sessionmaker: Sessionmaker = owner_maker
     async with sessionmaker() as session:
         row = await session.scalar(select(Booking).where(Booking.id == uuid.UUID(booking_id)))
     assert row is not None
     return row
 
 
-async def _drain(app: FastAPI, *, start: datetime) -> tuple[_RecordingWhatsAppSender, list[Outbox]]:
-    """Drain the outbox at reminder time with a WORKING WhatsApp channel; report what happened."""
-    sessionmaker: Sessionmaker = app.state.sessionmaker
+async def _drain(
+    pools: WorkerPools, owner_maker: Sessionmaker, *, start: datetime
+) -> tuple[_RecordingWhatsAppSender, list[Outbox]]:
+    """Drain the outbox at reminder time with a WORKING WhatsApp channel; report what happened.
+
+    ==The drain IS the system under test here, so it gets the REAL pools== — the ones the worker
+    process builds: a ``BYPASSRLS`` scan pool to find work whose business it cannot know until it
+    has read the row (``claim_one`` is an UPDATE on exactly such a row), and the APP role to
+    execute each item under RLS, bound to that item's own business by ``tenant_scope``. Collapsed
+    onto one app-role sessionmaker — which is what this file used to do — the claim would match
+    ZERO rows and the drain would send nothing at all, in silence, while every assertion below
+    went on being read as though it meant something.
+
+    The executor is built over ``pools.exec_maker``, exactly as ``make_outbox_drain_tick`` does.
+    """
     whatsapp = _RecordingWhatsAppSender()
     execute = make_booking_effect_executor(
-        sessionmaker=sessionmaker,
+        sessionmaker=pools.exec_maker,
         sender=_RecordingEmailSender(),
         service_factory=None,
         channels={Channel.WHATSAPP: whatsapp},
     )
-    await drain_outbox(_pools(sessionmaker), now=start - timedelta(hours=24), execute=execute)
-    async with sessionmaker() as session:
+    await drain_outbox(pools, now=start - timedelta(hours=24), execute=execute)
+    async with owner_maker() as session:
         rows = list(
             (
                 await session.scalars(
@@ -262,10 +264,10 @@ def _whatsapp_step(rows: list[Outbox]) -> Outbox:
 
 
 async def test_event_types_report_no_phone_needed_when_no_phone_rule_exists(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, wired_client: AsyncClient
 ) -> None:
     """The e-mail-only self-hoster. Their guests are never asked for a phone at all (RNF-8)."""
-    seeded = await _seed(app, phone_rule_active=None)
+    seeded = await _seed(owner_maker, phone_rule_active=None)
 
     response = await wired_client.get(EVENT_TYPES, headers=seeded["headers"])
 
@@ -274,9 +276,9 @@ async def test_event_types_report_no_phone_needed_when_no_phone_rule_exists(
 
 
 async def test_event_types_report_a_phone_is_needed_when_a_whatsapp_rule_is_active(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, wired_client: AsyncClient
 ) -> None:
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.get(EVENT_TYPES, headers=seeded["headers"])
 
@@ -285,10 +287,10 @@ async def test_event_types_report_a_phone_is_needed_when_a_whatsapp_rule_is_acti
 
 
 async def test_a_paused_phone_rule_stops_asking_for_the_phone(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, wired_client: AsyncClient
 ) -> None:
     """Switch the rule off and the question goes with it: nothing will send, so nothing is asked."""
-    seeded = await _seed(app, phone_rule_active=False)
+    seeded = await _seed(owner_maker, phone_rule_active=False)
 
     response = await wired_client.get(EVENT_TYPES, headers=seeded["headers"])
 
@@ -303,7 +305,7 @@ async def test_a_paused_phone_rule_stops_asking_for_the_phone(
 
 
 async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, worker_pools: WorkerPools, wired_client: AsyncClient
 ) -> None:
     """The happy path, asserted where it counts: in the column, and at the sender.
 
@@ -314,7 +316,7 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     It is the whole chain in one test: a checkbox ticked on a public form becomes a stamped column
     in Postgres, which unlocks a real WhatsApp send at drain time, to that exact number.
     """
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(
         BOOKINGS,
@@ -323,7 +325,7 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     )
     assert response.status_code == 201
 
-    stored = await _stored(app, response.json()["id"])
+    stored = await _stored(owner_maker, response.json()["id"])
     assert stored.guest_phone == "+13054131728"  # normalized to E.164 on the way in
     assert stored.guest_phone_consent_at is not None, (
         "the guest ticked the box and the column is NULL: the consent was thrown away"
@@ -332,7 +334,7 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     # is the SERVER's clock — never a timestamp the client supplied.
     assert stored.guest_phone_consent_at.tzinfo is not None
 
-    whatsapp, rows = await _drain(app, start=seeded["start"])
+    whatsapp, rows = await _drain(worker_pools, owner_maker, start=seeded["start"])
 
     assert whatsapp.sent, "a consented guest was never messaged — the gate is refusing everything"
     assert whatsapp.sent[0][0] == "+13054131728", "the message went to a number nobody consented to"
@@ -340,7 +342,10 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
 
 
 async def test_no_consent_leaves_the_column_null_and_the_channel_skips(
-    app: FastAPI, wired_client: AsyncClient, caplog: pytest.LogCaptureFixture
+    owner_maker: Sessionmaker,
+    worker_pools: WorkerPools,
+    wired_client: AsyncClient,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """==The legal one.== The number is real, the channel is configured, the guest never agreed.
 
@@ -348,7 +353,7 @@ async def test_no_consent_leaves_the_column_null_and_the_channel_skips(
     ``no-phone-consent``, distinguishable from "the channel is not configured", because "could not
     send" and "was not allowed to send" are different facts an operator has to tell apart.
     """
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(
         BOOKINGS,
@@ -358,12 +363,12 @@ async def test_no_consent_leaves_the_column_null_and_the_channel_skips(
     )
     assert response.status_code == 201
 
-    stored = await _stored(app, response.json()["id"])
+    stored = await _stored(owner_maker, response.json()["id"])
     assert stored.guest_phone == "+13054131728"
     assert stored.guest_phone_consent_at is None, "a consent nobody gave was stamped anyway"
 
     with caplog.at_level("WARNING"):
-        whatsapp, rows = await _drain(app, start=seeded["start"])
+        whatsapp, rows = await _drain(worker_pools, owner_maker, start=seeded["start"])
 
     assert whatsapp.sent == [], "an unconsented message was sent to a real phone number"
     assert _whatsapp_step(rows).status == "skipped"
@@ -372,28 +377,28 @@ async def test_no_consent_leaves_the_column_null_and_the_channel_skips(
 
 
 async def test_booking_with_no_phone_at_all_still_confirms(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, worker_pools: WorkerPools, wired_client: AsyncClient
 ) -> None:
     """The phone is optional: a guest who gives none books normally. It never blocks a booking."""
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(BOOKINGS, json=_payload(seeded), headers=seeded["headers"])
 
     assert response.status_code == 201
-    stored = await _stored(app, response.json()["id"])
+    stored = await _stored(owner_maker, response.json()["id"])
     assert stored.guest_phone is None
     assert stored.guest_phone_consent_at is None
 
-    whatsapp, rows = await _drain(app, start=seeded["start"])
+    whatsapp, rows = await _drain(worker_pools, owner_maker, start=seeded["start"])
     assert whatsapp.sent == []
     assert _whatsapp_step(rows).status == "skipped"  # nothing to message: skipped, not retried
 
 
 async def test_consent_without_a_number_is_refused_at_the_edge(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, wired_client: AsyncClient
 ) -> None:
     """Consent referencing no number consents to nothing. 422 — never a silently ignored field."""
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(
         BOOKINGS, json=_payload(seeded, guest_phone_consent=True), headers=seeded["headers"]
@@ -403,11 +408,11 @@ async def test_consent_without_a_number_is_refused_at_the_edge(
 
 
 async def test_a_malformed_phone_is_refused_at_the_edge(
-    app: FastAPI, wired_client: AsyncClient
+    owner_maker: Sessionmaker, wired_client: AsyncClient
 ) -> None:
     """No country code, and no guessing one: a number we cannot address is not stored as if we
     could."""
-    seeded = await _seed(app, phone_rule_active=True)
+    seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(
         BOOKINGS,

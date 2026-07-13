@@ -11,7 +11,7 @@ way `deploy/README.md` tells a self-hoster to do it. The suite never boots the a
 pnpm --dir e2e install
 pnpm --dir e2e exec playwright install --with-deps chromium
 
-pnpm --dir e2e stack:up      # compose up + migrate + create tenant + issue API key → .stack.json
+pnpm --dir e2e stack:up      # roles → migrate → app + worker → tenant + API key → .stack.json
 pnpm --dir e2e test          # the golden flow + accessibility
 pnpm --dir e2e stack:down    # down -v
 ```
@@ -53,9 +53,10 @@ So:
 
 | Path | What |
 |---|---|
-| `compose.e2e.yml` | Overlay on the shipping stack: a Mailpit mailbox + a webhook sink |
+| `compose.e2e.yml` | Overlay on the shipping stack: the three roles + a Mailpit mailbox + a webhook sink. It puts SMTP, the fast tick and the sink's network on the **`worker`** — the process that actually sends. Leaving them on `app`, where they used to be, is what silently broke this stack |
+| `sql/00-provision-roles.sh` | Creates `aethercal_app` / `_owner` / `_worker` on the postgres container's first boot, from the **shipped** `deploy/sql/provision_roles.sql`. Legitimate here (the volume is destroyed before every run) and a trap in `deploy/` — the file explains why |
 | `sink/receiver.py` | The sink: stores each delivery's raw bytes + headers (stdlib only) |
-| `scripts/stack-up.sh` | Boot, migrate, create the tenant, issue the key, write `.stack.json` |
+| `scripts/stack-up.sh` | Boot (including the one-shot `migrate` and the `worker`), create the tenant, issue the key, write `.stack.json` |
 | `global-setup.ts` | Reachability gate + this run's fixtures (schedule, event type, webhook) |
 | `src/` | The oracle: API client, mailbox, sink + HMAC verification, page helpers |
 | `specs/golden-flow.spec.ts` | The journey above |
