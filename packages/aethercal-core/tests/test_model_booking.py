@@ -26,6 +26,21 @@ def test_pending_booking_occupies_but_cancelled_does_not() -> None:
     assert Booking(interval=_interval(9, 10), status=BookingStatus.CANCELLED).occupies is False
 
 
+def test_no_show_still_occupies_its_slot() -> None:
+    """A no-show does NOT free the slot: the appointment time has already passed, so releasing it
+    would corrupt history and let a retroactive booking be written over it."""
+    assert Booking(interval=_interval(9, 10), status=BookingStatus.NO_SHOW).occupies is True
+
+
+def test_cancelled_is_the_only_status_that_frees_the_slot() -> None:
+    freed = {
+        status
+        for status in BookingStatus
+        if not Booking(interval=_interval(9, 10), status=status).occupies
+    }
+    assert freed == {BookingStatus.CANCELLED}
+
+
 def test_booking_is_frozen_and_value_equal() -> None:
     a = Booking(interval=_interval(9, 10))
     b = Booking(interval=_interval(9, 10))
