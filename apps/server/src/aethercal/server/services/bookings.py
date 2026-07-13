@@ -810,6 +810,25 @@ async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking
     )
 
 
+async def _chain_has_external_event(session: AsyncSession, booking: Booking) -> bool:
+    """True when this booking — or an ancestor it was rescheduled from — already has a live event.
+
+    A reschedule successor holds no event of its own until its own sync drains, so the walk up the
+    ``rescheduled_from_id`` chain is what makes "this chain is already in someone's calendar"
+    answerable at ENQUEUE time, which is when the decision to sync at all gets made.
+    """
+    current: Booking | None = booking
+    seen: set[uuid.UUID] = set()
+    while current is not None and current.id not in seen:
+        if current.external_event_id is not None:
+            return True
+        seen.add(current.id)
+        if current.rescheduled_from_id is None:
+            return False
+        current = await session.get(Booking, current.rescheduled_from_id)
+    return False
+
+
 async def _enqueue_google(
     session: AsyncSession,
     *,
@@ -832,6 +851,15 @@ async def _enqueue_google(
       into one silent ``return``, which is precisely why no booking ever reached a calendar and no
       one noticed.
 
+    ⚠️ **A CHAIN THAT ALREADY HAS AN EVENT IS ALWAYS SYNCED**, whatever the host's calendars look
+    like today. What a DELETE — or the move half of a RESCHEDULE — must act on is not the current
+    configuration; it is the event this booking ALREADY put in someone's calendar. A host who
+    revokes their Google account between the confirmation and the cancellation has no active
+    connection, so gating on that alone would drop the intent entirely: the guest is cancelled, the
+    meeting stays in the host's calendar forever, and nobody is ever told. The drain resolves the
+    event's RECORDED home (``_event_home``); if even that cannot be reached, the intent
+    dead-letters — which is a signal. Silence is not.
+
     Only the HOST is captured here (``host_id``), never a specific connection id: the exact target
     calendar is resolved at drain time from the live configuration, so there is one source of truth
     for "where does this event go" instead of a snapshot that can rot between enqueue and drain. The
@@ -843,9 +871,12 @@ async def _enqueue_google(
     connections = await load_active_connections(
         session, tenant_id=booking.tenant_id, user_id=host_id
     )
-    if not connections:
+    if not connections and not await _chain_has_external_event(session, booking):
         _logger.debug(
-            "booking %s: host %s has no connected calendar; nothing to sync", booking.id, host_id
+            "booking %s: host %s has no connected calendar and the chain has no external event; "
+            "nothing to sync",
+            booking.id,
+            host_id,
         )
         return
 

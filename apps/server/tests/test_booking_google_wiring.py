@@ -37,7 +37,6 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import (
     Booking,
     EventType,
-    ExternalCalendarLink,
     ExternalConnection,
     Outbox,
     Schedule,
@@ -137,6 +136,19 @@ async def _connect(
     connection.busy_synced_at = NOW
     await session.flush()
     return connection
+
+
+async def _refreshed(session: AsyncSession, connection: ExternalConnection) -> None:
+    """Stamp a fresh, EMPTY busy coverage — what the background refresher leaves behind.
+
+    Linking a calendar deliberately invalidates the cache (the occupancy of the calendar we no
+    longer read must never be served as current), so a test that changes the configuration and then
+    books has to let the refresher catch up first — exactly as production does.
+    """
+    connection.busy_synced_from = NOW
+    connection.busy_synced_to = NOW + timedelta(days=30)
+    connection.busy_synced_at = NOW
+    await session.flush()
 
 
 def _effects() -> BookingEffects:
@@ -245,15 +257,12 @@ async def test_the_event_lands_in_the_dedicated_calendar_when_one_is_designated(
     """The agency credential rule: a dedicated secondary calendar, never a personal ``primary``."""
     tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
-    sqlite_session.add(
-        ExternalCalendarLink(
-            tenant_id=tenant.id,
-            connection_id=connection.id,
-            external_calendar_id="bookings@group.calendar.google.com",
-            is_booking_target=True,
-        )
+    await link_booking_calendar(
+        sqlite_session,
+        connection=connection,
+        calendar_id="bookings@group.calendar.google.com",
     )
-    await sqlite_session.flush()
+    await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
 
     booking = await _book(sqlite_session, tenant, event_type)
@@ -278,15 +287,8 @@ async def test_cancelling_deletes_the_event_from_the_calendar_it_lives_in(
 ) -> None:
     tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
-    sqlite_session.add(
-        ExternalCalendarLink(
-            tenant_id=tenant.id,
-            connection_id=connection.id,
-            external_calendar_id="dedicated@cal",
-            is_booking_target=True,
-        )
-    )
-    await sqlite_session.flush()
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="dedicated@cal")
+    await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
         sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
@@ -358,6 +360,7 @@ async def test_cancelling_after_the_write_target_moved_deletes_from_the_original
     tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
     await link_booking_calendar(sqlite_session, connection=connection, calendar_id="old@cal")
+    await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
         sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
@@ -371,6 +374,7 @@ async def test_cancelling_after_the_write_target_moved_deletes_from_the_original
 
     # The operator moves the booking target to a brand-new calendar.
     await link_booking_calendar(sqlite_session, connection=connection, calendar_id="new@cal")
+    await _refreshed(sqlite_session, connection)
 
     await cancel_booking(
         sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=NOW, effects=_effects()
@@ -393,6 +397,7 @@ async def test_rescheduling_after_the_write_target_moved_deletes_old_and_creates
     tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
     await link_booking_calendar(sqlite_session, connection=connection, calendar_id="old@cal")
+    await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
         sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
@@ -401,6 +406,7 @@ async def test_rescheduling_after_the_write_target_moved_deletes_old_and_creates
     first = await _book(sqlite_session, tenant, event_type)
     await _drain(sqlite_session, sqlite_maker, execute)
     await link_booking_calendar(sqlite_session, connection=connection, calendar_id="new@cal")
+    await _refreshed(sqlite_session, connection)
 
     moved = await reschedule_booking(
         sqlite_session,
@@ -431,6 +437,7 @@ async def test_a_booking_from_before_the_columns_existed_falls_back_and_says_so(
     tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
     await link_booking_calendar(sqlite_session, connection=connection, calendar_id="current@cal")
+    await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
         sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
@@ -554,3 +561,83 @@ async def test_the_loud_errors_are_the_declared_ones(
     await sqlite_session.commit()
     with pytest.raises(AmbiguousCalendarTargetError):
         await run_google_effect(sqlite_maker, work, NOW, service_factory=lambda _c: FakeGoogle())
+
+
+async def test_cancelling_after_the_host_revoked_the_connection_still_removes_the_event(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+) -> None:
+    """What decides a DELETE is not whether the host has a calendar TODAY — it is whether the chain
+    already put an EVENT in one.
+
+    The host revokes their Google account between the booking and the cancellation. Gating the
+    enqueue on "are there active connections" drops the intent entirely: the guest is cancelled, the
+    meeting stays in the host's calendar forever, and nothing anywhere says so. The event's recorded
+    home is what the delete follows — and if even that cannot be reached, it dead-letters, which is
+    a signal. Silence is not.
+    """
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
+    google = FakeGoogle()
+    execute = make_booking_effect_executor(
+        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+    )
+
+    booking = await _book(sqlite_session, tenant, event_type)
+    await _drain(sqlite_session, sqlite_maker, execute)
+    await sqlite_session.refresh(booking)
+    assert google.created == [("primary", "evt-1")]
+
+    connection.revoked_at = NOW  # the host disconnects Google
+    await sqlite_session.flush()
+
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=NOW, effects=_effects()
+    )
+    intents = await _google_intents(sqlite_session, booking.id)
+    assert any(i.payload["operation"] == "delete" for i in intents), "the delete WAS enqueued"
+
+    await _drain(sqlite_session, sqlite_maker, execute)
+
+    # The event is removed from the calendar it lives in — no orphan left in the host's account.
+    assert google.deleted == [("primary", "evt-1")]
+
+
+async def test_an_intent_queued_in_the_old_payload_format_still_drains(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+) -> None:
+    """The intent payload changed (it names the HOST now, not a connection). Rows queued by the
+    PREVIOUS build are sitting in the outbox at deploy time: if the new reader cannot understand
+    them they fail six times and dead-letter — a self-inflicted outage on every upgrade. The reader
+    accepts both shapes, and derives the host from the old ``connection_id``."""
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
+    google = FakeGoogle()
+    booking = await _book(sqlite_session, tenant, event_type)
+
+    legacy = (await _google_intents(sqlite_session, booking.id))[0]
+    legacy.payload = {
+        "operation": "upsert",
+        # The OLD shape: a connection id, no host id.
+        "connection_id": str(connection.id),
+        "external_event_id": None,
+        "summary": "Discovery call",
+        "start": SLOT_9.isoformat(),
+        "end": (SLOT_9 + timedelta(minutes=30)).isoformat(),
+        "timezone": "UTC",
+        "guest_email": "lead@example.com",
+    }
+    work = _as_work(legacy)
+    await sqlite_session.commit()
+
+    await run_google_effect(sqlite_maker, work, NOW, service_factory=lambda _c: google)
+
+    await sqlite_session.refresh(booking)
+    assert google.created == [("primary", "evt-1")]
+    assert booking.external_event_id == "evt-1"
+    assert booking.external_connection_id == connection.id  # and it records its home like any other

@@ -239,30 +239,86 @@ async def link_booking_calendar(
     credential rule, and simple good hygiene for anyone connecting a real account.
 
     Idempotent: re-running it for the same calendar (a token refresh, a re-run of the connect
-    command) updates the existing link instead of piling up rows. Designating a NEW target demotes
-    the previous one first, so the one-target-per-connection unique index is never tripped — and so
-    the operator never ends up with two targets and a dead-lettered booking.
+    command) updates the existing link instead of piling up rows.
+
+    ONE TARGET PER HOST, not per connection. The partial unique index only guarantees one target per
+    CONNECTION, so a host with two connected accounts could end up with a write target in each — and
+    then :func:`resolve_calendar_target` refuses (rightly) and the operator is left with
+    dead-lettered bookings and no idea why. Designating a target is a CHOICE, so it gets written
+    down: every other target of this host, on ANY of their connections, is retired in the same
+    transaction.
+
+    IT ALSO INVALIDATES THE BUSY CACHE. The cache is keyed by connection, not by calendar, so
+    changing WHICH calendars are read leaves it holding the previous calendar's occupancy while
+    still stamped fresh and covering the window. Slots would then be offered against an occupancy
+    that is no longer the host's — a double-booking, which is the one invariant this product exists
+    to protect (RF-04).
     """
+    await _retire_other_targets(session, connection=connection, calendar_id=calendar_id)
+
     links = await _links(session, connection=connection)
-    for link in links:
-        if link.external_calendar_id != calendar_id:
-            link.is_booking_target = False
     existing = next((link for link in links if link.external_calendar_id == calendar_id), None)
-    if existing is not None:
-        existing.is_booking_target = True
-        existing.busy = True
-        await session.flush()
-        return existing
-    row = ExternalCalendarLink(
-        tenant_id=connection.tenant_id,
-        connection_id=connection.id,
-        external_calendar_id=calendar_id,
-        busy=True,
-        is_booking_target=True,
-    )
-    session.add(row)
+    if existing is None:
+        existing = ExternalCalendarLink(
+            tenant_id=connection.tenant_id,
+            connection_id=connection.id,
+            external_calendar_id=calendar_id,
+        )
+        session.add(existing)
+    existing.is_booking_target = True
+    existing.busy = True
+
+    await invalidate_busy_cache(session, connection=connection)
     await session.flush()
-    return row
+    return existing
+
+
+async def _retire_other_targets(
+    session: AsyncSession, *, connection: ExternalConnection, calendar_id: str
+) -> None:
+    """Clear ``is_booking_target`` on every OTHER calendar of this host, across ALL connections."""
+    connections = await load_active_connections(
+        session, tenant_id=connection.tenant_id, user_id=connection.user_id
+    )
+    connection_ids = {row.id for row in connections} | {connection.id}
+    rows = (
+        await session.scalars(
+            select(ExternalCalendarLink).where(
+                ExternalCalendarLink.tenant_id == connection.tenant_id,
+                ExternalCalendarLink.connection_id.in_(connection_ids),
+                ExternalCalendarLink.is_booking_target.is_(True),
+            )
+        )
+    ).all()
+    for row in rows:
+        if row.connection_id != connection.id or row.external_calendar_id != calendar_id:
+            row.is_booking_target = False
+    # Flush the demotions BEFORE the promotion above returns: the partial unique index (one target
+    # per connection) would reject an intermediate state with two targets on the same connection.
+    await session.flush()
+
+
+async def invalidate_busy_cache(session: AsyncSession, *, connection: ExternalConnection) -> None:
+    """Drop a connection's cached busy set AND its coverage stamp, in the caller's transaction.
+
+    Call this whenever the SET OF CALENDARS being read changes. The cache is per connection, so it
+    cannot tell that the blocks it holds came from a calendar the host no longer uses: it keeps
+    reading as fresh and covering the window, and slots get computed against an occupancy that is no
+    longer the host's. Clearing the stamp makes :func:`read_busy` treat the window as uncovered,
+    which — with no refresh available in the request path (RNF-6) — reads UNAVAILABLE, so the host
+    is offered NO slots until the background refresher repopulates it. Offering nothing for a few
+    minutes is the safe side of that trade; a double-booking is not.
+    """
+    await session.execute(
+        delete(BusyCache).where(
+            BusyCache.tenant_id == connection.tenant_id,
+            BusyCache.connection_id == connection.id,
+        )
+    )
+    connection.busy_synced_from = None
+    connection.busy_synced_to = None
+    connection.busy_synced_at = None
+    await session.flush()
 
 
 def load_credentials(connection: ExternalConnection, *, fernet: Fernet) -> str:
@@ -777,6 +833,7 @@ __all__ = [
     "busy_calendar_ids",
     "create_event_for_booking",
     "delete_event_for_booking",
+    "invalidate_busy_cache",
     "link_booking_calendar",
     "load_active_connections",
     "load_credentials",

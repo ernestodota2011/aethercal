@@ -47,6 +47,7 @@ from aethercal.server.services.calendars import (
     busy_calendar_ids,
     create_event_for_booking,
     delete_event_for_booking,
+    link_booking_calendar,
     load_active_connections,
     read_busy,
     refresh_busy_cache,
@@ -567,3 +568,102 @@ async def test_target_resolution_is_tenant_isolated(
         await load_active_connections(sqlite_session, tenant_id=tenant_a.id, user_id=uuid.uuid4())
         == []
     )
+
+
+# --------------------------------------------------------------------------------------
+# 5. Changing the calendar configuration must not leave a STALE availability cache behind.
+# --------------------------------------------------------------------------------------
+
+
+async def test_designating_a_calendar_invalidates_the_busy_cache(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """The busy cache is keyed by CONNECTION, not by calendar — so switching which calendars are
+    read leaves it holding the OLD calendar's occupancy while still stamped fresh and covered. Slots
+    would then be offered against an occupancy that is no longer the host's: a double-booking, which
+    is the one invariant this product exists to protect (RF-04). Changing the configuration must
+    invalidate the cache in the SAME transaction, so the next read refuses to serve it."""
+    tenant = await tenant_factory(sqlite_session)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    sqlite_session.add(
+        BusyCache(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            start_at=NOW + timedelta(hours=1),
+            end_at=NOW + timedelta(hours=2),
+            fetched_at=NOW,
+        )
+    )
+    await _cover(sqlite_session, connection)  # fresh AND covering the window
+
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="dedicated@cal")
+
+    # The cache of the calendar we are no longer reading is GONE, and the coverage stamp with it.
+    assert connection.busy_synced_at is None
+    assert connection.busy_synced_from is None
+    assert connection.busy_synced_to is None
+    rows = (
+        await sqlite_session.scalars(
+            select(BusyCache).where(BusyCache.connection_id == connection.id)
+        )
+    ).all()
+    assert rows == []
+
+
+async def test_a_stale_cache_is_not_served_after_the_calendar_changes(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """The consequence, end to end: with no way to refresh in the request path (RNF-6), a host whose
+    calendar configuration just changed reads as UNAVAILABLE — offer nothing — rather than serving
+    the previous calendar's busy set as if it were current."""
+    tenant = await tenant_factory(sqlite_session)
+    host = await _host(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _cover(sqlite_session, connection)
+
+    before = await read_busy(
+        sqlite_session, tenant_id=tenant.id, host_user_id=host.id, query=_query()
+    )
+    assert before.status is BusyStatus.FRESH  # covered + fresh against the account default
+
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="dedicated@cal")
+
+    after = await read_busy(
+        sqlite_session, tenant_id=tenant.id, host_user_id=host.id, query=_query()
+    )
+    assert after.status is BusyStatus.UNAVAILABLE  # never stale-but-confident
+    assert after.busy == ()
+
+
+# --------------------------------------------------------------------------------------
+# 6. ONE booking target per HOST — not one per connection.
+# --------------------------------------------------------------------------------------
+
+
+async def test_designating_a_target_retires_the_one_on_the_hosts_other_connection(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """The partial unique index guarantees one target per CONNECTION. A host with two connections
+    could therefore end up with two write targets — and then the resolver refuses (correctly) and
+    the operator is stuck with dead-lettered bookings and no idea why. Designating is a CHOICE, so
+    it is written down: the previous target, wherever it lives, is retired in the same transaction.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _host(sqlite_session, tenant)
+    work = await _connect(sqlite_session, tenant, fernet=fernet, account_email="work@agency.test")
+    ops = await _connect(sqlite_session, tenant, fernet=fernet, account_email="ops@agency.test")
+
+    await link_booking_calendar(sqlite_session, connection=work, calendar_id="work@cal")
+    target = await resolve_calendar_target(sqlite_session, tenant_id=tenant.id, user_id=host.id)
+    assert target is not None and target.calendar_id == "work@cal"
+
+    # The operator moves the booking target to the OTHER connected account.
+    await link_booking_calendar(sqlite_session, connection=ops, calendar_id="ops@cal")
+
+    target = await resolve_calendar_target(sqlite_session, tenant_id=tenant.id, user_id=host.id)
+    assert target is not None
+    assert target.calendar_id == "ops@cal"
+    assert target.connection.id == ops.id
+    # The old target was retired rather than left to collide: the work calendar still contributes
+    # busy (nothing was un-linked), it simply no longer receives the bookings.
+    assert await busy_calendar_ids(sqlite_session, connection=work) == ["work@cal"]

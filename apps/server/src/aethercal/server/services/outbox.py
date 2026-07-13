@@ -1203,7 +1203,12 @@ async def _prepare_google(
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
     payload = work.payload
-    host_id = uuid.UUID(str(payload["host_id"]))
+    host_id = await _payload_host_id(session, payload)
+    if host_id is None:
+        raise CalendarTargetMissingError(
+            f"booking {booking.id}: the Google intent names neither a host nor a resolvable "
+            "connection"
+        )
     operation = GoogleOperation(payload["operation"])
 
     # Resolve the event id from CURRENT DB state, never from the enqueue-time snapshot: an intent
@@ -1260,6 +1265,38 @@ async def _prepare_google(
         target_calendar_id=target.calendar_id,
         target_service=service_factory(target.connection),
     )
+
+
+async def _payload_host_id(session: AsyncSession, payload: Mapping[str, Any]) -> uuid.UUID | None:
+    """The host a Google intent is for — accepting the PREVIOUS payload shape as well.
+
+    The intent used to name a ``connection_id``; it now names a ``host_id`` (the calendar is
+    resolved from live configuration at drain time, so there is one source of truth rather
+    than a snapshot that can rot). Rows queued by the previous build are sitting in the outbox
+    the moment the new code deploys. A reader that cannot understand them fails them six times
+    each and dead-letters the lot — a self-inflicted outage, on every upgrade, over a change
+    that is purely internal.
+
+    So the reader accepts both shapes and derives the host from the old connection. Migrating the
+    rows instead would work too, but only if it ran BEFORE the new consumer; tolerating both formats
+    does not depend on getting a deploy order right.
+    """
+    raw_host = payload.get("host_id")
+    if isinstance(raw_host, str):
+        return uuid.UUID(raw_host)
+    raw_connection = payload.get("connection_id")
+    if not isinstance(raw_connection, str):
+        return None
+    connection = await session.get(ExternalConnection, uuid.UUID(raw_connection))
+    if connection is None:
+        return None
+    _logger.info(
+        "google intent carries the legacy connection_id payload; resolved host %s from "
+        "connection %s",
+        connection.user_id,
+        connection.id,
+    )
+    return connection.user_id
 
 
 async def _require_calendar_target(
