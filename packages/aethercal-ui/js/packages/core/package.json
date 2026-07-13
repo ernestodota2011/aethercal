@@ -5,6 +5,21 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
+  "keywords": [
+    "calendar",
+    "scheduling",
+    "headless",
+    "timeline",
+    "date",
+    "aethercal"
+  ],
+  "homepage": "https://github.com/ernestodota2011/aethercal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ernestodota2011/aethercal.git",
+    "directory": "packages/aethercal-ui/js/packages/core"
+  },
+  "bugs": "https://github.com/ernestodota2011/aethercal/issues",
   "exports": {
     ".": {
       "types": "./src/index.ts",
@@ -13,10 +28,22 @@
   },
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "files": ["src"],
+  "files": ["dist", "README.md"],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts"
   },
   "devDependencies": {
     "fast-check": "^3.23.0",
