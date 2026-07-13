@@ -135,8 +135,12 @@ jobs:
         env:
           AETHERCAL_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aethercal_test
         run: uv run pytest -m db -rs --junitxml=db-results.xml
+      # Each run takes a PostgreSQL SCHEMA of its own (apps/server/tests/conftest.py::pg_url), so
+      # this job is safe to run beside any other `-m db` run — two of them sharing one database is
+      # what used to make them drop each other's tables mid-flight.
+      #
       # THE GATE MUST NOT PASS ON AN EMPTY RUN. The db-marked tests skip themselves when
-      # AETHERCAL_TEST_DATABASE_URL is unset (apps/server/tests/conftest.py::_pg_url_or_skip), and a
+      # AETHERCAL_TEST_DATABASE_URL is unset (apps/server/tests/conftest.py::pg_url), and a
       # `pytest -m db` that skips everything exits 0 — so a typo in the variable name, a dropped
       # `services:` block, or a renamed marker would turn this job GREEN having executed not one
       # test against PostgreSQL. That is the silent no-op, aimed at our own safety net. So we read
