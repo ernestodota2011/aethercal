@@ -66,6 +66,7 @@ from aethercal.server.services.bookings import (
     BookingNotFoundError,
     BookingParams,
     DayFullError,
+    EventTypeInactiveError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     _mint_guest_links,
@@ -76,7 +77,7 @@ from aethercal.server.services.bookings import (
     reschedule_booking,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
-from aethercal.server.services.event_types import create_event_type
+from aethercal.server.services.event_types import create_event_type, deactivate_event_type
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
     OutboxEffect,
@@ -1752,3 +1753,90 @@ async def test_no_cap_declared_leaves_the_booking_path_unchanged(
         )
 
     assert await _active_count(sqlite_session, event_type) == 3
+
+
+# --------------------------------------------------------------------------------------
+# active (RF-14) — "deleting" an event type must actually delete it, for guests.
+# --------------------------------------------------------------------------------------
+
+
+async def test_create_booking_on_a_deactivated_event_type_is_refused(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """``active = False`` is the product's DELETE. It must stop taking bookings.
+
+    ``deactivate_event_type`` wrote the flag and nothing ever read it, so "delete this event type"
+    removed it from nothing: the guest path went on accepting bookings for a service the business
+    had withdrawn. The booking API is about to become public, which turns this from embarrassing
+    into a hole.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    assert await deactivate_event_type(
+        sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id
+    )
+
+    with pytest.raises(EventTypeInactiveError):
+        await create_booking(
+            sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+        )
+
+    assert await _active_count(sqlite_session, event_type) == 0
+
+
+async def test_a_booking_on_a_deactivated_event_type_can_still_be_cancelled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """==The one thing the fix must not break.==
+
+    Deactivating an event type withdraws it from SALE. It cannot strand the guests who already hold
+    an appointment: a booking nobody can cancel is worse than the bug being fixed — the guest is
+    trapped, and the host keeps an hour they will never get back. So the cancel path deliberately
+    keeps looking the event type up UNFILTERED (``_lock_and_reload_booking``), and only the paths
+    that would take a NEW booking require ``active``.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await deactivate_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id)
+
+    cancelled = await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=_BEFORE
+    )
+
+    assert cancelled.status == BookingStatus.CANCELLED
+
+
+async def test_a_booking_on_a_deactivated_event_type_cannot_be_rescheduled(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A reschedule OPENS A NEW BOOKING row, so it is a sale — and the service is withdrawn.
+
+    Refusing it explicitly (rather than letting it fall out of an empty slot list) is the honest
+    answer: the business is no longer publishing this service on any day, so there is no time we
+    could truthfully offer. The guest keeps the right to cancel; the business can reactivate.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+    await deactivate_event_type(sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id)
+
+    with pytest.raises(EventTypeInactiveError):
+        await reschedule_booking(
+            sqlite_session,
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            new_start=_SLOT_11,
+            now=_BEFORE,
+        )
+
+    still = await get_booking(sqlite_session, tenant_id=tenant.id, booking_id=booking.id)
+    assert still is not None
+    assert still.status == BookingStatus.CONFIRMED

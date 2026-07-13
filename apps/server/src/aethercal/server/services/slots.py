@@ -42,7 +42,7 @@ from aethercal.core.slots.engine import available_slots
 from aethercal.schemas.slots import Availability
 from aethercal.server.db.models import Booking, DateOverride, EventType, Schedule
 from aethercal.server.services.calendars import BusyQuery, ServiceFactory, read_busy
-from aethercal.server.services.event_types import get_event_type, to_core_event_type
+from aethercal.server.services.event_types import get_bookable_event_type, to_core_event_type
 from aethercal.server.services.schedules import to_core_overrides, to_core_schedule
 
 # How long a cached external busy window is treated as time-fresh (RF-12). Past this, ``read_busy``
@@ -313,7 +313,13 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     :func:`_days_at_cap`) — it does NOT free that booking's interval, which still occupies the host,
     so a booking can no more be rescheduled onto its own current slot than it could before.
     """
-    event_type = await get_event_type(session, tenant_id=tenant_id, event_type_id=event_type_id)
+    # The GUEST's lookup: a DEACTIVATED event type is not on sale, so it publishes no slots on any
+    # day, and is indistinguishable from one that never existed (``None`` → the router's 404). This
+    # used to be the unfiltered ``get_event_type``, so a "deleted" event type went on offering a
+    # full open week to anyone who asked — see :func:`get_bookable_event_type`.
+    event_type = await get_bookable_event_type(
+        session, tenant_id=tenant_id, event_type_id=event_type_id
+    )
     if event_type is None:
         return None
 

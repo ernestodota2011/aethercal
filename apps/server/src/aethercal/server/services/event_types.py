@@ -122,8 +122,50 @@ async def get_event_type(
     ).one_or_none()
 
 
+async def get_bookable_event_type(
+    session: AsyncSession, *, tenant_id: uuid.UUID, event_type_id: uuid.UUID
+) -> EventType | None:
+    """The tenant's EventType — but ONLY if it is still on sale (``active``). The GUEST's lookup.
+
+    .. rubric:: Why this is a new function and not a filter inside :func:`get_event_type`
+
+    ``active = False`` is this product's DELETE (:func:`deactivate_event_type`). The flag was
+    written, and read by nobody: ``get_event_type`` matched on ``id`` + ``tenant_id`` alone,
+    ``compute_slots`` never mentioned ``active``, and the only reader in the codebase was a display
+    column. So "delete this event type" removed it from precisely nothing — the slots endpoint kept
+    publishing a full open week for it and the booking endpoint kept accepting bookings for a
+    service the business had withdrawn. The public booking page filtered ``e.active`` in memory,
+    which is not a defence: ==that is the CLIENT, and a server must never rely on its client to
+    enforce what the business decided.== With the booking API going public, that stops being untidy.
+
+    But the fix cannot be "add ``active`` to ``get_event_type``", and that is the point of this
+    seam. The OPERATOR must keep seeing inactive rows — to list them, inspect them, and above all to
+    REACTIVATE them. Filter the shared lookup and ``deactivate`` becomes a one-way door that hides
+    the row from the only person who can undo it (``update_event_type`` reads through that very
+    function). Two audiences, two lookups:
+
+    * **Guest paths require ``active``** — ``compute_slots`` (offer nothing) and
+      ``create_booking`` / ``reschedule_booking`` (take nothing). They use THIS function.
+    * **Operator paths do not** — :func:`get_event_type` / :func:`list_event_types` stay unfiltered.
+      Nor does the CANCEL path: a guest holding an appointment on a withdrawn service must still be
+      able to cancel it, or deactivating a type would trap them with a booking nobody can undo.
+
+    Returning ``None`` rather than "it exists but is off" is deliberate: the router renders it as
+    the same 404 an unknown id gets, so a stranger cannot enumerate which of a business's event
+    types have been switched off.
+    """
+    row = await get_event_type(session, tenant_id=tenant_id, event_type_id=event_type_id)
+    return row if row is not None and row.active else None
+
+
 async def list_event_types(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[EventType]:
-    """Return all of the tenant's EventTypes (active and inactive), oldest first."""
+    """Return all of the tenant's EventTypes (active and inactive), oldest first.
+
+    ==Deliberately unfiltered — the OPERATOR's list.== The guest's equivalent is
+    :func:`get_bookable_event_type`. Do not "tidy up" by adding an ``active`` filter here: the admin
+    would lose the ability to see and reactivate a deactivated type
+    (``test_the_admin_keeps_its_full_view_of_a_deactivated_event_type`` pins this).
+    """
     result = await session.scalars(
         select(EventType)
         .where(EventType.tenant_id == tenant_id)
@@ -214,6 +256,7 @@ __all__ = [
     "InvalidReferenceError",
     "create_event_type",
     "deactivate_event_type",
+    "get_bookable_event_type",
     "get_event_type",
     "list_event_types",
     "to_core_event_type",

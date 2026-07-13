@@ -36,6 +36,7 @@ from aethercal.server.db.models import (
 )
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.api_keys import issue_api_key
+from aethercal.server.services.event_types import deactivate_event_type
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
@@ -386,3 +387,45 @@ async def test_no_show_fans_out_the_webhook_over_http(
         ).all()
     assert len(queued) == 1
     assert queued[0].payload["data"]["id"] == str(booking_id)
+
+
+async def test_a_deactivated_event_type_is_indistinguishable_from_an_unknown_one(
+    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """RF-14 over HTTP: "deleting" an event type must actually stop it taking bookings — and must
+    not become an oracle for which ones a business has switched off.
+
+    Deactivation (``active = False``, what ``DELETE /event-types/{id}`` performs) used to change
+    nothing a guest could observe: ``POST /bookings`` went on confirming appointments for the
+    withdrawn service, because no booking path ever read the flag.
+
+    Both halves are asserted, and the second matters as much as the first: the deactivated type must
+    answer with the EXACT status, code and message an id that never existed answers with. A distinct
+    "this one is disabled" reply would let a stranger enumerate a business's retired services.
+    """
+    unknown = await wired_client.post(
+        BOOKINGS,
+        json={**_payload(seeded, seeded["slot1"]), "event_type_id": str(uuid.uuid4())},
+        headers=seeded["headers"],
+    )
+    assert unknown.status_code == 404
+
+    # Soft-delete through the service (the event-types router is not mounted on this client).
+    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    async with sessionmaker() as session, session.begin():
+        assert await deactivate_event_type(
+            session,
+            tenant_id=seeded["tenant_id"],
+            event_type_id=uuid.UUID(seeded["event_type_id"]),
+        )
+
+    deactivated = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert deactivated.status_code == 404
+    assert deactivated.json()["detail"] == unknown.json()["detail"]  # byte-for-byte, no oracle
+
+    # (That it also publishes no SLOTS is proven offline, in
+    # ``test_slots_service.test_a_deactivated_event_type_publishes_no_slots``: the slots router is
+    # not mounted on this client, so asserting it here would pass on a ROUTING 404 and prove
+    # nothing at all.)

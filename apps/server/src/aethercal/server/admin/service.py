@@ -231,6 +231,12 @@ def _now(now: datetime | None) -> datetime:
 
 _BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str | None] = {
     bookings_service.EventTypeNotFoundError: "Event type not found",
+    # RF-14, and ``None`` on purpose. The PUBLIC API answers this with a plain "Event type not
+    # found" — identical to an unknown id, so the 404s cannot be used to enumerate which event
+    # types a business switched off. The operator is a different audience: they are looking at
+    # the row in their own list (which still shows inactive ones), so "not found" would be simply
+    # baffling. The service's own words name the real cause and the way out ("...reactivate it").
+    bookings_service.EventTypeInactiveError: None,
     bookings_service.BookingNotFoundError: "Booking not found",
     bookings_service.AvailabilityUnavailableError: (
         "Host availability is temporarily unavailable; please try again"

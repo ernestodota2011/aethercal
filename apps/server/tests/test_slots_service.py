@@ -32,7 +32,7 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
-from aethercal.server.services.event_types import create_event_type
+from aethercal.server.services.event_types import create_event_type, deactivate_event_type
 from aethercal.server.services.slots import SlotsResult, _load_overrides, compute_slots
 
 # Mon-Fri 09:00-17:00 in the schedule's own zone (Monday=0 .. Sunday=6).
@@ -667,3 +667,35 @@ async def test_no_cap_declared_means_no_cap_applied(
 
     assert result is not None
     assert len(result.slots) == _SLOTS_PER_DAY * 5 - 1  # only the booked slot is gone
+
+
+async def test_a_deactivated_event_type_publishes_no_slots(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """A withdrawn service is not on sale on ANY day (RF-14).
+
+    ``compute_slots`` never looked at ``active``, so a "deleted" event type went on publishing a
+    full open week to every guest who asked. The booking page filtered ``e.active`` in memory, which
+    is not a defence — that is the CLIENT, and the server must not depend on its client to enforce
+    what the business decided. Returning ``None`` (the router's 404) also declines to reveal that a
+    deactivated type exists at all.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule)
+
+    assert await deactivate_event_type(
+        sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id
+    )
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is None

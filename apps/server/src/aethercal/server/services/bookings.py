@@ -79,6 +79,18 @@ class EventTypeNotFoundError(BookingError):
     """The event type does not exist for the tenant (→ HTTP 404)."""
 
 
+class EventTypeInactiveError(BookingError):
+    """The event type is deactivated, so it takes no new bookings (RF-14) (→ HTTP 404).
+
+    ==404, not 409, and the API renders it with the SAME code and message as
+    :class:`EventTypeNotFoundError`.== To a guest, a withdrawn service and a service that never
+    existed must look identical, or the 404s become an oracle for enumerating which of a
+    business's event types were switched off. It is a distinct class only so the OPERATOR — who
+    is looking right at the row in their admin list — can be told the useful thing ("it is
+    deactivated") instead of the baffling one ("not found").
+    """
+
+
 class BookingNotFoundError(BookingError):
     """No booking with that id exists for the tenant (→ HTTP 404)."""
 
@@ -207,6 +219,21 @@ def _to_utc(moment: datetime) -> datetime:
     """Normalize any datetime to an aware UTC instant (SQLite drops tzinfo on round-trip)."""
     aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
     return aware.astimezone(UTC)
+
+
+def _require_bookable(event_type: EventType) -> None:
+    """Refuse to SELL a deactivated event type (RF-14).
+
+    Guards the two paths that open a new booking — ``create_booking`` and ``reschedule_booking``.
+    ==It deliberately does NOT guard ``cancel_booking`` or ``mark_no_show``:== those act on an
+    appointment that already exists, and a business withdrawing a service must never leave its
+    existing guests holding a booking that nobody is allowed to cancel.
+    """
+    if not event_type.active:
+        raise EventTypeInactiveError(
+            f"event type '{event_type.slug}' is deactivated and is not taking bookings; "
+            "reactivate it to make it bookable again"
+        )
 
 
 def _require_slot_on_offer(result: SlotsResult | None, *, start: datetime, end: datetime) -> None:
@@ -417,6 +444,10 @@ async def create_booking(
     )
     if event_type is None:
         raise EventTypeNotFoundError("event type not found")
+    # A DEACTIVATED event type is withdrawn from sale and takes no new bookings (RF-14). The row is
+    # fetched unfiltered above and checked here, rather than through ``get_bookable_event_type``,
+    # only so the OPERATOR can be told *why* — the guest is answered with an indistinguishable 404.
+    _require_bookable(event_type)
 
     start = _to_utc(params.start)
     end = start + timedelta(seconds=event_type.duration_seconds)
@@ -608,6 +639,13 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     )
     if old.status != BookingStatus.CONFIRMED:
         raise BookingNotActiveError("only a confirmed booking can be rescheduled")
+    # A reschedule OPENS A NEW BOOKING (the successor row below), so it is a sale — and a
+    # deactivated event type is withdrawn from sale (RF-14). Refused explicitly, rather than left to
+    # fall out of an empty slot list, because it is the honest answer: the business publishes this
+    # service on no day at all, so there is no time we could truthfully offer instead. ==Cancelling
+    # is NOT gated on ``active``== (see :func:`cancel_booking`) — withdrawing a service must never
+    # trap the guests already holding an appointment for it.
+    _require_bookable(event_type)
 
     start = _to_utc(new_start)
     end = start + timedelta(seconds=event_type.duration_seconds)
@@ -1072,6 +1110,7 @@ __all__ = [
     "BookingNotFoundError",
     "BookingParams",
     "DayFullError",
+    "EventTypeInactiveError",
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",
