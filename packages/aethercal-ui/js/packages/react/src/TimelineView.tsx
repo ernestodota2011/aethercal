@@ -494,6 +494,36 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
     [currentRow, eventInteractive],
   );
 
+  /**
+   * The actionable events sitting UNDER the day cursor — i.e. on the active day of the active row.
+   *
+   * This is what gives the keyboard the same reach as the mouse. The mouse decides by WHERE you
+   * click: on a bar you grab it, on empty track you select. The keyboard's position is the (row, day)
+   * cell, so it must decide by what is in THAT cell — not by whether the row happens to hold an event
+   * somewhere else entirely. Asking "is the whole row empty?" meant one Monday booking made every
+   * other day of that resource uncreatable by keyboard, while a mouse user could still create there.
+   *
+   * Occupancy is judged on the AXIS (the same fractions the bars are drawn from), so what the user
+   * sees in the cell is what the cursor acts on. A zero-width bar counts when it sits inside the day.
+   */
+  const eventsUnderCursor = React.useMemo(() => {
+    const day = timeline.dayHeaders[activeDayIndex];
+    if (!day || !currentRow) return [];
+    const dayStart = day.leftFraction;
+    const dayEnd = day.leftFraction + day.widthFraction;
+    const EPS = 1e-9; // day edges are derived fractions; never let 1 ulp decide the cell
+    return currentRow.blocks
+      .filter((block) => {
+        const start = block.leftFraction;
+        const end = block.leftFraction + block.widthFraction;
+        return end > start
+          ? start < dayEnd - EPS && end > dayStart + EPS
+          : start >= dayStart - EPS && start < dayEnd - EPS;
+      })
+      .map((block) => block.event)
+      .filter((event) => eventInteractive(event));
+  }, [timeline.dayHeaders, activeDayIndex, currentRow, eventInteractive]);
+
   // If the active/grabbed event vanished (events changed, or its group was collapsed), fall back to
   // the row so `aria-activedescendant` never points at a node that is not rendered.
   React.useEffect(() => {
@@ -764,18 +794,17 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
           toggleGroup(currentItem.group.id);
           return;
         }
-        // On a row with events, Enter descends into them; on an EMPTY row it creates.
-        if (navigableEvents.length > 0) {
+        // Enter acts on what is UNDER THE CURSOR, exactly as a click acts on what is under the
+        // pointer: on a cell holding events it descends into them; on a FREE cell it creates. The
+        // old rule asked whether the whole ROW was empty, which left a keyboard user unable to book
+        // an empty Thursday just because the resource had something on Monday — while a mouse user
+        // could. A busy row no longer freezes its own free days.
+        if (eventsUnderCursor.length > 0) {
           e.preventDefault();
-          setActiveEventId(navigableEvents[0]!.id);
+          setActiveEventId(eventsUnderCursor[0]!.id);
           return;
         }
-        if (
-          currentRow?.resource &&
-          currentRow.blocks.length === 0 &&
-          onRangeSelect &&
-          days.length > 0
-        ) {
+        if (currentRow?.resource && onRangeSelect && days.length > 0) {
           // Build a POSITIVE, window-bounded slot; never emit a zero-length range.
           const day = days[Math.min(activeDayIndex, days.length - 1)]!;
           const startMinute = timeline.config.dayStartHour * 60;
@@ -801,6 +830,7 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
       kbGrab,
       activeEventId,
       navigableEvents,
+      eventsUnderCursor,
       currentItem,
       currentRow,
       timeline.items.length,

@@ -211,7 +211,7 @@ describe("timeline — keyboard: groups", () => {
   });
 });
 
-describe("timeline — keyboard: creating on an empty row", () => {
+describe("timeline — keyboard: creating on an empty cell", () => {
   it("creates on the active row and day, naming the resource", () => {
     const onRangeSelect = vi.fn();
     const { getByRole } = renderTimeline({ events: [], onRangeSelect });
@@ -227,5 +227,43 @@ describe("timeline — keyboard: creating on an empty row", () => {
       start: "2026-07-14T00:00:00",
       allDay: false,
     });
+  });
+
+  it("creates on a FREE day of a row that is busy on ANOTHER day (keyboard/mouse parity)", () => {
+    // `e1` sits on day 1 of Dr. Rivas. A mouse user can still click day 2 of that row and create
+    // there. The keyboard must reach the same cell: asking "is the whole ROW empty?" froze every
+    // other day of a resource the moment it held a single booking — a silent dead key, and a parity
+    // regression in a component whose a11y is an acceptance criterion.
+    const onRangeSelect = vi.fn();
+    const { getByRole } = renderTimeline({ onRangeSelect }); // events = [e1], on day 1
+    const grid = getByRole("grid");
+
+    fireEvent.keyDown(grid, { key: "ArrowRight" }); // day cursor -> day 2, which is FREE
+    fireEvent.keyDown(grid, { key: "Enter" });
+
+    expect(onRangeSelect).toHaveBeenCalledTimes(1);
+    expect(onRangeSelect.mock.calls[0]![0]).toMatchObject({
+      resourceId: "h1", // the busy row
+      start: "2026-07-14T00:00:00", // its free day
+      allDay: false,
+    });
+  });
+
+  it("still descends into the events when the cursor IS on the occupied day", () => {
+    // The other half of the parity: Enter on a cell that holds a bar acts on the bar — exactly as a
+    // click on a bar does — and must never create on top of it.
+    const onRangeSelect = vi.fn();
+    const onEventDrop = vi.fn();
+    const { getByRole } = renderTimeline({ onRangeSelect, onEventDrop });
+    const grid = getByRole("grid");
+
+    fireEvent.keyDown(grid, { key: "Enter" }); // day 1 holds e1 -> descend into it
+    fireEvent.keyDown(grid, { key: "Enter" }); // grab it
+    fireEvent.keyDown(grid, { key: "ArrowDown" }); // move it to the next resource
+    fireEvent.keyDown(grid, { key: "Enter" }); // drop
+
+    expect(onRangeSelect).not.toHaveBeenCalled(); // never created on top of the event
+    expect(onEventDrop).toHaveBeenCalledTimes(1);
+    expect(onEventDrop.mock.calls[0]![0]).toMatchObject({ id: "e1", resourceId: "h2" });
   });
 });
