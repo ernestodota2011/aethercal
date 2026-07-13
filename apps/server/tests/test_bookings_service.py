@@ -38,6 +38,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import sqlalchemy as sa
 from cryptography.fernet import Fernet
 from icalendar import Calendar
 from sqlalchemy import func, select
@@ -687,6 +688,116 @@ async def test_reschedule_a_cancelled_booking_is_refused(
             new_start=_SLOT_11,
             now=_BEFORE,
         )
+
+
+async def test_reschedule_carries_the_guests_phone_and_its_consent_stamp(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The successor is the SAME guest's SAME appointment, so it keeps their phone — and the stamp
+    that says they agreed to be messaged on it.
+
+    Dropping either one silently unsubscribes the guest from every phone channel: the WhatsApp/SMS
+    step reads ``guest_phone`` (skip ``no-phone``) and then ``guest_phone_consent_at`` (skip
+    ``no-phone-consent``), so a reschedule would quietly end the reminders — no error, no log line
+    anybody reads, and the guest simply never hears from us again.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    original = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(
+            event_type.id, _SLOT_9, guest_phone="+13055551234", guest_phone_consent=True
+        ),
+        now=_BEFORE,
+    )
+    assert original.guest_phone == "+13055551234"
+    assert original.guest_phone_consent_at == _BEFORE
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert moved.guest_phone == original.guest_phone
+    assert moved.guest_phone_consent_at == original.guest_phone_consent_at
+
+
+def _sample_guest_value(column: sa.Column[Any]) -> Any:
+    """A distinctive non-null value for a guest column, chosen from its TYPE — never a hand-list.
+
+    This is what makes the inheritance test below structural instead of decorative. A guest column
+    left unpopulated would compare ``None == None`` on both rows and pass while proving nothing, so
+    a column whose type this does not know raises rather than being skipped: adding
+    ``guest_something`` of a new type fails HERE, loudly, and the author has to say what it means.
+    """
+    if isinstance(column.type, sa.String):  # covers Text (a String subclass)
+        value = f"sample-{column.name}"
+        return value[: column.type.length] if column.type.length else value
+    if isinstance(column.type, sa.DateTime):
+        return datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
+    if isinstance(column.type, sa.Boolean):
+        return True
+    if isinstance(column.type, sa.Integer):
+        return 7
+    raise AssertionError(
+        f"{column.name}: no sample value for {column.type!r}. Teach this helper the type — do not "
+        "skip the column, or the reschedule-inheritance assertion silently stops covering it."
+    )
+
+
+async def test_reschedule_inherits_every_guest_column_the_model_declares(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """The successor inherits EVERY ``guest_*`` column ``Booking`` declares — read off the metadata,
+    not off a list in this file.
+
+    The bug this pins is not "``guest_phone`` was forgotten". It is that the successor was built by
+    COPYING FIELDS BY HAND, so the set of inherited fields and the set of declared fields were two
+    lists kept in agreement by memory alone. They drifted the moment RF-24 added a column, and
+    nothing failed: the guest simply stopped getting messages.
+
+    So the assertion is derived the way ``test_models_metadata.py`` derives its invariants — from
+    ``Booking.__table__``. Add a guest column tomorrow and this test starts covering it on its own;
+    fail to carry it and this test, not a guest's missing reminder, is what tells you.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    original = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    columns = [col for col in Booking.__table__.columns if col.name.startswith("guest_")]
+    assert columns, "no guest_* columns found — the derivation is broken, not the model"
+    for column in columns:
+        setattr(original, column.name, _sample_guest_value(column))
+    await sqlite_session.flush()
+    await sqlite_session.refresh(original)
+
+    # Compare the successor against what the PREDECESSOR actually holds, not against the literals
+    # above: "inherits" means the two rows agree, and SQLite drops tzinfo on round-trip so the
+    # literals are not what came back. The not-None guard is what keeps this honest — an unpopulated
+    # column would compare None == None and pass while covering nothing.
+    stored = {column.name: getattr(original, column.name) for column in columns}
+    assert all(value is not None for value in stored.values()), (
+        f"every guest column must hold a real value before the move, else the assertion below is "
+        f"vacuous: {stored}"
+    )
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=original.id,
+        new_start=_SLOT_11,
+        now=_BEFORE,
+    )
+
+    assert {name: getattr(moved, name) for name in stored} == stored
 
 
 # --------------------------------------------------------------------------------------

@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
 from aethercal.server.db.models import Booking, EventType
+from aethercal.server.db.models.booking import guest_columns
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import load_active_connections
 from aethercal.server.services.event_types import get_event_type
@@ -514,6 +515,27 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     otherwise each see it active and each open a replacement (different ``start_at`` slips past the
     partial index) — a double-booking hole. Serializing on the lock and re-checking the committed
     status closes it: the loser sees it already cancelled/rescheduled and is refused (not active).
+
+    .. rubric:: The successor inherits the guest — INCLUDING their phone-consent stamp
+
+    Every ``guest_*`` column is carried over, read off the model by :func:`guest_columns` rather
+    than named in a literal here (a hand-copied list already dropped two of them in silence).
+
+    ``guest_phone_consent_at`` is inherited DELIBERATELY, and it is worth arguing rather than
+    assuming, because it is a record about a real person's agreement to be messaged. It is the same
+    guest, the same phone number, and the same appointment — moved, not replaced. The consent they
+    gave was to be messaged ABOUT THIS APPOINTMENT, and a reschedule is precisely the moment that
+    matters most: it is the message that tells them the time changed and reminds them of the new
+    one. Re-asking would be absurd (nobody re-consents to a reminder because the meeting moved an
+    hour), and DROPPING it — which is what the old code did by accident — silently withdraws a
+    consent the guest never withdrew, and ends the messages they asked for.
+
+    ==Its meaning does not widen by being inherited.== It remains a stamp that the box was ticked on
+    the form, at that original instant, by whoever filled it in — never proof that the OWNER of the
+    number agreed (an unverified number is a DECLARED GAP, ``docs/phone-channels.md``). The stamp
+    carried forward is the ORIGINAL tick's, not ``now``: back-dating it would be a lie, and
+    re-stamping it would forge a fresh agreement nobody gave. A guest who never ticked the box
+    inherits ``NULL`` and stays unmessaged, exactly as before.
     """
     old, event_type = await _lock_and_reload_booking(
         session, tenant_id=tenant_id, booking_id=booking_id
@@ -534,10 +556,12 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         start_at=start,
         end_at=end,
         status=BookingStatus.CONFIRMED,
-        guest_name=old.guest_name,
-        guest_email=old.guest_email,
-        guest_timezone=old.guest_timezone,
-        guest_notes=old.guest_notes,
+        # EVERY guest column, DERIVED from the model (:func:`guest_columns`) instead of named here.
+        # The literal that used to sit in this spot listed four of the six and silently dropped the
+        # other two — see that function's docstring for what it cost the guest.
+        **{name: getattr(old, name) for name in guest_columns()},
+        # ``answers`` is COPIED, not aliased: one shared dict would let a later edit of either row
+        # rewrite the other's history.
         answers=dict(old.answers),
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly

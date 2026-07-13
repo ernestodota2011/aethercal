@@ -129,6 +129,29 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
 
 
+def guest_columns() -> tuple[str, ...]:
+    """Every column carrying the GUEST's own data — DERIVED from the table, never hand-listed.
+
+    A reschedule does not create a new customer. It moves ONE appointment for ONE person, so the
+    successor row must carry that person over intact. It used to do that by naming each field in a
+    literal at the call site — and a hand-written list of fields is a SECOND declaration of the
+    model, kept in agreement with the first by memory alone.
+
+    They drifted, as that always ends. RF-24 added ``guest_phone`` and ``guest_phone_consent_at``;
+    the copy list never learned about them; so every reschedule dropped the guest's phone number and
+    their consent stamp. Nothing raised, nothing logged, every test passed — and the WhatsApp/SMS
+    steps then skipped that booking forever (``no-phone``), so the reminder for the appointment the
+    guest had *just moved* was the one that never arrived.
+
+    Deriving the set from ``Booking.__table__`` collapses the two declarations into one: the next
+    ``guest_*`` column is carried the day it is added, with nobody having to remember anything.
+
+    ``answers`` is guest data too and is deliberately NOT here: it is a mutable ``dict`` that must
+    be COPIED, not aliased onto both rows, so the caller carries it explicitly (``dict(...)``).
+    """
+    return tuple(col.name for col in Booking.__table__.columns if col.name.startswith("guest_"))
+
+
 def held_filter(now: _dt.datetime) -> sa.ColumnElement[bool]:
     """The appointments that ALREADY SHOULD HAVE HAPPENED — the denominator of the no-show rate.
 
@@ -177,4 +200,4 @@ class GuestToken(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     used_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
 
-__all__ = ["Booking", "GuestToken"]
+__all__ = ["Booking", "GuestToken", "guest_columns", "held_filter"]
