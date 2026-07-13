@@ -371,7 +371,12 @@ async def test_a_claimed_step_is_voided_and_its_workers_result_is_discarded(
         await _settle(sqlite_maker, work, now=_SLOT, outcome=_Outcome.DELIVERED, report=report)
 
     assert report.delivered == [], "the in-flight worker wrote its result onto a voided step"
-    assert report.lost == [step_id]
+    # ==It is NOT counted as a lost lease.== `lost` is the metric that proves in production whether
+    # the timeout assumption holds — i.e. whether a real duplicate send happened. Fill it with
+    # routine cancellations and that signal drowns in noise, and an alarm that always fires is an
+    # alarm nobody reads. A void gets its own bucket.
+    assert report.voided_midflight == [step_id]
+    assert report.lost == [], "a routine cancellation was filed as a lost lease (a false alarm)"
 
     async with sqlite_maker() as session:
         final = await session.get(Outbox, step_id)

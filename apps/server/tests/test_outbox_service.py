@@ -23,6 +23,7 @@ make its post-commit effects durable and safe:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -852,3 +853,111 @@ async def test_an_item_is_only_claimed_when_its_turn_comes(maker: Sessionmaker) 
         "the second item was claimed while the first was still sending — its lease burns down "
         "while it waits its turn"
     )
+
+
+# --------------------------------------------------------------------------------------
+# The ceiling is ENFORCED, not merely declared. A constant + a comment + a test of its own
+# arithmetic is a declared invariant that nothing applies — and the code goes on doing the
+# very thing the invariant forbids.
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_send_that_overruns_the_ceiling_is_aborted_and_retried(
+    maker: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A provider call that never returns must not be allowed to run forever.
+
+    It is aborted at the ceiling and treated as a RETRYABLE FAILURE — not a success (we have no idea
+    whether the provider acted) and not a death (this worker is alive and still holds its lease,
+    precisely because the abort fires strictly inside it).
+    """
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id)
+    cancelled = False
+
+    async def _hangs(_work: OutboxWork, _now: datetime) -> None:
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(30)  # a provider that simply never answers
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    with caplog.at_level("ERROR"):
+        report = await drain_outbox(
+            maker,
+            now=NOW,
+            execute=_hangs,
+            lease=timedelta(seconds=5),
+            provider_timeout=timedelta(milliseconds=50),
+        )
+
+    assert cancelled, "the send was never actually aborted — the ceiling is decorative"
+    assert report.failed == [intent_id]  # retryable
+    assert report.delivered == [] and report.dead == []
+    assert report.lost == []  # we still held our lease: the abort fired INSIDE it
+
+    row = await _row(maker, intent_id)
+    assert row.status == "failed"
+    assert row.attempts == 1
+    assert row.next_retry_at is not None  # it comes back, with backoff
+    assert any("PROVIDER_TIMEOUT_CEILING" in record.getMessage() for record in caplog.records)
+
+
+async def test_an_overrunning_send_can_never_run_twice_at_once(maker: Sessionmaker) -> None:
+    """The reason the ceiling exists.
+
+    Without it, a send outlives its lease → the recovery pass hands the row to a second worker →
+    that worker executes it WHILE the first is still executing it → the guest is messaged twice.
+
+    Here the send would run for 30 s against a 0.3 s lease, and a second worker hammers the same
+    queue throughout. What is asserted is not "no exception": it is that **the same intent is never
+    being executed by two workers at the same moment** — measured as peak concurrency in the fake.
+    """
+    tenant_id, booking_id = await _seed_booking(maker)
+    await _enqueue(maker, tenant_id, booking_id)
+    lease = timedelta(seconds=0.3)
+    in_flight = 0
+    peak = 0
+    executions = 0
+
+    async def _hangs(_work: OutboxWork, _now: datetime) -> None:
+        nonlocal in_flight, peak, executions
+        in_flight += 1
+        executions += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(30)  # would blow the lease many times over
+        finally:
+            in_flight -= 1
+
+    async def _pest() -> None:
+        """A second worker doing its best to steal the row for a concurrent second execution."""
+        for _ in range(12):
+            await drain_outbox(
+                maker,
+                now=NOW,
+                execute=_hangs,
+                worker_id="B",
+                lease=lease,
+                provider_timeout=timedelta(milliseconds=50),
+            )
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(
+        drain_outbox(
+            maker,
+            now=NOW,
+            execute=_hangs,
+            worker_id="A",
+            lease=lease,
+            provider_timeout=timedelta(milliseconds=50),
+        ),
+        _pest(),
+    )
+
+    # The send is aborted at 50 ms — well inside the 300 ms lease — so the row is settled and back
+    # on the queue long before recovery could hand it to anybody. Two workers are never inside the
+    # same intent at the same moment.
+    assert peak == 1, f"the same intent was executed by two workers at once (peak={peak})"
+    assert executions >= 1

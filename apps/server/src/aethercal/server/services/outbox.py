@@ -56,6 +56,7 @@ transition table in ``services/workflows.py``."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -105,7 +106,14 @@ DEFAULT_DRAIN_BATCH_SIZE = 100
 """Max intents one drain pass claims + processes."""
 
 PROVIDER_TIMEOUT_CEILING = timedelta(minutes=2)
-"""The hard ceiling every provider call must respect: **strictly less than** :data:`DEFAULT_LEASE`.
+"""The hard ceiling on every provider call: **strictly less than** :data:`DEFAULT_LEASE`, and
+ENFORCED — :func:`drain_outbox` runs every effect inside an ``asyncio.timeout`` of exactly this, and
+overrunning it is a retryable failure.
+
+The enforcement IS the point. A ceiling that is only a constant, a comment and a test of its own
+arithmetic is a **declared invariant that nothing applies**, and the code goes on doing precisely
+what the invariant forbids. Here that is not academic: an unbounded send outlives its lease, the
+recovery pass hands the row to another worker, and the guest is messaged twice.
 
 The lease is not self-renewing. A worker whose send outlives the TTL loses its claim, and its result
 is discarded at settle (see :func:`_settle`) — after the provider has already done the work, so the
@@ -340,12 +348,20 @@ class OutboxReport:
     """Steps that could never run (an unconfigured channel, a kind with no template).
 
     NOT failures. """
-    lost: list[uuid.UUID] = field(default_factory=list)
-    """Rows whose lease expired mid-send, so this worker's result was DISCARDED at settle time.
+    voided_midflight: list[uuid.UUID] = field(default_factory=list)
+    """Retired by a booking transition WHILE we were sending them. Routine, expected, and NOT lost.
 
-    Never silent: each one is an error-level log line. A non-empty ``lost`` means the lease TTL is
-    too short for the provider timeouts actually in play, and it is the metric to alert on — the
-    effect may well have been executed twice. """
+    Kept out of :attr:`lost` deliberately: that counter exists to alert on a broken timing
+    assumption, and an alarm that also fires on every ordinary cancellation is one nobody reads.
+    """
+    lost: list[uuid.UUID] = field(default_factory=list)
+    """Rows whose LEASE EXPIRED mid-send, so this worker's result was DISCARDED at settle time.
+
+    Never silent: each one is an error-level log line. A non-empty ``lost`` means a provider call
+    outran its lease despite :data:`PROVIDER_TIMEOUT_CEILING`, and the effect may well have been
+    executed twice. It is THE metric to alert on — which is exactly why a step retired by a routine
+    cancellation goes to :attr:`voided_midflight` instead, and never in here.
+    """
 
     @property
     def attempted(self) -> int:
@@ -674,6 +690,7 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
     worker_id: str | None = None,
     lease: timedelta = DEFAULT_LEASE,
     clock: Clock | None = None,
+    provider_timeout: timedelta = PROVIDER_TIMEOUT_CEILING,
 ) -> OutboxReport:
     """One drain pass: recover → plan → (claim → execute → settle) per item. Returns the report.
 
@@ -690,7 +707,12 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
 
     ``clock`` reads the wall clock. It defaults to ``now`` advanced by the REAL time elapsed since
     the pass began, because a lease is a wall-clock deadline — a frozen clock would put the deadline
-    right back where the bug was."""
+    right back where the bug was.
+
+    ``provider_timeout`` is ENFORCED, not merely declared: every effect runs inside
+    ``asyncio.timeout``, and overrunning it is a retryable failure. That is what makes
+    ``PROVIDER_TIMEOUT_CEILING < DEFAULT_LEASE`` a fact about the running system instead of an
+    assertion in a docstring."""
     tick = clock or _elapsed_clock(now)
     worker = worker_id or new_worker_id()
     report = OutboxReport()
@@ -716,8 +738,29 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
 
         # THE NETWORK I/O. No session, no transaction and no row lock is open across this line —
         # that is the entire point of R8. Each handler opens its own short transactions around it.
+        #
+        # And it is BOUNDED. `PROVIDER_TIMEOUT_CEILING` is not a constant, a comment and a hopeful
+        # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
+        # something actually stops the send. This is that something.
         try:
-            await execute(work, item_now)
+            async with asyncio.timeout(provider_timeout.total_seconds()):
+                await execute(work, item_now)
+        except TimeoutError:
+            # Retryable — and neither of the two things it could be mistaken for. NOT a success (we
+            # have no idea whether the provider acted). NOT a death (this worker is alive and still
+            # holds its lease, precisely because the timeout fired strictly INSIDE it). It goes back
+            # on the queue with backoff, exactly like any other transient provider failure.
+            _logger.error(
+                "outbox intent %s (%s) for booking %s: the provider call exceeded "
+                "PROVIDER_TIMEOUT_CEILING (%ss) and was ABORTED. It retries with backoff. This is "
+                "the guard that stops a send outliving its own lease — without it the row would be "
+                "recovered under us and delivered twice",
+                work.id,
+                work.effect,
+                work.booking_id,
+                provider_timeout.total_seconds(),
+            )
+            outcome = _Outcome.FAILED
         except OutboxDeferred as deferred:
             _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
             outcome = _Outcome.DEFERRED
@@ -772,8 +815,14 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
     async with sessionmaker() as session, session.begin():
         row = await _lock_if_still_ours(session, work)
         if row is None:
-            report.lost.append(work.id)
-            await _log_lost_claim(session, work)
+            # WHY we lost it decides which bucket it lands in, and that matters: `lost` is the
+            # metric that proves in production whether the timeout assumption holds. Fill it with
+            # routine cancellations and a real duplicate-send signal drowns in noise — and an alarm
+            # that always fires is an alarm nobody reads.
+            if await _lost_because_voided(session, work):
+                report.voided_midflight.append(work.id)
+            else:
+                report.lost.append(work.id)
             return
         row.claimed_by = None
         row.lease_expires_at = None
@@ -815,12 +864,17 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         assert_never(outcome)
 
 
-async def _log_lost_claim(session: AsyncSession, work: OutboxWork) -> None:
-    """Say WHY our result is being discarded. The two reasons are different facts, not one.
+async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
+    """Log why our result is being discarded; return whether it was a VOID rather than a lost lease.
 
-    Both end in "we do not write" — but one is our own fault (our send outran our own lease) and the
-    other is the system working exactly as designed (a cancellation retired the step under us).
-    Merging them into one line would bury a real duplicate-send signal inside routine noise."""
+    Both end in "we do not write", but they are different facts. One is the system working as
+    designed: a cancellation retired the step under us — routine, expected, harmless. The other is a
+    real failure of our own timing assumption: our send outran its lease, the row was recovered, and
+    somebody else owns it now — which means the effect may have been executed TWICE.
+
+    Collapsing them into one bucket would file routine cancellations into the very counter that is
+    supposed to alert on duplicate sends.
+    """
     current = await session.get(Outbox, work.id)
     status = current.status if current is not None else "gone"
 
@@ -833,7 +887,7 @@ async def _log_lost_claim(session: AsyncSession, work: OutboxWork) -> None:
             work.effect,
             work.booking_id,
         )
-        return
+        return True
 
     _logger.error(
         "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (we held it as %s; it is now "
@@ -846,6 +900,7 @@ async def _log_lost_claim(session: AsyncSession, work: OutboxWork) -> None:
         work.claimed_by,
         status,
     )
+    return False
 
 
 async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
