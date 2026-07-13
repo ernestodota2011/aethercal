@@ -85,12 +85,40 @@ def _unique_index_column_sets(table_name: str) -> set[tuple[str, ...]]:
 
 
 def test_tenant_scoping_unique_constraints() -> None:
-    assert ("tenant_id", "email") in _unique_column_sets("users")
+    # ``users`` is NOT here: a host's address is unique per business CASE-INSENSITIVELY, which is a
+    # functional index rather than a column constraint — see the test immediately below.
     assert ("tenant_id", "slug") in _unique_column_sets("event_types")
     assert ("tenant_id", "name") in _unique_column_sets("schedules")
     assert ("tenant_id", "schedule_id", "date") in _unique_column_sets("date_overrides")
     assert ("tenant_id", "workflow_id", "position") in _unique_column_sets("workflow_steps")
     assert ("tenant_id", "channel", "kind", "locale") in _unique_column_sets("workflow_templates")
+
+
+def test_a_hosts_address_is_unique_per_business_case_insensitively() -> None:
+    """RF-30 / 0006: ``Ana@example.com`` and ``ana@example.com`` are ONE host, and the DATABASE is
+    what says so.
+
+    The old ``UNIQUE (tenant_id, email)`` was on the exact string, so the pair was two rows for one
+    person: a selector offering both, an event type landing on whichever was clicked, mail going to
+    whichever was read first. The service refuses it case-insensitively, but a check-then-act cannot
+    survive two concurrent creates — only an index can.
+
+    The exact-string constraint is SUBSTITUTED, not kept alongside: ``lower(a) = lower(b)`` whenever
+    ``a = b``, so it now guarantees nothing this index does not, and a redundant unique is a second
+    B-tree per write and a second constraint name an ``IntegrityError`` can arrive under.
+    """
+    table = Base.metadata.tables["users"]
+    by_name = {index.name: index for index in table.indexes}
+    assert "uq_users_tenant_id_email_lower" in by_name, "missing the case-insensitive unique index"
+    index = by_name["uq_users_tenant_id_email_lower"]
+    assert index.unique
+    # Declared as an EXPRESSION, on both backends alike (SQLite has supported expression indexes
+    # since 3.9), so the offline suite proves the same guarantee production enforces.
+    assert [str(expression) for expression in index.expressions] == [
+        "users.tenant_id",
+        "lower(email)",
+    ]
+    assert ("tenant_id", "email") not in _unique_column_sets("users")
 
 
 def test_the_notification_ledger_is_unique_per_kind_channel_and_step() -> None:
