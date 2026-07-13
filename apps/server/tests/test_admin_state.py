@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
+from reflex.event import EventHandler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -35,6 +36,7 @@ Sessionmaker = async_sessionmaker[AsyncSession]
 _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.load_bookings.fn, ()),
     (AdminState.cancel.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.mark_no_show.fn, ("00000000-0000-0000-0000-000000000000",)),
     (AdminState.reschedule.fn, ({"booking_id": "x", "new_start": "x"},)),
     (AdminState.load_event_types.fn, ()),
     (AdminState.create_event_type.fn, ({},)),
@@ -44,6 +46,21 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.create_schedule.fn, ({},)),
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_metrics.fn, ()),
+    (AdminState.load_hosts.fn, ()),
+    (AdminState.create_host.fn, ({},)),
+    (AdminState.update_host.fn, ({},)),
+    (AdminState.delete_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.select_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.designate_calendar.fn, ({},)),
+    (AdminState.load_workflows.fn, ()),
+    (AdminState.create_workflow.fn, ({},)),
+    (AdminState.update_workflow.fn, ({},)),
+    (AdminState.activate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.deactivate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.create_template.fn, ({},)),
+    (AdminState.update_template.fn, ({},)),
+    (AdminState.delete_template.fn, ("00000000-0000-0000-0000-000000000000",)),
 ]
 
 
@@ -84,6 +101,18 @@ def _state() -> AdminState:
     return AdminState(_reflex_internal_init=True)
 
 
+async def _seeded_host_id(state: AdminState) -> str:
+    """The tenant's ONE host, as a form value.
+
+    RF-30 made the host an EXPLICIT field on the event-type form. It used to be injected by the
+    service — the tenant's first user — which is precisely why a business's second host could never
+    be given an event type. So every create now states which host it means, these tests included.
+    """
+    await AdminState.load_hosts.fn(state)
+    assert len(state.hosts) == 1, "these tests seed a single-host tenant"
+    return state.hosts[0]["id"]
+
+
 def test_authenticated_is_a_server_only_backend_var() -> None:
     # Not shipped to the frontend and no generated client setter → a client cannot flip it.
     assert "_authenticated" in AdminState.backend_vars
@@ -91,8 +120,62 @@ def test_authenticated_is_a_server_only_backend_var() -> None:
     assert "set__authenticated" not in dir(AdminState)
 
 
+#: Handlers that are PUBLIC by design: they are the auth surface itself.
+_PUBLIC_HANDLERS = frozenset({"login", "logout", "require_auth", "setvar"})
+
+#: Handlers that read and write NO tenant data — they only close a panel in the operator's own
+#: browser. They need no guard because there is nothing behind them to guard.
+_UI_ONLY_HANDLERS = frozenset({"clear_selection", "close_new_booking"})
+
+#: Calendar handlers whose unauthenticated no-op is proven in ``test_admin_calendar.py`` (they take
+#: gesture payloads, and two of them are async generators, so they are exercised there rather than
+#: in the parametrised sweep below).
+_GUARDED_ELSEWHERE = frozenset(
+    {
+        "on_calendar_event_drop",
+        "on_calendar_event_resize",
+        "on_calendar_range_select",
+        "on_calendar_event_click",
+        "on_calendar_range_change",
+        "on_calendar_view_change",
+        "set_calendar_view",
+        "create_booking",
+        "reschedule_selected",
+    }
+)
+
+
 def test_fresh_state_is_unauthenticated() -> None:
     assert _state()._authenticated is False
+
+
+def test_no_handler_can_skip_the_auth_census_unnoticed() -> None:
+    """==Every event handler on the state is CLASSIFIED, or this test fails.==
+
+    Reflex exposes each ``@rx.event`` over the websocket, so a client can invoke any of them
+    directly — a page's ``on_load`` guard protects nothing. The proof that a handler refuses an
+    unauthenticated caller therefore has to exist for EVERY handler, and until now the lists that
+    carry those proofs were maintained by hand: a handler added to ``state.py`` and forgotten was a
+    handler nobody had ever proven guarded, and nothing said so. The hole announced itself exactly
+    the way this project's defects always do — by being silent.
+
+    So the census is derived from the CLASS, not from a list somebody must remember to update. A new
+    handler is UNCLASSIFIED until its author decides which of the four it is, and an unclassified
+    handler fails here.
+    """
+    declared = {name for name, value in vars(AdminState).items() if isinstance(value, EventHandler)}
+    classified = (
+        {handler.__name__ for handler, _ in _GUARDED}
+        | _PUBLIC_HANDLERS
+        | _UI_ONLY_HANDLERS
+        | _GUARDED_ELSEWHERE
+    )
+    unclassified = declared - classified
+    assert unclassified == set(), (
+        f"event handlers with no auth-guard proof: {sorted(unclassified)}. Add each to _GUARDED "
+        "and prove it refuses an unauthenticated caller — or, if it touches no tenant data at all, "
+        "to _UI_ONLY_HANDLERS."
+    )
 
 
 @pytest.mark.parametrize("handler", [h for h, _ in _GUARDED], ids=lambda h: h.__name__)
@@ -271,6 +354,7 @@ async def test_create_event_type_saves_the_en_translations(seeded_maker: Session
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -295,6 +379,7 @@ async def test_create_event_type_with_blank_en_fields_does_not_store_the_key(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -318,6 +403,7 @@ async def test_update_event_type_sets_the_en_translation_and_reload_populates_it
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -348,6 +434,7 @@ async def test_update_event_type_absent_en_field_leaves_the_existing_translation
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -372,6 +459,7 @@ async def _event_with_en_translations(seeded_maker: Sessionmaker) -> tuple[Admin
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -468,6 +556,7 @@ async def test_update_event_type_blank_canonical_title_is_omitted_not_cleared(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -497,6 +586,7 @@ async def test_update_event_type_with_only_id_is_a_true_no_op(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",

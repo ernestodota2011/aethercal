@@ -78,14 +78,24 @@ async def test_create_app_does_not_mount_admin_by_default(monkeypatch: pytest.Mo
         await app.state.engine.dispose()
 
 
-def test_build_admin_app_registers_the_four_pages() -> None:
+def test_build_admin_app_registers_every_page() -> None:
+    """The page set is PINNED: a page function written but never routed is a screen the operator
+    cannot reach, and it would fail no other test."""
     engine = create_async_engine("sqlite+aiosqlite://")
     runtime = AdminRuntime(
         sessionmaker=async_sessionmaker(engine),
         config=AdminConfig(username="admin", password_hash="x", tenant_slug=None),
     )
     app = build_admin_app(runtime)
-    assert set(app._unevaluated_pages) == {"index", "login", "event-types", "schedules"}
+    assert set(app._unevaluated_pages) == {
+        "index",
+        "login",
+        "health",
+        "hosts",
+        "event-types",
+        "schedules",
+        "workflows",
+    }
 
 
 async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(

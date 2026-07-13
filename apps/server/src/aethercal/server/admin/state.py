@@ -37,19 +37,34 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate
+from aethercal.schemas.workflows import (
+    WorkflowCreate,
+    WorkflowStepIn,
+    WorkflowTemplateCreate,
+    WorkflowTemplateUpdate,
+    WorkflowUpdate,
+)
 from aethercal.server.admin import service
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.format import (
+    ALL_EVENT_TYPES,
+    SHARED_SCHEDULE,
     booking_event,
     booking_row,
+    connection_row,
     event_type_row,
+    host_resource,
+    host_row,
+    metrics_rows,
     parse_weekdays,
     schedule_row,
+    template_row,
     weekly_rules,
+    workflow_row,
 )
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
-from aethercal.ui import CalendarEvent
+from aethercal.ui import CalendarEvent, CalendarResource
 
 # Internal (prefix-free) routes; the mount prefix is applied by Reflex's ``frontend_path`` basename.
 LOGIN_ROUTE = "/login"
@@ -132,8 +147,26 @@ def _translation_update(
 
 
 #: The calendar surfaces the operator can switch between (kept in sync with the TS ``CalendarView``
-#: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback.
-_VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list"})
+#: union and the Reflex wrapper's ``_VALID_VIEWS``). ``list`` is the agenda-list fallback, and
+#: ``timeline`` is the RF-28 resource view (hosts in rows, time on the horizontal axis).
+#:
+#: A view missing from this set is IGNORED by the switcher, in silence — so a timeline the component
+#: renders perfectly and the state declines to select would ship, do nothing, and fail no test.
+_VALID_CALENDAR_VIEWS = frozenset({"month", "week", "day", "list", "timeline"})
+
+#: Why a booking cannot be dragged from one host's row to another (RF-28).
+#:
+#: ==The component offers the gesture; the backend has no operation for it, and that is a semantics
+#: nobody has designed — not an oversight to paper over.== ``bookings`` carries no ``host_id``: the
+#: host lives on the EVENT TYPE. So "move this booking to Bruno" means "give this booking a
+#: DIFFERENT event type" — another duration, another slug, another public page. Every
+#: available guess is wrong in a way the operator would not see, so the gesture is refused with its
+#: reason and the appointment is left exactly where it was.
+_CROSS_HOST_DRAG_MESSAGE = (
+    "Una reserva no se puede mover a otro anfitrión: el anfitrión lo determina el tipo de evento, "
+    "así que cambiarlo significaría cambiarle el tipo de cita (otra duración, otro enlace). "
+    "Reprograma la reserva en la fila de su anfitrión, o cancélala y crea la nueva."
+)
 
 #: The month view renders a FIXED 6-week (42-day) grid (``getMonthGridDays`` + ``_calendar()``'s
 #: ``first_day_of_week=1``), so its cells can show up to ~2 weeks of the adjacent months — a 28-day
@@ -156,6 +189,27 @@ _DURATION_FIXED_MESSAGE = (
 _RESYNC_MESSAGE = (
     "La reserva se reprogramó, pero no se pudo actualizar la vista. Recarga la agenda."
 )
+
+
+async def _host_of_event_type(runtime: AdminRuntime) -> dict[uuid.UUID, str]:
+    """``event_type_id → host_id``: the map that puts a booking's chip on a timeline row (RF-28).
+
+    It has to be a lookup, and that is the whole point of this requirement: a booking does NOT carry
+    a host. It carries an event type, and the event type carries the host. Which is exactly why
+    dragging a booking to another host's row has no meaning to give it.
+    """
+    rows = await service.list_event_types_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return {row.id: str(row.host_id) for row in rows}
+
+
+async def _fetch_resources(runtime: AdminRuntime) -> list[CalendarResource]:
+    """The timeline's rows: the tenant's hosts (RF-28)."""
+    rows = await service.list_hosts_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [host_resource(row) for row in rows]
 
 
 async def _fetch_booking_views(
@@ -186,8 +240,11 @@ async def _fetch_booking_views(
         event_reads = await service.list_bookings_view(
             runtime.sessionmaker, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
         )
+    hosts = await _host_of_event_type(runtime)
     events = [
-        booking_event(read) for read in event_reads if read.status is not BookingStatus.CANCELLED
+        booking_event(read, resource_id=hosts.get(read.event_type_id))
+        for read in event_reads
+        if read.status is not BookingStatus.CANCELLED
     ]
     return rows, events
 
@@ -210,7 +267,12 @@ async def _fetch_calendar_events(
         date_from=date_from,
         date_to=date_to,
     )
-    return [booking_event(read) for read in reads if read.status is not BookingStatus.CANCELLED]
+    hosts = await _host_of_event_type(runtime)
+    return [
+        booking_event(read, resource_id=hosts.get(read.event_type_id))
+        for read in reads
+        if read.status is not BookingStatus.CANCELLED
+    ]
 
 
 def _window(state: AdminState) -> dict[str, date | None]:
@@ -355,6 +417,28 @@ def _with_restored_event(
     return [(snapshot if event["id"] == snapshot["id"] else event) for event in events]
 
 
+def _is_cross_host_drag(payload: dict[str, str], snapshot: CalendarEvent) -> bool:
+    """Whether this drop landed on a DIFFERENT host's timeline row than the booking belongs to.
+
+    ``resourceId`` is present only on the timeline (RF-28); month / week / day have no resource
+    dimension and send none. ==An ABSENT resource is therefore not a DIFFERENT resource==: reading
+    the missing key as "moved to nothing" would refuse every ordinary drag in the other four views,
+    which is the same class of bug — a guard that fires on the case it was never meant for — as the
+    staleness check that marked cancellations delivered without sending them.
+
+    A booking whose event type has vanished has no row either (``resourceId`` absent from the chip);
+    it cannot be dragged ACROSS rows because it is on none, so it too falls through to the ordinary
+    reschedule.
+    """
+    target = payload.get("resourceId")
+    if target is None:
+        return False
+    current = snapshot.get("resourceId")
+    if current is None:
+        return False
+    return str(target) != str(current)
+
+
 def _parse_admin_start(raw: str) -> datetime:
     """Parse an ISO datetime from the admin/calendar; a naive value is stamped UTC (admin contract).
 
@@ -399,6 +483,11 @@ async def _optimistic_reschedule(
     snapshot = _find_calendar_event(state.calendar_events, booking_id)
     if snapshot is None:
         return  # a gesture on an event the server no longer has: nothing to move
+    if _is_cross_host_drag(payload, snapshot):
+        # RF-28. Refused BEFORE the optimistic apply, so the chip never even appears to move: an
+        # error message under a booking that visibly jumped rows is a lie the operator can see.
+        state.error = _CROSS_HOST_DRAG_MESSAGE
+        return
     new_start_raw = str(payload.get("start", ""))
     if require_start_change and _same_instant(new_start_raw, str(snapshot["start"])):
         # A pure duration change (start unchanged): not editable, and never a DB round-trip.
@@ -440,6 +529,108 @@ async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
     return [event_type_row(row) for row in rows]
 
 
+async def _fetch_hosts(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_hosts_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [host_row(row) for row in rows]
+
+
+async def _fetch_connections(runtime: AdminRuntime, host_id: uuid.UUID) -> list[dict[str, str]]:
+    rows = await service.list_connections_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, host_id=host_id
+    )
+    return [connection_row(row) for row in rows]
+
+
+def _owner_id(form_data: dict[str, str]) -> uuid.UUID | None:
+    """The host who owns a weekly pattern; the sentinel (or blank) → ``None`` = the BUSINESS.
+
+    ``None`` is a real value here, not an absence: a shared pattern is one every host may use. The
+    alternative — leaving the field off the form entirely, as it was — is how two hosts come to
+    share a schedule without anybody deciding they should (RF-30).
+    """
+    raw = _clean(form_data, "owner_id")
+    if not raw or raw == SHARED_SCHEDULE:
+        return None
+    return uuid.UUID(raw)
+
+
+async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_workflows_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [workflow_row(row) for row in rows]
+
+
+async def _fetch_templates(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_templates_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [template_row(row) for row in rows]
+
+
+# --------------------------------------------------------------------------------------
+# Rule-form parsing (RF-24). Both of this form's traps live here.
+# --------------------------------------------------------------------------------------
+
+#: The rule form carries ONE kind field per channel, which IS the schema's rule ("one step per
+#: channel": two steps on one channel are two dedupe keys, so the guest gets the same message
+#: twice). A non-blank kind means "send this on this channel"; blank means no step there.
+_STEP_CHANNELS = ("email", "whatsapp", "sms")
+
+
+def _parse_steps(form_data: dict[str, str]) -> list[WorkflowStepIn]:
+    """The steps a rule form describes: one per channel whose ``kind`` field was filled in.
+
+    Positions are assigned CONTIGUOUSLY over the channels actually present, so dropping the middle
+    step of three leaves no hole for the (unique-per-workflow) position constraint to trip over.
+    """
+    steps: list[WorkflowStepIn] = []
+    for channel in _STEP_CHANNELS:
+        kind = _clean(form_data, f"{channel}_kind")
+        if kind:
+            steps.append(WorkflowStepIn(channel=channel, kind=kind, position=len(steps)))
+    return steps
+
+
+def _parse_scope(form_data: dict[str, str]) -> uuid.UUID | None:
+    """The event type a rule governs on CREATE; the sentinel (or blank) → ``None`` = every one."""
+    raw = _clean(form_data, "event_type_id")
+    if not raw or raw == ALL_EVENT_TYPES:
+        return None
+    return uuid.UUID(raw)
+
+
+def _scope_update(form_data: dict[str, str]) -> dict[str, uuid.UUID | None]:
+    """The scope key for an UPDATE payload, or ``{}`` to leave the stored scope UNTOUCHED.
+
+    ``event_type_id`` is the one field of a rule where ``null`` is a real VALUE — "every event type"
+    — and not "leave this alone". A blank select therefore cannot be allowed to mean both: an
+    untouched select must never silently widen a rule from one event type to ALL of them while the
+    operator was editing its offset. That fires the rule across every booking in the business, and
+    nothing whatsoever would have said so.
+
+    So widening is EXPLICIT, exactly as clearing an EN translation is: the :data:`ALL_EVENT_TYPES`
+    sentinel sets the scope to ``None``, a real id sets that id, and a blank field omits the key.
+    """
+    raw = _clean(form_data, "event_type_id")
+    if not raw:
+        return {}
+    return {"event_type_id": None if raw == ALL_EVENT_TYPES else uuid.UUID(raw)}
+
+
+def _steps_update(form_data: dict[str, str]) -> dict[str, list[WorkflowStepIn]]:
+    """The steps key for an UPDATE payload, or ``{}`` to leave the stored steps UNTOUCHED.
+
+    ``steps`` REPLACES the list wholesale, and the schema forbids a rule with none — so "every kind
+    field blank" cannot mean "remove all the steps" (there is no such rule). It means the operator
+    was editing something else, and the steps are left exactly as they were.
+    """
+    steps = _parse_steps(form_data)
+    return {"steps": steps} if steps else {}
+
+
 async def _fetch_schedules(runtime: AdminRuntime) -> list[dict[str, str]]:
     rows = await service.list_schedules_view(
         runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
@@ -464,11 +655,26 @@ class AdminState(rx.State):
     bookings: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     event_types: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     schedules: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- notification rules (RF-24) --------------------------------------------------
+    workflows: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    templates: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- hosts + their connected calendars (RF-30) -----------------------------------
+    # ``hosts`` feeds the host SELECTOR on the event-type form (whose absence was the RF-30 defect)
+    # and the schedule-owner select, as well as the hosts table itself.
+    hosts: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- the health panel (RF-25 / R9) ------------------------------------------------
+    metrics: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # The connections of the host the operator is currently inspecting (they are per-host, so they
+    # are loaded on demand rather than for everybody).
+    connections: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    selected_host_id: str = ""
 
     # -- calendar (F2-F) ------------------------------------------------------------
     # The agenda's calendar events (active bookings) + the operator-selected view. The calendar
     # component reads both; ``calendar_events`` also carries the optimistic in-flight move.
     calendar_events: list[CalendarEvent] = []  # noqa: RUF012 (reflex state var)
+    # The timeline's rows (RF-28): the tenant's hosts. Ignored by the other four views.
+    calendar_resources: list[CalendarResource] = []  # noqa: RUF012 (reflex state var)
     calendar_view: str = "month"
     # The visible-period anchor (a day within the shown period) + the period's EXCLUSIVE upper
     # bound, both set from the calendar's on_range_change / on_view_change payload.
@@ -571,7 +777,11 @@ class AdminState(rx.State):
         events_token = self.calendar_reload_seq
         rows_token = self.bookings_reload_seq
         try:
-            rows, events = await _fetch_booking_views(current_runtime(), **_window(self))
+            runtime = current_runtime()
+            rows, events = await _fetch_booking_views(runtime, **_window(self))
+            # The timeline's rows (RF-28). They change only when a host is added or removed, so they
+            # are loaded here rather than on every navigation.
+            resources = await _fetch_resources(runtime)
         except service.AdminError as exc:
             if events_token == self.calendar_reload_seq:
                 self.error = _error_text(exc)
@@ -581,6 +791,7 @@ class AdminState(rx.State):
         if events_token != self.calendar_reload_seq:
             return
         self.calendar_events = events
+        self.calendar_resources = resources
         self.error = ""
 
     @rx.event
@@ -596,6 +807,35 @@ class AdminState(rx.State):
                 booking_id=uuid.UUID(booking_id),
             )
         except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+            return
+        self.selected_booking_id = ""
+        _settle_mutation(self, await _commit_calendar_view(self))
+
+    @rx.event
+    async def mark_no_show(self, booking_id: str) -> None:
+        """Mark the selected booking a no-show (RF-25) and refresh the agenda.
+
+        The button is always offered rather than hidden by a rule computed here: whether a booking
+        MAY be marked depends on its status and on whether it has ended, and the only authority on
+        both is the database at the moment of the click — a chip on the client can be minutes stale.
+        A refusal now arrives in the service's own words ("only a confirmed booking can be marked a
+        no-show", "a booking can only be marked a no-show after it has ended"), so the loud refusal
+        tells the operator more than a silently disabled button ever would.
+
+        The booking KEEPS ITS SLOT, so unlike a cancellation it stays on the calendar — as a muted,
+        non-draggable chip, because ``booking_event`` makes only a CONFIRMED booking editable.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.mark_no_show_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                booking_id=uuid.UUID(booking_id),
+            )
+        except (ValueError, service.AdminError, SQLAlchemyError) as exc:
             self.error = _error_text(exc)
             return
         self.selected_booking_id = ""
@@ -782,7 +1022,12 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_event_types(self) -> None:
-        """Load event types + schedules (the create form needs the schedule choices)."""
+        """Load event types + schedules + HOSTS.
+
+        The hosts are what the RF-30 host selector is built from. Without them the form has no host
+        field, and the service used to fill the gap by taking the tenant's first user — which is the
+        whole reason a second host could never be given an event type.
+        """
         if not self._authenticated:
             return
         self.error = ""
@@ -790,6 +1035,7 @@ class AdminState(rx.State):
             runtime = current_runtime()
             self.event_types = await _fetch_event_types(runtime)
             self.schedules = await _fetch_schedules(runtime)
+            self.hosts = await _fetch_hosts(runtime)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -801,6 +1047,9 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             form = service.EventTypeForm(
+                # RF-30: the host the operator PICKED. This used to be injected from the context —
+                # the tenant's first user — so a second host could never be given an event type.
+                host_id=uuid.UUID(_clean(form_data, "host_id")),
                 slug=_clean(form_data, "slug"),
                 title=_clean(form_data, "title"),
                 schedule_id=_schedule_id(self.schedules, _clean(form_data, "schedule")),
@@ -889,12 +1138,14 @@ class AdminState(rx.State):
 
     @rx.event
     async def load_schedules(self) -> None:
-        """Load the tenant's schedules (``on_load``)."""
+        """Load the tenant's schedules + hosts (the owner select needs the hosts — RF-30)."""
         if not self._authenticated:
             return
         self.error = ""
         try:
-            self.schedules = await _fetch_schedules(current_runtime())
+            runtime = current_runtime()
+            self.schedules = await _fetch_schedules(runtime)
+            self.hosts = await _fetch_hosts(runtime)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -908,6 +1159,10 @@ class AdminState(rx.State):
             data = ScheduleCreate(
                 name=_clean(form_data, "name"),
                 timezone=_clean(form_data, "timezone"),
+                # RF-30: whose pattern this is. Blank / the sentinel = the BUSINESS's, usable by
+                # every host. The field's absence is how two hosts came to share a schedule without
+                # anybody deciding they should.
+                user_id=_owner_id(form_data),
                 rules=weekly_rules(
                     parse_weekdays(_clean(form_data, "weekdays")),
                     _clean(form_data, "start"),
@@ -957,6 +1212,331 @@ class AdminState(rx.State):
                 schedule_id=uuid.UUID(schedule_id),
             )
             self.schedules = await _fetch_schedules(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    # -- the health panel (RF-25 / R9) ------------------------------------------------
+
+    @rx.event
+    async def load_metrics(self) -> None:
+        """Read this BUSINESS's outbox backlog and no-show rate (``on_load`` of the health page).
+
+        Tenant-scoped, deliberately: ``observability.collect_metrics`` is instance-wide because it
+        feeds the operator's ``/metrics``, and rendering that here would show this business the
+        pipeline volume of every other business on the instance.
+        """
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            runtime = current_runtime()
+            snapshot = await service.metrics_view(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+            )
+            self.metrics = metrics_rows(snapshot)
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    # -- hosts + their connected calendars (RF-30) -----------------------------------
+
+    @rx.event
+    async def load_hosts(self) -> None:
+        """Load the tenant's hosts (``on_load`` of the hosts page)."""
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            self.hosts = await _fetch_hosts(current_runtime())
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_host(self, form_data: dict[str, str]) -> None:
+        """Add a host to the business."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.create_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                form=service.HostForm(
+                    name=_clean(form_data, "name"),
+                    email=_clean(form_data, "email"),
+                    timezone=_clean(form_data, "timezone") or "UTC",
+                ),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_host(self, form_data: dict[str, str]) -> None:
+        """Edit a host's name / email / timezone (all three are sent, not patched)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.update_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                host_id=uuid.UUID(_clean(form_data, "id")),
+                form=service.HostForm(
+                    name=_clean(form_data, "name"),
+                    email=_clean(form_data, "email"),
+                    timezone=_clean(form_data, "timezone") or "UTC",
+                ),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def delete_host(self, host_id: str) -> None:
+        """Remove a host — refused while an event type or a schedule of theirs still exists."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.delete_host_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                host_id=uuid.UUID(host_id),
+            )
+            self.hosts = await _fetch_hosts(runtime)
+            if self.selected_host_id == host_id:
+                self.selected_host_id = ""
+                self.connections = []
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def select_host(self, host_id: str) -> None:
+        """Show a host's connected calendar accounts (so their write target can be designated)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            self.connections = await _fetch_connections(runtime, uuid.UUID(host_id))
+            self.selected_host_id = host_id
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def designate_calendar(self, form_data: dict[str, str]) -> None:
+        """Send this connection's bookings to a NAMED calendar (the admin's ``--calendar-id``).
+
+        Until now ``"primary"`` was a hard-coded constant, so a host's bookings could only land in
+        the connected account's own primary calendar — a personal one, for anybody who connects a
+        real account.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.designate_calendar_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                connection_id=uuid.UUID(_clean(form_data, "connection_id")),
+                calendar_id=_clean(form_data, "calendar_id"),
+            )
+            if self.selected_host_id:
+                self.connections = await _fetch_connections(
+                    runtime, uuid.UUID(self.selected_host_id)
+                )
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    # -- notification rules + templates (RF-24) --------------------------------------
+
+    @rx.event
+    async def load_workflows(self) -> None:
+        """Load the rules, the templates, and the event types the scope select offers (``on_load``).
+
+        All three, because the rule form cannot be filled in without the other two: a step needs a
+        template to render its body, and a rule needs the event types to choose its scope from.
+        """
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            runtime = current_runtime()
+            self.workflows = await _fetch_workflows(runtime)
+            self.templates = await _fetch_templates(runtime)
+            self.event_types = await _fetch_event_types(runtime)
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_workflow(self, form_data: dict[str, str]) -> None:
+        """Author a rule. It is ARMED against the bookings already on the books, not just future
+        ones — the service reconciles their queued steps, which is the whole point of the screen."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            data = WorkflowCreate(
+                name=_clean(form_data, "name"),
+                trigger=_clean(form_data, "trigger"),  # type: ignore[arg-type]  # schema validates
+                offset_minutes=int(_clean(form_data, "offset_min") or 0),
+                event_type_id=_parse_scope(form_data),
+                steps=_parse_steps(form_data),
+            )
+            await service.create_workflow_action(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_workflow(self, form_data: dict[str, str]) -> None:
+        """Edit a rule, and MAKE THE EDIT TRUE for every booking it already governs.
+
+        Only the fields the operator actually filled in are sent (``exclude_unset``): a blank field
+        leaves the stored value alone. The two fields where "blank" would otherwise be ambiguous —
+        the scope (``null`` is a real value there) and the steps (which replace the list wholesale)
+        — are decided by :func:`_scope_update` / :func:`_steps_update`, never by a default.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            fields: dict[str, object] = {}
+            name = _clean(form_data, "name")
+            if name:
+                fields["name"] = name
+            trigger = _clean(form_data, "trigger")
+            if trigger:
+                fields["trigger"] = trigger
+            offset = _clean(form_data, "offset_min")
+            if offset:
+                fields["offset_minutes"] = int(offset)
+            fields.update(_scope_update(form_data))
+            fields.update(_steps_update(form_data))
+            data = WorkflowUpdate.model_validate(fields)
+            await service.update_workflow_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                workflow_id=uuid.UUID(_clean(form_data, "id")),
+                data=data,
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def activate_workflow(self, workflow_id: str) -> None:
+        """Switch a rule ON: it re-arms the bookings taken while it was off, and re-times the steps
+        that came due meanwhile (they are made DUE, never destroyed)."""
+        if not self._authenticated:
+            return
+        await self._set_workflow_active(workflow_id, active=True)
+
+    @rx.event
+    async def deactivate_workflow(self, workflow_id: str) -> None:
+        """Switch a rule OFF: its queued messages are PAUSED, not destroyed — the toggle is
+        symmetric, and switching it back on delivers them."""
+        if not self._authenticated:
+            return
+        await self._set_workflow_active(workflow_id, active=False)
+
+    async def _set_workflow_active(self, workflow_id: str, *, active: bool) -> None:
+        """The shared body of the two toggles. NOT an ``@rx.event`` — a private helper Reflex must
+        not expose as a client-callable handler (the same reason the fetch helpers are free
+        functions). The public handlers own the auth guard."""
+        runtime = current_runtime()
+        try:
+            await service.set_workflow_active_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                workflow_id=uuid.UUID(workflow_id),
+                active=active,
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_template(self, form_data: dict[str, str]) -> None:
+        """Store the body one ``(channel, kind, locale)`` renders. The body is DATA: the schema's
+        allow-list decides which ``{{variables}}`` may appear, and nothing is ever evaluated."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            data = WorkflowTemplateCreate(
+                channel=_clean(form_data, "channel"),  # type: ignore[arg-type]  # schema validates
+                kind=_clean(form_data, "kind"),
+                locale=_clean(form_data, "locale"),
+                # An email needs a subject and the phone channels forbid one; the schema refuses the
+                # incoherent pair, so a blank is passed on as the ``None`` it means, not as "".
+                subject=_clean(form_data, "subject") or None,
+                body=_clean(form_data, "body"),
+            )
+            await service.create_template_action(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+            )
+            self.templates = await _fetch_templates(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_template(self, form_data: dict[str, str]) -> None:
+        """Edit a template's TEXT. Its ``(channel, kind, locale)`` identity is immutable by design:
+        re-pointing it would silently change what every step resolving through it sends.
+
+        A blank field leaves the stored text alone. ``subject`` is NOT nullable from here — the
+        service refuses to null an email's subject line anyway (an email that arrives blank), so a
+        blank field means "unchanged", and removing a subject means deleting the template.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            fields: dict[str, str] = {}
+            subject = _clean(form_data, "subject")
+            if subject:
+                fields["subject"] = subject
+            body = _clean(form_data, "body")
+            if body:
+                fields["body"] = body
+            data = WorkflowTemplateUpdate.model_validate(fields)
+            await service.update_template_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                template_id=uuid.UUID(_clean(form_data, "id")),
+                data=data,
+            )
+            self.templates = await _fetch_templates(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def delete_template(self, template_id: str) -> None:
+        """Delete a template — refused while it is the last body a live step can render (deleting it
+        would leave that step reading ``active: true`` and silently messaging nobody)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.delete_template_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                template_id=uuid.UUID(template_id),
+            )
+            self.templates = await _fetch_templates(runtime)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)

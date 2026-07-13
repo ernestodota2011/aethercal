@@ -9,7 +9,7 @@ surface, and lets the whole layer be unit-tested offline against an aiosqlite se
 Two error families cross the boundary:
 
 * :class:`AdminSetupError` — the admin is misconfigured for this tenant (no tenant, an ambiguous
-  choice with several tenants, an unknown slug, or a tenant with no host user).
+  choice with several tenants, or an unknown slug).
 * :class:`AdminActionError` — a requested action was refused by the underlying service (unknown
   booking, slot taken, duplicate slug/name, invalid input, ...). Its ``message`` is operator-facing.
 
@@ -25,17 +25,40 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeCreate, EventTypeRead, EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleRead, ScheduleUpdate
-from aethercal.server.db.models import Tenant, User
+from aethercal.schemas.workflows import (
+    WorkflowCreate,
+    WorkflowRead,
+    WorkflowStepRead,
+    WorkflowTemplateCreate,
+    WorkflowTemplateRead,
+    WorkflowTemplateUpdate,
+    WorkflowUpdate,
+)
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    ExternalCalendarLink,
+    ExternalConnection,
+    Outbox,
+    OutboxStatus,
+    Schedule,
+    Tenant,
+    User,
+)
+from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.services import bookings as bookings_service
+from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
 from aethercal.server.services import schedules as schedules_service
+from aethercal.server.services import workflow_rules as workflow_rules_service
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -68,10 +91,52 @@ class AdminActionError(AdminError):
 
 @dataclass(frozen=True, slots=True)
 class AdminContext:
-    """The resolved single-user operating context: which tenant, acting as which host user."""
+    """The resolved operating context: WHICH TENANT the admin is administering. That is all.
+
+    ==It used to carry a ``host_user_id`` too, and that field was the whole of the RF-30 defect.==
+    It was resolved by taking the tenant's FIRST user and injected as the host of every event type
+    the admin created — while the form had no host field at all. A business with two hosts therefore
+    watched every event type it authored land on whichever host happened to exist first, silently.
+
+    The field is gone rather than fixed, because there is no correct value for it: the host is a
+    CHOICE, and a choice belongs on the form (:class:`EventTypeForm`), not in a context that guesses
+    it. Leaving a "default host" here would just keep the trap loaded for the next caller.
+    """
 
     tenant_id: uuid.UUID
-    host_user_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class HostForm:
+    """The admin-controlled fields of a host (a ``users`` row): who they are and where they work."""
+
+    name: str
+    email: str
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class HostRead:
+    """A host as the panel lists them (a flat read model — the ORM row never leaves the session)."""
+
+    id: uuid.UUID
+    name: str
+    email: str
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionRead:
+    """One of a host's connected calendar accounts, and where its bookings are written.
+
+    ``booking_calendar_id`` is ``None`` when nothing has been designated: the account's default
+    calendar is then used, which is the zero-config path. ==It is NOT the same as "no connection"==
+    — a host with no connected account has no row here at all.
+    """
+
+    id: uuid.UUID
+    account_email: str
+    booking_calendar_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,8 +158,15 @@ class BookingForm:
 
 @dataclass(frozen=True, slots=True)
 class EventTypeForm:
-    """The admin-controlled fields of an event type; ``host_id`` is injected from the context."""
+    """The admin-controlled fields of an event type.
 
+    ``host_id`` is EXPLICIT (RF-30). It used to be injected from the context — the tenant's first
+    user — which is why a second host was unreachable from this panel. It is now whichever host the
+    operator picked, and the event-type service checks that the host is theirs and that the schedule
+    is one that host may actually use.
+    """
+
+    host_id: uuid.UUID
     slug: str
     title: str
     schedule_id: uuid.UUID
@@ -140,16 +212,15 @@ async def _resolve_tenant(session: AsyncSession, tenant_slug: str | None) -> Ten
 
 
 async def resolve_admin_context(session: AsyncSession, *, tenant_slug: str | None) -> AdminContext:
-    """Resolve the tenant + its host user for the single-user admin (RF-18)."""
+    """Resolve the tenant the admin is administering (RF-18).
+
+    It no longer resolves a host. It used to end in ``.first()`` over the tenant's users and hand
+    that back as "the" host, which silently decided RF-30 for the operator every time they created
+    an event type. The host is now a field on the form, checked against the tenant by the
+    event-type service — so there is nothing left here to guess.
+    """
     tenant = await _resolve_tenant(session, tenant_slug)
-    host = (
-        await session.scalars(
-            select(User).where(User.tenant_id == tenant.id).order_by(User.created_at, User.id)
-        )
-    ).first()
-    if host is None:
-        raise AdminSetupError(f"tenant {tenant.slug!r} has no user to act as host")
-    return AdminContext(tenant_id=tenant.id, host_user_id=host.id)
+    return AdminContext(tenant_id=tenant.id)
 
 
 def _now(now: datetime | None) -> datetime:
@@ -160,22 +231,41 @@ def _now(now: datetime | None) -> datetime:
 # Bookings.
 # --------------------------------------------------------------------------------------
 
-_BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str] = {
+_BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str | None] = {
     bookings_service.EventTypeNotFoundError: "Event type not found",
     bookings_service.BookingNotFoundError: "Booking not found",
     bookings_service.AvailabilityUnavailableError: (
         "Host availability is temporarily unavailable; please try again"
     ),
-    bookings_service.BookingNotActiveError: "Booking cannot be rescheduled",
     bookings_service.SlotUnavailableError: "That time is no longer available",
+    # ``None`` = the SERVICE's own message IS the operator-facing one. These two are refusals of the
+    # booking STATE MACHINE, and the same type is raised by SEVERAL operations: ``mark_no_show``
+    # raises ``BookingNotActiveError`` exactly as ``reschedule_booking`` does. One hard-coded
+    # sentence therefore has to be wrong for every caller but one — this map used to answer "Booking
+    # cannot be rescheduled" to an operator who had clicked NO-SHOW and never asked to reschedule.
+    # Only the service knows WHICH operation it refused, and it already words its refusal for a
+    # human ("only a confirmed booking can be marked a no-show"), so that message is passed through
+    # instead of being replaced by a guess. ``BookingNotEndedError`` was mapped nowhere at all and
+    # fell through to the catch-all below, which names no cause whatsoever.
+    bookings_service.BookingNotActiveError: None,
+    bookings_service.BookingNotEndedError: None,
 }
+"""Every :class:`~aethercal.server.services.bookings.BookingError`, mapped to what the operator is
+told. ``test_every_booking_error_has_an_operator_message`` asserts this map stays EXHAUSTIVE over
+the service's error tree, so a new subclass fails a test instead of silently inheriting a vague
+catch-all that names no cause."""
 
 
 def _booking_action_error(exc: bookings_service.BookingError) -> AdminActionError:
-    """Map a booking-service domain error to a safe, operator-facing :class:`AdminActionError`."""
-    for error_type, message in _BOOKING_ERROR_MESSAGES.items():
-        if isinstance(exc, error_type):
-            return AdminActionError(message)
+    """Map a booking-service domain error to a safe, operator-facing :class:`AdminActionError`.
+
+    Resolved along the exception's MRO rather than by dict iteration order, so a future subclass of
+    a mapped error deterministically inherits its parent's wording instead of depending on where it
+    happened to be inserted.
+    """
+    for error_type in type(exc).__mro__:
+        if error_type in _BOOKING_ERROR_MESSAGES:
+            return AdminActionError(_BOOKING_ERROR_MESSAGES[error_type] or str(exc))
     return AdminActionError("The booking could not be updated")  # pragma: no cover - defensive
 
 
@@ -238,6 +328,36 @@ async def reschedule_booking_action(
                 booking_id=booking_id,
                 new_start=new_start,
                 now=_now(now),
+            )
+        except bookings_service.BookingError as exc:
+            raise _booking_action_error(exc) from exc
+        await session.refresh(booking)
+        return BookingRead.model_validate(booking)
+
+
+async def mark_no_show_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    booking_id: uuid.UUID,
+    now: datetime | None = None,
+) -> BookingRead:
+    """Mark a finished appointment as a no-show (RF-25). Idempotent.
+
+    ==It does NOT free the slot.== The appointment time has passed: releasing it would corrupt the
+    history and let a booking be written retroactively over it. ``Booking.occupies`` is "not
+    cancelled", so ``no_show`` keeps its slot automatically — and the partial index that enforces it
+    needed no change at all.
+
+    Refused unless the booking is CONFIRMED and has ENDED. Both refusals reach the operator in the
+    service's own words (see :data:`_BOOKING_ERROR_MESSAGES`): a no-show allowed before the end
+    would be a cancellation by another name that does not give the time back.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            booking = await bookings_service.mark_no_show(
+                session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
             )
         except bookings_service.BookingError as exc:
             raise _booking_action_error(exc) from exc
@@ -310,7 +430,7 @@ async def create_event_type_action(
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
         try:
             data = EventTypeCreate(
-                host_id=ctx.host_user_id,
+                host_id=form.host_id,
                 schedule_id=form.schedule_id,
                 slug=form.slug,
                 title=form.title,
@@ -433,24 +553,566 @@ async def delete_schedule_action(
             raise AdminActionError(str(exc)) from exc
 
 
+# --------------------------------------------------------------------------------------
+# The health panel (RF-25 / R9) — THIS business's outbox and no-show rate.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AdminMetrics:
+    """One read of the operating state of ONE business.
+
+    .. rubric:: Why this is not :func:`~aethercal.server.observability.collect_metrics`
+
+    That snapshot is INSTANCE-WIDE on purpose — "no tenant id, no slug; not in a label, not in a
+    value" — because it feeds ``GET /metrics``, the OPERATOR's view, guarded by an operator token
+    precisely so that one business's API key can never read the numbers of all of them.
+
+    The admin is the mirror image: it is scoped to ONE tenant, and this module's contract is that
+    administering tenant A can never see tenant B's rows. Rendering the instance-wide snapshot in a
+    tenant's panel would hand that business the pipeline volume of every other business on the box —
+    the very leak ``/metrics`` is locked down to prevent, walked back in through the front door.
+
+    So the facts are the same and the query is not: every count below carries a ``tenant_id``. What
+    is NOT re-typed is the VOCABULARY — :class:`OutboxStatus` and :func:`due_filter` are imported,
+    because the drain WRITES those states and this COUNTS them, and a backlog gauge that counts a
+    status nobody writes any more reports a reassuring ``0`` for ever.
+
+    .. rubric:: What is deliberately absent
+
+    ``lost`` and ``voided_midflight`` are PROCESS-local drain counters with no tenant dimension at
+    all. Shown on a tenant's panel they would present instance-wide numbers as if they were this
+    business's — apparent state, not effective state, which is the one thing this batch is about.
+    They stay where they mean something: the operator's ``/metrics``.
+    """
+
+    outbox_by_status: dict[str, int]
+    """Every member of :class:`OutboxStatus`, whether or not it has rows. ==Absent and zero must
+    never look the same== — nobody can alert on a series that does not exist, and "no dead intents"
+    is not the same news as "we stopped counting dead intents"."""
+    outbox_due: int
+    """Intents whose send time has PASSED and which are still undelivered. ==The alertable one.==
+
+    Not ``pending``: the outbox doubles as the durable scheduler, so a 24 h reminder for a booking
+    three weeks out sits ``pending`` for three weeks and is in perfect health. A panel that called
+    that backlog would make a healthy business look sick, and the operator would learn to ignore
+    the number that was supposed to warn them."""
+    outbox_oldest_due_age_seconds: float
+    """How long the oldest DUE intent has been waiting. ==The dead-man switch.== Flat on a healthy
+    instance; unbounded growth from the moment nothing drains — which is the failure nobody sees,
+    because the bookings keep confirming and only the messages stop."""
+    bookings_by_status: dict[str, int]
+    no_show_ratio: float
+    """No-shows over the appointments that were SUPPOSED to happen (no-show + confirmed).
+
+    ==Cancelled bookings are not in the denominator.== Nobody was ever expected to attend them, and
+    counting them would make a host's no-show rate improve simply because more people cancelled."""
+
+
+def _age_seconds(moment: datetime | None, *, now: datetime) -> float:
+    """Seconds since ``moment``, never negative; ``None`` — nothing is due — is ``0``.
+
+    SQLite hands timestamps back naive, so it is normalised before the arithmetic: subtracting a
+    naive from an aware datetime raises, and a health panel that crashes during an incident is worse
+    than no health panel at all.
+    """
+    if moment is None:
+        return 0.0
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return max((now - aware).total_seconds(), 0.0)
+
+
+async def metrics_view(
+    maker: Sessionmaker, *, tenant_slug: str | None, now: datetime | None = None
+) -> AdminMetrics:
+    """Read this business's operational state: the outbox backlog and the no-show rate (RF-25/R9).
+
+    This is what makes a dead scheduler visible to the person who would otherwise never find out:
+    today, if the drain dies, every booking still confirms, every intent is still queued, and no
+    guest ever hears from the system again — in silence.
+    """
+    moment = _now(now)
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+
+        by_status = {status.value: 0 for status in OutboxStatus}
+        for status, count in await session.execute(
+            select(Outbox.status, func.count())
+            .where(Outbox.tenant_id == ctx.tenant_id)
+            .group_by(Outbox.status)
+        ):
+            if status not in by_status:
+                # A status the table holds but the enum does not know is a real divergence, not a
+                # rounding error — and silently dropping those rows would make the backlog read
+                # reassuringly low. It is the operator's ``/metrics`` that logs it loudly; the panel
+                # simply refuses to pretend it counted them.
+                continue
+            by_status[status] = count
+
+        due = due_filter(moment)
+        outbox_due = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Outbox)
+                .where(Outbox.tenant_id == ctx.tenant_id, due)
+            )
+        ) or 0
+        due_at = func.coalesce(Outbox.next_retry_at, Outbox.created_at)
+        oldest_due = await session.scalar(
+            select(due_at)
+            .where(Outbox.tenant_id == ctx.tenant_id, due)
+            .order_by(due_at.asc())
+            .limit(1)
+        )
+
+        bookings = {status.value: 0 for status in BookingStatus}
+        for status, count in await session.execute(
+            select(Booking.status, func.count())
+            .where(Booking.tenant_id == ctx.tenant_id)
+            .group_by(Booking.status)
+        ):
+            bookings[BookingStatus(status).value] = count
+
+        expected = bookings[BookingStatus.NO_SHOW.value] + bookings[BookingStatus.CONFIRMED.value]
+        return AdminMetrics(
+            outbox_by_status=by_status,
+            outbox_due=outbox_due,
+            outbox_oldest_due_age_seconds=_age_seconds(oldest_due, now=moment),
+            bookings_by_status=bookings,
+            no_show_ratio=(bookings[BookingStatus.NO_SHOW.value] / expected) if expected else 0.0,
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Hosts, and where a host's bookings are written (RF-30).
+# --------------------------------------------------------------------------------------
+#
+# Hosts are ``users`` rows, and there is no ``services/users.py`` to delegate to — the CLI creates
+# the first one inline in ``create-tenant``, and nothing else has ever needed to. So the CRUD is
+# written here, against the model, exactly as ``_resolve_tenant`` already is. (A domain service
+# would be the better home the moment a second caller wants it; see the handover note.)
+#
+# Every id below arrives from a FORM, which makes each one a cross-tenant write surface until it is
+# checked. They are all resolved tenant-scoped, and an id that is not this tenant's is simply "not
+# found" — never a row that gets written.
+
+
+def _host_read(row: User) -> HostRead:
+    return HostRead(id=row.id, name=row.name, email=row.email, timezone=row.timezone)
+
+
+async def _load_host(session: AsyncSession, *, tenant_id: uuid.UUID, host_id: uuid.UUID) -> User:
+    """The tenant's host by id, or an :class:`AdminActionError`. Tenant-scoped, always."""
+    host = (
+        await session.scalars(select(User).where(User.id == host_id, User.tenant_id == tenant_id))
+    ).one_or_none()
+    if host is None:
+        raise AdminActionError("Host not found")
+    return host
+
+
+async def list_hosts_view(maker: Sessionmaker, *, tenant_slug: str | None) -> list[HostRead]:
+    """The tenant's hosts, oldest first — the choices the host selector offers."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rows = (
+            await session.scalars(
+                select(User)
+                .where(User.tenant_id == ctx.tenant_id)
+                .order_by(User.created_at, User.id)
+            )
+        ).all()
+        return [_host_read(row) for row in rows]
+
+
+async def create_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, form: HostForm
+) -> HostRead:
+    """Add a host to the business. ``(tenant_id, email)`` is unique: two hosts on one address is one
+    host with a typo, and it would make the pair ambiguous everywhere it is used to find them."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        row = User(
+            tenant_id=ctx.tenant_id, name=form.name, email=form.email, timezone=form.timezone
+        )
+        try:
+            async with session.begin_nested():
+                session.add(row)
+                await session.flush()
+        except IntegrityError as exc:
+            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
+        return _host_read(row)
+
+
+async def update_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
+) -> HostRead:
+    """Edit a host's name / email / timezone."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+        host.name = form.name
+        host.email = form.email
+        host.timezone = form.timezone
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
+        return _host_read(host)
+
+
+async def delete_host_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+) -> None:
+    """Remove a host — REFUSED while anything of the business still points at them.
+
+    Both silent outcomes are catastrophic and neither raises anything on its own: let it CASCADE and
+    the business's booking page loses event types nobody asked to remove (and their bookings with
+    them); let it ORPHAN and the page keeps offering slots for a host who no longer exists. So the
+    refusal names what is holding them, and the operator decides.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+
+        hosted = (
+            await session.scalars(
+                select(EventType.slug).where(
+                    EventType.tenant_id == ctx.tenant_id, EventType.host_id == host.id
+                )
+            )
+        ).all()
+        if hosted:
+            names = ", ".join(f"'{slug}'" for slug in hosted)
+            raise AdminActionError(
+                f"host '{host.name}' still hosts the event type(s) {names}: deleting them would "
+                "either take those event types (and their bookings) with them, or leave the "
+                "booking page offering slots for a host who no longer exists. Re-assign or "
+                "deactivate them first"
+            )
+        owned = (
+            await session.scalars(
+                select(Schedule.name).where(
+                    Schedule.tenant_id == ctx.tenant_id, Schedule.user_id == host.id
+                )
+            )
+        ).all()
+        if owned:
+            names = ", ".join(f"'{name}'" for name in owned)
+            raise AdminActionError(
+                f"host '{host.name}' still owns the schedule(s) {names}. Delete them, or hand them "
+                "to the business (clear their owner), first"
+            )
+
+        await session.delete(host)
+        await session.flush()
+
+
+async def list_connections_view(
+    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+) -> list[ConnectionRead]:
+    """A host's connected calendar accounts, and the calendar each writes bookings into.
+
+    ==Every one of them, not the first.== ``load_active_connections`` is deliberately plural: its
+    predecessor ended in ``.first()``, so a host with two connected accounts had one silently
+    ignored — and an ignored calendar is an ignored busy set, which is a double-booking waiting to
+    happen. The operator cannot designate a calendar on a connection the panel never shows them.
+    """
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+        connections = await calendars_service.load_active_connections(
+            session, tenant_id=ctx.tenant_id, user_id=host.id
+        )
+        reads: list[ConnectionRead] = []
+        for connection in connections:
+            links = (
+                await session.scalars(
+                    select(ExternalCalendarLink).where(
+                        ExternalCalendarLink.tenant_id == ctx.tenant_id,
+                        ExternalCalendarLink.connection_id == connection.id,
+                        ExternalCalendarLink.is_booking_target.is_(True),
+                    )
+                )
+            ).all()
+            target = links[0].external_calendar_id if links else None
+            reads.append(
+                ConnectionRead(
+                    id=connection.id,
+                    account_email=connection.account_email,
+                    booking_calendar_id=target,
+                )
+            )
+        return reads
+
+
+async def designate_calendar_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    connection_id: uuid.UUID,
+    calendar_id: str,
+) -> None:
+    """Point a connection's bookings at ONE named calendar — the admin's ``--calendar-id`` (RF-11).
+
+    This is the write side of the table that used to be dead: ``_DEFAULT_CALENDAR_ID = "primary"``
+    was a hard-coded constant, so nobody ever read or wrote ``external_calendar_links`` and a host
+    could not send bookings anywhere but the connected account's primary calendar. Using a
+    dedicated, secondary calendar is the rule for a real account — and it was not expressible.
+
+    The service does the rest: it retires the host's other targets (one target per HOST, not per
+    connection — two would dead-letter every booking on an ambiguity nobody chose), serialises the
+    choice on the host's row, and invalidates the busy cache only when the calendars actually read
+    have changed.
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        # Tenant-scoped BEFORE it is handed to the service: the id came off a form, and the service
+        # takes the connection row itself, so an unscoped load here would let one business re-point
+        # another's calendar and write its meetings into theirs.
+        connection = (
+            await session.scalars(
+                select(ExternalConnection).where(
+                    ExternalConnection.id == connection_id,
+                    ExternalConnection.tenant_id == ctx.tenant_id,
+                )
+            )
+        ).one_or_none()
+        if connection is None:
+            raise AdminActionError("Calendar connection not found")
+        await calendars_service.link_booking_calendar(
+            session, connection=connection, calendar_id=calendar_id
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Workflow rules + templates (RF-24).
+# --------------------------------------------------------------------------------------
+#
+# Every mutation here is routed through ``services/workflow_rules``, and that is the whole point:
+# that module RECONCILES the queue of every booking a rule governs. A rule edit that writes only the
+# ``workflows`` row leaves each guest already on the books reminded at the OLD time. The panel shows
+# the change, the database agrees with the panel, and nothing sends what the operator asked for. The
+# admin therefore owns no rule logic of its own; it resolves the tenant, passes the clock down, and
+# lets that service do the arming.
+#
+# ``WorkflowRuleError`` is surfaced by its OWN message rather than remapped. Each one was written to
+# be read by the person who caused it ("the whatsapp step of kind 'reminder' has no template to
+# render its body ... without one the step is skipped at send time and the guest is never messaged,
+# silently"), and a hand-written table of replacements is precisely the thing that drifted into
+# lying about the booking errors above.
+
+
+def _rule_read(rule: workflow_rules_service.Rule) -> WorkflowRead:
+    """Project a rule + its steps for the panel (there is no ORM relationship — see ``Rule``).
+
+    Built field-by-field because ``steps`` is not an attribute of the ``Workflow`` row: it is loaded
+    separately, on purpose (a lazy load on an ``AsyncSession`` is a ``MissingGreenlet`` crash). The
+    field set is pyright-checked against ``WorkflowRead``, so a new field on the schema breaks this
+    projection at type-check rather than silently omitting itself from the panel.
+    """
+    workflow = rule.workflow
+    return WorkflowRead(
+        id=workflow.id,
+        name=workflow.name,
+        trigger=workflow.trigger,  # type: ignore[arg-type]  # validated in; the set is test-locked
+        offset_minutes=workflow.offset_minutes,
+        event_type_id=workflow.event_type_id,
+        active=workflow.active,
+        steps=[WorkflowStepRead.model_validate(step) for step in rule.steps],
+        created_at=workflow.created_at,
+        updated_at=workflow.updated_at,
+    )
+
+
+async def list_workflows_view(
+    maker: Sessionmaker, *, tenant_slug: str | None
+) -> list[WorkflowRead]:
+    """Every rule of the tenant (active and inactive), each with its steps."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rules = await workflow_rules_service.list_workflows(session, tenant_id=ctx.tenant_id)
+        return [_rule_read(rule) for rule in rules]
+
+
+async def create_workflow_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    data: WorkflowCreate,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Author a rule and ARM it against the bookings that already exist."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.create_workflow(
+                session, tenant_id=ctx.tenant_id, data=data, now=_now(now)
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return _rule_read(rule)
+
+
+async def update_workflow_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    workflow_id: uuid.UUID,
+    data: WorkflowUpdate,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Edit a rule and MAKE THE EDIT TRUE for every booking it already governs."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.update_workflow(
+                session,
+                tenant_id=ctx.tenant_id,
+                workflow_id=workflow_id,
+                data=data,
+                now=_now(now),
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if rule is None:
+            # The service returns ``None`` rather than raising for an absent row. Reported as a
+            # success, that is the panel confirming a save that never touched anything.
+            raise AdminActionError("Workflow not found")
+        return _rule_read(rule)
+
+
+async def set_workflow_active_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    workflow_id: uuid.UUID,
+    active: bool,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Switch a rule on or off. Off PAUSES its queued messages; on re-arms and re-times them."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.set_workflow_active(
+                session,
+                tenant_id=ctx.tenant_id,
+                workflow_id=workflow_id,
+                active=active,
+                now=_now(now),
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if rule is None:
+            raise AdminActionError("Workflow not found")
+        return _rule_read(rule)
+
+
+async def list_templates_view(
+    maker: Sessionmaker, *, tenant_slug: str | None
+) -> list[WorkflowTemplateRead]:
+    """Every message body the tenant has authored."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rows = await workflow_rules_service.list_templates(session, tenant_id=ctx.tenant_id)
+        return [WorkflowTemplateRead.model_validate(row) for row in rows]
+
+
+async def create_template_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, data: WorkflowTemplateCreate
+) -> WorkflowTemplateRead:
+    """Store the body for one ``(channel, kind, locale)``."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            row = await workflow_rules_service.create_template(
+                session, tenant_id=ctx.tenant_id, data=data
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return WorkflowTemplateRead.model_validate(row)
+
+
+async def update_template_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    template_id: uuid.UUID,
+    data: WorkflowTemplateUpdate,
+) -> WorkflowTemplateRead:
+    """Edit a template's TEXT (its ``(channel, kind, locale)`` identity is immutable by design)."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            row = await workflow_rules_service.update_template(
+                session, tenant_id=ctx.tenant_id, template_id=template_id, data=data
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if row is None:
+            raise AdminActionError("Template not found")
+        return WorkflowTemplateRead.model_validate(row)
+
+
+async def delete_template_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, template_id: uuid.UUID
+) -> None:
+    """Delete a template; refused while it is the last body a live step can render.
+
+    An absent row is an ERROR, not a quiet success: ``delete_template`` returns ``False`` for one,
+    and a handler that reports that as "deleted" tells the operator it removed something that was
+    never there (the same no-op ``deactivate_event_type`` already guards against).
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            deleted = await workflow_rules_service.delete_template(
+                session, tenant_id=ctx.tenant_id, template_id=template_id
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if not deleted:
+            raise AdminActionError("Template not found")
+
+
 __all__ = [
     "AdminActionError",
     "AdminContext",
     "AdminError",
+    "AdminMetrics",
     "AdminSetupError",
     "BookingForm",
+    "ConnectionRead",
     "EventTypeForm",
+    "HostForm",
+    "HostRead",
     "cancel_booking_action",
     "create_booking_action",
     "create_event_type_action",
+    "create_host_action",
     "create_schedule_action",
+    "create_template_action",
+    "create_workflow_action",
     "deactivate_event_type_action",
+    "delete_host_action",
     "delete_schedule_action",
+    "delete_template_action",
+    "designate_calendar_action",
     "list_bookings_view",
+    "list_connections_view",
     "list_event_types_view",
+    "list_hosts_view",
     "list_schedules_view",
+    "list_templates_view",
+    "list_workflows_view",
+    "mark_no_show_action",
+    "metrics_view",
     "reschedule_booking_action",
     "resolve_admin_context",
+    "set_workflow_active_action",
     "update_event_type_action",
+    "update_host_action",
     "update_schedule_action",
+    "update_template_action",
+    "update_workflow_action",
 ]

@@ -138,11 +138,24 @@ async def _tenant_id(maker: Sessionmaker) -> uuid.UUID:
         return tenant.id
 
 
+async def _seeded_host_id(state: AdminState) -> str:
+    """The tenant's ONE host, as a form value.
+
+    RF-30 made the host an EXPLICIT field on the event-type form. It used to be injected by the
+    service — the tenant's first user — which is precisely why a business's second host could never
+    be given an event type. So every create now states which host it means, these tests included.
+    """
+    await AdminState.load_hosts.fn(state)
+    assert len(state.hosts) == 1, "these tests seed a single-host tenant"
+    return state.hosts[0]["id"]
+
+
 async def _seed_event_type(state: AdminState) -> None:
     await AdminState.create_schedule.fn(state, _WEEKLY_FORM)
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
