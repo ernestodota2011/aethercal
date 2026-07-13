@@ -21,7 +21,7 @@ from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
-from aethercal.server.db.models import ApiKey, Outbox, OutboxStatus, Tenant, User
+from aethercal.server.db.models import ApiKey, Outbox, OutboxStatus, Tenant
 from aethercal.server.integrations.google.oauth import get_credentials
 from aethercal.server.services.api_keys import (
     RevokeKeyOutcome,
@@ -35,6 +35,13 @@ from aethercal.server.services.calendars import (
     store_google_connection,
 )
 from aethercal.server.services.privacy import PurgeReport, purge_guest
+from aethercal.server.services.users import (
+    UserData,
+    UserNotFoundError,
+    UserServiceError,
+    create_user,
+    get_user_by_email,
+)
 from aethercal.server.services.workflows import seed_default_workflows
 from aethercal.server.settings import Settings
 
@@ -65,14 +72,27 @@ async def run_create_tenant(
     email: str,
     timezone: str,
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    """Create a tenant and its first user in one transaction. Returns ``(tenant_id, user_id)``."""
+    """Create a tenant and its first host in one transaction. Returns ``(tenant_id, user_id)``.
+
+    ==The host is written through ``services/users``, like every other host in the product.== It
+    used to be built here, inline against the model — a second copy of the CRUD the admin panel
+    already had, and the two had diverged: this one validated NOTHING, so ``--email "not-an-email"
+    --timezone "America/Mars"`` created that host in silence and the first symptom would have been a
+    confirmation email that never arrived.
+
+    A refusal raises :class:`~aethercal.server.services.users.InvalidUserError` and the whole
+    transaction rolls back: no half-made tenant is left behind for the operator to collide with when
+    they fix the typo and run it again.
+    """
     async with sessionmaker() as session, session.begin():
         tenant = Tenant(slug=slug, name=name)
         session.add(tenant)
         await session.flush()
-        user = User(tenant_id=tenant.id, email=email, name=name, timezone=timezone)
-        session.add(user)
-        await session.flush()
+        # The first host is named after the business — ``create-tenant`` has a single ``--name``,
+        # and a real host list is authored in the panel (RF-30's host CRUD).
+        user = await create_user(
+            session, tenant_id=tenant.id, data=UserData(name=name, email=email, timezone=timezone)
+        )
         # A tenant with no workflow rules has no reminders. Migration 0005 seeds the default rule
         # for the tenants that already existed; this is the other half — every tenant created
         # AFTERWARDS. Miss it and a brand-new self-host silently never reminds anybody.
@@ -164,13 +184,12 @@ async def run_connect_google(  # noqa: PLR0913 - the tenant/host pair + credenti
         ).one_or_none()
         if tenant is None:
             raise LookupError(f"no tenant with slug {tenant_slug!r}")
-        user = (
-            await session.scalars(
-                select(User).where(User.tenant_id == tenant.id, User.email == user_email)
-            )
-        ).one_or_none()
-        if user is None:
-            raise LookupError(f"no user with email {user_email!r} in tenant {tenant_slug!r}")
+        try:
+            user = await get_user_by_email(session, tenant_id=tenant.id, email=user_email)
+        except UserNotFoundError as exc:
+            raise LookupError(
+                f"no user with email {user_email!r} in tenant {tenant_slug!r}"
+            ) from exc
         connection = await store_google_connection(
             session,
             tenant_id=tenant.id,
@@ -314,10 +333,19 @@ def create_tenant_command(
     email: Annotated[str, typer.Option(help="Email of the tenant's first user.")],
     timezone: Annotated[str, typer.Option(help="IANA timezone of the first user.")] = "UTC",
 ) -> None:
-    """Create a tenant and its first user, printing their ids."""
-    tenant_id, user_id = asyncio.run(
-        run_create_tenant(_sessionmaker(), slug=slug, name=name, email=email, timezone=timezone)
-    )
+    """Create a tenant and its first user, printing their ids.
+
+    A malformed address or a timezone that is not a real IANA zone is REFUSED here — with the
+    service's own sentence and a non-zero exit, not a traceback. It used to be accepted in silence,
+    and the operator found out weeks later, from a guest.
+    """
+    try:
+        tenant_id, user_id = asyncio.run(
+            run_create_tenant(_sessionmaker(), slug=slug, name=name, email=email, timezone=timezone)
+        )
+    except UserServiceError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"tenant_id={tenant_id}")
     typer.echo(f"user_id={user_id}")
 

@@ -26,7 +26,6 @@ from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
@@ -43,12 +42,10 @@ from aethercal.schemas.workflows import (
 )
 from aethercal.server.db.models import (
     Booking,
-    EventType,
     ExternalCalendarLink,
     ExternalConnection,
     Outbox,
     OutboxStatus,
-    Schedule,
     Tenant,
     User,
 )
@@ -57,6 +54,7 @@ from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
 from aethercal.server.services import schedules as schedules_service
+from aethercal.server.services import users as users_service
 from aethercal.server.services import workflow_rules as workflow_rules_service
 
 Sessionmaker = async_sessionmaker[AsyncSession]
@@ -686,125 +684,84 @@ async def metrics_view(
 # Hosts, and where a host's bookings are written (RF-30).
 # --------------------------------------------------------------------------------------
 #
-# Hosts are ``users`` rows, and there is no ``services/users.py`` to delegate to — the CLI creates
-# the first one inline in ``create-tenant``, and nothing else has ever needed to. So the CRUD is
-# written here, against the model, exactly as ``_resolve_tenant`` already is. (A domain service
-# would be the better home the moment a second caller wants it; see the handover note.)
+# Hosts are ``users`` rows, and every mutation of one goes through ``services/users`` — which is now
+# the ONLY thing in the product that writes that table.
+#
+# ==It used to be written here, inline, against the model== — and the CLI wrote a second copy of the
+# same CRUD inside ``create-tenant``. Two surfaces, two ideas of what a host is, and they had
+# already diverged: a duplicate address was a clean refusal here and an unhandled ``IntegrityError``
+# there, and NEITHER of them validated the address or the timezone at all (the guest's equivalents
+# have been refused at the edge since the first booking). The service holds those rules once; this
+# layer resolves the tenant, hands the form down, and turns the domain error into operator-facing
+# text.
 #
 # Every id below arrives from a FORM, which makes each one a cross-tenant write surface until it is
-# checked. They are all resolved tenant-scoped, and an id that is not this tenant's is simply "not
-# found" — never a row that gets written.
+# checked. They are all resolved tenant-scoped by the service, and an id that is not this tenant's
+# is simply "not found" — never a row that gets written.
 
 
 def _host_read(row: User) -> HostRead:
     return HostRead(id=row.id, name=row.name, email=row.email, timezone=row.timezone)
 
 
-async def _load_host(session: AsyncSession, *, tenant_id: uuid.UUID, host_id: uuid.UUID) -> User:
-    """The tenant's host by id, or an :class:`AdminActionError`. Tenant-scoped, always."""
-    host = (
-        await session.scalars(select(User).where(User.id == host_id, User.tenant_id == tenant_id))
-    ).one_or_none()
-    if host is None:
-        raise AdminActionError("Host not found")
-    return host
+def _host_form_data(form: HostForm) -> users_service.UserData:
+    return users_service.UserData(name=form.name, email=form.email, timezone=form.timezone)
 
 
 async def list_hosts_view(maker: Sessionmaker, *, tenant_slug: str | None) -> list[HostRead]:
     """The tenant's hosts, oldest first — the choices the host selector offers."""
     async with maker() as session:
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-        rows = (
-            await session.scalars(
-                select(User)
-                .where(User.tenant_id == ctx.tenant_id)
-                .order_by(User.created_at, User.id)
-            )
-        ).all()
+        rows = await users_service.list_users(session, tenant_id=ctx.tenant_id)
         return [_host_read(row) for row in rows]
 
 
 async def create_host_action(
     maker: Sessionmaker, *, tenant_slug: str | None, form: HostForm
 ) -> HostRead:
-    """Add a host to the business. ``(tenant_id, email)`` is unique: two hosts on one address is one
-    host with a typo, and it would make the pair ambiguous everywhere it is used to find them."""
+    """Add a host to the business (name, a real address, a real timezone — the service decides)."""
     async with maker() as session, session.begin():
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-        row = User(
-            tenant_id=ctx.tenant_id, name=form.name, email=form.email, timezone=form.timezone
-        )
         try:
-            async with session.begin_nested():
-                session.add(row)
-                await session.flush()
-        except IntegrityError as exc:
-            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
+            row = await users_service.create_user(
+                session, tenant_id=ctx.tenant_id, data=_host_form_data(form)
+            )
+        except users_service.UserServiceError as exc:
+            raise AdminActionError(str(exc)) from exc
         return _host_read(row)
 
 
 async def update_host_action(
     maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
 ) -> HostRead:
-    """Edit a host's name / email / timezone."""
+    """Edit a host's name / email / timezone (all three are sent; the create rules apply again)."""
     async with maker() as session, session.begin():
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
-        host.name = form.name
-        host.email = form.email
-        host.timezone = form.timezone
         try:
-            await session.flush()
-        except IntegrityError as exc:
-            raise AdminActionError(f"a host with the email '{form.email}' already exists") from exc
-        return _host_read(host)
+            row = await users_service.update_user(
+                session, tenant_id=ctx.tenant_id, user_id=host_id, data=_host_form_data(form)
+            )
+        except users_service.UserServiceError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return _host_read(row)
 
 
 async def delete_host_action(
     maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
 ) -> None:
-    """Remove a host — REFUSED while anything of the business still points at them.
+    """Remove a host — refused, by the service, while an event type or a schedule still holds them.
 
     Both silent outcomes are catastrophic and neither raises anything on its own: let it CASCADE and
     the business's booking page loses event types nobody asked to remove (and their bookings with
-    them); let it ORPHAN and the page keeps offering slots for a host who no longer exists. So the
+    them); let it ORPHAN and the page keeps offering slots for a host who no longer exists. The
     refusal names what is holding them, and the operator decides.
     """
     async with maker() as session, session.begin():
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
-
-        hosted = (
-            await session.scalars(
-                select(EventType.slug).where(
-                    EventType.tenant_id == ctx.tenant_id, EventType.host_id == host.id
-                )
-            )
-        ).all()
-        if hosted:
-            names = ", ".join(f"'{slug}'" for slug in hosted)
-            raise AdminActionError(
-                f"host '{host.name}' still hosts the event type(s) {names}: deleting them would "
-                "either take those event types (and their bookings) with them, or leave the "
-                "booking page offering slots for a host who no longer exists. Re-assign or "
-                "deactivate them first"
-            )
-        owned = (
-            await session.scalars(
-                select(Schedule.name).where(
-                    Schedule.tenant_id == ctx.tenant_id, Schedule.user_id == host.id
-                )
-            )
-        ).all()
-        if owned:
-            names = ", ".join(f"'{name}'" for name in owned)
-            raise AdminActionError(
-                f"host '{host.name}' still owns the schedule(s) {names}. Delete them, or hand them "
-                "to the business (clear their owner), first"
-            )
-
-        await session.delete(host)
-        await session.flush()
+        try:
+            await users_service.delete_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
+        except users_service.UserServiceError as exc:
+            raise AdminActionError(str(exc)) from exc
 
 
 async def list_connections_view(
@@ -819,7 +776,10 @@ async def list_connections_view(
     """
     async with maker() as session:
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-        host = await _load_host(session, tenant_id=ctx.tenant_id, host_id=host_id)
+        try:
+            host = await users_service.get_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
+        except users_service.UserServiceError as exc:
+            raise AdminActionError(str(exc)) from exc
         connections = await calendars_service.load_active_connections(
             session, tenant_id=ctx.tenant_id, user_id=host.id
         )
