@@ -44,11 +44,22 @@ from aethercal.server.integrations.smtp.compose import (
 from aethercal.server.integrations.smtp.sender import EmailSender
 
 
+def ledger_kind(kind: NotificationKind | str) -> str:
+    """The ledger's ``kind`` key, from either the built-in vocabulary or a tenant's own.
+
+    ``workflow_steps.kind`` is a free-text column BY DESIGN — a tenant may define a step whose kind
+    is ``follow_up`` and give it a template. The four :class:`NotificationKind` values are the kinds
+    that have a built-in COMPOSER (they carry the ``.ics``), not the kinds that may exist. Forcing
+    the ledger through that enum would make a tenant's own kind unrepresentable, so a perfectly
+    well-configured step would be skipped forever with a message about a renderer that exists."""
+    return kind.value if isinstance(kind, NotificationKind) else kind
+
+
 async def notification_already_sent(
     session: AsyncSession,
     *,
     booking: Booking,
-    kind: NotificationKind,
+    kind: NotificationKind | str,
     channel: Channel = Channel.EMAIL,
     step_id: uuid.UUID | None = None,
 ) -> bool:
@@ -57,7 +68,7 @@ async def notification_already_sent(
         select(SentNotification.id).where(
             SentNotification.tenant_id == booking.tenant_id,
             SentNotification.booking_id == booking.id,
-            SentNotification.kind == kind.value,
+            SentNotification.kind == ledger_kind(kind),
             SentNotification.channel == channel.value,
             SentNotification.step_id == step_id,
         )
@@ -69,7 +80,7 @@ async def record_booking_notification(  # noqa: PLR0913 - the ledger identity IS
     session: AsyncSession,
     *,
     booking: Booking,
-    kind: NotificationKind,
+    kind: NotificationKind | str,
     now: datetime,
     channel: Channel = Channel.EMAIL,
     step_id: uuid.UUID | None = None,
@@ -82,7 +93,7 @@ async def record_booking_notification(  # noqa: PLR0913 - the ledger identity IS
     row = SentNotification(
         tenant_id=booking.tenant_id,
         booking_id=booking.id,
-        kind=kind.value,
+        kind=ledger_kind(kind),
         channel=channel.value,
         step_id=step_id,
         sent_at=now,
@@ -208,6 +219,7 @@ async def _build_context(  # noqa: PLR0913 - the context needs the booking, the 
 
 __all__ = [
     "compose_booking_notification",
+    "ledger_kind",
     "notification_already_sent",
     "record_booking_notification",
     "send_booking_notification",

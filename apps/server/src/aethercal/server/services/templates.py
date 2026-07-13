@@ -46,11 +46,20 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime
 from typing import assert_never
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from aethercal.schemas.event_types import resolve_translation
 from aethercal.server.channels import Channel
+from aethercal.server.db.models import Booking, EventType, User, WorkflowTemplate
+from aethercal.server.integrations.smtp.compose import normalize_locale
 
 ALLOWED_VARIABLES = frozenset(
     {
@@ -335,15 +344,155 @@ def _cap(value: str, limit: int) -> str:
     return value[: limit - len(_TRUNCATION_MARK)] + _TRUNCATION_MARK
 
 
+# --------------------------------------------------------------------------------------
+# The template STORE: the tenant's own row, or the built-in ES/EN fallback.
+# --------------------------------------------------------------------------------------
+
+# The built-in bodies for the phone channels, per (kind, locale). A tenant that has authored nothing
+# still gets a correct, sober message rather than silence — "no template" must never be the reason a
+# reminder does not arrive.
+#
+# Deliberately they do NOT reference {{cancel_url}} / {{reschedule_url}}: a workflow step carries no
+# signed guest links (the same shape the retired reminder job had), so those variables render EMPTY,
+# and a built-in that said "Cancel: " followed by nothing would ship a broken message to every guest
+# of every tenant who never wrote a template.
+_BUILTIN_PHONE_BODIES: Mapping[tuple[str, str], str] = {
+    ("confirmation", "es"): (
+        'Hola {{guest_name}}: tu reserva "{{event_title}}" quedó confirmada para el '
+        "{{start_local}} ({{timezone}})."
+    ),
+    ("confirmation", "en"): (
+        'Hi {{guest_name}}: your booking "{{event_title}}" is confirmed for {{start_local}} '
+        "({{timezone}})."
+    ),
+    ("reminder", "es"): (
+        'Hola {{guest_name}}: te recordamos tu reserva "{{event_title}}" el {{start_local}} '
+        "({{timezone}})."
+    ),
+    ("reminder", "en"): (
+        'Hi {{guest_name}}: a reminder of your booking "{{event_title}}" on {{start_local}} '
+        "({{timezone}})."
+    ),
+    ("reschedule", "es"): (
+        'Hola {{guest_name}}: tu reserva "{{event_title}}" se reprogramó para el {{start_local}} '
+        "({{timezone}})."
+    ),
+    ("reschedule", "en"): (
+        'Hi {{guest_name}}: your booking "{{event_title}}" has moved to {{start_local}} '
+        "({{timezone}})."
+    ),
+    ("cancellation", "es"): (
+        'Hola {{guest_name}}: tu reserva "{{event_title}}" del {{start_local}} fue cancelada.'
+    ),
+    ("cancellation", "en"): (
+        'Hi {{guest_name}}: your booking "{{event_title}}" on {{start_local}} has been cancelled.'
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelTemplate:
+    """The template a step will render: its body, its optional subject, and where it came from."""
+
+    body: str
+    subject: str | None
+    source: str
+    """``"tenant"`` or ``"builtin"`` — carried so the log can say WHICH body went out."""
+
+
+async def load_template(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    channel: Channel,
+    kind: str,
+    locale: str,
+) -> ChannelTemplate | None:
+    """The tenant's template for ``(channel, kind, locale)``, else the built-in; ``None`` if
+    neither exists.
+
+    ``None`` is a real answer, not a failure to find one: a tenant can author a step of a custom
+    ``kind`` (a follow-up, say) on a phone channel and never write its body. The step is then
+    SKIPPED with that reason, loudly — rather than sending an empty message, which is what a ""
+    default would quietly do."""
+    language = normalize_locale(locale)
+    row = (
+        await session.scalars(
+            select(WorkflowTemplate).where(
+                WorkflowTemplate.tenant_id == tenant_id,
+                WorkflowTemplate.channel == channel.value,
+                WorkflowTemplate.kind == kind,
+                WorkflowTemplate.locale == language,
+            )
+        )
+    ).one_or_none()
+    if row is not None and row.body.strip():
+        return ChannelTemplate(body=row.body, subject=row.subject, source="tenant")
+
+    builtin = _BUILTIN_PHONE_BODIES.get((kind, language))
+    if builtin is None:
+        return None
+    return ChannelTemplate(body=builtin, subject=None, source="builtin")
+
+
+async def build_template_context(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    locale: str,
+    cancel_url: str | None = None,
+    reschedule_url: str | None = None,
+) -> TemplateContext:
+    """Resolve every allow-listed variable for ``booking``. **Complete by construction.**
+
+    The event title is localised through the same :func:`resolve_translation` rule the booking page
+    and the email composer use — a fourth answer to "which title?" is exactly the bug this codebase
+    just finished paying for."""
+    event_type = await session.get(EventType, booking.event_type_id)
+    host = await session.get(User, event_type.host_id) if event_type is not None else None
+    language = normalize_locale(locale)
+
+    title = (
+        resolve_translation(event_type.title, event_type.title_translations, language)
+        if event_type is not None
+        else ""
+    )
+    timezone = booking.guest_timezone
+    return TemplateContext(
+        guest_name=booking.guest_name,
+        guest_email=booking.guest_email,
+        event_title=title,
+        start_local=_local_time(booking.start_at, timezone),
+        end_local=_local_time(booking.end_at, timezone),
+        timezone=timezone,
+        host_name=host.name if host is not None else "",
+        # A workflow step carries no signed guest links; an in-person booking has no meeting URL.
+        # These are legitimately EMPTY values, which is a different thing from a MISSING variable,
+        # and keeping them distinct is what stops a context typo blanking a real one in silence.
+        cancel_url=cancel_url or "",
+        reschedule_url=reschedule_url or "",
+        meeting_url=booking.meeting_url or "",
+    )
+
+
+def _local_time(moment: datetime, timezone: str) -> str:
+    """Render an instant in the guest's IANA zone (no locale-dependent names → deterministic)."""
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return f"{aware.astimezone(ZoneInfo(timezone)):%Y-%m-%d %H:%M}"
+
+
 __all__ = [
     "ALLOWED_VARIABLES",
     "MAX_BODY_LENGTH",
     "MAX_URL_LENGTH",
     "MAX_VARIABLE_LENGTH",
+    "ChannelTemplate",
     "RenderedMessage",
     "TemplateContext",
     "TemplateError",
     "UnknownVariableError",
+    "build_template_context",
+    "load_template",
     "render_template",
     "validate_template_body",
 ]
