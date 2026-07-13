@@ -63,8 +63,14 @@ TenantFactory = Callable[..., Awaitable[Tenant]]
 
 
 @pytest_asyncio.fixture
-async def sqlite_session() -> AsyncIterator[AsyncSession]:
-    """An in-memory aiosqlite AsyncSession with the full schema — offline service-layer TDD."""
+async def sqlite_maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """An in-memory aiosqlite sessionmaker with the full schema — offline service-layer TDD.
+
+    A ``sessionmaker``, not just a session, because the outbox drain owns its own transaction
+    BOUNDARIES (claim → commit → network I/O with nothing open → settle) and therefore opens its own
+    sessions. ``StaticPool`` keeps every one of them on the SAME in-memory database, so a test can
+    drive a service through ``sqlite_session`` and then drain through this maker.
+    """
     engine = create_async_engine(
         "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},
@@ -72,13 +78,22 @@ async def sqlite_session() -> AsyncIterator[AsyncSession]:
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    session = maker()
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def sqlite_session(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """A session on the SAME in-memory database as ``sqlite_maker``."""
+    session = sqlite_maker()
     try:
         yield session
     finally:
         await session.close()
-        await engine.dispose()
 
 
 @pytest.fixture

@@ -265,7 +265,7 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
 
     google = _FakeGoogle()
     execute = make_booking_effect_executor(
-        sender=_RecordingSender(), service_factory=lambda _c: google
+        sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
     )
     await asyncio.gather(
         run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
@@ -354,7 +354,7 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
 
     google = _FakeGoogle()
     execute = make_booking_effect_executor(
-        sender=_RecordingSender(), service_factory=lambda _c: google
+        sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
     )
     await asyncio.gather(
         run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
