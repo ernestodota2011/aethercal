@@ -23,6 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from aethercal.server.admin import runtime as runtime_mod
 from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.format import SHARED_SCHEDULE
 from aethercal.server.admin.passwords import hash_password
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER
 from aethercal.server.admin.runtime import AdminRuntime, configure_runtime
@@ -601,3 +602,134 @@ async def test_update_event_type_with_only_id_is_a_true_no_op(
     assert state.error == ""
     assert state.event_types[0]["title"] == "Introducción"
     assert state.event_types[0]["duration_min"] == "30"
+
+
+# --------------------------------------------------------------------------------------
+# A schedule's owner can be MOVED (RF-30). The column existed and nobody could touch it.
+# --------------------------------------------------------------------------------------
+
+
+async def _authed(maker: Sessionmaker) -> AdminState:
+    configure_runtime(
+        AdminRuntime(
+            sessionmaker=maker,
+            config=AdminConfig(
+                username="operator", password_hash=hash_password("s3cret"), tenant_slug=None
+            ),
+        )
+    )
+    state = _state()
+    state._authenticated = True
+    return state
+
+
+async def _schedule_owner(state: AdminState, name: str) -> str:
+    """The ``owner`` cell of the schedule called ``name`` — the id of its host, or the sentinel."""
+    await AdminState.load_schedules.fn(state)
+    return next(row["owner"] for row in state.schedules if row["name"] == name)
+
+
+async def _schedule_id_of(state: AdminState, name: str) -> str:
+    await AdminState.load_schedules.fn(state)
+    return next(row["id"] for row in state.schedules if row["name"] == name)
+
+
+async def test_a_schedule_can_be_handed_from_one_host_to_another(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The column existed and nobody could move it.==
+
+    ``schedules.user_id`` shipped with RF-30, and the EDIT form never exposed it — so a schedule
+    created with an owner could not be transferred, and a shared one could not be assigned. A field
+    the database has and the panel cannot reach is a field that does not exist.
+    """
+    state = await _authed(seeded_maker)
+    await AdminState.create_host.fn(
+        state, {"name": "Bruno", "email": "bruno@example.com", "timezone": "UTC"}
+    )
+    await AdminState.load_hosts.fn(state)
+    by_name = {row["name"]: row["id"] for row in state.hosts}
+    ana, bruno = by_name["Host"], by_name["Bruno"]
+
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    assert await _schedule_owner(state, "Weekly") == ana
+
+    await AdminState.update_schedule.fn(
+        state, {"id": await _schedule_id_of(state, "Weekly"), "owner_id": bruno}
+    )
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Weekly") == bruno
+
+
+async def test_a_schedule_can_be_handed_back_to_the_whole_business(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The sentinel earns its keep here.==
+
+    "I did not touch the field" and "I want this to belong to nobody" cannot be the same value, so
+    an untouched (blank) select leaves the owner alone and the explicit ``(business)`` option is
+    what clears it. Otherwise editing a schedule's NAME would quietly take it from its host.
+    """
+    state = await _authed(seeded_maker)
+    await AdminState.load_hosts.fn(state)
+    ana = state.hosts[0]["id"]
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "owner_id": SHARED_SCHEDULE})
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE
+
+
+async def test_editing_only_the_name_never_takes_a_schedule_away_from_its_host(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """The blank field PRESERVES the owner. If it meant "shared", renaming a schedule would silently
+    hand it to the whole business — and two hosts would come to share a pattern nobody chose."""
+    state = await _authed(seeded_maker)
+    await AdminState.load_hosts.fn(state)
+    ana = state.hosts[0]["id"]
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "name": "Renamed"})
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Renamed") == ana  # still hers
+
+
+async def test_a_schedule_cannot_be_given_to_another_businesss_host(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """The owner arrives from a form, so it is a cross-tenant write surface until it is checked."""
+    async with seeded_maker() as session, session.begin():
+        intruder_tenant = Tenant(slug="beta", name="Beta")
+        session.add(intruder_tenant)
+        await session.flush()
+        intruder = User(
+            tenant_id=intruder_tenant.id, email="b@example.com", name="Beto", timezone="UTC"
+        )
+        session.add(intruder)
+        await session.flush()
+        intruder_id = str(intruder.id)
+
+    # Two tenants now exist, so the admin must be told which one it administers.
+    configure_runtime(
+        AdminRuntime(
+            sessionmaker=seeded_maker,
+            config=AdminConfig(
+                username="operator", password_hash=hash_password("s3cret"), tenant_slug="acme"
+            ),
+        )
+    )
+    state = _state()
+    state._authenticated = True
+    await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "owner_id": intruder_id})
+
+    assert state.error != ""
+    assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE  # untouched

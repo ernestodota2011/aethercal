@@ -556,6 +556,26 @@ def _owner_id(form_data: dict[str, str]) -> uuid.UUID | None:
     return uuid.UUID(raw)
 
 
+def _owner_update(form_data: dict[str, str]) -> dict[str, uuid.UUID | None]:
+    """The owner key for an UPDATE payload, or ``{}`` to leave the stored owner UNTOUCHED.
+
+    ==Three values, and only two of them are a value.== ``schedules.user_id`` is one of the fields
+    where ``null`` MEANS something — the pattern belongs to the whole business, and every host may
+    use it — so "I did not touch this field" and "give this to nobody" cannot be the same blank.
+
+    Read the blank as ``None`` and renaming a schedule would quietly take it away from its host, and
+    two hosts would end up sharing a pattern nobody chose — which is the exact accident the column
+    was added to prevent. So an untouched select PRESERVES the owner (the key is omitted, and the
+    service leaves it alone via ``model_fields_set``), and handing a schedule back to the business
+    is the explicit :data:`SHARED_SCHEDULE` option. Same shape as the rule scope and the EN
+    translations: removal is never something a field you did not touch does for you.
+    """
+    raw = _clean(form_data, "owner_id")
+    if not raw:
+        return {}
+    return {"user_id": None if raw == SHARED_SCHEDULE else uuid.UUID(raw)}
+
+
 async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
     rows = await service.list_workflows_view(
         runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
@@ -1179,15 +1199,31 @@ class AdminState(rx.State):
 
     @rx.event
     async def update_schedule(self, form_data: dict[str, str]) -> None:
-        """Update a schedule's name/timezone (blank fields left unchanged)."""
+        """Update a schedule's name / timezone / OWNER (blank fields left unchanged).
+
+        The owner (RF-30) is what this form was missing. ``schedules.user_id`` shipped with the
+        column and no way to move it, so a schedule created for one host could never be transferred
+        and a shared one could never be assigned — a field the database has and the panel cannot
+        reach is a field that does not exist.
+
+        It is three-valued, and :func:`_owner_update` is what keeps the three values apart.
+        """
         if not self._authenticated:
             return
         runtime = current_runtime()
         try:
-            data = ScheduleUpdate(
-                name=_clean(form_data, "name") or None,
-                timezone=_clean(form_data, "timezone") or None,
-            )
+            fields: dict[str, object] = {}
+            name = _clean(form_data, "name")
+            if name:
+                fields["name"] = name
+            timezone = _clean(form_data, "timezone")
+            if timezone:
+                fields["timezone"] = timezone
+            fields.update(_owner_update(form_data))
+            # ``model_validate``, not the constructor: the service reads the owner through
+            # ``model_fields_set``, and a key passed explicitly as ``None`` would arrive as "hand
+            # this schedule back to the whole business" rather than "leave the owner alone".
+            data = ScheduleUpdate.model_validate(fields)
             await service.update_schedule_action(
                 runtime.sessionmaker,
                 tenant_slug=runtime.config.tenant_slug,

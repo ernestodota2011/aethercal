@@ -684,12 +684,22 @@ def schedules_page() -> rx.Component:
             on_submit=AdminState.create_schedule,
             reset_on_submit=True,
         ),
-        rx.heading("Rename a schedule", size="4"),
+        rx.heading("Update a schedule", size="4"),
+        rx.text(
+            "Un campo en blanco se deja como está. El dueño solo cambia si eliges uno: "
+            f"'{SHARED_SCHEDULE}' devuelve el horario a todo el negocio.",
+            size="1",
+            color_scheme="gray",
+        ),
         rx.form(
             rx.hstack(
                 rx.input(name="id", placeholder="Schedule id", required=True),
                 rx.input(name="name", placeholder="New name (optional)"),
                 rx.input(name="timezone", placeholder="New timezone (optional)"),
+                # RF-30. The column shipped and this form never exposed it, so a schedule created
+                # for one host could not be transferred and a shared one could not be assigned: the
+                # database had the field and nobody could move it.
+                _owner_select(),
                 rx.button("Update", type="submit"),
                 spacing="3",
                 align="end",

@@ -218,7 +218,13 @@ def metrics_rows(metrics: AdminMetrics) -> list[dict[str, str]]:
         {
             "label": "Tasa de no-show",
             "value": f"{metrics.no_show_ratio:.0%}",
-            "hint": "No-shows sobre las citas que iban a ocurrir (las canceladas no cuentan).",
+            # The denominator is SHOWN. A rate with no visible denominator is a number the operator
+            # has to take on trust, and this is precisely the number they trusted: it used to count
+            # every booking still in the diary, so it fell every time a new one was taken.
+            "hint": (
+                f"Sobre {metrics.appointments_expected} cita(s) que ya debían haber ocurrido. "
+                "Las futuras y las canceladas no cuentan: a ninguna ha faltado nadie todavía."
+            ),
         },
     ]
 
