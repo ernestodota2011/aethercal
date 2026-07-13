@@ -180,3 +180,46 @@ def test_a_misconfigured_allowlist_fails_the_BOOT(value: str) -> None:
     """
     with pytest.raises(ValidationError):
         _settings(webhook_private_target_cidrs=value)
+
+
+# ======================================================================================
+# The PREVIOUS app secret — the second half of a key rotation (criterion 42).
+# ======================================================================================
+
+
+def test_there_is_no_previous_secret_by_default() -> None:
+    """==Steady state carries ONE secret.== The previous one exists only during a rotation.
+
+    Leaving ``AETHERCAL_PREVIOUS_APP_SECRET`` set forever would keep a retired secret able to
+    decrypt nothing (everything has moved) while still sitting in the process environment, in the
+    deployment manifest and in whatever holds them — a secret with no job and a full blast radius.
+    So it defaults to absent, and the rotation runbook says to unset it when the rotation is done.
+    """
+    assert _settings().previous_app_secret is None
+    assert _settings().previous_fernet_key() is None
+
+
+def test_the_previous_secret_derives_the_key_that_still_opens_the_old_rows() -> None:
+    settings = _settings(app_secret="the-new-one", previous_app_secret="the-old-one")
+    assert settings.fernet_key() == derive_fernet_key("the-new-one")
+    assert settings.previous_fernet_key() == derive_fernet_key("the-old-one")
+
+
+def test_a_blank_previous_secret_is_absent_rather_than_a_key() -> None:
+    """``AETHERCAL_PREVIOUS_APP_SECRET=`` is a line an operator left in an env file, not a secret.
+
+    Read as a key it would derive one from the empty string — a perfectly valid Fernet key that
+    decrypts nothing — and the rotation would then fail on its first row, blaming the data.
+    """
+    assert _settings(previous_app_secret="   ").previous_fernet_key() is None
+
+
+def test_the_previous_secret_must_differ_from_the_current_one() -> None:
+    """==A rotation to the same secret is a no-op wearing the costume of a rotation.==
+
+    It would rewrite every row, report success, and leave every one of them decryptable by exactly
+    the secret the operator believes they have just retired. The most dangerous shape a green run
+    can take is one that proves nothing — so this fails the BOOT instead.
+    """
+    with pytest.raises(ValidationError):
+        _settings(app_secret="same", previous_app_secret="same")

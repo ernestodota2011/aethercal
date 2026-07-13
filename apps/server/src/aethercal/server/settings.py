@@ -8,7 +8,7 @@ depending on process environment.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aethercal.server.crypto import derive_fernet_key
@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # Required. This one is the APP role (aethercal_app): the request path and the admin, under RLS.
     database_url: str
     app_secret: str
+
+    # The PREVIOUS app secret — set ONLY while a key rotation is in flight, and unset afterwards.
+    #
+    # The Fernet key that encrypts every stored secret (BYOK credentials, webhook secrets, calendar
+    # tokens) is derived from `app_secret`, so rotating that key IS rotating this value.
+    # Mid-rotation the database still holds ciphertext under the OLD key while the process already
+    # holds the new one, and `aethercal-admin credentials rotate-key` needs both in order to move
+    # the rows across. Steady state carries ONE secret: a retired secret left sitting in the
+    # environment is a secret with no job and a full blast radius.
+    previous_app_secret: str | None = None
 
     # The OWNER role (aethercal_owner): Alembic + the CLI. Owns the tables, carries BYPASSRLS.
     #
@@ -261,6 +271,44 @@ class Settings(BaseSettings):
             echo=self.echo_sql,
         )
 
+    @model_validator(mode="after")
+    def _refuse_a_rotation_to_the_same_secret(self) -> Settings:
+        """``AETHERCAL_PREVIOUS_APP_SECRET == AETHERCAL_APP_SECRET`` FAILS THE BOOT.
+
+        ==A rotation to the same secret is a no-op wearing the costume of a rotation.== Every row
+        would be rewritten, the report would say so, and every one of them would still be
+        decryptable by exactly the secret the operator believes they have just retired — with a
+        green run and a summary line to say otherwise. It is this codebase's signature failure
+        (something that looks applied and does nothing), aimed at the one operation whose entire
+        purpose is to make an old secret worthless.
+        """
+        previous = (self.previous_app_secret or "").strip()
+        if previous and previous == self.app_secret.strip():
+            raise ValueError(
+                "AETHERCAL_PREVIOUS_APP_SECRET is the same value as AETHERCAL_APP_SECRET.\n"
+                "\n"
+                "That is not a rotation. Every stored secret would be re-encrypted under the key "
+                "it already uses, the rotation would report success, and the 'old' secret would go "
+                "on decrypting every row — while everybody believed it had been retired.\n"
+                "\n"
+                "Set AETHERCAL_APP_SECRET to the NEW secret and AETHERCAL_PREVIOUS_APP_SECRET to "
+                "the one being retired, run `aethercal-admin credentials rotate-key`, then unset "
+                "AETHERCAL_PREVIOUS_APP_SECRET."
+            )
+        return self
+
     def fernet_key(self) -> bytes:
         """The Fernet key used to encrypt stored provider credentials, derived from the secret."""
         return derive_fernet_key(self.app_secret)
+
+    def previous_fernet_key(self) -> bytes | None:
+        """The RETIRING key — the one the database's rows are still encrypted under mid-rotation.
+
+        ``None`` when there is no rotation in flight, and a blank value reads as ``None`` rather
+        than as a key: ``AETHERCAL_PREVIOUS_APP_SECRET=`` is a line somebody left in an env file,
+        not a secret. Deriving a key from the empty string would produce a perfectly valid Fernet
+        key that opens nothing — after which the rotation would fail on its first row, and blame
+        the data.
+        """
+        secret = (self.previous_app_secret or "").strip()
+        return derive_fernet_key(secret) if secret else None

@@ -9,8 +9,11 @@ CLI-issued key verifies through the same service the API uses.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import sys
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -39,9 +42,23 @@ from aethercal.server.services.calendars import (
     link_booking_calendar,
     store_google_connection,
 )
+from aethercal.server.services.key_rotation import (
+    KeyRotationError,
+    RotationReport,
+    rotate_fernet_key,
+)
 from aethercal.server.services.notifications import record_booking_notification
 from aethercal.server.services.outbox import PROVIDER_CALL_MARKER
 from aethercal.server.services.privacy import PurgeReport, purge_guest
+from aethercal.server.services.tenant_credentials import (
+    CredentialClass,
+    CredentialError,
+    CredentialProvider,
+    credential_class,
+    delete_credential,
+    list_credential_providers,
+    store_credential,
+)
 from aethercal.server.services.users import (
     UserData,
     UserNotFoundError,
@@ -65,6 +82,10 @@ guest_app = typer.Typer(help="Guest data: erasure (RNF-8).", no_args_is_help=Tru
 app.add_typer(guest_app, name="guest")
 db_app = typer.Typer(help="Schema migrations (run as the OWNER role).", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+credentials_app = typer.Typer(
+    help="BYOK: each business's own provider credentials (RF-27).", no_args_is_help=True
+)
+app.add_typer(credentials_app, name="credentials")
 
 # Default cache location for the Google OAuth token during the loopback consent flow (matches the
 # F0-11 spike). Outside the repo, so a token never lands in version control.
@@ -328,6 +349,226 @@ async def run_guest_purge(
                 "business on this instance"
             )
         return await purge_guest(session, tenant_id=tenant.id, email=email)
+
+
+# --------------------------------------------------------------------------------------
+# BYOK credentials (RF-27) — and the key rotation that keeps them readable.
+# --------------------------------------------------------------------------------------
+
+
+async def _tenant_id_for(session: AsyncSession, slug: str) -> uuid.UUID:
+    """Resolve a business by slug, or STOP. ==An unresolvable business is never a filter.==
+
+    The same rule ``guest purge`` runs on, and here it guards the other direction: a payment
+    credential written to the wrong business is money arriving in the wrong account.
+    """
+    tenant = (
+        await session.scalars(select(Tenant).where(Tenant.slug == slug.strip()))
+    ).one_or_none()
+    if tenant is None:
+        raise LookupError(f"no tenant with slug {slug!r}")
+    return tenant.id
+
+
+async def run_credentials_set(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_slug: str,
+    provider: CredentialProvider,
+    secrets: Mapping[str, str],
+    key: bytes,
+) -> None:
+    """Store (or replace) one business's credential for ``provider``, encrypted at rest."""
+    async with sessionmaker() as session, session.begin():
+        tenant_id = await _tenant_id_for(session, tenant_slug)
+        await store_credential(
+            session, tenant_id=tenant_id, provider=provider, secrets=secrets, fernet_key=key
+        )
+
+
+async def run_credentials_list(
+    sessionmaker: async_sessionmaker[AsyncSession], *, tenant_slug: str
+) -> tuple[CredentialProvider, ...]:
+    """Which providers this business has configured. ==Takes no key, so it can leak no secret.=="""
+    async with sessionmaker() as session, session.begin():
+        tenant_id = await _tenant_id_for(session, tenant_slug)
+        return await list_credential_providers(session, tenant_id=tenant_id)
+
+
+async def run_credentials_delete(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_slug: str,
+    provider: CredentialProvider,
+) -> bool:
+    """Remove a business's credential. For a money provider: ==this business stops charging.=="""
+    async with sessionmaker() as session, session.begin():
+        tenant_id = await _tenant_id_for(session, tenant_slug)
+        return await delete_credential(session, tenant_id=tenant_id, provider=provider)
+
+
+async def run_rotate_key(
+    sessionmaker: async_sessionmaker[AsyncSession], *, new_key: bytes, previous_key: bytes
+) -> RotationReport:
+    """Re-encrypt every stored secret onto the new key.
+
+    ==One transaction: all of the rows, or none of them.==
+    """
+    async with sessionmaker() as session, session.begin():
+        return await rotate_fernet_key(session, new_key=new_key, previous_key=previous_key)
+
+
+@credentials_app.command("set")
+def credentials_set_command(
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the business it belongs to.")],
+    provider: Annotated[CredentialProvider, typer.Option(help="Which provider this is for.")],
+) -> None:
+    """Store a business's own credential for a provider, read as JSON from STDIN.
+
+    ==The secret is read from STDIN and never from the command line.== An ``--api-key sk_live_…``
+    option would put a live payment key into the process table (where every user on the box can read
+    it with ``ps``), into the shell's history file, and into the terminal scrollback. There is no
+    way to write that option safely, so it does not exist.
+
+        cat stripe.json | aethercal-admin credentials set --tenant-slug acme --provider stripe
+
+    where ``stripe.json`` is ``{"secret_key": "...", "webhook_secret": "..."}``. Every field that
+    provider requires must be present: a credential that exists but cannot finish its job is worse
+    than none at all — for a payment provider it fails at the moment the guest's money has already
+    left their card.
+
+    ==For a MONEY provider, storing this is what makes the business able to charge — into ITS OWN
+    account.== Without it, it does not charge at all; it does NOT fall back to the instance's.
+    """
+    if sys.stdin.isatty():
+        typer.echo(
+            "refusing to read a credential from an interactive terminal: pipe it in as JSON.\n"
+            "\n"
+            f"  cat credential.json | aethercal-admin credentials set --tenant-slug {tenant_slug} "
+            f"--provider {provider.value}\n"
+            "\n"
+            "The secret is never taken as a command-line option — it would land in `ps`, in the "
+            "shell history and in the scrollback.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    raw = sys.stdin.read()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # The message names the PARSE failure and never echoes what was piped in — it is a secret.
+        typer.echo(
+            f"stdin is not valid JSON ({exc.msg}); expected an object of field → value.", err=True
+        )
+        raise typer.Exit(code=2) from exc
+    if not isinstance(parsed, dict):
+        typer.echo("stdin must be a JSON object of field → value.", err=True)
+        raise typer.Exit(code=2)
+
+    settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
+    secrets = {str(field): str(value) for field, value in cast(dict[Any, Any], parsed).items()}
+    try:
+        asyncio.run(
+            run_credentials_set(
+                _sessionmaker(),
+                tenant_slug=tenant_slug,
+                provider=provider,
+                secrets=secrets,
+                key=settings.fernet_key(),
+            )
+        )
+    except (CredentialError, LookupError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    # Names the provider and the business. Never the value — not even a prefix of it.
+    typer.echo(f"stored the {provider.value} credential for {tenant_slug}")
+
+
+@credentials_app.command("list")
+def credentials_list_command(
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the business.")],
+) -> None:
+    """List which providers a business has configured. ==Never prints a secret; never decrypts.=="""
+    try:
+        providers = asyncio.run(run_credentials_list(_sessionmaker(), tenant_slug=tenant_slug))
+    except LookupError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if not providers:
+        typer.echo(
+            f"{tenant_slug} has no credentials of its own: it uses the instance defaults for "
+            "sending, and it cannot charge at all."
+        )
+        return
+    for provider in providers:
+        typer.echo(f"{provider.value}  ({credential_class(provider).value})")
+
+
+@credentials_app.command("delete")
+def credentials_delete_command(
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the business.")],
+    provider: Annotated[CredentialProvider, typer.Option(help="Which provider to remove.")],
+) -> None:
+    """Remove a business's credential. ==For a money provider, this business then STOPS CHARGING.==
+
+    It does not fall back to the instance's account — that is the one thing it must never do.
+    """
+    try:
+        removed = asyncio.run(
+            run_credentials_delete(_sessionmaker(), tenant_slug=tenant_slug, provider=provider)
+        )
+    except LookupError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if not removed:
+        typer.echo(f"{tenant_slug} had no {provider.value} credential")
+        raise typer.Exit(code=1)
+    typer.echo(f"removed the {provider.value} credential for {tenant_slug}")
+    if credential_class(provider) is CredentialClass.MONEY:
+        typer.echo(f"{tenant_slug} can no longer charge: it has no payment credential of its own.")
+
+
+@credentials_app.command("rotate-key")
+def credentials_rotate_key_command() -> None:
+    """Re-encrypt every stored secret onto a new app secret. ==Loses nothing; exposes nothing.==
+
+    The Fernet key is derived from ``AETHERCAL_APP_SECRET``, so rotating it means rotating that
+    secret. Run this with the NEW secret in ``AETHERCAL_APP_SECRET`` and the retiring one in
+    ``AETHERCAL_PREVIOUS_APP_SECRET``; then unset the latter.
+
+    It runs as the OWNER, and it must: under row-level security every other role sees one business
+    at a time — and a rotation that reached only one business is the failure it exists to prevent.
+
+    Every stored secret moves in ONE transaction: every row, or none. It is resumable (a row already
+    on the new key needs nothing), and a row that decrypts under NEITHER key stops it dead rather
+    than being skipped — because a skipped row is a row nobody can read once the old secret is gone.
+
+    It prints COUNTS. Never a secret.
+    """
+    settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
+    previous = settings.previous_fernet_key()
+    if previous is None:
+        typer.echo(
+            "AETHERCAL_PREVIOUS_APP_SECRET is not set, so there is nothing to rotate FROM.\n"
+            "\n"
+            "A rotation needs both halves: the NEW secret in AETHERCAL_APP_SECRET, and the one "
+            "being retired in AETHERCAL_PREVIOUS_APP_SECRET. Without the old one, every stored "
+            "secret in the database is ciphertext this process cannot open — and a 'rotation' that "
+            "silently did nothing would be far worse than this message.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        report = asyncio.run(
+            run_rotate_key(_sessionmaker(), new_key=settings.fernet_key(), previous_key=previous)
+        )
+    except KeyRotationError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(report.summary())
+    typer.echo("now unset AETHERCAL_PREVIOUS_APP_SECRET: it opens nothing any more.")
 
 
 @db_app.command("upgrade")

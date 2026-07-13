@@ -17,8 +17,9 @@ from aethercal.server.db import Base
 from aethercal.server.db.migrate import run_migrations
 
 # The F1 MVP core, plus the shared foundation this cut lands: the multichannel Workflow tables
-# (migration 0005). Payments, RBAC/memberships and per-tenant credentials are deliberately NOT here
-# — they ship with the payments/tenancy batch, which carries its own migration and its own gate.
+# (migration 0005) and the per-business credential vault (migration 0010). Payments and
+# RBAC/memberships are deliberately NOT here yet — they ship with their own waves of the
+# payments/tenancy batch, each carrying its own migration and its own gate.
 # ``outbox`` (the transactional-outbox queue for a booking's post-commit effects, and now also the
 # durable scheduler) landed with the F1-05 residual fix in migration 0003. This set is asserted
 # EXACTLY, so an accidental omission or a stray extra table fails loudly.
@@ -42,6 +43,8 @@ EXPECTED_TABLES = {
     "workflows",
     "workflow_steps",
     "workflow_templates",
+    # 0010 — BYOK: each business's own provider credentials, encrypted at rest (RF-27).
+    "tenant_credentials",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.

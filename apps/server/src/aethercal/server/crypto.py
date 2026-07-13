@@ -1,9 +1,23 @@
 """Deriving symmetric keys from the single app secret (RF-19: no secrets in source).
 
 The environment carries one high-entropy value, ``AETHERCAL_APP_SECRET``. The Fernet key that
-encrypts stored provider credentials (``external_connections.encrypted_credentials``, once F1-07
-lands) is *derived* from it deterministically, so operators manage one secret rather than two and
-the same secret always yields the same key across restarts and replicas.
+encrypts every stored secret — ``external_connections.encrypted_credentials``, ``webhooks.secret``,
+and each business's BYOK ``tenant_credentials.encrypted_payload`` — is *derived* from it
+deterministically, so operators manage one secret rather than several, and the same secret always
+yields the same key across restarts and replicas.
+
+.. rubric:: ==One key, every business. Encryption at rest — NOT cryptographic isolation.==
+
+Because the key is a pure function of the instance's single app secret, the same key encrypts the
+credentials of EVERY business on the instance: whoever operates the instance can decrypt any of
+them. What that buys is real, and narrower than it looks — a stolen dump, a leaked backup or a
+SQL-injection read is useless without the app secret, which lives in the process environment and not
+in the database. It is written up in full in
+:mod:`aethercal.server.services.tenant_credentials` and in ``docs/byok-credentials.md``.
+
+Rotating the key therefore means rotating the app secret and re-encrypting everything stored under
+the old one: :func:`rotate_secret` is the primitive, and
+:mod:`aethercal.server.services.key_rotation` is the operation.
 """
 
 from __future__ import annotations
@@ -11,7 +25,7 @@ from __future__ import annotations
 import base64
 import hashlib
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 
 
 def derive_fernet_key(app_secret: str) -> bytes:
@@ -37,3 +51,26 @@ def encrypt_secret(plaintext: bytes, fernet_key: bytes) -> bytes:
 def decrypt_secret(token: bytes, fernet_key: bytes) -> bytes:
     """Decrypt a token produced by :func:`encrypt_secret` back to its plaintext bytes."""
     return Fernet(fernet_key).decrypt(token)
+
+
+def rotate_secret(token: bytes, *, new_key: bytes, previous_key: bytes) -> bytes:
+    """Re-encrypt ``token`` under ``new_key``, accepting ciphertext written under EITHER key.
+
+    ``MultiFernet.rotate`` decrypts with any key in the list and re-encrypts with the **first**, so
+    with ``[new, previous]``:
+
+    * a token still under the old key is moved onto the new one — the rotation's actual job;
+    * a token ALREADY under the new key is decrypted by the first key and simply rewritten. ==That
+      is what makes the rotation resumable==: a run interrupted half-way (a killed process, a
+      dropped connection) can be finished by running it again, because a row that needs nothing is
+      not an error.
+
+    A token under NEITHER key raises :class:`~cryptography.fernet.InvalidToken`, which the rotation
+    turns into a hard stop rather than a skip: a row nothing can decrypt is a row that will be
+    unreadable for ever once the old secret is retired, and it must be discovered NOW — loudly —
+    rather than by whoever needs it, months later.
+
+    The plaintext exists only inside this call, between the decrypt and the encrypt. It is never
+    returned, logged or stored.
+    """
+    return MultiFernet([Fernet(new_key), Fernet(previous_key)]).rotate(token)

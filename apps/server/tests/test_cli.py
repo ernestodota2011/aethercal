@@ -19,11 +19,15 @@ from aethercal.server.cli import (
     RevokeKeyOutcome,
     run_connect_google,
     run_create_tenant,
+    run_credentials_delete,
+    run_credentials_list,
+    run_credentials_set,
     run_issue_key,
     run_list_dead_intents,
     run_list_keys,
     run_replay_intent,
     run_revoke_key,
+    run_rotate_key,
 )
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
@@ -36,11 +40,16 @@ from aethercal.server.db.models import (
     OutboxStatus,
     Schedule,
     Tenant,
+    TenantCredential,
     User,
 )
 from aethercal.server.services.api_keys import verify_api_key
 from aethercal.server.services.calendars import GoogleCredential, load_credentials
 from aethercal.server.services.outbox import OutboxEffect
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    resolve_money_credential,
+)
 
 
 @pytest_asyncio.fixture
@@ -483,3 +492,123 @@ async def test_listing_dead_intents_finds_them_without_touching_the_database_by_
     rows = await run_list_dead_intents(maker)
 
     assert [row.id for row in rows] == [dead_id]
+
+
+# ======================================================================================
+# BYOK credentials — the operator's surface (criteria 40, 41, 42).
+#
+# ==Every secret below is synthetic.== `sk_test_NOT_A_REAL_KEY` is not a redaction of anything.
+# ======================================================================================
+
+
+CLI_STRIPE = {"secret_key": "sk_test_NOT_A_REAL_KEY", "webhook_secret": "whsec_FAKE"}
+
+
+async def test_credentials_set_stores_an_encrypted_credential_the_business_can_charge_with(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    async with maker() as session:
+        row = (await session.scalars(select(TenantCredential))).one()
+        resolved = await resolve_money_credential(
+            session, tenant_id=row.tenant_id, provider=CredentialProvider.STRIPE, fernet_key=key
+        )
+    assert resolved.secrets == CLI_STRIPE
+    assert CLI_STRIPE["secret_key"].encode() not in row.encrypted_payload
+
+
+async def test_credentials_set_for_an_unknown_business_is_a_hard_stop(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The same rule as ``guest purge``.== An unresolvable business is never a filter to fall back
+    from: a payment credential written to the wrong business is money going to the wrong account."""
+    with pytest.raises(LookupError, match="ghost"):
+        await run_credentials_set(
+            maker,
+            tenant_slug="ghost",
+            provider=CredentialProvider.STRIPE,
+            secrets=CLI_STRIPE,
+            key=derive_fernet_key("cli-secret"),
+        )
+
+
+async def test_credentials_list_names_the_providers_and_never_a_secret(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """What the operator sees on their terminal. It answers "is Stripe configured?" without
+    decrypting anything — which is why the coroutine takes no key at all."""
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    await run_credentials_set(
+        maker,
+        tenant_slug="acme",
+        provider=CredentialProvider.STRIPE,
+        secrets=CLI_STRIPE,
+        key=derive_fernet_key("cli-secret"),
+    )
+
+    listed = await run_credentials_list(maker, tenant_slug="acme")
+    assert listed == (CredentialProvider.STRIPE,)
+
+
+async def test_credentials_delete_is_the_off_switch(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    assert await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+    assert await run_credentials_list(maker, tenant_slug="acme") == ()
+    # And deleting again reports "there was nothing", rather than pretending it removed something.
+    assert not await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+
+
+async def test_rotate_key_moves_every_business_onto_the_new_key(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Criterion 42, through the operator's actual command.==
+
+    Two businesses, so the rotation is proved to be instance-wide: it runs as the OWNER precisely
+    because, under row-level security, no other role can see more than one business at a time.
+    """
+    old, new = derive_fernet_key("old-app-secret"), derive_fernet_key("new-app-secret")
+    for slug in ("acme", "globex"):
+        await run_create_tenant(
+            maker, slug=slug, name=slug, email=f"host@{slug}.test", timezone="UTC"
+        )
+        await run_credentials_set(
+            maker,
+            tenant_slug=slug,
+            provider=CredentialProvider.STRIPE,
+            secrets={"secret_key": f"sk_test_NOT_REAL_{slug}", "webhook_secret": "whsec_FAKE"},
+            key=old,
+        )
+
+    report = await run_rotate_key(maker, new_key=new, previous_key=old)
+    assert report.total == 2
+
+    async with maker() as session:
+        rows = (await session.scalars(select(TenantCredential))).all()
+        for row in rows:
+            resolved = await resolve_money_credential(
+                session,
+                tenant_id=row.tenant_id,
+                provider=CredentialProvider.STRIPE,
+                fernet_key=new,
+            )
+            assert resolved.secrets["secret_key"].startswith("sk_test_NOT_REAL_")
+
+    # And the summary the operator reads back is counts — never a secret.
+    assert "sk_test" not in report.summary()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from aethercal.server.db.models.booking import Booking, GuestToken
+from aethercal.server.db.models.credentials import TenantCredential
 from aethercal.server.db.models.integrations import (
     BusyCache,
     ExternalCalendarLink,
@@ -34,6 +35,7 @@ __all__ = [
     "Schedule",
     "SentNotification",
     "Tenant",
+    "TenantCredential",
     "User",
     "Webhook",
     "WebhookDelivery",
