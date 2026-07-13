@@ -58,13 +58,32 @@ def require_iana_zone(value: str) -> str:
     """Reject a timezone that is not a real IANA zone (so email/ICS rendering never fails).
 
     ==Public, and deliberately not "the guest's".== The HOST's timezone is the same string, rendered
-    into the same messages, and ``server/services/users.py`` holds it to this very function. A
-    second copy of "what a real zone is" is precisely how two write surfaces come to disagree about
-    it — which is what happened to the host CRUD before it had a service.
+    into the same messages, and ``server/services/users.py`` holds it to this very function; the
+    ``GET /slots`` endpoint translates its refusal into that contract's 422. A second copy of "what
+    a real zone is" is precisely how two write surfaces come to disagree about it — which is what
+    happened to the host CRUD before it had a service.
+
+    ==``OSError`` is in the tuple on purpose, and it is not defensive padding.== ``ZoneInfo`` does
+    not always refuse a bad key with ``ZoneInfoNotFoundError``: it resolves the key to a PATH and
+    opens it, so a key the filesystem cannot answer for escapes as a raw ``OSError`` instead. The
+    reachable shapes are all still just "this is not a zone":
+
+    * a key naming a DIRECTORY of the tz database — ``"America"`` and ``"Etc"`` are folders, not
+      zones — which ``open()`` refuses with ``IsADirectoryError`` (Linux) or ``PermissionError``
+      (Windows); ``zoneinfo`` converts only ``(ImportError, FileNotFoundError, UnicodeEncodeError)``
+      on that path, so neither one becomes a ``ZoneInfoNotFoundError``;
+    * a key the filesystem cannot even name: whitespace, an embedded newline, 300 characters
+      (``EINVAL`` / ``ENAMETOOLONG``).
+
+    Uncaught, each of those is an unhandled crash — a 500 on ``GET /slots?tz=America``, and on a
+    booking whose ``guest_timezone`` is ``"Etc"`` — where every caller was promised a clean refusal.
+    Whether it bites depends on where the zones come from (the ``tzdata`` wheel raises it; a system
+    tz tree without that wheel installed masks it behind an ``ImportError``), which is exactly what
+    kept it latent. A zone this function cannot resolve is refused — by every road, in one currency.
     """
     try:
         ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
         raise ValueError(f"unknown timezone: {value!r}") from exc
     return value
 

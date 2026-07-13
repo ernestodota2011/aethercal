@@ -19,6 +19,7 @@ from aethercal.schemas.bookings import (
     BookingRead,
     BookingReschedule,
     normalize_phone,
+    require_iana_zone,
 )
 
 
@@ -162,3 +163,41 @@ def test_booking_create_rejects_consent_for_a_phone_that_was_never_given() -> No
     """Consent that references no number consents to nothing. Fail loudly rather than stamp it."""
     with pytest.raises(ValidationError):
         BookingCreate.model_validate({**_valid_create_kwargs(), "guest_phone_consent": True})
+
+
+# --------------------------------------------------------------------------------------
+# The IANA-zone rule itself — the ONE owner. ``services/users.py`` (the host) and ``api/slots.py``
+# (the ``tz`` query param) both delegate here, so a hole in this function is a hole in every
+# surface at once — which is the whole argument for there being only one of it.
+# --------------------------------------------------------------------------------------
+#: Keys that ``ZoneInfo`` refuses with a raw ``OSError`` instead of ``ZoneInfoNotFoundError``,
+#: because it resolves a key to a PATH and opens it. ``"America"`` and ``"Etc"`` are DIRECTORIES of
+#: the tz database (folders, not zones); the rest cannot be filenames at all. Every one of them used
+#: to escape this function uncaught — a 500 on ``GET /slots?tz=America``, and on a booking whose
+#: ``guest_timezone`` is ``"Etc"``, both of which the contract answers with a clean refusal.
+UNNAMEABLE_ZONE_KEYS = ["America", "Etc", " ", "UTC\n", "A" * 300]
+
+
+@pytest.mark.parametrize("key", UNNAMEABLE_ZONE_KEYS)
+def test_require_iana_zone_refuses_a_key_the_filesystem_chokes_on(key: str) -> None:
+    """Refused in the rule's own currency — a ``ValueError`` — never an escaping ``OSError``.
+
+    The currency matters as much as the refusal: ``BookingCreate`` needs a ``ValueError`` for
+    Pydantic to turn it into a 422, and ``services/users.py`` catches exactly ``ValueError`` to
+    word its ``InvalidUserError``. An ``OSError`` sails straight through all three call sites.
+    """
+    with pytest.raises(ValueError, match="unknown timezone"):
+        require_iana_zone(key)
+
+
+@pytest.mark.parametrize("key", UNNAMEABLE_ZONE_KEYS)
+def test_booking_create_refuses_a_key_the_filesystem_chokes_on(key: str) -> None:
+    """And the refusal reaches the wire as a validation error, not a crash."""
+    with pytest.raises(ValidationError):
+        BookingCreate.model_validate({**_valid_create_kwargs(), "guest_timezone": key})
+
+
+@pytest.mark.parametrize("zone", ["UTC", "America/New_York", "Etc/GMT+5", "Pacific/Kiritimati"])
+def test_require_iana_zone_still_accepts_a_real_zone(zone: str) -> None:
+    """The refusal was widened, not the net: a real zone is still returned unchanged."""
+    assert require_iana_zone(zone) == zone
