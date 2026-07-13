@@ -51,6 +51,8 @@ from aethercal.server.scheduler import (
     stop_scheduler,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
+from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS, PrivateTargetAllowlist
+from aethercal.server.webhooks.delivery import DeliveryReport
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -251,6 +253,7 @@ async def test_run_webhook_delivery_once_reports_a_clean_empty_pass(
             sessionmaker=sqlite_sessionmaker,
             http_client=http_client,
             fernet_key=derive_fernet_key("test-app-secret"),
+            allowlist=NO_PRIVATE_TARGETS,
             now=NOW,
         )
 
@@ -272,11 +275,47 @@ async def test_run_webhook_delivery_once_swallows_a_failing_tick(
             sessionmaker=sqlite_sessionmaker,
             http_client=http_client,
             fernet_key=derive_fernet_key("test-app-secret"),
+            allowlist=NO_PRIVATE_TARGETS,
             now=NOW,
         )
 
     # One bad tick must never propagate — it returns None so the scheduler keeps ticking.
     assert report is None
+
+
+async def test_the_tick_hands_the_operators_allowlist_to_the_worker(
+    sqlite_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==The wiring itself is a place a silent no-op can hide.==
+
+    An operator declares ``192.168.1.0/24``, the process comes up, and every delivery to their n8n
+    still dies — because the tick never passed the allowlist down and the worker fell back to
+    "nothing private is allowed". Nothing errors; nothing is delivered. So this asserts the
+    EFFECTIVE state: the exact object the caller was given is the object ``deliver_due`` receives.
+
+    (``deliver_due`` also takes it as a required keyword, so pyright refuses to let a call site drop
+    it. This test is the belt to that braces, over the one seam types cannot see: ``app.state``.)
+    """
+    declared = PrivateTargetAllowlist.parse("192.168.1.0/24")
+    seen: dict[str, object] = {}
+
+    async def _spy(*_args: Any, **kwargs: Any) -> DeliveryReport:
+        seen["allowlist"] = kwargs["allowlist"]
+        return DeliveryReport()
+
+    monkeypatch.setattr(sched, "deliver_due", _spy)
+
+    async with httpx.AsyncClient() as http_client:
+        await run_webhook_delivery_once(
+            sessionmaker=sqlite_sessionmaker,
+            http_client=http_client,
+            fernet_key=derive_fernet_key("test-app-secret"),
+            allowlist=declared,
+            now=NOW,
+        )
+
+    assert seen["allowlist"] is declared
 
 
 # --------------------------------------------------------------------------------------

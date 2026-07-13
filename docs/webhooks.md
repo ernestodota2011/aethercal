@@ -24,6 +24,107 @@ Only `http` and `https` URLs are accepted, and the URL is re-checked against an 
 immediately before every POST, so a subscription cannot be turned into a probe of private addresses
 inside the host's network.
 
+> **Self-hosting, with your webhook target on your own network?** A URL like
+> `http://n8n:5678/webhook/...` or `http://192.168.1.50:5678/...` — anything not reachable from the
+> public internet — is **refused by default**. Read
+> [Delivering to a private network](#delivering-to-a-private-network). It is one environment
+> variable, and you should understand what it opens before you set it.
+
+## Delivering to a private network
+
+By default AetherCal POSTs only to a **globally routable** address. A target that resolves to a
+private one — `192.168.x.x`, `10.x.x.x`, `172.16–31.x.x`, a Docker network, a VPN, `127.0.0.1` — is
+refused: the delivery is parked `dead` and never retried.
+
+That default is deliberate, and for a hosted instance it is the right one. It is also the wrong one
+for the deployment most people run this in: **your n8n, your CRM, your ERP are on the same network as
+AetherCal.** So you can declare which private networks this instance may reach:
+
+```bash
+# Explicit CIDRs, comma-separated. Unset = none, and none is the default.
+AETHERCAL_WEBHOOK_PRIVATE_TARGET_CIDRS=192.168.1.0/24,172.17.0.0/16
+```
+
+A subscription pointing at `http://192.168.1.50:5678/webhook/aethercal` is now delivered, signed
+exactly like any other. Everything **outside** those CIDRs stays refused.
+
+### The risk, stated plainly
+
+**A webhook URL is chosen by whoever creates the subscription. This variable decides where those URLs
+are allowed to reach.**
+
+That is the whole of it. If someone who can create a subscription points it at
+`http://192.168.1.10:9200/` and you have declared `192.168.1.0/24`, AetherCal will POST a signed
+booking envelope at your Elasticsearch — and the delivery log will tell them whether it answered.
+This is **Server-Side Request Forgery**: the server is used as a proxy into a network the caller
+cannot otherwise reach. Services on an internal network are routinely unauthenticated *because* they
+are on an internal network, and "it is behind the firewall" is precisely the assumption being spent
+here.
+
+So:
+
+- **declare the narrowest network that contains your target.** `192.168.1.0/24` if that is where n8n
+  lives — not `192.168.0.0/16`, and not "all of RFC1918 while I am at it";
+- on a **single-tenant** instance, where you are the only person who can create subscriptions, the
+  exposure is small: you are pointing your own server at your own service;
+- on an instance where **anyone else** can create subscriptions, every address inside that CIDR is
+  something they can make your server talk to. Decide accordingly.
+
+### Why it is a list and not a switch
+
+There is no `allow_private = true`. A boolean is something people copy out of a forum post without
+reading the sentence after it; a CIDR is a statement about a specific network you had to go and look
+up. The mechanism is the same — the difference is whether you knew what you were opening.
+
+### What cannot be allowlisted, whatever you write
+
+The process **refuses to start** if you declare any of these:
+
+| Refused | Why |
+|---|---|
+| `0.0.0.0/0`, `::/0` | The default route holds loopback, the cloud-metadata address and every private range at once. This is the single entry that would turn the feature into the vulnerability it exists to avoid. |
+| `169.254.0.0/16`, `fe80::/10` | Link-local. `169.254.169.254` is the cloud metadata endpoint — on AWS/GCP/Azure, your instance's credentials one GET away. No webhook consumer has ever lived there. |
+| Any public CIDR | Public targets already work. They need no allowlist. |
+| Multicast; host bits set (`192.168.1.5/24`); a bare address with no prefix (`10.0.0.0`) | Typos. `10.0.0.0` parses as `10.0.0.0/32` — one address — which is almost never what was meant, and would leave you with an allowlist that permits nothing while looking configured. |
+
+Declarable: subnets of `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (CGNAT —
+where Tailscale lives), `127.0.0.0/8`, `fc00::/7` (IPv6 ULA), `::1/128`.
+
+**Loopback (`127.0.0.0/8`) is allowed, and warns at boot.** On a bare-metal box running AetherCal and
+n8n side by side it is the correct target. It is also the widest thing you can open: every service
+bound to localhost *because it treats localhost as trusted* becomes reachable from a caller-supplied
+URL. Narrow it if you can.
+
+### DNS rebinding is still refused
+
+Declaring `192.168.1.0/24` does not make `192.168.1.50` reachable *by any name that can be pointed at
+it*. AetherCal resolves the target, validates the addresses, and then connects to **that exact IP** —
+it never re-resolves. A hostname that answers with a public address for the check and a private one
+for the socket is refused (`blocked-dns-rebind`) **even when the private address is inside your
+CIDR**: you declared a network, not a licence for any hostname on the internet to be re-pointed into
+it mid-flight. TLS is unaffected — SNI and certificate verification stay bound to the real hostname.
+
+### A refused delivery says so
+
+It is parked `dead` with a reason on the row (`webhook_deliveries.error_reason`), a `WARNING` in the
+log, and a series on `GET /metrics`:
+
+| Reason | Meaning |
+|---|---|
+| `blocked-private-target` | Not routable, and not inside any CIDR you declared. **If this is your own n8n, the variable above is the fix.** |
+| `blocked-dns-rebind` | The address changed between validation and connect. |
+| `dns-failure` | The name did not resolve. **Retried** — not fatal. |
+| `transport-error` | Connection refused / TLS / timeout. Retried. |
+| `http-error` | Your endpoint answered, but not with a 2xx. Retried. |
+
+```bash
+# Is this instance refusing to send anywhere?
+curl -sH "Authorization: Bearer $AETHERCAL_METRICS_TOKEN" localhost:8000/metrics \
+  | grep aethercal_webhook_deliveries_failed
+
+docker compose logs app | grep blocked-private-target
+```
+
 ## Events
 
 | Event | Fires when |

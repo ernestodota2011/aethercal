@@ -18,6 +18,7 @@ from aethercal.server.scheduler import (
     DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
     DEFAULT_WEBHOOK_INTERVAL_SECONDS,
 )
+from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 
 METRICS_TOKEN_MIN_LENGTH = 32
 """The shortest bearer token ``GET /metrics`` will accept as its guard (R9).
@@ -73,6 +74,21 @@ class Settings(BaseSettings):
     # exposed instance is the normal case, not the exotic one.
     metrics_token: str | None = None
 
+    # The PRIVATE networks outbound webhooks may be delivered to, as explicit CIDRs
+    # (e.g. "192.168.1.0/24,172.17.0.0/16"). Blank = none, which is exactly the behaviour that
+    # shipped: every non-routable target is refused.
+    #
+    # It exists because the SSRF guard, correct as it is, makes the PRIMARY use case of a
+    # self-hostable product impossible: an operator whose n8n/CRM/ERP runs on the same Docker
+    # network, LAN or VPN receives NOTHING, and the failure is silent. This is the one knob that
+    # opens it — and it is a list of networks rather than a boolean precisely so that nobody can
+    # copy `allow_private = true` out of a forum post without stating WHICH network they meant.
+    #
+    # ==Read from the ENVIRONMENT and from nowhere else.== A webhook URL is caller-supplied; the
+    # networks it may reach are operator-supplied. That asymmetry is the whole difference between
+    # this feature and an SSRF hole, and it is why the value can never come from a row or a request.
+    webhook_private_target_cidrs: str = ""
+
     # Descriptive.
     app_name: str = "AetherCal"
     environment: str = "production"
@@ -113,6 +129,25 @@ class Settings(BaseSettings):
                 "with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
             )
         return value
+
+    @field_validator("webhook_private_target_cidrs", mode="after")
+    @classmethod
+    def _validate_webhook_private_target_cidrs(cls, value: str) -> str:
+        """Parse the allowlist AT BOOT, so a bad CIDR is a startup error and never a silent nothing.
+
+        ==Validating here, in ``Settings``, is the point.== Deferring it to the first delivery would
+        make a typo indistinguishable from the feature simply not working: the operator declares
+        their LAN, the process comes up, and every webhook keeps dying exactly as before — with a
+        configured allowlist to prove it should have worked. The parse is thrown away (the value
+        stays a string, and :meth:`private_target_allowlist` builds the real object); running it
+        here is purely so that a misconfiguration cannot boot.
+        """
+        PrivateTargetAllowlist.parse(value)  # raises AllowlistConfigError (a ValueError) if bad
+        return value
+
+    def private_target_allowlist(self) -> PrivateTargetAllowlist:
+        """The private networks outbound webhooks may reach. Empty (fail-closed) unless declared."""
+        return PrivateTargetAllowlist.parse(self.webhook_private_target_cidrs)
 
     def database_config(self) -> DatabaseConfig:
         """Build a :class:`DatabaseConfig` (URL normalized to the psycopg driver)."""

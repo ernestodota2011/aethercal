@@ -46,6 +46,7 @@ from aethercal.server.services.outbox import (
     drain_outbox,
     make_booking_effect_executor,
 )
+from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
 
 if TYPE_CHECKING:
@@ -176,15 +177,22 @@ async def run_webhook_delivery_once(
     sessionmaker: async_sessionmaker[AsyncSession],
     http_client: httpx.AsyncClient,
     fernet_key: bytes,
+    allowlist: PrivateTargetAllowlist,
     now: datetime | None = None,
 ) -> DeliveryReport | None:
     """One outbound-webhook delivery pass, in its own transaction. Returns the report, or ``None``
     if the tick failed (logged) — a failure never propagates, so the scheduler keeps ticking.
+
+    ``allowlist`` is a required keyword and is threaded straight through to :func:`deliver_due`. It
+    is NOT read from the environment here: the process edge reads it once, at boot, so a bad CIDR
+    fails startup rather than every tick — and so this function stays offline-testable.
     """
     moment = now if now is not None else datetime.now(UTC)
     try:
         async with sessionmaker() as session, session.begin():
-            return await deliver_due(session, http_client, now=moment, fernet_key=fernet_key)
+            return await deliver_due(
+                session, http_client, now=moment, fernet_key=fernet_key, allowlist=allowlist
+            )
     except Exception:
         _logger.exception("webhook-delivery tick failed; scheduler continues")
         return None
@@ -285,13 +293,19 @@ async def run_busy_refresh_once(
 
 
 def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind a webhook-delivery tick to ``app.state`` (sessionmaker / http_client / fernet_key)."""
+    """Bind a webhook-delivery tick to ``app.state`` (sessionmaker / http_client / fernet_key).
+
+    ``webhook_allowlist`` is put on ``app.state`` by ``create_app``, eagerly — not by the lifespan —
+    so it exists on every shape of the app, and the tick cannot fall back to "nothing allowed" for
+    an instance whose operator DID declare their network.
+    """
 
     async def _tick() -> None:
         await run_webhook_delivery_once(
             sessionmaker=app.state.sessionmaker,
             http_client=app.state.http_client,
             fernet_key=app.state.fernet_key,
+            allowlist=app.state.webhook_allowlist,
         )
 
     return _tick
