@@ -36,7 +36,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -152,6 +152,31 @@ def check_template_text(text: str, *, field: str) -> None:
             )
 
 
+_NOT_NULLABLE: tuple[str, ...] = ("name", "trigger", "offset_minutes", "active", "steps")
+"""The PATCH keys whose column is NOT NULL. ``event_type_id`` is absent on purpose: there ``null``
+is a real value ("every event type"), not the absence of one."""
+
+_TEMPLATE_NOT_NULLABLE: tuple[str, ...] = ("body",)
+"""``subject`` is absent on purpose: ``null`` is its real value on the phone channels. Whether that
+is COHERENT with the template's channel is decided by the service, which knows the channel."""
+
+
+def _reject_nulls(data: Any, keys: tuple[str, ...]) -> Any:
+    """Refuse an explicit ``null`` on a key that has no such value. Runs BEFORE parsing.
+
+    It has to be a ``before`` validator: by the time the model exists, an absent key and a present
+    ``null`` are both simply ``None``, and the difference between "leave this alone" and "set this
+    to
+    nothing" is gone. The raw payload is the last place where the two can still be told apart."""
+    if isinstance(data, dict):
+        for key in keys:
+            if key in data and data[key] is None:
+                raise ValueError(
+                    f"'{key}' may not be null; omit the key entirely to leave it unchanged"
+                )
+    return data
+
+
 def _check_steps(steps: list[WorkflowStepIn]) -> None:
     """One step per channel, one step per position — both, or the rule sends twice (or fails)."""
     channels = [step.channel for step in steps]
@@ -204,9 +229,20 @@ class WorkflowCreate(BaseModel):
 class WorkflowUpdate(BaseModel):
     """Partial update. An omitted field is left alone; ``steps`` REPLACES the step list wholesale.
 
-    ``event_type_id`` is nullable *and* optional: send ``null`` to widen the rule to every event
-    type, omit it to leave the scope untouched (the service reads ``exclude_unset``, so the two are
-    never confused).
+    .. rubric:: "Absent" and "null" are different words, and only one of them is a value
+
+    Every field is optional so that an OMITTED one is left untouched (the service reads
+    ``exclude_unset``). Expressing that optionality with ``| None`` would otherwise make
+    ``{"name": null}`` a perfectly VALID request meaning *set the name to nothing* — and ``name``,
+    ``trigger``, ``offset_minutes`` and ``active`` are NOT NULL columns. The write would blow up in
+    the database and surface as a 500; worse, ``{"offset_minutes": null}`` would reach the coherence
+    check as a ``None`` that is not an int at all.
+
+    So an explicit ``null`` on any of them is refused at the edge (:data:`_NOT_NULLABLE`, in a
+    ``before`` validator — the only place that can still SEE the difference between an absent key
+    and
+    a present ``null``). ``event_type_id`` is the sole exception, because there ``null`` is a real
+    value with a real meaning: **the rule applies to every event type**.
 
     Offset coherence is checked by the SERVICE, on the merged rule — a PATCH carrying only
     ``{"trigger": "on_cancel"}`` is self-consistent and would still leave a stored ``-1440`` behind
@@ -218,6 +254,12 @@ class WorkflowUpdate(BaseModel):
     event_type_id: uuid.UUID | None = None
     active: bool | None = None
     steps: Annotated[list[WorkflowStepIn], Field(min_length=1)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_nulls(cls, data: Any) -> Any:
+        """``null`` does not mean "leave it alone" — omit the key for that. See the docstring."""
+        return _reject_nulls(data, _NOT_NULLABLE)
 
     @model_validator(mode="after")
     def _check(self) -> WorkflowUpdate:
@@ -268,10 +310,21 @@ class WorkflowTemplateUpdate(BaseModel):
     """Partial update of a template's TEXT.
 
     The ``(channel, kind, locale)`` identity is immutable: changing it would silently re-point every
-    step that resolves through this body. Delete it and write a new one instead."""
+    step that resolves through this body. Delete it and write a new one instead.
+
+    ``body`` may not be sent as ``null`` (the column is NOT NULL — it would 500). ``subject`` MAY
+    be,
+    because ``null`` is its real value on WhatsApp and SMS; whether that is coherent with THIS
+    template's channel is decided by the service, which is what knows the channel — an email whose
+    subject was quietly nulled would arrive blank."""
 
     subject: ShortText | None = None
     body: Body | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_nulls(cls, data: Any) -> Any:
+        return _reject_nulls(data, _TEMPLATE_NOT_NULLABLE)
 
     @model_validator(mode="after")
     def _check(self) -> WorkflowTemplateUpdate:

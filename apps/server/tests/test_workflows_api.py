@@ -198,6 +198,118 @@ async def test_patching_only_the_trigger_is_validated_against_the_merged_rule(
     assert resp.json()["detail"]["error"] == "invalid_rule"
 
 
+# --------------------------------------------------------------------------------------
+# A PATCH that sends `null`. "Absent" and "null" are different words, and only one is a value.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["name", "trigger", "offset_minutes", "active", "steps"])
+async def test_a_null_on_a_NOT_NULL_field_is_refused_not_500(
+    wired_client: AsyncClient, seeded: dict[str, Any], field: str
+) -> None:
+    """Every PATCH field is optional so that an OMITTED one is left alone. Expressed as ``| None``,
+    that also makes ``{"name": null}`` a perfectly valid request — and these are NOT NULL columns,
+    so
+    the write would reach the database and come back a 500 (or, for ``offset_minutes``, as a
+    ``None``
+    walking into the coherence check where an int is expected). ``null`` is refused at the edge."""
+    headers = seeded["headers"]
+    created = await wired_client.post(WORKFLOWS, json=_reminder(), headers=headers)
+    workflow_id = created.json()["id"]
+
+    resp = await wired_client.patch(
+        f"/workflows/{workflow_id}", json={field: None}, headers=headers
+    )
+
+    assert resp.status_code == 422, f"a null {field} was accepted ({resp.status_code})"
+    # And the rule is untouched: a rejected write writes nothing.
+    after = await wired_client.get(f"/workflows/{workflow_id}", headers=headers)
+    assert after.json()["name"] == "24h reminder"
+    assert after.json()["offset_minutes"] == -1440
+    assert after.json()["active"] is True
+    assert len(after.json()["steps"]) == 1
+
+
+async def test_a_null_event_type_id_is_ACCEPTED_because_there_null_means_something(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """The sole exception, and the reason the refusal is a list rather than a blanket rule: on
+    ``event_type_id`` a ``null`` IS a value with a meaning — the rule applies to EVERY event
+    type."""
+    headers = seeded["headers"]
+    created = await wired_client.post(WORKFLOWS, json=_reminder(), headers=headers)
+    workflow_id = created.json()["id"]
+
+    resp = await wired_client.patch(
+        f"/workflows/{workflow_id}", json={"event_type_id": None}, headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["event_type_id"] is None
+
+
+async def test_a_null_template_body_is_refused_and_a_null_email_subject_too(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """``body`` is NOT NULL — a null would 500. ``subject`` IS nullable, and that is the trap:
+    ``{"subject": null}`` is exactly what a WhatsApp template's subject is, so the column would take
+    it on an EMAIL template too — and the guest would get an email with a blank subject line. Only
+    the service knows the channel, so only the service can refuse it."""
+    headers = seeded["headers"]
+    created = await wired_client.post(
+        TEMPLATES,
+        json={
+            "channel": "email",
+            "kind": "follow_up",
+            "locale": "es",
+            "subject": "Gracias, {{guest_name}}",
+            "body": "Un gusto verte",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201
+    template_id = created.json()["id"]
+
+    null_body = await wired_client.patch(
+        f"/workflow-templates/{template_id}", json={"body": None}, headers=headers
+    )
+    assert null_body.status_code == 422
+
+    null_subject = await wired_client.patch(
+        f"/workflow-templates/{template_id}", json={"subject": None}, headers=headers
+    )
+    assert null_subject.status_code == 422
+    assert null_subject.json()["detail"]["error"] == "invalid_template"
+
+    # Neither write landed: the template still has its subject and its body.
+    after = await wired_client.get(f"/workflow-templates/{template_id}", headers=headers)
+    assert after.json()["subject"] == "Gracias, {{guest_name}}"
+    assert after.json()["body"] == "Un gusto verte"
+
+
+async def test_a_subject_may_not_be_added_to_a_phone_template(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """The same coherence from the other direction: WhatsApp has no subject line, so one stored
+    there
+    is a field nobody ever reads. The create path forbids it; the edit path must not be the way
+    in."""
+    headers = seeded["headers"]
+    created = await wired_client.post(
+        TEMPLATES,
+        json={"channel": "whatsapp", "kind": "reminder", "locale": "es", "body": "Hola"},
+        headers=headers,
+    )
+    template_id = created.json()["id"]
+
+    resp = await wired_client.patch(
+        f"/workflow-templates/{template_id}", json={"subject": "Nope"}, headers=headers
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_template"
+
+
 async def test_another_tenants_workflow_is_a_404(
     wired_client: AsyncClient, seeded: dict[str, Any], auth_headers: dict[str, str]
 ) -> None:

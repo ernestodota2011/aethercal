@@ -43,6 +43,7 @@ from aethercal.server.services.workflow_rules import (
     DuplicateTemplateError,
     InvalidReferenceError,
     InvalidRuleError,
+    InvalidTemplateError,
     Rule,
     TemplateInUseError,
     create_template,
@@ -67,6 +68,7 @@ _DUPLICATE_NAME = "duplicate_name"
 _DUPLICATE_TEMPLATE = "duplicate_template"
 _INVALID_REFERENCE = "invalid_reference"
 _INVALID_RULE = "invalid_rule"
+_INVALID_TEMPLATE = "invalid_template"
 _TEMPLATE_IN_USE = "template_in_use"
 _NOT_FOUND = "not_found"
 
@@ -254,10 +256,16 @@ async def patch_template(
     session: SessionDep,
     ctx: AuthDep,
 ) -> WorkflowTemplateRead:
-    """Edit a template's text. Its (channel, kind, locale) identity is immutable by design."""
-    row = await update_template(
-        session, tenant_id=ctx.tenant_id, template_id=template_id, data=payload
-    )
+    """Edit a template's text. Its (channel, kind, locale) identity is immutable by design.
+
+    422 when the new text contradicts the template's own channel — nulling the subject of an EMAIL
+    template, say, which the column would happily accept and the guest would receive blank."""
+    try:
+        row = await update_template(
+            session, tenant_id=ctx.tenant_id, template_id=template_id, data=payload
+        )
+    except InvalidTemplateError as exc:
+        raise _unprocessable(_INVALID_TEMPLATE, exc) from exc
     if row is None:
         raise _not_found("Template")
     return _read_template(row)

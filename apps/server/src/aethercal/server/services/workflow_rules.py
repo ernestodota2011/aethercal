@@ -56,6 +56,7 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateUpdate,
     WorkflowUpdate,
     check_offset,
+    check_subject,
 )
 from aethercal.server.channels import Channel
 from aethercal.server.db.models import (
@@ -110,6 +111,12 @@ class InvalidReferenceError(WorkflowRuleError):
 
 class InvalidRuleError(WorkflowRuleError):
     """The rule is self-defeating: an incoherent offset, or a step that can never render (→ 422)."""
+
+
+class InvalidTemplateError(WorkflowRuleError):
+    """The template's text contradicts its own channel — an email with no subject line, say (→ 422).
+
+    It can only be caught HERE: the schema sees the new text but not the channel it belongs to."""
 
 
 class TemplateInUseError(WorkflowRuleError):
@@ -617,7 +624,20 @@ async def update_template(
     row = await get_template(session, tenant_id=tenant_id, template_id=template_id)
     if row is None:
         return None
-    for key, value in data.model_dump(exclude_unset=True).items():
+
+    fields = data.model_dump(exclude_unset=True)
+    # The subject is judged against the template's CHANNEL, and only this layer knows the channel.
+    # The schema can refuse a null body (the column is NOT NULL), but not this: `{"subject": null}`
+    # is a perfectly valid payload — it is what a WhatsApp template's subject IS — and applied to an
+    # EMAIL template the column would accept it, store it, and later deliver an email with a blank
+    # subject line. The CREATE path already forbids exactly that shape; the edit path must not be
+    # the way around it.
+    try:
+        check_subject(row.channel, fields.get("subject", row.subject))
+    except ValueError as exc:
+        raise InvalidTemplateError(str(exc)) from exc
+
+    for key, value in fields.items():
         setattr(row, key, value)
     await session.flush()
     await _reload(session, row)
@@ -686,6 +706,7 @@ __all__ = [
     "DuplicateTemplateError",
     "InvalidReferenceError",
     "InvalidRuleError",
+    "InvalidTemplateError",
     "Rule",
     "TemplateInUseError",
     "WorkflowRuleError",
