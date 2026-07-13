@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.schemas.event_types import EventTypeCreate
@@ -222,12 +223,15 @@ async def test_a_duplicate_email_is_refused(sqlite_session: AsyncSession) -> Non
 async def test_a_duplicate_email_that_differs_only_in_case_is_refused(
     sqlite_session: AsyncSession,
 ) -> None:
-    """==The typo the unique constraint cannot see.==
+    """==The typo an exact-string unique constraint cannot see.==
 
-    ``(tenant_id, email)`` is unique on the EXACT string, so ``Ana@example.com`` and
-    ``ana@example.com`` are two hosts as far as the database is concerned — and one human being. Two
-    rows for one person means a selector offering both, an event type landing on whichever was
-    clicked, and mail going to whichever row happens to be read.
+    ``Ana@example.com`` and ``ana@example.com`` were two hosts as far as the database was concerned
+    — and one human being. Two rows for one person means a selector offering both, an event type
+    landing on whichever was clicked, and mail going to whichever row happens to be read.
+
+    The guard below is the OPERATOR-facing half of the fix: it refuses before anything is written,
+    with a sentence a person can act on. The half it cannot supply — an invariant that holds under
+    concurrency — is migration 0006's, and is proven in the three tests that follow.
     """
     tenant = await _tenant(sqlite_session)
     await create_user(sqlite_session, tenant_id=tenant.id, data=_ana())
@@ -236,6 +240,109 @@ async def test_a_duplicate_email_that_differs_only_in_case_is_refused(
         await create_user(sqlite_session, tenant_id=tenant.id, data=_ana(email="Ana@Example.com"))
 
     assert await _count_users(sqlite_session, tenant) == 1
+
+
+# --------------------------------------------------------------------------------------
+# The invariant is the DATABASE's; the service only makes its refusal legible (0006).
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_database_refuses_a_case_variant_pair_with_no_service_in_the_way(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The guard is a courtesy. THIS is the invariant.==
+
+    Written straight against the model, with nothing between the write and the table — which is, in
+    effect, exactly where two concurrent creates end up: each one's check-then-act has already read,
+    found nobody, and moved on. What refuses the second row here is the functional unique index on
+    ``(tenant_id, lower(email))``, and nothing else.
+    """
+    tenant = await _tenant(sqlite_session)
+    sqlite_session.add(
+        User(tenant_id=tenant.id, name="Ana", email="Ana@example.com", timezone="UTC")
+    )
+    await sqlite_session.flush()
+
+    sqlite_session.add(
+        User(tenant_id=tenant.id, name="Ana Ruiz", email="ana@example.com", timezone="UTC")
+    )
+    with pytest.raises(IntegrityError):
+        await sqlite_session.flush()
+
+
+async def test_a_refusal_only_the_database_could_make_is_still_the_domain_error(
+    sqlite_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the guard cannot win, arriving at the caller as a SENTENCE rather than a traceback.
+
+    Blinding the guard is precisely what a concurrent create does to it: the other transaction has
+    not committed, so there is nothing for the read to find, and the write goes ahead. The database
+    then refuses it — and the operator must get "that address is already taken", not
+    ``IntegrityError: UNIQUE constraint failed: index 'uq_users_tenant_id_email_lower'``, which
+    tells them nothing they can act on and reads as a crash.
+
+    (The real, concurrent version of this is ``test_users_concurrency.py``, on PostgreSQL. SQLite
+    serialises writers, so the race itself cannot be staged here — only its outcome.)
+    """
+    tenant = await _tenant(sqlite_session)
+    await create_user(sqlite_session, tenant_id=tenant.id, data=_ana())
+
+    async def _blind(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(users, "_ensure_email_available", _blind)
+
+    with pytest.raises(DuplicateUserEmailError, match="already exists"):
+        await create_user(sqlite_session, tenant_id=tenant.id, data=_ana(email="Ana@Example.com"))
+
+    assert await _count_users(sqlite_session, tenant) == 1
+
+
+async def test_an_edit_that_loses_the_race_is_the_domain_error_too(
+    sqlite_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit path is not the way around the create path's guarantees — and never was.
+
+    ==And the refusal leaves NOTHING half-written — not even in memory.==
+
+    This is where a real defect was hiding. ``update_user`` assigned the new address to the row
+    BEFORE opening the SAVEPOINT, so the doomed ``UPDATE`` was emitted OUTSIDE the savepoint meant
+    to
+    contain it: the refusal was raised and read perfectly, and the caller's transaction was dead.
+    The
+    damage then surfaced somewhere else entirely — at the next query on that session, as a
+    ``PendingRollbackError``, in code that had done nothing wrong. Nobody had ever seen it because
+    the guard always won first; the DATABASE's refusal (i.e. the race this whole change is about) is
+    what actually reaches that line.
+
+    So the assertions below are deliberately about what happens AFTER the refusal: the session still
+    works, the row still reads as it did, and the count is what it was.
+    """
+    tenant = await _tenant(sqlite_session)
+    await create_user(sqlite_session, tenant_id=tenant.id, data=_ana())
+    bruno = await create_user(
+        sqlite_session, tenant_id=tenant.id, data=_ana(name="Bruno", email="bruno@example.com")
+    )
+
+    async def _blind(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(users, "_ensure_email_available", _blind)
+
+    with pytest.raises(DuplicateUserEmailError, match="already exists"):
+        await update_user(
+            sqlite_session,
+            tenant_id=tenant.id,
+            user_id=bruno.id,
+            data=_ana(name="Bruno", email="ANA@example.com"),
+        )
+
+    # The session is ALIVE (this query is what used to raise PendingRollbackError)...
+    assert await _count_users(sqlite_session, tenant) == 2
+    # ...and Bruno is untouched — the rejected address did not survive on the object either.
+    row = await sqlite_session.get(User, bruno.id)
+    assert row is not None
+    assert row.email == "bruno@example.com"
 
 
 async def test_the_same_email_in_another_tenant_is_perfectly_fine(

@@ -33,6 +33,12 @@ email with a blank. And a second row for the same person — ``Ana@example.com``
 offering two of somebody, an event type landing on whichever was clicked, and mail going to
 whichever row is read first.
 
+That last one is the only refusal here the service cannot actually make good on alone: its guard is
+a check-then-act, and two concurrent creates walk straight through it. ==So the invariant is the
+database's== — a functional unique index on ``(tenant_id, lower(email))``, migration 0007 — and what
+this module owes the operator is that the index's refusal reads like the guard's, rather than like a
+crash. See :func:`_ensure_email_available` and :func:`_is_duplicate_email`.
+
 Transaction control (commit / rollback) belongs to the caller, as everywhere else in this layer.
 """
 
@@ -82,12 +88,16 @@ class UserInUseError(UserServiceError):
 
 
 class AmbiguousUserEmailError(UserServiceError):
-    """Two rows, one address, differing only in case — a pair only a pre-service write could make.
+    """Two rows, one address, differing only in case — a pair only a pre-0007 write could make.
 
     ==Never resolved by picking one.== A ``.first()`` over an ambiguous set is the very defect RF-30
-    was raised for (a host's second calendar connection, silently dropped). The guard below stops a
-    new pair from being written, but ``users`` has no case-insensitive constraint, so a database
-    that already contains one says so — loudly — instead of guessing which host was meant.
+    was raised for (a host's second calendar connection, silently dropped).
+
+    Since migration 0007 the database itself cannot hold such a pair — the functional unique index
+    on ``(tenant_id, lower(email))`` — and the migration refuses to run against a database that
+    already does, naming the rows rather than merging them. This remains the answer for the only
+    case left: a database that predates 0007, or one whose index somebody has dropped. It says so,
+    loudly, instead of guessing which host was meant.
     """
 
 
@@ -147,16 +157,17 @@ async def _ensure_email_available(
 ) -> None:
     """Refuse a second host on the same address — ==case-insensitively==.
 
-    ``(tenant_id, email)`` is unique on the EXACT string, so the constraint by itself reads
-    ``Ana@example.com`` and ``ana@example.com`` as two different people. They are one person with a
-    typo, and two rows for one person is a real defect: the selector offers both, an event type
-    lands on whichever was clicked, and mail goes to whichever row is read.
+    ``Ana@example.com`` and ``ana@example.com`` are one person with a typo, and two rows for one
+    person is a real defect: the selector offers both, an event type lands on whichever was clicked,
+    and mail goes to whichever row is read.
 
-    A check-then-act is not atomic, so the database constraint stays as the backstop for an exact
-    collision (the ``IntegrityError`` handling below). Two CONCURRENT creates differing only in case
-    could still both land; the airtight fix is a functional unique index on ``lower(email)``, which
-    is a migration and belongs with whoever owns the next one. This closes the hole a human can
-    actually walk into on a single-operator panel.
+    ==This is NOT what makes the address unique.== A check-then-act cannot be: it reads, finds
+    nobody, and writes, and two CONCURRENT creates can each do all three. The invariant is the
+    DATABASE's — the functional unique index on ``(tenant_id, lower(email))`` (migration 0007) — and
+    this guard exists for the one thing an index cannot do: refuse the operator BEFORE anything is
+    written, in a sentence they can act on. When it loses the race, the index refuses the write and
+    :func:`_is_duplicate_email` turns that refusal back into this same error, so the two paths are
+    indistinguishable from outside.
     """
     stmt = select(User.id).where(
         User.tenant_id == tenant_id, func.lower(User.email) == email.lower()
@@ -168,6 +179,33 @@ async def _ensure_email_available(
             f"a host with the email '{email}' already exists in this business: two hosts on one "
             "address is one host with a typo"
         )
+
+
+# The database's own name for the invariant (migration 0007). It is the ONE unique index on
+# ``users``, which is precisely why the exact-string ``UNIQUE`` was substituted rather than kept:
+# with two of them, an IntegrityError could arrive under either name and this function would have to
+# guess.
+_EMAIL_UNIQUE_INDEX = "uq_users_tenant_id_email_lower"
+
+
+def _is_duplicate_email(exc: IntegrityError) -> bool:
+    """Is this the case-insensitive uniqueness index refusing a second host on one address?
+
+    ==Asked, rather than assumed.== A blanket ``except IntegrityError: raise
+    DuplicateUserEmailError`` reports "a host with the email 'ana@example.com' already exists" for
+    ANY refusal the database makes — a foreign key to a tenant that does not exist, a NOT NULL that
+    a future column adds — and sends the operator hunting for a host that was never there. A
+    misdiagnosis is worse than a traceback: the traceback at least says it does not know.
+
+    PostgreSQL names the violated constraint in ``Diagnostic.constraint_name``; SQLite carries it in
+    the message (``UNIQUE constraint failed: index '...'``). Both are checked, so this holds on the
+    backend production runs on AND on the one the offline suite proves it with.
+    """
+    origin = exc.orig
+    named = getattr(getattr(origin, "diag", None), "constraint_name", None)
+    if named is not None:
+        return bool(named == _EMAIL_UNIQUE_INDEX)
+    return _EMAIL_UNIQUE_INDEX in str(origin)
 
 
 # --------------------------------------------------------------------------------------
@@ -228,12 +266,18 @@ async def create_user(session: AsyncSession, *, tenant_id: uuid.UUID, data: User
 
     row = User(tenant_id=tenant_id, name=clean.name, email=clean.email, timezone=clean.timezone)
     try:
-        # A SAVEPOINT, so losing the race with the unique constraint refuses the ACTION without
-        # killing the caller's transaction — the CLI creates the tenant in that same one.
+        # A SAVEPOINT, so losing the race with the unique index refuses the ACTION without killing
+        # the caller's transaction — the CLI creates the tenant in that same one.
         async with session.begin_nested():
             session.add(row)
             await session.flush()
     except IntegrityError as exc:
+        # ==The failure the guard above cannot prevent, made legible rather than invisible.== The
+        # guard read before the winner committed, so it found nobody; the INDEX is what refused this
+        # write. The caller gets the SAME error either way — an operator cannot tell (and should not
+        # have to care) whether they lost a race or simply typed a taken address.
+        if not _is_duplicate_email(exc):
+            raise  # not our invariant: somebody else's bug, and it travels intact
         raise DuplicateUserEmailError(
             f"a host with the email '{clean.email}' already exists in this business"
         ) from exc
@@ -254,13 +298,40 @@ async def update_user(
         session, tenant_id=tenant_id, email=clean.email, exclude_id=row.id
     )
 
-    row.name = clean.name
-    row.email = clean.email
-    row.timezone = clean.timezone
     try:
+        # ==The row is mutated INSIDE the SAVEPOINT, and that is not a style choice.==
+        #
+        # Assigning the new email BEFORE ``begin_nested()`` leaves the row dirty on the way in, so
+        # the doomed UPDATE is emitted OUTSIDE the savepoint that exists to contain it — and its
+        # ``IntegrityError`` takes the caller's whole transaction down with it. The refusal was
+        # still
+        # raised, and still read correctly, so the damage surfaced somewhere else entirely: at the
+        # NEXT query on that session, as ``PendingRollbackError``, in code that had done nothing
+        # wrong. (Invisible until now only because the guard above always won first; the database's
+        # refusal — the race — is what actually reaches this line.)
+        #
+        # Inside, the savepoint owns the write: its rollback undoes the UPDATE *and* restores the
+        # object, so a refused edit leaves the host exactly as they were — in the session as well as
+        # in the database — and the caller's transaction stays usable. ``create_user`` has always
+        # had
+        # this shape (its ``session.add`` is inside); this makes the two paths the same.
         async with session.begin_nested():
+            row.name = clean.name
+            row.email = clean.email
+            row.timezone = clean.timezone
             await session.flush()
     except IntegrityError as exc:
+        # Rolling the savepoint back EXPIRES the row it had modified — correct (its attributes no
+        # longer reflect anything), and a landmine on an async session: the caller still holds that
+        # object, and the next plain ``row.email`` on it is a lazy load outside the greenlet, i.e.
+        # ``MissingGreenlet`` — an exception about IO plumbing, thrown at whoever merely looked at
+        # the host they were told they could not rename. Reloading it here is what makes "the
+        # refusal
+        # left the host exactly as they were" TRUE of the object as well as of the table.
+        await session.refresh(row)
+        # Same reasoning as ``create_user``: ONLY the address index is translated.
+        if not _is_duplicate_email(exc):
+            raise
         raise DuplicateUserEmailError(
             f"a host with the email '{clean.email}' already exists in this business"
         ) from exc
