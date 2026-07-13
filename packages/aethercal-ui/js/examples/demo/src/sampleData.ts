@@ -71,7 +71,10 @@ const EVENT_RESOURCE: Readonly<Record<string, string>> = {
   design: "cami",
   oneonone: "ana",
   lunch: "beto",
-  onboarding: "ana",
+  // "onboarding" is deliberately left out — it is the ONLY orphan, and it rides the "unassigned"
+  // row. It is anchored to TODAY on purpose: the timeline window starts at the anchor, so an orphan
+  // pinned to a fixed day of the month leaves the window on most days and the row silently
+  // disappears — which is how this demo's own test came to depend on the date.
   release: "dani",
   focus: "cami",
   conf: "beto",
@@ -87,8 +90,7 @@ const EVENT_RESOURCE: Readonly<Record<string, string>> = {
   "m-d": "cami",
   "m-launch": "beto",
   "m-holiday": "sala",
-  // "m-e" is deliberately left out — the only one — so the unassigned row has exactly what the
-  // docstring above promises: one orphan, not three.
+  "m-e": "dani",
 };
 
 export function buildSampleEvents(today: Date): CalendarEvent[] {
