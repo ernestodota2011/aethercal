@@ -37,15 +37,25 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate
+from aethercal.schemas.workflows import (
+    WorkflowCreate,
+    WorkflowStepIn,
+    WorkflowTemplateCreate,
+    WorkflowTemplateUpdate,
+    WorkflowUpdate,
+)
 from aethercal.server.admin import service
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.format import (
+    ALL_EVENT_TYPES,
     booking_event,
     booking_row,
     event_type_row,
     parse_weekdays,
     schedule_row,
+    template_row,
     weekly_rules,
+    workflow_row,
 )
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
@@ -440,6 +450,81 @@ async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
     return [event_type_row(row) for row in rows]
 
 
+async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_workflows_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [workflow_row(row) for row in rows]
+
+
+async def _fetch_templates(runtime: AdminRuntime) -> list[dict[str, str]]:
+    rows = await service.list_templates_view(
+        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+    )
+    return [template_row(row) for row in rows]
+
+
+# --------------------------------------------------------------------------------------
+# Rule-form parsing (RF-24). Both of this form's traps live here.
+# --------------------------------------------------------------------------------------
+
+#: The rule form carries ONE kind field per channel, which IS the schema's rule ("one step per
+#: channel": two steps on one channel are two dedupe keys, so the guest gets the same message
+#: twice). A non-blank kind means "send this on this channel"; blank means no step there.
+_STEP_CHANNELS = ("email", "whatsapp", "sms")
+
+
+def _parse_steps(form_data: dict[str, str]) -> list[WorkflowStepIn]:
+    """The steps a rule form describes: one per channel whose ``kind`` field was filled in.
+
+    Positions are assigned CONTIGUOUSLY over the channels actually present, so dropping the middle
+    step of three leaves no hole for the (unique-per-workflow) position constraint to trip over.
+    """
+    steps: list[WorkflowStepIn] = []
+    for channel in _STEP_CHANNELS:
+        kind = _clean(form_data, f"{channel}_kind")
+        if kind:
+            steps.append(WorkflowStepIn(channel=channel, kind=kind, position=len(steps)))
+    return steps
+
+
+def _parse_scope(form_data: dict[str, str]) -> uuid.UUID | None:
+    """The event type a rule governs on CREATE; the sentinel (or blank) → ``None`` = every one."""
+    raw = _clean(form_data, "event_type_id")
+    if not raw or raw == ALL_EVENT_TYPES:
+        return None
+    return uuid.UUID(raw)
+
+
+def _scope_update(form_data: dict[str, str]) -> dict[str, uuid.UUID | None]:
+    """The scope key for an UPDATE payload, or ``{}`` to leave the stored scope UNTOUCHED.
+
+    ``event_type_id`` is the one field of a rule where ``null`` is a real VALUE — "every event type"
+    — and not "leave this alone". A blank select therefore cannot be allowed to mean both: an
+    untouched select must never silently widen a rule from one event type to ALL of them while the
+    operator was editing its offset. That fires the rule across every booking in the business, and
+    nothing whatsoever would have said so.
+
+    So widening is EXPLICIT, exactly as clearing an EN translation is: the :data:`ALL_EVENT_TYPES`
+    sentinel sets the scope to ``None``, a real id sets that id, and a blank field omits the key.
+    """
+    raw = _clean(form_data, "event_type_id")
+    if not raw:
+        return {}
+    return {"event_type_id": None if raw == ALL_EVENT_TYPES else uuid.UUID(raw)}
+
+
+def _steps_update(form_data: dict[str, str]) -> dict[str, list[WorkflowStepIn]]:
+    """The steps key for an UPDATE payload, or ``{}`` to leave the stored steps UNTOUCHED.
+
+    ``steps`` REPLACES the list wholesale, and the schema forbids a rule with none — so "every kind
+    field blank" cannot mean "remove all the steps" (there is no such rule). It means the operator
+    was editing something else, and the steps are left exactly as they were.
+    """
+    steps = _parse_steps(form_data)
+    return {"steps": steps} if steps else {}
+
+
 async def _fetch_schedules(runtime: AdminRuntime) -> list[dict[str, str]]:
     rows = await service.list_schedules_view(
         runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
@@ -464,6 +549,9 @@ class AdminState(rx.State):
     bookings: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     event_types: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     schedules: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- notification rules (RF-24) --------------------------------------------------
+    workflows: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    templates: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
 
     # -- calendar (F2-F) ------------------------------------------------------------
     # The agenda's calendar events (active bookings) + the operator-selected view. The calendar
@@ -957,6 +1045,194 @@ class AdminState(rx.State):
                 schedule_id=uuid.UUID(schedule_id),
             )
             self.schedules = await _fetch_schedules(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    # -- notification rules + templates (RF-24) --------------------------------------
+
+    @rx.event
+    async def load_workflows(self) -> None:
+        """Load the rules, the templates, and the event types the scope select offers (``on_load``).
+
+        All three, because the rule form cannot be filled in without the other two: a step needs a
+        template to render its body, and a rule needs the event types to choose its scope from.
+        """
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            runtime = current_runtime()
+            self.workflows = await _fetch_workflows(runtime)
+            self.templates = await _fetch_templates(runtime)
+            self.event_types = await _fetch_event_types(runtime)
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_workflow(self, form_data: dict[str, str]) -> None:
+        """Author a rule. It is ARMED against the bookings already on the books, not just future
+        ones — the service reconciles their queued steps, which is the whole point of the screen."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            data = WorkflowCreate(
+                name=_clean(form_data, "name"),
+                trigger=_clean(form_data, "trigger"),  # type: ignore[arg-type]  # schema validates
+                offset_minutes=int(_clean(form_data, "offset_min") or 0),
+                event_type_id=_parse_scope(form_data),
+                steps=_parse_steps(form_data),
+            )
+            await service.create_workflow_action(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_workflow(self, form_data: dict[str, str]) -> None:
+        """Edit a rule, and MAKE THE EDIT TRUE for every booking it already governs.
+
+        Only the fields the operator actually filled in are sent (``exclude_unset``): a blank field
+        leaves the stored value alone. The two fields where "blank" would otherwise be ambiguous —
+        the scope (``null`` is a real value there) and the steps (which replace the list wholesale)
+        — are decided by :func:`_scope_update` / :func:`_steps_update`, never by a default.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            fields: dict[str, object] = {}
+            name = _clean(form_data, "name")
+            if name:
+                fields["name"] = name
+            trigger = _clean(form_data, "trigger")
+            if trigger:
+                fields["trigger"] = trigger
+            offset = _clean(form_data, "offset_min")
+            if offset:
+                fields["offset_minutes"] = int(offset)
+            fields.update(_scope_update(form_data))
+            fields.update(_steps_update(form_data))
+            data = WorkflowUpdate.model_validate(fields)
+            await service.update_workflow_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                workflow_id=uuid.UUID(_clean(form_data, "id")),
+                data=data,
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def activate_workflow(self, workflow_id: str) -> None:
+        """Switch a rule ON: it re-arms the bookings taken while it was off, and re-times the steps
+        that came due meanwhile (they are made DUE, never destroyed)."""
+        if not self._authenticated:
+            return
+        await self._set_workflow_active(workflow_id, active=True)
+
+    @rx.event
+    async def deactivate_workflow(self, workflow_id: str) -> None:
+        """Switch a rule OFF: its queued messages are PAUSED, not destroyed — the toggle is
+        symmetric, and switching it back on delivers them."""
+        if not self._authenticated:
+            return
+        await self._set_workflow_active(workflow_id, active=False)
+
+    async def _set_workflow_active(self, workflow_id: str, *, active: bool) -> None:
+        """The shared body of the two toggles. NOT an ``@rx.event`` — a private helper Reflex must
+        not expose as a client-callable handler (the same reason the fetch helpers are free
+        functions). The public handlers own the auth guard."""
+        runtime = current_runtime()
+        try:
+            await service.set_workflow_active_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                workflow_id=uuid.UUID(workflow_id),
+                active=active,
+            )
+            self.workflows = await _fetch_workflows(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def create_template(self, form_data: dict[str, str]) -> None:
+        """Store the body one ``(channel, kind, locale)`` renders. The body is DATA: the schema's
+        allow-list decides which ``{{variables}}`` may appear, and nothing is ever evaluated."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            data = WorkflowTemplateCreate(
+                channel=_clean(form_data, "channel"),  # type: ignore[arg-type]  # schema validates
+                kind=_clean(form_data, "kind"),
+                locale=_clean(form_data, "locale"),
+                # An email needs a subject and the phone channels forbid one; the schema refuses the
+                # incoherent pair, so a blank is passed on as the ``None`` it means, not as "".
+                subject=_clean(form_data, "subject") or None,
+                body=_clean(form_data, "body"),
+            )
+            await service.create_template_action(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+            )
+            self.templates = await _fetch_templates(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def update_template(self, form_data: dict[str, str]) -> None:
+        """Edit a template's TEXT. Its ``(channel, kind, locale)`` identity is immutable by design:
+        re-pointing it would silently change what every step resolving through it sends.
+
+        A blank field leaves the stored text alone. ``subject`` is NOT nullable from here — the
+        service refuses to null an email's subject line anyway (an email that arrives blank), so a
+        blank field means "unchanged", and removing a subject means deleting the template.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            fields: dict[str, str] = {}
+            subject = _clean(form_data, "subject")
+            if subject:
+                fields["subject"] = subject
+            body = _clean(form_data, "body")
+            if body:
+                fields["body"] = body
+            data = WorkflowTemplateUpdate.model_validate(fields)
+            await service.update_template_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                template_id=uuid.UUID(_clean(form_data, "id")),
+                data=data,
+            )
+            self.templates = await _fetch_templates(runtime)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def delete_template(self, template_id: str) -> None:
+        """Delete a template — refused while it is the last body a live step can render (deleting it
+        would leave that step reading ``active: true`` and silently messaging nobody)."""
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            await service.delete_template_action(
+                runtime.sessionmaker,
+                tenant_slug=runtime.config.tenant_slug,
+                template_id=uuid.UUID(template_id),
+            )
+            self.templates = await _fetch_templates(runtime)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)

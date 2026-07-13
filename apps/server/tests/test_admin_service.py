@@ -30,6 +30,7 @@ from sqlalchemy.pool import StaticPool
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate, TimeRangeSchema
+from aethercal.server.admin import service
 from aethercal.server.admin.service import (
     AdminActionError,
     AdminSetupError,
@@ -47,7 +48,6 @@ from aethercal.server.admin.service import (
     update_event_type_action,
     update_schedule_action,
 )
-from aethercal.server.admin import service
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant, User
 from aethercal.server.services import bookings as bookings_service
@@ -498,7 +498,9 @@ async def test_admin_cannot_cancel_another_tenants_booking(sessionmaker: Session
 def _booking_error_subclasses() -> list[type[bookings_service.BookingError]]:
     """Every concrete ``BookingError`` in the service, found by walking the class tree."""
 
-    def _walk(cls: type[bookings_service.BookingError]) -> list[type[bookings_service.BookingError]]:
+    def _walk(
+        cls: type[bookings_service.BookingError],
+    ) -> list[type[bookings_service.BookingError]]:
         found: list[type[bookings_service.BookingError]] = []
         for sub in cls.__subclasses__():
             found.append(sub)

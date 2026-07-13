@@ -15,6 +15,7 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead
 from aethercal.schemas.schedules import Rules, ScheduleRead, TimeRangeSchema
+from aethercal.schemas.workflows import WorkflowRead, WorkflowTemplateRead
 
 if TYPE_CHECKING:
     # Imported for the return type only; the runtime value is a plain dict, so this module keeps its
@@ -24,6 +25,15 @@ if TYPE_CHECKING:
 
 _MIN_WEEKDAY = 0
 _MAX_WEEKDAY = 6
+
+ALL_EVENT_TYPES = "(all)"
+"""What a rule's ``scope`` cell reads when ``event_type_id`` is NULL — it governs EVERY event type.
+
+Spelled out rather than left blank: an empty cell reads as "unset / broken", and this is the rule's
+widest and most consequential setting. It is also the sentinel the scope ``select`` submits, so the
+handler can tell "every event type" (a value) from "leave the scope alone" (an absence)."""
+
+_PREVIEW_CHARS = 60
 
 # A muted grey chip for a booking that is not an editable, confirmed slot (e.g. a pending one), so
 # the calendar visibly distinguishes it from a live, draggable booking. Neutral by design — no
@@ -102,6 +112,51 @@ def schedule_row(schedule: ScheduleRead) -> dict[str, str]:
     }
 
 
+def workflow_row(workflow: WorkflowRead) -> dict[str, str]:
+    """Flatten a rule into the string cells its table renders.
+
+    ``steps`` is rendered as ``channel:kind`` pairs because a rule's substance IS its steps — listed
+    by name and trigger alone, a rule that messages the guest looks identical to one that does
+    nothing at all. ``scope`` names the event type it governs; :data:`ALL_EVENT_TYPES` means every
+    one of them, which is a real value (``event_type_id`` is nullable) rather than an absence.
+    """
+    return {
+        "id": str(workflow.id),
+        "name": workflow.name,
+        "trigger": workflow.trigger,
+        "offset_min": str(workflow.offset_minutes),
+        "scope": str(workflow.event_type_id) if workflow.event_type_id else ALL_EVENT_TYPES,
+        "steps": ", ".join(f"{step.channel}:{step.kind}" for step in workflow.steps),
+        "active": "yes" if workflow.active else "no",
+    }
+
+
+def template_row(template: WorkflowTemplateRead) -> dict[str, str]:
+    """Flatten a template into the string cells its table renders.
+
+    The body is PREVIEWED for the table only: it is operator-authored, guest-facing text of up to
+    4000 characters, and pasting all of it into a cell makes the table unreadable. The edit form
+    round-trips the full body.
+    """
+    return {
+        "id": str(template.id),
+        "channel": template.channel,
+        "kind": template.kind,
+        "locale": template.locale,
+        "subject": template.subject or "",
+        "body": _preview(template.body),
+    }
+
+
+def _preview(body: str) -> str:
+    """The first line of a body, capped: enough to recognise it, never enough to flood a table."""
+    lines = body.strip().splitlines()
+    first = lines[0] if lines else ""
+    if len(first) <= _PREVIEW_CHARS:
+        return first
+    return first[: _PREVIEW_CHARS - 1].rstrip() + "…"
+
+
 def parse_weekdays(raw: str) -> list[int]:
     """Parse a comma-separated weekday list (``"0,1,2"``, Monday=0..Sunday=6); ``""`` → ``[]``.
 
@@ -129,10 +184,13 @@ def weekly_rules(weekdays: list[int], start: str, end: str) -> Rules:
 
 
 __all__ = [
+    "ALL_EVENT_TYPES",
     "booking_event",
     "booking_row",
     "event_type_row",
     "parse_weekdays",
     "schedule_row",
+    "template_row",
     "weekly_rules",
+    "workflow_row",
 ]

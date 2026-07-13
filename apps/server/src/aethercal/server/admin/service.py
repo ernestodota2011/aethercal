@@ -32,10 +32,20 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeCreate, EventTypeRead, EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleRead, ScheduleUpdate
+from aethercal.schemas.workflows import (
+    WorkflowCreate,
+    WorkflowRead,
+    WorkflowStepRead,
+    WorkflowTemplateCreate,
+    WorkflowTemplateRead,
+    WorkflowTemplateUpdate,
+    WorkflowUpdate,
+)
 from aethercal.server.db.models import Tenant, User
 from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services import event_types as event_types_service
 from aethercal.server.services import schedules as schedules_service
+from aethercal.server.services import workflow_rules as workflow_rules_service
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -180,9 +190,9 @@ _BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str | None] =
     bookings_service.BookingNotEndedError: None,
 }
 """Every :class:`~aethercal.server.services.bookings.BookingError`, mapped to what the operator is
-told. ``test_every_booking_error_has_an_operator_message`` asserts this map stays EXHAUSTIVE over the
-service's error tree, so a new subclass fails a test instead of silently inheriting a vague catch-all
-that names no cause."""
+told. ``test_every_booking_error_has_an_operator_message`` asserts this map stays EXHAUSTIVE over
+the service's error tree, so a new subclass fails a test instead of silently inheriting a vague
+catch-all that names no cause."""
 
 
 def _booking_action_error(exc: bookings_service.BookingError) -> AdminActionError:
@@ -452,6 +462,196 @@ async def delete_schedule_action(
             raise AdminActionError(str(exc)) from exc
 
 
+# --------------------------------------------------------------------------------------
+# Workflow rules + templates (RF-24).
+# --------------------------------------------------------------------------------------
+#
+# Every mutation here is routed through ``services/workflow_rules``, and that is the whole point:
+# that module RECONCILES the queue of every booking a rule governs. A rule edit that writes only the
+# ``workflows`` row leaves each guest already on the books reminded at the OLD time. The panel shows
+# the change, the database agrees with the panel, and nothing sends what the operator asked for. The
+# admin therefore owns no rule logic of its own; it resolves the tenant, passes the clock down, and
+# lets that service do the arming.
+#
+# ``WorkflowRuleError`` is surfaced by its OWN message rather than remapped. Each one was written to
+# be read by the person who caused it ("the whatsapp step of kind 'reminder' has no template to
+# render its body ... without one the step is skipped at send time and the guest is never messaged,
+# silently"), and a hand-written table of replacements is precisely the thing that drifted into
+# lying about the booking errors above.
+
+
+def _rule_read(rule: workflow_rules_service.Rule) -> WorkflowRead:
+    """Project a rule + its steps for the panel (there is no ORM relationship — see ``Rule``).
+
+    Built field-by-field because ``steps`` is not an attribute of the ``Workflow`` row: it is loaded
+    separately, on purpose (a lazy load on an ``AsyncSession`` is a ``MissingGreenlet`` crash). The
+    field set is pyright-checked against ``WorkflowRead``, so a new field on the schema breaks this
+    projection at type-check rather than silently omitting itself from the panel.
+    """
+    workflow = rule.workflow
+    return WorkflowRead(
+        id=workflow.id,
+        name=workflow.name,
+        trigger=workflow.trigger,  # type: ignore[arg-type]  # validated in; the set is test-locked
+        offset_minutes=workflow.offset_minutes,
+        event_type_id=workflow.event_type_id,
+        active=workflow.active,
+        steps=[WorkflowStepRead.model_validate(step) for step in rule.steps],
+        created_at=workflow.created_at,
+        updated_at=workflow.updated_at,
+    )
+
+
+async def list_workflows_view(
+    maker: Sessionmaker, *, tenant_slug: str | None
+) -> list[WorkflowRead]:
+    """Every rule of the tenant (active and inactive), each with its steps."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rules = await workflow_rules_service.list_workflows(session, tenant_id=ctx.tenant_id)
+        return [_rule_read(rule) for rule in rules]
+
+
+async def create_workflow_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    data: WorkflowCreate,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Author a rule and ARM it against the bookings that already exist."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.create_workflow(
+                session, tenant_id=ctx.tenant_id, data=data, now=_now(now)
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return _rule_read(rule)
+
+
+async def update_workflow_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    workflow_id: uuid.UUID,
+    data: WorkflowUpdate,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Edit a rule and MAKE THE EDIT TRUE for every booking it already governs."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.update_workflow(
+                session,
+                tenant_id=ctx.tenant_id,
+                workflow_id=workflow_id,
+                data=data,
+                now=_now(now),
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if rule is None:
+            # The service returns ``None`` rather than raising for an absent row. Reported as a
+            # success, that is the panel confirming a save that never touched anything.
+            raise AdminActionError("Workflow not found")
+        return _rule_read(rule)
+
+
+async def set_workflow_active_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    workflow_id: uuid.UUID,
+    active: bool,
+    now: datetime | None = None,
+) -> WorkflowRead:
+    """Switch a rule on or off. Off PAUSES its queued messages; on re-arms and re-times them."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            rule = await workflow_rules_service.set_workflow_active(
+                session,
+                tenant_id=ctx.tenant_id,
+                workflow_id=workflow_id,
+                active=active,
+                now=_now(now),
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if rule is None:
+            raise AdminActionError("Workflow not found")
+        return _rule_read(rule)
+
+
+async def list_templates_view(
+    maker: Sessionmaker, *, tenant_slug: str | None
+) -> list[WorkflowTemplateRead]:
+    """Every message body the tenant has authored."""
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        rows = await workflow_rules_service.list_templates(session, tenant_id=ctx.tenant_id)
+        return [WorkflowTemplateRead.model_validate(row) for row in rows]
+
+
+async def create_template_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, data: WorkflowTemplateCreate
+) -> WorkflowTemplateRead:
+    """Store the body for one ``(channel, kind, locale)``."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            row = await workflow_rules_service.create_template(
+                session, tenant_id=ctx.tenant_id, data=data
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return WorkflowTemplateRead.model_validate(row)
+
+
+async def update_template_action(
+    maker: Sessionmaker,
+    *,
+    tenant_slug: str | None,
+    template_id: uuid.UUID,
+    data: WorkflowTemplateUpdate,
+) -> WorkflowTemplateRead:
+    """Edit a template's TEXT (its ``(channel, kind, locale)`` identity is immutable by design)."""
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            row = await workflow_rules_service.update_template(
+                session, tenant_id=ctx.tenant_id, template_id=template_id, data=data
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if row is None:
+            raise AdminActionError("Template not found")
+        return WorkflowTemplateRead.model_validate(row)
+
+
+async def delete_template_action(
+    maker: Sessionmaker, *, tenant_slug: str | None, template_id: uuid.UUID
+) -> None:
+    """Delete a template; refused while it is the last body a live step can render.
+
+    An absent row is an ERROR, not a quiet success: ``delete_template`` returns ``False`` for one,
+    and a handler that reports that as "deleted" tells the operator it removed something that was
+    never there (the same no-op ``deactivate_event_type`` already guards against).
+    """
+    async with maker() as session, session.begin():
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+        try:
+            deleted = await workflow_rules_service.delete_template(
+                session, tenant_id=ctx.tenant_id, template_id=template_id
+            )
+        except workflow_rules_service.WorkflowRuleError as exc:
+            raise AdminActionError(str(exc)) from exc
+        if not deleted:
+            raise AdminActionError("Template not found")
+
+
 __all__ = [
     "AdminActionError",
     "AdminContext",
@@ -463,13 +663,21 @@ __all__ = [
     "create_booking_action",
     "create_event_type_action",
     "create_schedule_action",
+    "create_template_action",
+    "create_workflow_action",
     "deactivate_event_type_action",
     "delete_schedule_action",
+    "delete_template_action",
     "list_bookings_view",
     "list_event_types_view",
     "list_schedules_view",
+    "list_templates_view",
+    "list_workflows_view",
     "reschedule_booking_action",
     "resolve_admin_context",
+    "set_workflow_active_action",
     "update_event_type_action",
     "update_schedule_action",
+    "update_template_action",
+    "update_workflow_action",
 ]

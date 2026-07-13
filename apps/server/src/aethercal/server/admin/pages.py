@@ -15,10 +15,21 @@ from __future__ import annotations
 import reflex as rx
 from reflex.vars import ObjectVar
 
+from aethercal.schemas.workflows import (
+    CHANNEL_NAMES,
+    TEMPLATE_VARIABLES,
+    WORKFLOW_TRIGGER_NAMES,
+)
+from aethercal.server.admin.format import ALL_EVENT_TYPES
 from aethercal.server.admin.state import AdminState
 from aethercal.ui import Calendar
 
-_NAV = (("Agenda", "/"), ("Event types", "/event-types"), ("Schedules", "/schedules"))
+_NAV = (
+    ("Agenda", "/"),
+    ("Event types", "/event-types"),
+    ("Schedules", "/schedules"),
+    ("Rules", "/workflows"),
+)
 
 
 def _error(message: str) -> rx.Component:
@@ -421,4 +432,261 @@ def schedules_page() -> rx.Component:
     )
 
 
-__all__ = ["bookings_page", "event_types_page", "login_page", "schedules_page"]
+# --------------------------------------------------------------------------------------
+# Notification rules + templates (RF-24).
+# --------------------------------------------------------------------------------------
+
+
+def _workflow_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    """One rule. The toggle is TWO explicit buttons chosen by the row's stored state, never one
+    button carrying "the opposite of whatever the row says" — that is a guess about state the row
+    may already hold stale, and this toggle pauses (or releases) real messages to real guests."""
+    return rx.table.row(
+        rx.table.cell(row["name"]),
+        rx.table.cell(row["trigger"]),
+        rx.table.cell(row["offset_min"]),
+        rx.table.cell(row["scope"]),
+        rx.table.cell(row["steps"]),
+        rx.table.cell(row["active"]),
+        rx.table.cell(
+            rx.cond(
+                row["active"] == "yes",
+                rx.button(
+                    "Switch off",
+                    on_click=AdminState.deactivate_workflow(row["id"]),
+                    color_scheme="red",
+                    variant="soft",
+                    size="1",
+                ),
+                rx.button(
+                    "Switch on",
+                    on_click=AdminState.activate_workflow(row["id"]),
+                    variant="soft",
+                    size="1",
+                ),
+            )
+        ),
+        rx.table.cell(rx.code(row["id"])),
+    )
+
+
+def _template_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(row["channel"]),
+        rx.table.cell(row["kind"]),
+        rx.table.cell(row["locale"]),
+        rx.table.cell(row["subject"]),
+        rx.table.cell(row["body"]),
+        rx.table.cell(
+            rx.button(
+                "Delete",
+                on_click=AdminState.delete_template(row["id"]),
+                color_scheme="red",
+                variant="soft",
+                size="1",
+            )
+        ),
+        rx.table.cell(rx.code(row["id"])),
+    )
+
+
+def _named_option(name: str) -> rx.Component:
+    return rx.select.item(name, value=name)
+
+
+def _scope_option(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.select.item(row["title"], value=row["id"])
+
+
+def _scope_select() -> rx.Component:
+    """The event type a rule governs. ``(all)`` is an EXPLICIT option, not the empty one: on the
+    update form a blank means "leave the scope alone", so widening a rule to EVERY event type has to
+    be something the operator says — never something a field they never touched does for them."""
+    return rx.select.root(
+        rx.select.trigger(placeholder="Event type (blank = unchanged)"),
+        rx.select.content(
+            rx.select.item(ALL_EVENT_TYPES, value=ALL_EVENT_TYPES),
+            rx.foreach(AdminState.event_types, _scope_option),
+        ),
+        name="event_type_id",
+    )
+
+
+def _step_fields() -> rx.Component:
+    """One ``kind`` per channel — which IS the schema's "one step per channel" rule. Two steps on
+    one channel are two dedupe keys, so the guest would get the same message twice."""
+    return rx.vstack(
+        rx.text(
+            "Steps — one content kind per channel; leave a channel blank to send nothing on it.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.input(name="email_kind", placeholder="email kind (e.g. reminder)"),
+        rx.input(name="whatsapp_kind", placeholder="whatsapp kind (needs a template)"),
+        rx.input(name="sms_kind", placeholder="sms kind (needs a template)"),
+        spacing="2",
+        width="100%",
+    )
+
+
+def workflows_page() -> rx.Component:
+    """Rule + template CRUD (RF-24).
+
+    Editing a rule here does not merely rewrite a row: the service reconciles the queued steps of
+    every booking that rule already governs, so "remind 24 h before" changed to "1 h before" moves
+    the reminder of the guest who is ALREADY in the diary. That is the whole reason this screen
+    exists rather than a thin form over a table.
+    """
+    return _shell(
+        "Notification rules",
+        _error(AdminState.error),
+        rx.text(
+            "Editing a rule also re-times the messages already queued for the bookings it "
+            "governs — "
+            "including the ones already in the diary.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell("Name"),
+                    rx.table.column_header_cell("Trigger"),
+                    rx.table.column_header_cell("Offset (min)"),
+                    rx.table.column_header_cell("Event type"),
+                    rx.table.column_header_cell("Steps"),
+                    rx.table.column_header_cell("Active"),
+                    rx.table.column_header_cell("Actions"),
+                    rx.table.column_header_cell("Id"),
+                )
+            ),
+            rx.table.body(rx.foreach(AdminState.workflows, _workflow_row)),
+            width="100%",
+        ),
+        rx.heading("Create a rule", size="4"),
+        rx.form(
+            rx.vstack(
+                rx.input(name="name", placeholder="Name (e.g. 24h reminder)", required=True),
+                rx.select.root(
+                    rx.select.trigger(placeholder="Trigger"),
+                    rx.select.content(*[_named_option(name) for name in WORKFLOW_TRIGGER_NAMES]),
+                    name="trigger",
+                    required=True,
+                ),
+                rx.input(
+                    name="offset_min",
+                    type="number",
+                    placeholder="Offset in minutes (-1440 = 24 h before the start)",
+                ),
+                _scope_select(),
+                _step_fields(),
+                rx.button("Create", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="28em",
+            ),
+            on_submit=AdminState.create_workflow,
+            reset_on_submit=True,
+        ),
+        rx.heading("Update a rule", size="4"),
+        rx.text(
+            "A blank field is left unchanged. Filling in ANY step kind REPLACES the rule's whole "
+            "step list.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.form(
+            rx.vstack(
+                rx.input(name="id", placeholder="Rule id", required=True),
+                rx.input(name="name", placeholder="New name (optional)"),
+                rx.select.root(
+                    rx.select.trigger(placeholder="New trigger (optional)"),
+                    rx.select.content(*[_named_option(name) for name in WORKFLOW_TRIGGER_NAMES]),
+                    name="trigger",
+                ),
+                rx.input(name="offset_min", type="number", placeholder="New offset (optional)"),
+                _scope_select(),
+                _step_fields(),
+                rx.button("Update", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="28em",
+            ),
+            on_submit=AdminState.update_workflow,
+            reset_on_submit=True,
+        ),
+        rx.heading("Message templates", size="4"),
+        rx.text(
+            "A step with no template is skipped at send time and the guest is never messaged "
+            "— so a "
+            "rule cannot be saved until the body its steps render exists. Only these variables are "
+            f"substituted: {', '.join('{{' + name + '}}' for name in sorted(TEMPLATE_VARIABLES))}.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell("Channel"),
+                    rx.table.column_header_cell("Kind"),
+                    rx.table.column_header_cell("Locale"),
+                    rx.table.column_header_cell("Subject"),
+                    rx.table.column_header_cell("Body"),
+                    rx.table.column_header_cell("Actions"),
+                    rx.table.column_header_cell("Id"),
+                )
+            ),
+            rx.table.body(rx.foreach(AdminState.templates, _template_row)),
+            width="100%",
+        ),
+        rx.heading("Write a template", size="4"),
+        rx.form(
+            rx.vstack(
+                rx.select.root(
+                    rx.select.trigger(placeholder="Channel"),
+                    rx.select.content(*[_named_option(name) for name in CHANNEL_NAMES]),
+                    name="channel",
+                    required=True,
+                ),
+                rx.input(name="kind", placeholder="Kind (e.g. reminder)", required=True),
+                rx.input(name="locale", placeholder="Locale (es / en)", required=True),
+                rx.input(name="subject", placeholder="Subject (email only; blank for phone)"),
+                rx.text_area(name="body", placeholder="Body", required=True),
+                rx.button("Save template", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="28em",
+            ),
+            on_submit=AdminState.create_template,
+            reset_on_submit=True,
+        ),
+        rx.heading("Edit a template's text", size="4"),
+        rx.text(
+            "Its channel / kind / locale are immutable: re-pointing a template would silently "
+            "change what every step resolving through it sends.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.form(
+            rx.vstack(
+                rx.input(name="id", placeholder="Template id", required=True),
+                rx.input(name="subject", placeholder="New subject (blank keeps current)"),
+                rx.text_area(name="body", placeholder="New body (blank keeps current)"),
+                rx.button("Update template", type="submit"),
+                spacing="3",
+                width="100%",
+                max_width="28em",
+            ),
+            on_submit=AdminState.update_template,
+            reset_on_submit=True,
+        ),
+    )
+
+
+__all__ = [
+    "bookings_page",
+    "event_types_page",
+    "login_page",
+    "schedules_page",
+    "workflows_page",
+]

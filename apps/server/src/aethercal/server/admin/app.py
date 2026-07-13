@@ -56,6 +56,14 @@ def build_admin_app(runtime: AdminRuntime) -> rx.App:
         on_load=[AdminState.require_auth, AdminState.load_schedules],
         title="Schedules · AetherCal admin",
     )
+    app.add_page(
+        pages.workflows_page,
+        route="/workflows",
+        # ``load_workflows`` also loads the templates and the event types: a rule cannot be authored
+        # without either (a step needs a body to render, and a rule needs a scope to choose).
+        on_load=[AdminState.require_auth, AdminState.load_workflows],
+        title="Notification rules · AetherCal admin",
+    )
     return app
 
 

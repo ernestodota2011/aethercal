@@ -45,6 +45,14 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.create_schedule.fn, ({},)),
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_workflows.fn, ()),
+    (AdminState.create_workflow.fn, ({},)),
+    (AdminState.update_workflow.fn, ({},)),
+    (AdminState.activate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.deactivate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.create_template.fn, ({},)),
+    (AdminState.update_template.fn, ({},)),
+    (AdminState.delete_template.fn, ("00000000-0000-0000-0000-000000000000",)),
 ]
 
 
@@ -145,8 +153,8 @@ def test_no_handler_can_skip_the_auth_census_unnoticed() -> None:
     unclassified = declared - classified
     assert unclassified == set(), (
         f"event handlers with no auth-guard proof: {sorted(unclassified)}. Add each to _GUARDED "
-        "(and prove it refuses an unauthenticated caller), or to _UI_ONLY_HANDLERS if it touches no "
-        "tenant data at all."
+        "and prove it refuses an unauthenticated caller — or, if it touches no tenant data at all, "
+        "to _UI_ONLY_HANDLERS."
     )
 
 
