@@ -3,7 +3,12 @@
  * axis, collapsible groups, and — the point of the whole view — dragging an event from one resource
  * onto another.
  */
-import type { CalendarEvent, CalendarResource, EventDropPayload } from "@aethercal/calendar-core";
+import type {
+  CalendarEvent,
+  CalendarResource,
+  EventDropPayload,
+  EventResizePayload,
+} from "@aethercal/calendar-core";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import type * as React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -294,6 +299,84 @@ describe("timeline — no dishonest drag affordance", () => {
     // the dragging state.
     expect(setData).not.toHaveBeenCalled();
     expect(container.querySelector(".aethercal-timeline.is-dragging")).toBeNull();
+  });
+});
+
+describe("timeline — resize shows a LIVE preview", () => {
+  /** Start a pointer resize on one edge of `e1` and drag it to `clientX`, WITHOUT releasing. */
+  function dragEdge(container: HTMLElement, edge: "start" | "end", clientX: number): HTMLElement {
+    const track = tracks(container)[0]!; // Dr. Rivas
+    measure(track);
+    const handle = container.querySelector<HTMLElement>(`.aethercal-tl-resize-handle-${edge}`)!;
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 1, clientX: 0 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX });
+    return container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+  }
+
+  const left = (bar: HTMLElement): number => Number.parseFloat(bar.style.left);
+  const width = (bar: HTMLElement): number => Number.parseFloat(bar.style.width);
+
+  it("grows the bar as the END edge is dragged — before the pointer is released", () => {
+    // The bug lived exactly here: the payload was right, but the bar never moved, so the user
+    // dragged an edge and saw nothing happen. Assert the GEOMETRY mid-gesture, not the final payload.
+    const { container } = renderTimeline({ onEventResize: () => {} });
+    const before = container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+    expect(width(before)).toBeCloseTo((100 / 24) * (1 / 3), 6); // 1h of a 3-day axis
+
+    // 300px track, 3-day axis: x=62.5 => 20.83% => 15:00 on day 1. The event becomes 09:00–15:00.
+    const bar = dragEdge(container, "end", 62.5);
+
+    expect(bar.className).toContain("is-resizing");
+    expect(left(bar)).toBeCloseTo(12.5, 6); // the start edge is held fixed
+    expect(width(bar)).toBeCloseTo((100 * 6) / 24 / 3, 6); // 6 hours wide, live
+  });
+
+  it("moves the bar's left edge as the START edge is dragged — before the pointer is released", () => {
+    const { container } = renderTimeline({ onEventResize: () => {} });
+
+    // x=25 => 8.33% => 06:00 on day 1. The event becomes 06:00–10:00.
+    const bar = dragEdge(container, "start", 25);
+
+    expect(left(bar)).toBeCloseTo((100 * 6) / 24 / 3, 6); // starts at 06:00
+    expect(width(bar)).toBeCloseTo((100 * 4) / 24 / 3, 6); // 4 hours wide, live
+  });
+
+  it("keeps the live geometry and the committed payload in agreement on release", () => {
+    const onEventResize = vi.fn<(p: EventResizePayload) => void>();
+    const { container } = renderTimeline({ onEventResize });
+
+    const bar = dragEdge(container, "end", 62.5);
+    const previewWidth = width(bar);
+    fireEvent.pointerUp(window, { pointerId: 1 });
+
+    // What the user SAW while dragging is what the host is told on drop — no surprise on release.
+    expect(onEventResize).toHaveBeenCalledTimes(1);
+    expect(onEventResize.mock.calls[0]![0]).toMatchObject({
+      id: "e1",
+      start: "2026-07-13T09:00:00",
+      end: "2026-07-13T15:00:00",
+    });
+    expect(previewWidth).toBeCloseTo((100 * 6) / 24 / 3, 6);
+  });
+
+  it("restores the original geometry when the gesture is cancelled", () => {
+    const onEventResize = vi.fn();
+    const { container } = renderTimeline({ onEventResize });
+
+    const bar = dragEdge(container, "end", 62.5);
+    expect(width(bar)).toBeCloseTo((100 * 6) / 24 / 3, 6);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    const after = container.querySelector<HTMLElement>("[data-event-id='e1']")!;
+    expect(width(after)).toBeCloseTo((100 / 24) * (1 / 3), 6); // back to its committed 1 hour
+    expect(after.className).not.toContain("is-resizing");
+    expect(onEventResize).not.toHaveBeenCalled();
+  });
+
+  it("offers no resize handles when the host wired no onEventResize", () => {
+    const { container } = renderTimeline();
+    expect(container.querySelector(".aethercal-tl-resize-handle")).toBeNull();
   });
 });
 

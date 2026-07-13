@@ -19,6 +19,7 @@ import {
   formatLocalDateTime,
   initialInteractionState,
   interactionReducer,
+  layoutTimelineEvent,
   parseLocalDateTime,
   timelineNowFraction,
   timelinePointAt,
@@ -978,9 +979,23 @@ export function TimelineView(props: TimelineViewProps): React.JSX.Element {
                     const timeLabel = block.allDay
                       ? messages.allDay
                       : formatEventTime(previewed?.start ?? event.start, locale);
+
+                    // While a resize is in flight the bar must actually MOVE — otherwise the user
+                    // drags an edge and sees nothing change, which is the affordance lying again (and
+                    // in the one component whose whole point is that a mutation feels instant, RF-21).
+                    // The provisional fractions come from the CORE's axis transform, never from a
+                    // local wall-clock derivation: the axis is compressed, and re-deriving it here is
+                    // exactly the bug `packLanesBy` was introduced to kill.
+                    const previewBlock = previewed
+                      ? layoutTimelineEvent(
+                          { ...event, start: previewed.start, end: previewed.end },
+                          days,
+                          timeline.config,
+                        )[0]
+                      : undefined;
                     const style: StyleWithVars = {
-                      left: pct(block.leftFraction),
-                      width: pct(block.widthFraction),
+                      left: pct(previewBlock?.leftFraction ?? block.leftFraction),
+                      width: pct(previewBlock?.widthFraction ?? block.widthFraction),
                       top: pct(block.lane / block.laneCount),
                       height: pct(1 / block.laneCount),
                       ...(event.color ? { "--ac-tl-event-accent": event.color } : {}),

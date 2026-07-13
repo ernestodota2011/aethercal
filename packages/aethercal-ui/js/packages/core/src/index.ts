@@ -83,6 +83,7 @@ export {
   MAX_TIMELINE_DAYS,
   MIN_TIMELINE_DAYS,
   buildResourceTimeline,
+  layoutTimelineEvent,
   resolveTimelineDays,
   timelineNowFraction,
   timelinePointAt,

@@ -296,6 +296,26 @@ function layoutRow(
   );
 }
 
+/**
+ * Lay out a SINGLE event on the timeline axis, ignoring overlap (it always lands on lane 0 of 1).
+ *
+ * The sibling of `layoutDayColumn` for the horizontal axis, and the piece a LIVE PREVIEW needs: while
+ * a resize gesture is in flight the React layer must draw the provisional bar with the exact same
+ * axis transform the committed geometry uses. Deriving those fractions in the React layer would mean
+ * re-implementing the compressed-axis mapping there — and the obvious re-implementation is the
+ * wall-clock one, i.e. precisely the assumption `packLanesBy` exists to kill. So the transform stays
+ * here, in the core, with one owner (RF-23).
+ *
+ * Returns `[]` when the event has no visible extent in the window (nothing to preview).
+ */
+export function layoutTimelineEvent(
+  event: CalendarEvent,
+  days: readonly string[],
+  config: TimelineConfigInput = {},
+): TimelineBlock[] {
+  return layoutRow([{ event, ...timelineSpan(event) }], days, resolveWindow(config));
+}
+
 /** A resource's slot in the display order: its own row, or the group it anchors. */
 type Slot = { kind: "group"; id: string } | { kind: "solo"; resource: CalendarResource };
 
