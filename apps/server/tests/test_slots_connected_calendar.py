@@ -4,13 +4,14 @@ The mechanism (busy cache, window coverage, safe degradation) was already built.
 was the proof that it holds once a host's calendar is ACTUALLY connected to the booking path, and
 the explicit separation of the two states that look identical from the outside and are opposites:
 
-| The host has...                        | Slots offered?  | Why                                     |
-|----------------------------------------|-----------------|-----------------------------------------|
-| no connected calendar at all           | YES             | nothing external to be ignorant of —    |
-|                                        |                 | the self-hoster (RNF-9)                 |
-| a connected calendar with a busy block | minus the block | RF-12                                   |
-| a connected calendar it cannot read,   | NO              | an unknown calendar is never free —     |
-| and no cached copy of it               |                 | RF-13                                   |
+| The host has...                      | Slots offered?  | Why                              |
+|--------------------------------------|-----------------|----------------------------------|
+| no connected calendar at all         | YES             | nothing external to be ignorant  |
+|                                      |                 | of — the self-hoster (RNF-9)     |
+| a connected calendar with a busy     | minus the block | RF-12                            |
+| block                                |                 |                                  |
+| a connected calendar it cannot read, | NO              | an unknown calendar is never     |
+| and no cached copy of it             |                 | free — RF-13                     |
 
 Reading RF-13 without that first row is what would kill the product for anyone who never linked a
 Google account: no connection and no cache reads exactly like "unreachable", and they would be left
@@ -147,7 +148,9 @@ async def _slots(
     )
 
 
-async def _book(session: AsyncSession, tenant: Tenant, event_type: EventType, start: datetime) -> None:
+async def _book(
+    session: AsyncSession, tenant: Tenant, event_type: EventType, start: datetime
+) -> None:
     await create_booking(
         session,
         tenant_id=tenant.id,

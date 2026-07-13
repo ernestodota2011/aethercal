@@ -14,9 +14,9 @@ truthful to stand on:
   calendar. The event's home is now persisted with it.
 
 These are metadata assertions: they need no database and run on every CI cell. The DDL that backs
-them belongs to the batch's SINGLE migration (``0005``, owned serially by the foundations wave) — the
-columns are declared here and CONSUMED here, never created by a second migration, so the Alembic
-chain keeps exactly one head.
+them belongs to the batch's SINGLE migration (``0005``, owned serially by the foundations wave) —
+the columns are declared here and CONSUMED here, never created by a second migration, so the
+Alembic chain keeps exactly one head.
 """
 
 from __future__ import annotations

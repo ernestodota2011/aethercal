@@ -1,8 +1,8 @@
-"""A schedule belongs to one host, or to the whole business — never to two hosts by accident (RF-30).
+"""A schedule belongs to one host, or to the whole business — never to two by accident (RF-30).
 
-``schedules`` was only tenant-scoped, so nothing stopped an event type hosted by Ana from pointing at
-a weekly pattern that Bruno owns and edits. Nothing would raise, nothing would look wrong, and the
-first symptom would be Ana taking bookings at Bruno's hours.
+``schedules`` was only tenant-scoped, so nothing stopped an event type hosted by Ana from pointing
+at a weekly pattern that Bruno owns and edits. Nothing would raise, nothing would look wrong, and
+the first symptom would be Ana taking bookings at Bruno's hours.
 
 The ownership axis is ``schedules.user_id``:
 
@@ -92,9 +92,7 @@ async def test_a_schedule_can_belong_to_one_host(
     schedule = await create_schedule(
         sqlite_session,
         tenant_id=tenant.id,
-        data=ScheduleCreate(
-            name="Ana's hours", timezone="UTC", rules={0: WORKDAY}, user_id=ana.id
-        ),
+        data=ScheduleCreate(name="Ana's hours", timezone="UTC", rules={0: WORKDAY}, user_id=ana.id),
     )
 
     assert schedule.user_id == ana.id
@@ -189,9 +187,7 @@ async def test_reassigning_the_host_re_checks_the_schedule(
     ana_hours = await create_schedule(
         sqlite_session,
         tenant_id=tenant.id,
-        data=ScheduleCreate(
-            name="Ana's hours", timezone="UTC", rules={0: WORKDAY}, user_id=ana.id
-        ),
+        data=ScheduleCreate(name="Ana's hours", timezone="UTC", rules={0: WORKDAY}, user_id=ana.id),
     )
     event_type = await create_event_type(
         sqlite_session, tenant_id=tenant.id, data=_event_type(ana, ana_hours.id)
@@ -210,8 +206,8 @@ async def test_a_schedule_cannot_be_claimed_out_from_under_its_event_types(
     sqlite_session: AsyncSession, tenant_factory: Any
 ) -> None:
     """The other direction of the same rot: a shared schedule that Ana and Bruno both use cannot be
-    quietly re-assigned to Ana — that would leave Bruno's event type running on a pattern he does not
-    own, the exact state RF-30 forbids."""
+    quietly re-assigned to Ana — that would leave Bruno's event type on a pattern he does not own,
+    the exact state RF-30 forbids."""
     tenant, ana, bruno = await _two_hosts(sqlite_session, tenant_factory)
     shared = await create_schedule(
         sqlite_session,

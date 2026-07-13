@@ -120,7 +120,7 @@ class _Events:
 
 
 class FakeGoogle:
-    """Records the calendar id of every call, so a silent fallback to ``"primary"`` is detectable."""
+    """Records the calendar id of every call, so a silent fallback to ``"primary"`` is visible."""
 
     def __init__(
         self,

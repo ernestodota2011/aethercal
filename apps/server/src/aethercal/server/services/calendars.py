@@ -26,8 +26,8 @@ usable for a query only if it is both time-fresh AND its synced coverage window 
 queried window -- a cache filled for one window never answers a query about another (that is how a
 double-booking slips through). The result is one of FRESH / STALE / UNAVAILABLE. ``FRESH`` = data
 from a covered + time-fresh cache or a successful refresh (an empty-but-covered window is FRESH with
-no busy). ``STALE`` = a refresh failed and the prior coverage fully contained the window, so we serve
-the last-known (complete-for-this-window) copy (``is_degraded``); slots may still be offered.
+no busy). ``STALE`` = a refresh failed and the prior coverage fully contained the window, so we
+serve the last-known (complete-for-this-window) copy (``is_degraded``); slots may still be offered.
 ``UNAVAILABLE`` = a refresh failed with partial or absent coverage and we cannot reach Google
 (``not is_available``) -- the slots engine MUST refuse to offer this host's slots rather than serve
 incomplete data as complete and risk a double-booking.
@@ -229,6 +229,42 @@ async def store_google_connection(
     return connection
 
 
+async def link_booking_calendar(
+    session: AsyncSession, *, connection: ExternalConnection, calendar_id: str
+) -> ExternalCalendarLink:
+    """Point a connection's bookings at ONE named calendar, and read its freebusy (RF-11).
+
+    This is the write side of the table that used to be dead. It is what lets a host book into a
+    DEDICATED secondary calendar instead of the connected account's ``primary`` — the agency
+    credential rule, and simple good hygiene for anyone connecting a real account.
+
+    Idempotent: re-running it for the same calendar (a token refresh, a re-run of the connect
+    command) updates the existing link instead of piling up rows. Designating a NEW target demotes
+    the previous one first, so the one-target-per-connection unique index is never tripped — and so
+    the operator never ends up with two targets and a dead-lettered booking.
+    """
+    links = await _links(session, connection=connection)
+    for link in links:
+        if link.external_calendar_id != calendar_id:
+            link.is_booking_target = False
+    existing = next((link for link in links if link.external_calendar_id == calendar_id), None)
+    if existing is not None:
+        existing.is_booking_target = True
+        existing.busy = True
+        await session.flush()
+        return existing
+    row = ExternalCalendarLink(
+        tenant_id=connection.tenant_id,
+        connection_id=connection.id,
+        external_calendar_id=calendar_id,
+        busy=True,
+        is_booking_target=True,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
 def load_credentials(connection: ExternalConnection, *, fernet: Fernet) -> str:
     """Decrypt and return a connection's stored OAuth token JSON (the serialized credentials).
 
@@ -299,9 +335,7 @@ async def _links(
     )
 
 
-async def busy_calendar_ids(
-    session: AsyncSession, *, connection: ExternalConnection
-) -> list[str]:
+async def busy_calendar_ids(session: AsyncSession, *, connection: ExternalConnection) -> list[str]:
     """The calendars of ``connection`` whose freebusy counts toward the host's busy set (RF-12).
 
     No links at all → the account's default calendar (the zero-config path, and what the hard-coded
@@ -746,6 +780,7 @@ __all__ = [
     "busy_calendar_ids",
     "create_event_for_booking",
     "delete_event_for_booking",
+    "link_booking_calendar",
     "load_active_connections",
     "load_credentials",
     "read_busy",

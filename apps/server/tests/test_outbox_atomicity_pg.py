@@ -223,7 +223,7 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
         event_type = (
             await session.scalars(select(EventType).where(EventType.tenant_id == tenant_id))
         ).one()
-        connection = await store_google_connection(
+        await store_google_connection(
             session,
             tenant_id=tenant_id,
             user_id=host.id,
@@ -252,8 +252,7 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
             dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
             payload={
                 "operation": GoogleOperation.UPSERT.value,
-                "connection_id": str(connection.id),
-                "external_event_id": None,
+                "host_id": str(host.id),
                 "summary": "Intro",
                 "start": start.isoformat(),
                 "end": (start + timedelta(minutes=30)).isoformat(),
@@ -280,12 +279,11 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
 
 
 def _google_sync_payload(
-    connection_id: uuid.UUID, operation: GoogleOperation, start: datetime
+    host_id: uuid.UUID, operation: GoogleOperation, start: datetime
 ) -> dict[str, Any]:
     return {
         "operation": operation.value,
-        "connection_id": str(connection_id),
-        "external_event_id": None,
+        "host_id": str(host_id),
         "summary": "Intro",
         "start": start.isoformat(),
         "end": (start + timedelta(minutes=30)).isoformat(),
@@ -309,7 +307,7 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
         event_type = (
             await session.scalars(select(EventType).where(EventType.tenant_id == tenant_id))
         ).one()
-        connection = await store_google_connection(
+        await store_google_connection(
             session,
             tenant_id=tenant_id,
             user_id=host.id,
@@ -340,7 +338,7 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
             booking_id=b1.id,
             effect=OutboxEffect.GOOGLE,
             dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
-            payload=_google_sync_payload(connection.id, GoogleOperation.UPSERT, start),
+            payload=_google_sync_payload(host.id, GoogleOperation.UPSERT, start),
         )
         await enqueue_effect(
             session,
@@ -348,7 +346,7 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
             booking_id=b2.id,
             effect=OutboxEffect.GOOGLE,
             dedupe_key=google_dedupe_key(GoogleOperation.RESCHEDULE),
-            payload=_google_sync_payload(connection.id, GoogleOperation.RESCHEDULE, start),
+            payload=_google_sync_payload(host.id, GoogleOperation.RESCHEDULE, start),
         )
         b1_id, b2_id = b1.id, b2.id
 

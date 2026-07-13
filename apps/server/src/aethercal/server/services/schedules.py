@@ -80,7 +80,7 @@ class ScheduleValidationError(ScheduleServiceError):
 
 
 class ScheduleOwnershipError(ScheduleServiceError):
-    """The schedule's owner is not a host of this tenant, or claiming it would strand a host (→ 422).
+    """The owner is not a host of this tenant, or claiming the schedule would strand one (→ 422).
 
     RF-30. A schedule is owned by ONE host (``user_id``) or shared by the business (``NULL``).
     Assigning it to a stranger, or claiming a schedule that another host's event types already run
@@ -342,9 +342,9 @@ async def update_schedule(
     if "user_id" in data.model_fields_set:
         await _ensure_owner_is_a_host(session, tenant_id=tenant_id, user_id=data.user_id)
         if data.user_id is not None:
-            stranded = await _hosts_using(
-                session, tenant_id=tenant_id, schedule_id=row.id
-            ) - {data.user_id}
+            stranded = await _hosts_using(session, tenant_id=tenant_id, schedule_id=row.id) - {
+                data.user_id
+            }
             if stranded:
                 raise ScheduleOwnershipError(
                     f"schedule {row.id} is in use by {len(stranded)} other host(s); giving it to "
