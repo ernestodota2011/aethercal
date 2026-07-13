@@ -14,7 +14,12 @@ import pytest
 from pydantic import ValidationError
 
 from aethercal.core.model import BookingStatus
-from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
+from aethercal.schemas.bookings import (
+    BookingCreate,
+    BookingRead,
+    BookingReschedule,
+    normalize_phone,
+)
 
 
 def _valid_create_kwargs() -> dict[str, object]:
@@ -79,3 +84,81 @@ def test_booking_read_maps_columns_and_hides_internal_fields() -> None:
 def test_booking_reschedule_carries_the_new_start() -> None:
     body = BookingReschedule.model_validate({"new_start": "2026-07-06T11:00:00+00:00"})
     assert body.new_start == datetime(2026, 7, 6, 11, 0, tzinfo=UTC)
+
+
+# --------------------------------------------------------------------------------------
+# Guest phone + consent (RF-24). The phone is E.164 on the wire; the consent is a BOOLEAN the
+# server stamps into ``bookings.guest_phone_consent_at``. A checkbox whose answer is discarded is
+# not consent, so the contract has to carry it — these tests pin that it does.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("+13054131728", "+13054131728"),  # already canonical
+        ("+1 (305) 413-1728", "+13054131728"),  # the formatting a human actually types
+        ("  +34 600 123 456  ", "+34600123456"),  # surrounding whitespace
+        ("+1.305.413.1728", "+13054131728"),  # dot-separated
+    ],
+)
+def test_normalize_phone_strips_human_formatting_to_e164(raw: str, expected: str) -> None:
+    assert normalize_phone(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "3054131728",  # no country code: we must NEVER guess one
+        "+0305413172",  # E.164 country codes never start at 0
+        "+1305413172812345",  # > 15 digits
+        "+",  # no digits
+        "",  # empty
+        "not a phone",
+        "+1-305-413-1728 ext 4",  # trailing junk is not silently dropped
+        "+1305413172a",  # a letter hiding among the digits
+    ],
+)
+def test_normalize_phone_rejects_anything_that_is_not_e164(raw: str) -> None:
+    assert normalize_phone(raw) is None
+
+
+def test_booking_create_defaults_to_no_phone_and_no_consent() -> None:
+    payload = BookingCreate.model_validate(_valid_create_kwargs())
+    assert payload.guest_phone is None
+    assert payload.guest_phone_consent is False  # never pre-ticked, never assumed
+
+
+def test_booking_create_normalizes_and_carries_a_consented_phone() -> None:
+    payload = BookingCreate.model_validate(
+        {
+            **_valid_create_kwargs(),
+            "guest_phone": "+1 (305) 413-1728",
+            "guest_phone_consent": True,
+        }
+    )
+    assert payload.guest_phone == "+13054131728"
+    assert payload.guest_phone_consent is True
+
+
+def test_booking_create_accepts_a_phone_without_consent() -> None:
+    """A number with no consent is a REAL state the outbox gate is built to refuse — not an error.
+
+    The guest typed a number but did not tick the box: we may hold it, we may never message it.
+    """
+    payload = BookingCreate.model_validate(
+        {**_valid_create_kwargs(), "guest_phone": "+13054131728"}
+    )
+    assert payload.guest_phone == "+13054131728"
+    assert payload.guest_phone_consent is False
+
+
+def test_booking_create_rejects_a_malformed_phone() -> None:
+    with pytest.raises(ValidationError):
+        BookingCreate.model_validate({**_valid_create_kwargs(), "guest_phone": "305-413-1728"})
+
+
+def test_booking_create_rejects_consent_for_a_phone_that_was_never_given() -> None:
+    """Consent that references no number consents to nothing. Fail loudly rather than stamp it."""
+    with pytest.raises(ValidationError):
+        BookingCreate.model_validate({**_valid_create_kwargs(), "guest_phone_consent": True})

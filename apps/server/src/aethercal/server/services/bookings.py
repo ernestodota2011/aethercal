@@ -105,7 +105,13 @@ class BookingNotEndedError(BookingError):
 
 @dataclass(frozen=True, slots=True)
 class BookingParams:
-    """The guest-supplied inputs for a new booking (RF-07). ``end`` is derived from the duration."""
+    """The guest-supplied inputs for a new booking (RF-07). ``end`` is derived from the duration.
+
+    ``guest_phone_consent`` is a BOOLEAN here, never a timestamp: the caller reports *that* the
+    guest ticked the box, and :func:`create_booking` stamps ``guest_phone_consent_at`` from the
+    server's own clock. So a caller cannot back-date a consent, and cannot assert one for a number
+    it did not also supply (see :func:`_consent_stamp`).
+    """
 
     event_type_id: uuid.UUID
     start: datetime
@@ -115,6 +121,11 @@ class BookingParams:
     guest_notes: str | None = None
     answers: dict[str, Any] | None = None
     locale: str = "es"
+    #: The guest's phone in E.164 (validated at the edge by ``BookingCreate``), or ``None``.
+    guest_phone: str | None = None
+    #: Whether the guest EXPLICITLY consented to be messaged there. Never assumed: an unticked box
+    #: and an absent field mean the same thing — no consent.
+    guest_phone_consent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +307,24 @@ async def _lock_and_reload_booking(
 # --------------------------------------------------------------------------------------
 
 
+def _consent_stamp(params: BookingParams, *, now: datetime) -> datetime | None:
+    """When the guest consented to be messaged on their phone — or ``None`` if they did not.
+
+    This is the ONLY place ``bookings.guest_phone_consent_at`` is written on the create path, and
+    it writes the SERVER's ``now``, never a client-supplied instant: the column is evidence that
+    this person agreed, at this moment, so a client must not be able to author it.
+
+    Consent without a number is refused here rather than stamped. ``BookingCreate`` already rejects
+    that payload at the edge (422), but the service is reachable without it — the admin builds
+    :class:`BookingParams` directly — and a stamp on a row with no phone would assert that a guest
+    agreed to be messaged at a number that does not exist. Two belts, because the thing on the
+    other side of them is an unsolicited message to a real person's phone.
+    """
+    if not params.guest_phone_consent or params.guest_phone is None:
+        return None
+    return now
+
+
 async def create_booking(
     session: AsyncSession,
     *,
@@ -337,6 +366,8 @@ async def create_booking(
         guest_name=params.guest_name,
         guest_email=params.guest_email,
         guest_timezone=params.guest_timezone,
+        guest_phone=params.guest_phone,
+        guest_phone_consent_at=_consent_stamp(params, now=now),
         guest_notes=params.guest_notes,
         answers=dict(params.answers) if params.answers is not None else {},
     )

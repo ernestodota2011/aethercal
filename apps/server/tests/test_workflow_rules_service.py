@@ -21,6 +21,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -69,6 +70,7 @@ from aethercal.server.services.workflow_rules import (
     get_workflow,
     list_templates,
     list_workflows,
+    phone_channel_scope,
     set_workflow_active,
     update_template,
     update_workflow,
@@ -991,3 +993,142 @@ def test_the_dedupe_key_is_built_from_uuids() -> None:
     """Guard against a stray string id sneaking into the key a message's uniqueness depends on."""
     key = workflow_step_dedupe_key(uuid.uuid4(), uuid.uuid4(), Channel.EMAIL)
     assert key.startswith("wf:") and key.endswith(":email")
+
+
+# --------------------------------------------------------------------------------------
+# Who may be asked for a phone (RF-24 + RNF-8). The booking page asks for a phone number ONLY
+# where an ACTIVE WhatsApp/SMS rule will actually use it. Every case below is a case where the
+# naive implementation ("does the tenant have any rule?") would collect a stranger's phone number
+# for nothing — and collecting PII you will never use is the whole thing RNF-8 forbids.
+# --------------------------------------------------------------------------------------
+
+
+async def _whatsapp_template(session: AsyncSession, tenant: Tenant) -> None:
+    await create_template(
+        session,
+        tenant_id=tenant.id,
+        data=WorkflowTemplateCreate(
+            channel="whatsapp", kind="reminder", locale="es", body="Hola {{guest_name}}"
+        ),
+    )
+
+
+async def _phone_rule(  # noqa: PLR0913 - each argument is a distinct axis of the case under test
+    session: AsyncSession,
+    tenant: Tenant,
+    *,
+    event_type_id: uuid.UUID | None,
+    name: str,
+    channel: str = "whatsapp",
+    active: bool = True,
+) -> None:
+    await create_workflow(
+        session,
+        tenant_id=tenant.id,
+        now=_NOW,
+        data=WorkflowCreate(
+            name=name,
+            trigger="before_start",
+            offset_minutes=-60,
+            event_type_id=event_type_id,
+            active=active,
+            steps=[WorkflowStepIn(channel=channel, kind="reminder")],
+        ),
+    )
+
+
+async def test_no_rules_at_all_asks_nobody_for_a_phone(
+    sqlite_session: AsyncSession, tenant: Tenant
+) -> None:
+    event_type = await _event_type(sqlite_session, tenant)
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(event_type.id) is False
+
+
+async def test_an_email_only_rule_does_not_ask_for_a_phone(
+    sqlite_session: AsyncSession, tenant: Tenant, reminder: WorkflowCreate
+) -> None:
+    """The seeded 24 h e-mail reminder governs every tenant. It must not make anyone type a phone.
+
+    This is the case that turns "does the tenant have a rule?" into a phone field on every booking
+    form on the instance — the reason the channel filter exists.
+    """
+    event_type = await _event_type(sqlite_session, tenant)
+    await create_workflow(sqlite_session, tenant_id=tenant.id, now=_NOW, data=reminder)
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(event_type.id) is False
+
+
+async def test_an_active_whatsapp_rule_scoped_to_one_event_type_asks_only_there(
+    sqlite_session: AsyncSession, tenant: Tenant
+) -> None:
+    """A rule bound to ONE event type must not make the OTHER one collect a phone it never uses."""
+    governed = await _event_type(sqlite_session, tenant, slug="intro")
+    untouched = await _event_type(sqlite_session, tenant, slug="demo")
+    await _whatsapp_template(sqlite_session, tenant)
+    await _phone_rule(sqlite_session, tenant, event_type_id=governed.id, name="wa intro")
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(governed.id) is True
+    assert scope.covers(untouched.id) is False
+
+
+async def test_a_tenant_wide_rule_asks_on_every_event_type(
+    sqlite_session: AsyncSession, tenant: Tenant
+) -> None:
+    """``event_type_id = NULL`` means "all of them" — so every booking form must ask."""
+    first = await _event_type(sqlite_session, tenant, slug="intro")
+    second = await _event_type(sqlite_session, tenant, slug="demo")
+    await _whatsapp_template(sqlite_session, tenant)
+    await _phone_rule(sqlite_session, tenant, event_type_id=None, name="wa all")
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(first.id) is True
+    assert scope.covers(second.id) is True
+
+
+async def test_a_switched_off_phone_rule_stops_asking_for_the_phone(
+    sqlite_session: AsyncSession, tenant: Tenant
+) -> None:
+    """A paused rule sends nothing — so it may collect nothing. ``active`` is the whole question."""
+    event_type = await _event_type(sqlite_session, tenant)
+    await _whatsapp_template(sqlite_session, tenant)
+    await _phone_rule(
+        sqlite_session, tenant, event_type_id=event_type.id, name="wa off", active=False
+    )
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(event_type.id) is False
+
+
+async def test_an_sms_rule_asks_for_the_phone_too(
+    sqlite_session: AsyncSession, tenant: Tenant
+) -> None:
+    event_type = await _event_type(sqlite_session, tenant)
+    await create_template(
+        sqlite_session,
+        tenant_id=tenant.id,
+        data=WorkflowTemplateCreate(
+            channel="sms", kind="reminder", locale="es", body="Hola {{guest_name}}"
+        ),
+    )
+    await _phone_rule(
+        sqlite_session, tenant, event_type_id=event_type.id, name="sms r", channel="sms"
+    )
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(event_type.id) is True
+
+
+async def test_another_tenants_phone_rule_never_makes_us_ask(
+    sqlite_session: AsyncSession, tenant: Tenant, tenant_factory: Any
+) -> None:
+    """Isolation: a neighbour's WhatsApp rule must not make OUR guests hand over their number."""
+    ours = await _event_type(sqlite_session, tenant)
+    neighbour = await tenant_factory(sqlite_session)
+    await _whatsapp_template(sqlite_session, neighbour)
+    await _phone_rule(sqlite_session, neighbour, event_type_id=None, name="wa all")
+
+    scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
+    assert scope.covers(ours.id) is False

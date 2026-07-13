@@ -13,18 +13,45 @@ guest-facing ``meeting_url`` is.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from aethercal.core.model import BookingStatus
 
 GuestName = Annotated[str, Field(min_length=1, max_length=255)]
 GuestEmail = Annotated[str, Field(min_length=3, max_length=320)]
 GuestTimezone = Annotated[str, Field(min_length=1, max_length=64)]
+# The bound on the RAW submitted string — generous enough for the punctuation a human types
+# (``+1 (305) 413-1728`` is 17 characters), tight enough that a hostile payload cannot hand the
+# normalizer a megabyte to chew on. The REAL shape is enforced by ``_E164`` after normalization:
+# a ``+``, a non-zero country digit, then up to 14 more — 15 digits max, so 16 characters, which
+# ``bookings.guest_phone`` (``String(20)``) can never overflow.
+GuestPhone = Annotated[str, Field(min_length=2, max_length=32)]
+
+#: The canonical E.164 form — the ONLY shape that reaches the database.
+_E164 = re.compile(r"^\+[1-9]\d{1,14}$")
+#: Punctuation a human sprinkles through a phone number. It is stripped before matching; anything
+#: left over that is not a digit (a letter, an "ext", a second ``+``) makes the number INVALID
+#: rather than being quietly discarded — deleting characters until a string parses is how you end
+#: up messaging a stranger's phone.
+_PHONE_PUNCTUATION = re.compile(r"[\s\-().]")
+
+
+def normalize_phone(value: str) -> str | None:
+    """Canonicalize a human-typed phone to E.164, or ``None`` if it simply is not one.
+
+    Formatting is forgiven (``+1 (305) 413-1728`` → ``+13054131728``); a missing country code is
+    NOT. A bare ``3054131728`` could belong to a dozen countries, and guessing one means a
+    WhatsApp message sent to a stranger. The caller decides what ``None`` means: the booking form
+    turns it into a friendly field error, the API contract into a 422.
+    """
+    candidate = _PHONE_PUNCTUATION.sub("", value.strip())
+    return candidate if _E164.match(candidate) else None
 
 
 def _require_iana_zone(value: str) -> str:
@@ -50,7 +77,13 @@ def _require_emailish(value: str) -> str:
 
 
 class BookingCreate(BaseModel):
-    """Request body to book a slot (RF-07). Only ``start`` is sent; ``end`` is server-derived."""
+    """Request body to book a slot (RF-07). Only ``start`` is sent; ``end`` is server-derived.
+
+    ``guest_phone`` / ``guest_phone_consent`` carry RF-24's consent across the wire. The consent is
+    a **boolean the guest actively set**, not a timestamp the client invents: the SERVER stamps
+    ``bookings.guest_phone_consent_at`` from its own clock, so a client can neither back-date a
+    consent nor forge one for a booking it did not just make.
+    """
 
     event_type_id: uuid.UUID
     start: datetime
@@ -60,6 +93,11 @@ class BookingCreate(BaseModel):
     guest_notes: Annotated[str | None, Field(max_length=2000)] = None
     answers: dict[str, Any] | None = None
     locale: Annotated[str | None, Field(max_length=16)] = None
+    #: The guest's phone in E.164 — ``None`` when they gave none. Booking without one always works.
+    guest_phone: GuestPhone | None = None
+    #: Whether the guest EXPLICITLY agreed to be messaged on that number. Defaults to ``False``:
+    #: consent is opted INTO, never assumed, and never pre-ticked.
+    guest_phone_consent: bool = False
 
     @field_validator("guest_timezone")
     @classmethod
@@ -70,6 +108,30 @@ class BookingCreate(BaseModel):
     @classmethod
     def _validate_email(cls, value: str) -> str:
         return _require_emailish(value)
+
+    @field_validator("guest_phone")
+    @classmethod
+    def _validate_phone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_phone(value)
+        if normalized is None:
+            raise ValueError(
+                "guest_phone must be an E.164 number including the country code (e.g. +13054131728)"
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def _consent_needs_a_number(self) -> BookingCreate:
+        """Refuse consent that references no number — it consents to nothing, and cannot be proven.
+
+        Accepting it would write ``guest_phone_consent_at`` onto a row with no phone: a stamp
+        asserting the guest agreed to be messaged somewhere we cannot name. The inverse (a number
+        with no consent) is legitimate and stays allowed — the outbox gate is built to refuse it.
+        """
+        if self.guest_phone_consent and self.guest_phone is None:
+            raise ValueError("guest_phone_consent requires a guest_phone to consent about")
+        return self
 
 
 class BookingReschedule(BaseModel):
@@ -103,4 +165,4 @@ class BookingRead(BaseModel):
     created_at: datetime
 
 
-__all__ = ["BookingCreate", "BookingRead", "BookingReschedule"]
+__all__ = ["BookingCreate", "BookingRead", "BookingReschedule", "normalize_phone"]
