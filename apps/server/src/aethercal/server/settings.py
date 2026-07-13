@@ -64,18 +64,32 @@ class Settings(BaseSettings):
     @field_validator("metrics_token", mode="after")
     @classmethod
     def _validate_metrics_token(cls, value: str | None) -> str | None:
-        """Blank means UNSET; anything else must be long enough to actually be a secret.
+        """Blank means UNSET; anything else must be a secret that can actually be COMPARED.
 
-        Two failure modes, two different answers, neither of them silent:
+        Three failure modes, three different answers, none of them silent:
 
         * ``AETHERCAL_METRICS_TOKEN=`` (or spaces) is a blank an operator left in an env file, not a
           password. It reads as ``None`` — the endpoint is off, and off is CLOSED. It must never
           become a "token" that an empty header matches.
-        * a short token is a hole with the light left on: the endpoint LOOKS guarded, and everybody
-          downstream assumes it is. That fails at boot, loudly, rather than being discovered later.
+        * a SHORT token is a hole with the light left on: the endpoint LOOKS guarded, and everybody
+          downstream assumes it is. That fails at boot, loudly, rather than being found out later.
+        * a NON-ASCII token fails in the opposite direction, which is why it is easy to miss: it is
+          long, it looks like a perfectly good secret, and ``secrets.compare_digest`` cannot compare
+          it at all — comparing non-ASCII ``str`` raises ``TypeError``. A guard nobody can ever
+          present correctly is not a guard; it is an outage lying in wait for the day somebody
+          actually needs the metrics. Homoglyphs make it worse: two tokens that render identically
+          in a terminal do not compare equal. A token is bytes-with-a-keyboard.
         """
         if value is None or not value.strip():
             return None
+        if not value.isascii():
+            raise ValueError(
+                "AETHERCAL_METRICS_TOKEN must be ASCII. A non-ASCII token cannot be compared in "
+                "constant time (secrets.compare_digest refuses non-ASCII str), so it would be a "
+                "guard nobody could ever satisfy — and homoglyphs make two visually identical "
+                "tokens unequal. Generate one with: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
         if len(value) < METRICS_TOKEN_MIN_LENGTH:
             raise ValueError(
                 f"AETHERCAL_METRICS_TOKEN must be at least {METRICS_TOKEN_MIN_LENGTH} characters "

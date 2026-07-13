@@ -45,12 +45,30 @@ router = APIRouter(tags=["metrics"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
+def _token_matches(presented: str, configured: str) -> bool:
+    """Constant-time compare, ==over BYTES, so that it CANNOT raise.==
+
+    ``secrets.compare_digest`` accepts ``str`` only when BOTH sides are ASCII, and raises
+    ``TypeError`` otherwise. The presented token is attacker-controlled: one accented character in
+    the header crashed this comparison, and the endpoint whose entire purpose is to TELL YOU
+    SOMETHING IS WRONG answered 500 — from inside its own auth check, to an unauthenticated caller.
+    ==A 500 on the observability surface is the worst 500 available:== the operator debugging an
+    outage finds their instruments broken by the very request they made to read them.
+
+    Encoding both sides explicitly makes the comparison TOTAL: every possible header is now either a
+    match or a 401, and nothing is left that can throw. (The configured side is already guaranteed
+    ASCII — ``Settings`` refuses to boot otherwise — so this is the belt to that braces, and it
+    guards the one input we do not control.)
+    """
+    return secrets.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))
+
+
 def _require_operator(request: Request) -> None:
     """Authorise a scrape with the OPERATOR token, or refuse. ==Never with a tenant's API key.==
 
     503 when no token is configured (the endpoint is OFF, and OFF is closed); 401 when the token is
-    missing or wrong. ``compare_digest`` because a plain ``==`` over a secret leaks its prefix to a
-    patient attacker one byte at a time.
+    missing, wrong, or unpresentable. Constant-time, because a plain ``==`` over a secret leaks its
+    prefix to a patient attacker one byte at a time.
     """
     settings: Settings = request.app.state.settings
     configured = settings.metrics_token
@@ -67,7 +85,7 @@ def _require_operator(request: Request) -> None:
             },
         )
     presented = bearer_token(request)
-    if presented is None or not secrets.compare_digest(presented, configured):
+    if presented is None or not _token_matches(presented, configured):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "unauthorized", "message": "Invalid or missing metrics token"},

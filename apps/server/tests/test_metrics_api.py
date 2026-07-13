@@ -193,11 +193,58 @@ async def test_metrics_with_the_operator_token_serves_prometheus_text(
     assert "ada@example.com" not in body
 
 
+async def test_a_non_ascii_bearer_token_is_401_not_500(
+    sqlite_maker: async_sessionmaker[AsyncSession], client_factory: ClientFactory
+) -> None:
+    """==A 500 on the observability endpoint is the worst 500 available.==
+
+    ``secrets.compare_digest`` REFUSES to compare non-ASCII ``str``: it raises ``TypeError``. So a
+    bearer token carrying one accented character crashed the comparison, and the surface whose whole
+    job is to TELL YOU SOMETHING IS WRONG answered 500 — from inside its own auth check, to an
+    unauthenticated caller. An operator debugging an outage would find their instruments broken by
+    the very request they made to read them.
+
+    A wrong token is a wrong token, whatever alphabet it is written in: 401.
+    """
+    await _seed(sqlite_maker)
+    client = await client_factory(metrics_token=_TOKEN)
+
+    # BYTES, because httpx itself refuses to ascii-encode a non-ASCII header value — which is
+    # precisely why this reaches the server as raw bytes in the wild, and why the handler must cope.
+    # ASGI carries headers as bytes and Starlette decodes them latin-1, so the token arrives at the
+    # comparison as a non-ASCII `str`: exactly the input that used to raise TypeError.
+    resp = await client.get(
+        "/api/v1/metrics",
+        headers={"Authorization": ("Bearer " + "m" * 39 + "é").encode()},
+    )
+
+    assert resp.status_code == 401
+
+
 def test_a_token_too_short_to_be_a_secret_is_refused_at_boot() -> None:
     """A configured-but-weak token is not a degraded feature — it is a hole with the light left on.
     It fails LOUDLY, at construction, rather than guarding the endpoint with something guessable."""
     with pytest.raises(ValueError, match="AETHERCAL_METRICS_TOKEN"):
         Settings(database_url="postgresql://unused/db", app_secret="s", metrics_token="short")
+
+
+def test_a_non_ascii_configured_token_is_refused_at_boot() -> None:
+    """==Fail-closed, exactly like every other misconfiguration of this token.==
+
+    Long enough, but not ASCII. It sails past the length check and then stands in front of the
+    endpoint as a secret that ``compare_digest`` cannot compare at all — a "guard" nobody can ever
+    present correctly is not a guard, it is an outage lying in wait for the day somebody needs the
+    metrics.
+
+    Non-ASCII secrets are a homoglyph trap besides: two tokens that render identically in a terminal
+    do not compare equal. A token is bytes-with-a-keyboard. Checked here, at boot, rather than
+    discovered at 3am."""
+    with pytest.raises(ValueError, match="AETHERCAL_METRICS_TOKEN"):
+        Settings(
+            database_url="postgresql://unused/db",
+            app_secret="s",
+            metrics_token="m" * 39 + "é",
+        )
 
 
 def test_an_empty_token_reads_as_unset_rather_than_as_a_password() -> None:
