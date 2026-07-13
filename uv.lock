@@ -20,13 +20,12 @@ members = [
 
 [[package]]
 name = "aethercal"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "packages/aethercal" }
 dependencies = [
     { name = "aethercal-client" },
     { name = "aethercal-core" },
     { name = "aethercal-schemas" },
-    { name = "typer" },
 ]
 
 [package.metadata]
@@ -34,7 +33,6 @@ requires-dist = [
     { name = "aethercal-client", editable = "packages/aethercal-client" },
     { name = "aethercal-core", editable = "packages/aethercal-core" },
     { name = "aethercal-schemas", editable = "packages/aethercal-schemas" },
-    { name = "typer", specifier = ">=0.12" },
 ]
 
 [[package]]
@@ -56,7 +54,7 @@ requires-dist = [
 
 [[package]]
 name = "aethercal-client"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "packages/aethercal-client" }
 dependencies = [
     { name = "aethercal-schemas" },
@@ -71,7 +69,7 @@ requires-dist = [
 
 [[package]]
 name = "aethercal-core"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "packages/aethercal-core" }
 dependencies = [
     { name = "icalendar" },
@@ -145,7 +143,7 @@ dev = [
 
 [[package]]
 name = "aethercal-schemas"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "packages/aethercal-schemas" }
 dependencies = [
     { name = "aethercal-core" },
@@ -214,7 +212,7 @@ provides-extras = ["google"]
 
 [[package]]
 name = "aethercal-ui"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "packages/aethercal-ui" }
 
 [package.optional-dependencies]
