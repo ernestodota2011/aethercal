@@ -60,9 +60,15 @@ async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
 
 
 @pytest_asyncio.fixture
-async def seeded(app: FastAPI) -> dict[str, Any]:
-    """Seed a tenant + host + open schedule + event type + API key; return ids, headers, slots."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+async def seeded(app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]) -> dict[str, Any]:
+    """Seed a tenant + host + open schedule + event type + API key; return ids, headers, slots.
+
+    ==On the OWNER engine.== Under ``FORCE ROW LEVEL SECURITY`` these INSERTs carry a business
+    that nothing has bound yet, so the ``WITH CHECK`` refuses every one of them on the app role.
+    The REQUEST is the system under test, and it binds its own business — from the API key this
+    fixture returns, through the resolver, in ``require_api_key``.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Seeded Tenant")
         session.add(tenant)
@@ -118,9 +124,14 @@ def _payload(seeded: dict[str, Any], start: str) -> dict[str, Any]:
 
 
 async def _mint_token(
-    app: FastAPI, *, booking_id: uuid.UUID, tenant_id: uuid.UUID, purpose: GuestTokenPurpose
+    owner_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    purpose: GuestTokenPurpose,
 ) -> str:
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    """Arrangement: the guest link the product would have e-mailed. On the OWNER engine."""
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         return await issue_guest_token(
             session,
@@ -151,7 +162,9 @@ async def test_create_returns_201_and_confirms(
 
 
 async def test_http_create_enqueues_email_intent_but_not_google(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     """R6 deferral is clean + safe: the real HTTP booking path ALWAYS enqueues the confirmation
     email intent (durable, drained post-commit), but with no host ``ExternalConnection`` resolved it
@@ -164,7 +177,9 @@ async def test_http_create_enqueues_email_intent_but_not_google(
     assert resp.status_code == 201
     booking_id = uuid.UUID(resp.json()["id"])
 
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    # Observation, on the OWNER engine: what the REQUEST wrote, read back by something that can
+    # see every business — so a row filed under the wrong one would show up, not vanish.
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session:
         rows = list(
             (await session.scalars(select(Outbox).where(Outbox.booking_id == booking_id))).all()
@@ -212,14 +227,16 @@ async def test_get_and_list(wired_client: AsyncClient, seeded: dict[str, Any]) -
 
 
 async def test_cancel_via_guest_token(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     created = await wired_client.post(
         BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
     )
     booking_id = created.json()["id"]
     token = await _mint_token(
-        app,
+        owner_maker,
         booking_id=uuid.UUID(booking_id),
         tenant_id=seeded["tenant_id"],
         purpose=GuestTokenPurpose.CANCEL,
@@ -262,13 +279,15 @@ async def test_reschedule_via_api_key(wired_client: AsyncClient, seeded: dict[st
 # --------------------------------------------------------------------------------------
 
 
-async def _book_in_the_past(app: FastAPI, seeded: dict[str, Any]) -> uuid.UUID:
+async def _book_in_the_past(
+    owner_maker: async_sessionmaker[AsyncSession], seeded: dict[str, Any]
+) -> uuid.UUID:
     """A CONFIRMED booking whose appointment has already ENDED.
 
     Inserted directly: the create path (rightly) refuses to book a slot in the past, and a no-show
-    is only ever a statement about an appointment that already happened.
+    is only ever a statement about an appointment that already happened. On the OWNER engine.
     """
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     start = datetime.now(UTC) - timedelta(hours=2)
     async with sessionmaker() as session, session.begin():
         booking = Booking(
@@ -287,12 +306,14 @@ async def _book_in_the_past(app: FastAPI, seeded: dict[str, Any]) -> uuid.UUID:
 
 
 async def test_no_show_requires_the_api_key(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     """No guest-token door, deliberately: cancelling is the guest's right, but declaring that they
     failed to show up is the HOST's judgement about them. A guest-reachable no-show would also hand
     anyone holding an emailed link a way to smear the record."""
-    booking_id = await _book_in_the_past(app, seeded)
+    booking_id = await _book_in_the_past(owner_maker, seeded)
 
     resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show")
 
@@ -300,9 +321,11 @@ async def test_no_show_requires_the_api_key(
 
 
 async def test_no_show_marks_a_finished_booking(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
-    booking_id = await _book_in_the_past(app, seeded)
+    booking_id = await _book_in_the_past(owner_maker, seeded)
 
     resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
 
@@ -311,9 +334,11 @@ async def test_no_show_marks_a_finished_booking(
 
 
 async def test_no_show_is_idempotent_over_http(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
-    booking_id = await _book_in_the_past(app, seeded)
+    booking_id = await _book_in_the_past(owner_maker, seeded)
     first = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
 
     again = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
@@ -340,9 +365,11 @@ async def test_no_show_of_an_unfinished_booking_returns_409_not_ended(
 
 
 async def test_no_show_of_a_cancelled_booking_returns_409_not_active(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
-    booking_id = await _book_in_the_past(app, seeded)
+    booking_id = await _book_in_the_past(owner_maker, seeded)
     await wired_client.post(f"{BOOKINGS}{booking_id}/cancel", headers=seeded["headers"])
 
     resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
@@ -360,11 +387,13 @@ async def test_no_show_of_an_unknown_booking_returns_404(
 
 
 async def test_no_show_fans_out_the_webhook_over_http(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     """End to end on the real database: the transition and its delivery row commit together."""
-    booking_id = await _book_in_the_past(app, seeded)
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         session.add(
             Webhook(
@@ -390,7 +419,9 @@ async def test_no_show_fans_out_the_webhook_over_http(
 
 
 async def test_a_deactivated_event_type_is_indistinguishable_from_an_unknown_one(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     """RF-14 over HTTP: "deleting" an event type must actually stop it taking bookings — and must
     not become an oracle for which ones a business has switched off.
@@ -411,7 +442,8 @@ async def test_a_deactivated_event_type_is_indistinguishable_from_an_unknown_one
     assert unknown.status_code == 404
 
     # Soft-delete through the service (the event-types router is not mounted on this client).
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    # Arrangement for the request that follows — so, the OWNER engine.
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         assert await deactivate_event_type(
             session,

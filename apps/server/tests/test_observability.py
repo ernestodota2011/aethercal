@@ -21,6 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
@@ -33,6 +34,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.db.pools import BypassReason, WorkerPools, mark_bypass
 from aethercal.server.observability import (
     DRAIN_COUNTERS,
     DrainCounters,
@@ -41,6 +43,61 @@ from aethercal.server.observability import (
     render_prometheus,
 )
 from aethercal.server.services.outbox import OutboxEffect, OutboxReport, OutboxWork, drain_outbox
+
+
+@pytest.fixture(autouse=True)
+def _the_offline_session_is_a_scan_session(sqlite_session: AsyncSession) -> None:
+    """==Mark the fixture, because ``collect_metrics`` now REFUSES a session with no bypass.==
+
+    It reads across EVERY business by design, and it fills its gauges with zeros wherever it finds
+    nothing. Under row-level security, on the app role, those two facts together produce
+    ``outbox.due = 0`` and ``status: ready`` - for ever, with the queue on fire. So it fails rather
+    than degrading.
+
+    The detection is a MARKER on ``session.info`` rather than ``SELECT current_user``, and this
+    fixture is exactly why: these eleven tests run on SQLite, which has no roles at all. Detecting
+    by
+    role would have forced the whole suite into the Postgres job and cost real offline coverage. The
+    marker is set by ``scan_session`` in the product - a structural test asserts nothing else does -
+    and by a test fixture here, where there is no RLS to bypass in the first place.
+    """
+    mark_bypass(sqlite_session, BypassReason.OPERATOR_METRICS)
+
+
+@pytest.fixture(autouse=True)
+def _the_offline_session_is_a_scan_session(sqlite_session: AsyncSession) -> None:
+    """==Mark the fixture, because ``collect_metrics`` now REFUSES a session with no bypass.==
+
+    It reads across EVERY business by design, and it fills its gauges with zeros wherever it finds
+    nothing. Under row-level security, on the app role, those two facts together produce
+    ``outbox.due = 0`` and ``status: ready`` - for ever, with the queue on fire. So it fails rather
+    than degrading.
+
+    The detection is a MARKER on ``session.info`` rather than ``SELECT current_user``, and this
+    fixture is exactly why: these eleven tests run on SQLite, which has no roles at all. Detecting
+    by
+    role would have forced the whole suite into the Postgres job and cost real offline coverage. The
+    marker is set by ``scan_session`` in the product - a structural test asserts nothing else does -
+    and by a test fixture here, where there is no RLS to bypass in the first place.
+    """
+    mark_bypass(sqlite_session, BypassReason.OPERATOR_METRICS)
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 _NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
@@ -365,7 +422,7 @@ async def test_draining_the_outbox_feeds_the_counters_without_being_asked(
     async def _execute(work: OutboxWork, now: datetime) -> None:
         return None
 
-    await drain_outbox(sqlite_maker, now=_NOW, execute=_execute)
+    await drain_outbox(_pools(sqlite_maker), now=_NOW, execute=_execute)
 
     assert DRAIN_COUNTERS.passes == passes_before + 1
     assert DRAIN_COUNTERS.delivered == delivered_before + 1
@@ -397,7 +454,6 @@ async def test_the_exposition_carries_no_per_business_data(sqlite_session: Async
     text = render_prometheus(
         await collect_metrics(sqlite_session, now=_NOW),
         counters=DrainCounters(),
-        scheduler_enabled=True,
     )
 
     for private in (
@@ -427,9 +483,7 @@ async def test_the_exposition_is_valid_prometheus_text(sqlite_session: AsyncSess
     report.lost.append(uuid.uuid4())
     counters.observe(report)
 
-    text = render_prometheus(
-        await collect_metrics(sqlite_session, now=_NOW), counters=counters, scheduler_enabled=True
-    )
+    text = render_prometheus(await collect_metrics(sqlite_session, now=_NOW), counters=counters)
     lines = text.splitlines()
 
     assert "# HELP aethercal_outbox_intents Outbox intents by status." in lines
@@ -440,7 +494,6 @@ async def test_the_exposition_is_valid_prometheus_text(sqlite_session: AsyncSess
     # THE one to alert on: a send that outran its lease, i.e. a possible duplicate delivery.
     assert "aethercal_outbox_drain_lost_total 1" in lines
     assert 'aethercal_bookings{status="no_show"} 1' in lines
-    assert "aethercal_scheduler_enabled 1" in lines
     for line in lines:
         if line.startswith("#") or not line:
             continue
@@ -448,19 +501,25 @@ async def test_the_exposition_is_valid_prometheus_text(sqlite_session: AsyncSess
         float(value)  # a sample whose value is not a number is not Prometheus text
 
 
-async def test_the_exposition_says_when_this_process_is_not_the_one_draining(
+async def test_the_scheduler_enabled_gauge_is_gone_with_the_process_that_needed_it(
     sqlite_session: AsyncSession,
 ) -> None:
-    """The drain counters are PROCESS-local, and the container runs the scheduler in exactly one
-    process. Scrape a different one and they read zero — which looks identical to "nothing was ever
-    lost". So the exposition states which kind of process answered, and an operator can tell a
-    healthy zero from a meaningless one. (The backlog gauges are read from the DATABASE and are
-    therefore correct from ANY process — which is precisely why the dead-man switch is built on
-    them and not on the counters.)"""
+    """==A gauge whose only job was to warn you that you were reading the wrong process.==
+
+    The drain counters are PROCESS-local. Published from the WEB process — which is where
+    ``/metrics`` used to live — they could only ever read zero, and a zero there is
+    indistinguishable
+
+    ``/metrics`` is served by ``aethercal-worker`` now, which IS the drain: the counters are true
+    where they are published, and there is no longer any such thing as a scrape of a process that
+    does not drain. So the warning gauge goes with the problem it described. Leaving it behind would
+    have meant a series that is always ``1`` — noise pretending to be a signal.
+    """
     text = render_prometheus(
-        await collect_metrics(sqlite_session, now=_NOW),
-        counters=DrainCounters(),
-        scheduler_enabled=False,
+        await collect_metrics(sqlite_session, now=_NOW), counters=DrainCounters()
     )
 
-    assert "aethercal_scheduler_enabled 0" in text.splitlines()
+    # The gauges that MATTER are read from the database and are correct from any process — which is
+    # precisely why the dead-man switch was built on them, and not on the counters.
+    assert "aethercal_outbox_oldest_due_age_seconds" in text
+    assert "aethercal_outbox_due" in text

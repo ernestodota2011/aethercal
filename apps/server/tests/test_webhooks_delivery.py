@@ -26,16 +26,50 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.schemas.webhooks import WebhookCreate
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant, WebhookDelivery
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.services.webhooks import create_webhook, enqueue_event
 from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS, PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryFailure, backoff_delay, deliver_due
 from aethercal.server.webhooks.signing import SIGNATURE_HEADER, canonical_body, verify_signature
 from aethercal.server.webhooks.ssrf import BlockReason, Resolver
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    """A re-read timestamp, normalised to UTC.
+
+    ``DateTime(timezone=True)`` round-trips through SQLite as a NAIVE datetime — PostgreSQL, which
+    is
+    the only backend this ships on, keeps the offset. The settle now happens in a session of its
+    own,
+    so these tests compare a RE-READ value rather than the one still in memory, and that difference
+    became visible. It is a property of the offline harness, not of the product.
+    """
+    return (
+        None if moment is None else moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment
+    )
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the worker pools over ONE offline sessionmaker.
+
+    ``deliver_due`` takes :class:`WorkerPools` now, and not a session, because it was rewritten from
+    "one transaction, a cross-business loop, with the POST inside it" to plan -> bind per item ->
+    execute -> settle. Under row-level security the old shape was not merely wrong, it was
+    invisible:
+    the planning SELECT carries no tenant clause at all (it matched by foreign key, which is correct
+    BY THE FK and not by a belt), so on the app role it returns zero rows - and no webhook would
+    ever
+    leave the instance again, while the tick went on reporting a clean, empty, successful pass.
+
+    SQLite has neither roles nor RLS, so here the two pools collapse back into one.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -98,6 +132,12 @@ async def _seed_one(
         data={"booking_id": "bk_1"},
         now=NOW,
     )
+    # ==Committed, not merely flushed.== `deliver_due` opens its OWN sessions now: it plans on
+    # the bypass pool (whose webhooks are due is the answer, not the question), then re-reads
+    # each delivery on the app pool under that delivery's own business. An uncommitted
+    # arrangement is invisible to both - which is exactly the property that makes the per-item
+    # binding possible in the first place.
+    await session.commit()
     return deliveries[0]
 
 
@@ -110,7 +150,9 @@ def test_backoff_grows_exponentially_and_caps() -> None:
 
 
 async def test_2xx_marks_delivered_with_a_valid_signature(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
     captured: dict[str, object] = {}
@@ -122,18 +164,22 @@ async def test_2xx_marks_delivered_with_a_valid_signature(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert delivery.response_code == 200
     assert delivery.attempts == 1
-    assert delivery.last_attempt_at == NOW
+    assert _aware(delivery.last_attempt_at) == NOW
     assert delivery.next_retry_at is None
     assert delivery.error_reason is None
     assert delivery.id in report.delivered
@@ -148,44 +194,56 @@ async def test_2xx_marks_delivered_with_a_valid_signature(
 
 
 async def test_5xx_marks_failed_and_schedules_growing_backoff(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
     transport = httpx.MockTransport(lambda _req: httpx.Response(503))
 
     async with httpx.AsyncClient(transport=transport) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
     assert delivery.status == "failed"
     assert delivery.attempts == 1
     assert delivery.response_code == 503
     assert delivery.error_reason == DeliveryFailure.HTTP_ERROR.value
-    assert delivery.next_retry_at == NOW + timedelta(seconds=30)
+    assert _aware(delivery.next_retry_at) == NOW + timedelta(seconds=30)
 
     # A second run, once due, increments attempts and grows the backoff.
     due = delivery.next_retry_at
     assert due is not None
     async with httpx.AsyncClient(transport=transport) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=due,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
     assert delivery.attempts == 2
     assert delivery.next_retry_at == due + timedelta(seconds=60)
 
 
 async def test_network_error_is_treated_as_a_failure(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
 
@@ -194,23 +252,29 @@ async def test_network_error_is_treated_as_a_failure(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
     assert delivery.status == "failed"
     assert delivery.attempts == 1
     assert delivery.response_code is None
     # A transport error is a NETWORK failure — a different word from a policy block, on purpose.
     assert delivery.error_reason == DeliveryFailure.TRANSPORT_ERROR.value
-    assert delivery.next_retry_at == NOW + timedelta(seconds=30)
+    assert _aware(delivery.next_retry_at) == NOW + timedelta(seconds=30)
 
 
 async def test_a_recovered_delivery_clears_its_stale_failure_reason(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     """A row that failed and then succeeded must not keep saying why it once failed.
 
@@ -222,31 +286,41 @@ async def test_a_recovered_delivery_clears_its_stale_failure_reason(
 
     async with httpx.AsyncClient(transport=transport) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
         assert delivery.error_reason == DeliveryFailure.HTTP_ERROR.value
         due = delivery.next_retry_at
         assert due is not None
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=due,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert delivery.error_reason is None
 
 
 async def test_dead_after_max_attempts(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
     transport = httpx.MockTransport(lambda _req: httpx.Response(500))
@@ -255,7 +329,7 @@ async def test_dead_after_max_attempts(
     async with httpx.AsyncClient(transport=transport) as http:
         for _ in range(2):
             await deliver_due(
-                sqlite_session,
+                _pools(sqlite_maker),
                 http,
                 now=now,
                 fernet_key=KEY,
@@ -263,11 +337,17 @@ async def test_dead_after_max_attempts(
                 resolver=_public_resolver,
                 allowlist=NO_PRIVATE_TARGETS,
             )
+            # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to
+            # this
+            # delivery's business), so the row this test seeded is STALE: with
+            # `expire_on_commit=False`
+            # it would happily go on reporting the status it held before the worker ever touched it.
+            await sqlite_session.refresh(delivery)
             assert delivery.status == "failed"
             assert delivery.next_retry_at is not None
             now = delivery.next_retry_at
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=now,
             fernet_key=KEY,
@@ -275,6 +355,10 @@ async def test_dead_after_max_attempts(
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.attempts == 3
     assert delivery.status == "dead"
@@ -285,61 +369,78 @@ async def test_dead_after_max_attempts(
 
 
 async def test_not_yet_due_failed_delivery_is_skipped(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
     transport = httpx.MockTransport(lambda _req: httpx.Response(500))
 
     async with httpx.AsyncClient(transport=transport) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )  # → failed, retry at +30s
+        await sqlite_session.refresh(delivery)  # settled in its own session now
         assert delivery.attempts == 1
 
         # Run again BEFORE next_retry_at: the delivery must be skipped, untouched.
         before_due = NOW + timedelta(seconds=10)
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=before_due,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.attempts == 1
     assert report.attempted == 0
 
 
 async def test_delivered_delivery_is_not_reattempted(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     delivery = await _seed_one(sqlite_session, tenant_factory)
     ok = httpx.MockTransport(lambda _r: httpx.Response(200))
 
     async with httpx.AsyncClient(transport=ok) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
         assert delivery.status == "delivered"
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW + timedelta(hours=1),
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert report.attempted == 0
     assert delivery.attempts == 1
@@ -351,7 +452,9 @@ async def test_delivered_delivery_is_not_reattempted(
 
 
 async def test_ssrf_blocked_url_is_marked_dead_and_never_posts(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # A subscriber pointing at the cloud-metadata IP must be parked ``dead`` with no HTTP call.
     delivery = await _seed_one(sqlite_session, tenant_factory, url="http://169.254.169.254/meta")
@@ -363,13 +466,17 @@ async def test_ssrf_blocked_url_is_marked_dead_and_never_posts(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.next_retry_at is None
@@ -379,7 +486,9 @@ async def test_ssrf_blocked_url_is_marked_dead_and_never_posts(
 
 
 async def test_a_private_target_with_no_allowlist_configured_is_refused(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     """==Fail-closed: an operator who has declared nothing gets exactly today's behaviour.==
 
@@ -394,13 +503,17 @@ async def test_a_private_target_with_no_allowlist_configured_is_refused(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,  # nothing declared
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.error_reason == BlockReason.PRIVATE_TARGET.value
@@ -414,7 +527,9 @@ async def test_a_private_target_with_no_allowlist_configured_is_refused(
 
 
 async def test_a_target_inside_the_declared_cidr_is_accepted_and_delivered(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     """==The headline: "connect AetherCal to your n8n" finally works.==
 
@@ -432,13 +547,17 @@ async def test_a_target_inside_the_declared_cidr_is_accepted_and_delivered(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,  # never consulted: the URL is a literal IP
             allowlist=LAN,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert delivery.response_code == 200
@@ -456,7 +575,9 @@ async def test_a_target_inside_the_declared_cidr_is_accepted_and_delivered(
 
 
 async def test_a_hostname_resolving_into_the_declared_cidr_is_delivered(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # The Docker/LAN shape: a NAME (`n8n.lan`) resolving to a private address inside the allowlist.
     delivery = await _seed_one(sqlite_session, tenant_factory, url="http://n8n.lan:5678/hook")
@@ -469,13 +590,17 @@ async def test_a_hostname_resolving_into_the_declared_cidr_is_delivered(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_resolves_to("192.168.1.50"),
             allowlist=LAN,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert delivery.response_code == 204
@@ -484,7 +609,10 @@ async def test_a_hostname_resolving_into_the_declared_cidr_is_delivered(
 
 
 async def test_a_private_target_outside_the_declared_cidr_is_refused_with_its_reason(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory, caplog: pytest.LogCaptureFixture
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The allowlist declares NETWORKS, not "private" as a category — and when a target is refused,
     the row and the log both SAY SO. ``dead`` with an empty ``response_code`` and no line anywhere
@@ -499,13 +627,19 @@ async def test_a_private_target_outside_the_declared_cidr_is_refused_with_its_re
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with caplog.at_level(logging.WARNING):
             report = await deliver_due(
-                sqlite_session,
+                _pools(sqlite_maker),
                 http,
                 now=NOW,
                 fernet_key=KEY,
                 resolver=_public_resolver,
                 allowlist=LAN,  # 192.168.1.0/24 only
             )
+            # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to
+            # this
+            # delivery's business), so the row this test seeded is STALE: with
+            # `expire_on_commit=False`
+            # it would happily go on reporting the status it held before the worker ever touched it.
+            await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.next_retry_at is None
@@ -520,7 +654,9 @@ async def test_a_private_target_outside_the_declared_cidr_is_refused_with_its_re
 
 
 async def test_a_rebind_into_the_allowlisted_cidr_is_refused(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     """==A permitted network must never become a pivot.==
 
@@ -537,13 +673,17 @@ async def test_a_rebind_into_the_allowlisted_cidr_is_refused(
     resolver = _rebinding_resolver(guard_answer=[PUBLIC_IP], connect_answer=["192.168.1.50"])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=resolver,
             allowlist=LAN,  # 192.168.1.50 IS inside it — and the send is still refused
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.error_reason == "blocked-dns-rebind"
@@ -552,7 +692,9 @@ async def test_a_rebind_into_the_allowlisted_cidr_is_refused(
 
 
 async def test_dns_rebinding_between_guard_and_connect_is_blocked_and_marked_dead(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # The host passes the pre-flight guard (first resolve → public) but rebinds to a private IP by
     # connect time (second resolve → loopback). The pin re-validates the exact IP it will dial, so
@@ -567,13 +709,17 @@ async def test_dns_rebinding_between_guard_and_connect_is_blocked_and_marked_dea
     resolver = _rebinding_resolver(guard_answer=[PUBLIC_IP], connect_answer=["127.0.0.1"])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.next_retry_at is None
@@ -584,7 +730,9 @@ async def test_dns_rebinding_between_guard_and_connect_is_blocked_and_marked_dea
 
 
 async def test_public_target_is_dialed_on_the_validated_pinned_ip(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # A legitimate public subscriber is delivered — and the socket targets the validated IP literal,
     # not the hostname, so httpx cannot re-resolve to a different address behind our back.
@@ -597,13 +745,17 @@ async def test_public_target_is_dialed_on_the_validated_pinned_ip(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert delivery.response_code == 200
@@ -611,7 +763,9 @@ async def test_public_target_is_dialed_on_the_validated_pinned_ip(
 
 
 async def test_sni_and_host_stay_bound_to_the_hostname_not_the_ip(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # Pinning the IP must not weaken TLS: SNI + certificate verification stay bound to the real
     # hostname (via the ``sni_hostname`` extension, which httpcore uses as ``server_hostname``), and
@@ -627,13 +781,17 @@ async def test_sni_and_host_stay_bound_to_the_hostname_not_the_ip(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_public_resolver,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "delivered"
     assert captured["url_host"] == PUBLIC_IP  # connects to the IP...
@@ -648,7 +806,9 @@ async def test_sni_and_host_stay_bound_to_the_hostname_not_the_ip(
 
 
 async def test_a_dns_failure_is_retried_not_dead_lettered(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     """==A resolver hiccup used to kill a legitimate delivery, permanently and silently.==
 
@@ -666,24 +826,30 @@ async def test_a_dns_failure_is_retried_not_dead_lettered(
         transport=httpx.MockTransport(lambda _r: httpx.Response(200))
     ) as http:
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=NOW,
             fernet_key=KEY,
             resolver=_boom,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "failed"  # NOT dead
     assert delivery.attempts == 1
-    assert delivery.next_retry_at == NOW + timedelta(seconds=30)
+    assert _aware(delivery.next_retry_at) == NOW + timedelta(seconds=30)
     assert delivery.error_reason == DeliveryFailure.DNS_FAILURE.value
     assert delivery.id in report.failed
     assert delivery.id not in report.blocked  # a network failure is not a policy refusal
 
 
 async def test_a_dns_failure_still_dead_letters_once_the_attempts_are_exhausted(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
 ) -> None:
     # Retryable does not mean forever: a name that never resolves eventually dead-letters like any
     # other failing target — with its reason recorded, not as an anonymous `dead`.
@@ -698,7 +864,7 @@ async def test_a_dns_failure_still_dead_letters_once_the_attempts_are_exhausted(
     ) as http:
         for _ in range(2):
             await deliver_due(
-                sqlite_session,
+                _pools(sqlite_maker),
                 http,
                 now=now,
                 fernet_key=KEY,
@@ -706,10 +872,16 @@ async def test_a_dns_failure_still_dead_letters_once_the_attempts_are_exhausted(
                 resolver=_boom,
                 allowlist=NO_PRIVATE_TARGETS,
             )
+            # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to
+            # this
+            # delivery's business), so the row this test seeded is STALE: with
+            # `expire_on_commit=False`
+            # it would happily go on reporting the status it held before the worker ever touched it.
+            await sqlite_session.refresh(delivery)
             assert delivery.next_retry_at is not None
             now = delivery.next_retry_at
         report = await deliver_due(
-            sqlite_session,
+            _pools(sqlite_maker),
             http,
             now=now,
             fernet_key=KEY,
@@ -717,6 +889,10 @@ async def test_a_dns_failure_still_dead_letters_once_the_attempts_are_exhausted(
             resolver=_boom,
             allowlist=NO_PRIVATE_TARGETS,
         )
+        # ==Re-read.== The settle happens in a session of its OWN now (the app pool, bound to this
+        # delivery's business), so the row this test seeded is STALE: with `expire_on_commit=False`
+        # it would happily go on reporting the status it held before the worker ever touched it.
+        await sqlite_session.refresh(delivery)
 
     assert delivery.status == "dead"
     assert delivery.attempts == 3

@@ -26,21 +26,32 @@ def _settings(**overrides: object) -> Settings:
 
 def test_defaults_are_sensible() -> None:
     settings = _settings()
-    assert settings.auto_migrate is True
     assert settings.echo_sql is False
-    # The scheduler is OFF by default so the offline test/API path never starts a background loop;
-    # the container turns it on with AETHERCAL_RUN_SCHEDULER=1 in exactly one process (RF-19).
+    # Both of these are RETIRED, and both survive only as tripwires: a truthy value now FAILS the
+    # boot. Off is therefore the default, and the only value either may hold. Migrations are
+    # `aethercal-admin db upgrade` (as the OWNER); the drain is the `aethercal-worker` process.
+    assert settings.auto_migrate is False
     assert settings.run_scheduler is False
     # No public booking base by default → the request path falls back to the request's base URL.
     assert settings.booking_base_url is None
 
 
-def test_run_scheduler_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_scheduler_is_retired_and_a_truthy_value_fails_the_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==It is not read from the environment any more. It REFUSES to be.==
+
+    The field survives so that it can refuse. ``extra="ignore"`` means deleting it would let the
+    shipped image own ``AETHERCAL_RUN_SCHEDULER=1`` go on being set, be silently dropped, and
+    leave an operator certain that a drain is running which is not. The drain lives in the
+    ``aethercal-worker`` process now, on its own two pools.
+    """
     monkeypatch.setenv("AETHERCAL_DATABASE_URL", "postgres://u:p@h/db")
     monkeypatch.setenv("AETHERCAL_APP_SECRET", "from-env")
     monkeypatch.setenv("AETHERCAL_RUN_SCHEDULER", "true")
-    settings = Settings()  # type: ignore[call-arg]
-    assert settings.run_scheduler is True
+
+    with pytest.raises(ValueError, match="aethercal-worker"):
+        Settings()  # type: ignore[call-arg]
 
 
 def test_booking_base_url_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:

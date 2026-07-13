@@ -43,6 +43,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.services.bookings import (
     BookingEffects,
     BookingParams,
@@ -67,6 +68,23 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
     run_google_effect,
 )
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)  # a Friday
 SLOT_9 = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)  # the following Monday, 09:00 UTC
@@ -184,7 +202,7 @@ async def _drain(
     sessions — it must hold no transaction across the network call (R8) — so the intents have to be
     committed before a handler can see them."""
     await session.commit()
-    return await drain_outbox(maker, now=NOW, execute=execute)
+    return await drain_outbox(_pools(maker), now=NOW, execute=execute)
 
 
 def _as_work(row: Outbox) -> OutboxWork:

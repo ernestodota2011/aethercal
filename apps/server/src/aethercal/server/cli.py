@@ -19,11 +19,14 @@ from typing import Annotated, Any, cast
 import typer
 from cryptography.fernet import Fernet
 from sqlalchemy import CursorResult, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from aethercal.server.channels import Channel
-from aethercal.server.db.engine import build_async_engine, build_sessionmaker
+from aethercal.server.db.config import OWNER_DATABASE_URL_ENV
+from aethercal.server.db.engine import build_async_engine, build_sessionmaker, build_sync_engine
+from aethercal.server.db.migrate import head_revision, run_migrations
 from aethercal.server.db.models import ApiKey, Booking, Outbox, OutboxStatus, Tenant
+from aethercal.server.db.roles import DbRole, assert_engine_role, assert_sync_engine_role
 from aethercal.server.integrations.google.oauth import get_credentials
 from aethercal.server.services.api_keys import (
     RevokeKeyOutcome,
@@ -60,6 +63,8 @@ outbox_app = typer.Typer(
 app.add_typer(outbox_app, name="outbox")
 guest_app = typer.Typer(help="Guest data: erasure (RNF-8).", no_args_is_help=True)
 app.add_typer(guest_app, name="guest")
+db_app = typer.Typer(help="Schema migrations (run as the OWNER role).", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 # Default cache location for the Google OAuth token during the loopback consent flow (matches the
 # F0-11 spike). Outside the repo, so a token never lands in version control.
@@ -325,9 +330,72 @@ async def run_guest_purge(
         return await purge_guest(session, tenant_id=tenant.id, email=email)
 
 
+@db_app.command("upgrade")
+def db_upgrade_command() -> None:
+    """Migrate the database to head, as the OWNER. ==The migration path that did not exist.==
+
+    Before the isolation batch, migrations ran on ``AETHERCAL_AUTO_MIGRATE=1`` — inside the web
+    process, on the web process's own URL. That single fact is *why* the app had to be the table
+    owner, and therefore why row-level security would have been a placebo on this product: the role
+    serving requests was the role that owned every table, and an owner bypasses its own policies.
+
+    Separating the roles closes that hole and opens another one, immediately: with ``auto_migrate``
+    retired, and the web running as ``aethercal_app`` (which owns nothing and cannot execute DDL),
+    ==there was no supported way to migrate at all.== There is no ``alembic.ini`` in this repository
+    and there was no CLI command. This is that command.
+
+    It runs Alembic under ``AETHERCAL_OWNER_DATABASE_URL``, with the same PostgreSQL advisory lock
+    the boot migrator used, so several instances starting at once still serialize instead of racing
+    to create the same tables.
+
+    Run it as a one-shot step BEFORE the web process starts (``deploy/docker-compose.yml`` does).
+    The web then refuses to serve a schema behind head, so "running on a stale schema" is not a
+    state
+    the deployment can reach.
+    """
+    settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
+    config = settings.owner_database_config()
+    engine = build_sync_engine(config)
+    try:
+        # The same assertion every other entry point makes, in its synchronous form: an owner URL
+        # that is quietly the app role would fail the DDL here — loudly, which is fine — but it
+        # could
+        # also be a URL pointing at the WORKER role, which owns nothing and would fail confusingly.
+        # Say which role was expected, and which one answered, before Alembic says anything at all.
+        assert_sync_engine_role(engine, DbRole.OWNER, url_env=OWNER_DATABASE_URL_ENV)
+        run_migrations(engine)
+    finally:
+        engine.dispose()
+    typer.echo(f"schema is at head: {head_revision()}")
+
+
+def _owner_engine(settings: Settings) -> AsyncEngine:
+    """The CLI's engine — ``aethercal_owner``, ==asserted, on every single invocation.==
+
+    ``AETHERCAL_OWNER_DATABASE_URL`` is FAIL-CLOSED (``settings.owner_database_config()`` raises
+    when
+    it is unset; there is deliberately no fallback to the app URL), and then the role is CHECKED.
+
+    Both halves matter, and the reason they matter is ``guest purge``. It runs as the owner because
+    it has to reach every row belonging to one business — including the rows a policy would hide
+    from
+    the app role. Point it at ``aethercal_app`` by accident and it does not fail: it matches **zero
+    rows**, deletes nothing, prints its report, and exits **0**. ==Erasure of a real person's data,
+    reporting success, having erased nothing== — on the one command path with a legal deadline
+    attached to it.
+
+    The check costs one round-trip per invocation. It is the only thing standing between that
+    outcome
+    and a green exit code.
+    """
+    engine = build_async_engine(settings.owner_database_config())
+    asyncio.run(assert_engine_role(engine, DbRole.OWNER, url_env=OWNER_DATABASE_URL_ENV))
+    return engine
+
+
 def _sessionmaker() -> async_sessionmaker[AsyncSession]:
     settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
-    return build_sessionmaker(build_async_engine(settings.database_config()))
+    return build_sessionmaker(_owner_engine(settings))
 
 
 @app.command("create-tenant")
@@ -441,7 +509,11 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
     credentials = get_credentials(token_path)
     connection_id = asyncio.run(
         run_connect_google(
-            build_sessionmaker(build_async_engine(settings.database_config())),
+            # ==The SECOND engine-building site in this file, and it needs the same belt as the
+            # first.== It was a copy of `_sessionmaker()` that grew its own settings lookup; under
+            # RLS a copy that forgot the assertion would be a CLI invocation silently running as the
+            # app role — writing an external connection that lands nowhere, and saying it worked.
+            build_sessionmaker(_owner_engine(settings)),
             tenant_slug=tenant_slug,
             user_email=user_email,
             credential=GoogleCredential(

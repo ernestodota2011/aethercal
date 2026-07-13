@@ -41,6 +41,7 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.db.models.workflows import Workflow, WorkflowStep, WorkflowTrigger
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.messaging.guard import (
     CAP_WINDOW,
     ChannelUnavailable,
@@ -63,6 +64,23 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.workflows import seed_default_workflows
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 _ALWAYS_OPEN = {str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)}
 _NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -402,12 +420,12 @@ async def test_book_then_drain_actually_sends_the_reminder_email(migrated: Sessi
     )
 
     # Not due yet: the reminder is scheduled for start - 24 h.
-    assert (await drain_outbox(migrated, now=_NOW, execute=execute)).attempted == 0
+    assert (await drain_outbox(_pools(migrated), now=_NOW, execute=execute)).attempted == 0
     assert sender.sent == []
 
     # At its send time, it drains — and the email is really sent.
     due = _SLOT - timedelta(hours=24)
-    report = await drain_outbox(migrated, now=due, execute=execute)
+    report = await drain_outbox(_pools(migrated), now=due, execute=execute)
 
     assert len(report.delivered) == 1, f"the reminder did not deliver: {report}"
     assert report.dead == [] and report.failed == []
@@ -433,7 +451,7 @@ async def test_book_then_drain_actually_sends_the_reminder_email(migrated: Sessi
     assert ledger[0].step_id == uuid.UUID(str(step.payload["step_id"]))
 
     # A re-drain sends nothing: the ledger, not luck, is what makes it exactly-once.
-    again = await drain_outbox(migrated, now=due + timedelta(hours=1), execute=execute)
+    again = await drain_outbox(_pools(migrated), now=due + timedelta(hours=1), execute=execute)
     assert again.attempted == 0
     assert len(sender.sent) == 1
 
@@ -480,7 +498,7 @@ async def test_a_step_on_an_unconfigured_channel_is_skipped_not_dead_lettered(
     )
     due = _SLOT - timedelta(hours=24)
     with caplog.at_level("WARNING"):
-        report = await drain_outbox(migrated, now=due, execute=execute)
+        report = await drain_outbox(_pools(migrated), now=due, execute=execute)
 
     # The email step delivered; the WhatsApp step was SKIPPED — not failed, not dead.
     assert len(report.delivered) == 1
@@ -502,7 +520,7 @@ async def test_a_step_on_an_unconfigured_channel_is_skipped_not_dead_lettered(
 
     # And it stays out of the queue: a later drain never touches it again.
     assert (
-        await drain_outbox(migrated, now=due + timedelta(days=1), execute=execute)
+        await drain_outbox(_pools(migrated), now=due + timedelta(days=1), execute=execute)
     ).attempted == 0
 
 
@@ -593,7 +611,7 @@ async def _drain_whatsapp_at(
         service_factory=None,
         channels={Channel.WHATSAPP: whatsapp},
     )
-    await drain_outbox(migrated, now=now, execute=execute)
+    await drain_outbox(_pools(migrated), now=now, execute=execute)
     async with migrated() as session:
         steps = await _steps(session, booking_id)
     return next(

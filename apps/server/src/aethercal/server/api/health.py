@@ -1,4 +1,5 @@
-"""Health endpoints: ``GET /health`` (liveness) and ``GET /health/ready`` (readiness + backlog).
+"""Health endpoints of the WEB process: ``GET /health`` (liveness) and ``/health/ready``
+(readiness).
 
 They answer two different questions, and conflating them is how an instance goes on reporting
 "healthy" while nothing actually works:
@@ -8,33 +9,51 @@ They answer two different questions, and conflating them is how an instance goes
   and restarted into exactly the same slow database. Its payload is unchanged, and the container
   HEALTHCHECK and the client library both depend on that.
 * **readiness** (``/health/ready``) — should this process be handed traffic? It actually ASKS the
-  database, and while it is there it reports the outbox backlog (R9), so an operator can see the
-  queue without scraping Prometheus. Unauthenticated (a container healthcheck carries no
-  credentials) and therefore strictly instance-wide: operational counts only — never a tenant,
-  never a guest.
+  database. Unauthenticated (a container healthcheck carries no credentials) and therefore strictly
+  instance-wide: it reports nothing but its own reachability — never a tenant, never a guest.
 
-The backlog is REPORTED here but does not, by itself, make the instance "not ready": a deep queue is
-no reason to pull a healthy process out of rotation — that would restart the very worker draining
-it. Alerting on the backlog is what ``GET /metrics`` and
-:attr:`~aethercal.server.observability.MetricsSnapshot.outbox_oldest_due_age_seconds` are for.
+.. rubric:: ==Why the outbox backlog is NO LONGER served here — the second dead-man switch==
+
+This endpoint used to report the outbox backlog, by calling the same cross-business
+``collect_metrics`` that ``GET /metrics`` calls. Under row-level security that would have been a
+catastrophe of precisely the kind this product keeps writing about:
+
+* it is **unauthenticated**, so it can hold no tenant's authority and bind no business;
+* it runs in the **web** process, on the app role, where a cross-business query returns **zero
+  rows**;
+* and ``collect_metrics`` **fills with zeros by construction** — it never raises.
+
+The result would have been ``status: "ready"``, ``database: "up"``, ``outbox.due = 0``,
+``oldest_due_age_seconds = 0.0`` — **for ever, with the outbox on fire** — on the very probe the
+deployment uses to decide whether this instance is healthy. The first dead-man switch (``/metrics``)
+was rescued by moving it to the worker; this one would have been left behind, lying in green.
+
+So the backlog moves to where it means something and where the bypass exists: the **worker**'s own
+``/health/ready`` (:mod:`aethercal.server.api.operator`). What stays here is the half that is both
+honest and useful in this process — *can I reach the database at all* — asked with a ``SELECT 1``,
+which under RLS still works and, crucially, still **fails loudly** when the database is gone.
+
+And the root cause is closed at the root: ``collect_metrics`` now REFUSES a session without the
+bypass marker. An endpoint that reinvents this mistake will not return zeros; it will crash.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.deps import get_session
-from aethercal.server.observability import collect_metrics
 
 router = APIRouter(tags=["health"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+_PING = text("SELECT 1")
 
 
 class HealthStatus(BaseModel):
@@ -43,29 +62,16 @@ class HealthStatus(BaseModel):
     status: str
 
 
-class OutboxBacklog(BaseModel):
-    """The queue, as readiness sees it. Instance-wide counts; nothing that says whose."""
-
-    pending: int
-    claimed: int
-    failed: int
-    dead: int
-    skipped: int
-    due: int
-    """Intents whose send time has PASSED and which are still undelivered — the REAL backlog.
-
-    Not the same thing as ``pending``: the outbox doubles as the durable scheduler, so a 24 h
-    reminder for a booking three weeks out is ``pending`` and in perfect health."""
-    oldest_due_age_seconds: float
-    """How long the oldest due intent has waited. Unbounded growth means nothing is draining."""
-
-
 class ReadyStatus(BaseModel):
-    """The readiness payload: can this process serve, and what is the queue doing?"""
+    """The readiness payload of the WEB process: can it reach its database?
+
+    There is no ``outbox`` block any more — see the module docstring. The queue is the worker's to
+    report, on the worker's own ``/health/ready``, where a bypass pool exists to measure it
+    truthfully instead of filling it with zeros.
+    """
 
     status: str
     database: str
-    outbox: OutboxBacklog
 
 
 @router.get("/health")
@@ -76,15 +82,20 @@ async def health() -> HealthStatus:
 
 @router.get("/health/ready")
 async def ready(session: SessionDep) -> ReadyStatus:
-    """Report whether this process can serve, and how deep the outbox backlog is (R9).
+    """Can this process reach its database? ==It FAILS (503) when it cannot.==
 
-    ==It FAILS (503) when the database is unreachable.== That is the entire point of a readiness
-    probe: one that answers "ready" no matter what has told you nothing. ``/health`` above opens no
-    connection at all, so it stays cheerfully green while the database is on fire — which is correct
-    for liveness, and useless as a statement that this instance can do its job.
+    That is the entire point of a readiness probe: one that answers "ready" no matter what has told
+    you nothing. ``/health`` above opens no connection at all, so it stays cheerfully green while
+    the database is on fire — which is correct for liveness, and useless as a statement that this
+    instance can do its job.
+
+    ``SELECT 1`` is deliberately the whole of it. It is the one question this process can answer
+    truthfully about the database: it needs no business bound, it is unaffected by row-level
+    security, and when the database is unreachable it **raises** — which is exactly the property the
+    backlog block did not have.
     """
     try:
-        snapshot = await collect_metrics(session, now=datetime.now(UTC))
+        await session.execute(_PING)
     except SQLAlchemyError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -97,20 +108,7 @@ async def ready(session: SessionDep) -> ReadyStatus:
             },
         ) from exc
 
-    counts = snapshot.outbox_by_status
-    return ReadyStatus(
-        status="ready",
-        database="up",
-        outbox=OutboxBacklog(
-            pending=counts["pending"],
-            claimed=counts["claimed"],
-            failed=counts["failed"],
-            dead=counts["dead"],
-            skipped=counts["skipped"],
-            due=snapshot.outbox_due,
-            oldest_due_age_seconds=snapshot.outbox_oldest_due_age_seconds,
-        ),
-    )
+    return ReadyStatus(status="ready", database="up")
 
 
 __all__ = ["router"]

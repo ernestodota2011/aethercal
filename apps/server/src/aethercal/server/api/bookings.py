@@ -27,6 +27,7 @@ from starlette.requests import Request
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
 from aethercal.server.api.auth import AuthContext, require_api_key
+from aethercal.server.db.guc import bind_tenant
 from aethercal.server.deps import get_session
 from aethercal.server.services.bookings import (
     AvailabilityUnavailableError,
@@ -51,7 +52,9 @@ from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
     consume_guest_token,
+    hash_token,
 )
+from aethercal.server.services.tenant_resolution import tenant_by_guest_token_hash
 from aethercal.server.settings import Settings
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
@@ -186,8 +189,30 @@ async def _authorize_mutation(
     app-wide 401). Consuming the token in the request transaction means a later failed mutation
     (rolled back by ``get_session``) also rolls back the token's single-use stamp — the guest can
     retry.
+
+    .. rubric:: ==The guest token is the second half of the bootstrap paradox==
+
+    ``guest_tokens`` is a tenant-scoped table, and the cancel link in a guest's inbox carries a
+    token
+    and NOTHING ELSE — no business, no key. Under RLS with no GUC, ``consume_guest_token``'s lookup
+    (which is by hash alone) returns zero rows, and ==every cancel/reschedule link already sitting
+    in
+    a customer's inbox stops working==, permanently: only the ``sha256`` was ever stored, so the
+    business cannot be recovered from the token by any other route.
+
+    So the token is translated into a business FIRST, through the ``SECURITY DEFINER`` resolver, and
+    the GUC is bound before a single scoped row is touched. Everything after that — the consume, the
+    booking read, the mutation — happens under RLS with this business bound and no other. The token
+    payload is deliberately NOT extended with a ``tenant_id``: two sources of truth for one fact is
+    how drift is born, and the tokens already issued could never have been re-signed anyway.
     """
     if token is not None:
+        # Resolve → bind → THEN read. In that order and no other: the read is itself tenant-scoped.
+        tenant_id = await tenant_by_guest_token_hash(session, hash_token(token))
+        if tenant_id is None:
+            raise _http(status.HTTP_403_FORBIDDEN, "forbidden", "Invalid or expired link")
+        await bind_tenant(session, tenant_id)
+
         signer = GuestTokenSigner(_settings(request).app_secret)
         row = await consume_guest_token(session, signer, token, expected_purpose=purpose)
         if row is None or row.booking_id != booking_id:

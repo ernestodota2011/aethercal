@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
@@ -31,10 +32,11 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from cryptography.fernet import Fernet
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import TimeInterval
+from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import ExternalConnection
+from aethercal.server.db.pools import BypassReason, WorkerPools
 from aethercal.server.services.calendars import (
     ServiceFactory,
     build_live_service,
@@ -174,14 +176,14 @@ def stop_scheduler(scheduler: SchedulerLike) -> None:
 
 async def run_webhook_delivery_once(
     *,
-    sessionmaker: async_sessionmaker[AsyncSession],
+    pools: WorkerPools,
     http_client: httpx.AsyncClient,
     fernet_key: bytes,
     allowlist: PrivateTargetAllowlist,
     now: datetime | None = None,
 ) -> DeliveryReport | None:
-    """One outbound-webhook delivery pass, in its own transaction. Returns the report, or ``None``
-    if the tick failed (logged) — a failure never propagates, so the scheduler keeps ticking.
+    """One outbound-webhook delivery pass. Returns the report, or ``None`` if the tick failed
+    (logged) — a failure never propagates, so the scheduler keeps ticking.
 
     ``allowlist`` is a required keyword and is threaded straight through to :func:`deliver_due`. It
     is NOT read from the environment here: the process edge reads it once, at boot, so a bad CIDR
@@ -189,10 +191,9 @@ async def run_webhook_delivery_once(
     """
     moment = now if now is not None else datetime.now(UTC)
     try:
-        async with sessionmaker() as session, session.begin():
-            return await deliver_due(
-                session, http_client, now=moment, fernet_key=fernet_key, allowlist=allowlist
-            )
+        return await deliver_due(
+            pools, http_client, now=moment, fernet_key=fernet_key, allowlist=allowlist
+        )
     except Exception:
         _logger.exception("webhook-delivery tick failed; scheduler continues")
         return None
@@ -200,88 +201,155 @@ async def run_webhook_delivery_once(
 
 async def run_outbox_drain_once(
     *,
-    sessionmaker: async_sessionmaker[AsyncSession],
+    pools: WorkerPools,
     execute: OutboxExecutor,
     now: datetime | None = None,
 ) -> OutboxReport | None:
     """One transactional-outbox drain pass. Returns the report, or ``None`` if the tick failed
     (logged) — a failure never propagates, so the scheduler keeps ticking.
 
-    The ``sessionmaker`` is handed to :func:`drain_outbox` rather than a session: the drain owns its
-    own transaction BOUNDARIES (claim, commit, run the network I/O with nothing open, then settle).
-    Opening one long transaction here and passing the session down would put every SMTP/Google call
-    back inside it — exactly the lock-across-I/O bug the claim/lease design removes (R8).
+    The ``pools`` go to :func:`drain_outbox` rather than a session: the drain owns its own
+    transaction BOUNDARIES (claim, commit, run the network I/O with nothing open, then settle) — and
+    it owns WHICH POOL each of them runs on: a bypass one to find work whose business it cannot know
+    yet, the app one under RLS to execute it. Opening one long transaction here and passing the
+    session down would put every SMTP/Google call back inside it (the lock-across-I/O bug R8
+    removed)
+    and would collapse the two pools back into one.
     """
     moment = now if now is not None else datetime.now(UTC)
     try:
-        return await drain_outbox(sessionmaker, now=moment, execute=execute)
+        return await drain_outbox(pools, now=moment, execute=execute)
     except Exception:
         _logger.exception("outbox-drain tick failed; scheduler continues")
         return None
 
 
+async def plan_active_connections(pools: WorkerPools) -> list[uuid.UUID]:
+    """The ids of every active (non-revoked) external connection, ACROSS every business.
+
+    The planning half of the refresh, and the reason it needs the bypass: *which* businesses have a
+    connected calendar is the ANSWER, not the question. Under RLS with no GUC this returns zero rows
+    — and the tick reports ``refreshed=0``, in silence, for ever.
+
+    It returns **ids**, deliberately, and not ORM rows: the rows are re-read on the exec pool under
+    their own business, so nothing loaded with the bypass ever reaches the execution path.
+    """
+    async with pools.scan_session(BypassReason.PLAN_CALENDARS) as session:
+        rows = await session.scalars(
+            select(ExternalConnection.id).where(ExternalConnection.revoked_at.is_(None))
+        )
+        return list(rows.all())
+
+
 async def refresh_all_busy_caches(
-    session: AsyncSession,
+    pools: WorkerPools,
     *,
     now: datetime,
     window: TimeInterval,
     service_factory: ServiceFactory,
 ) -> int:
-    """Refresh the busy cache for every active (non-revoked) connection over ``window`` (RF-12).
+    """Refresh the busy cache for every active connection over ``window`` (RF-12).
 
-    Each connection is refreshed inside its OWN ``SAVEPOINT`` (``session.begin_nested()``) so a
-    failure is isolated to that connection: a raised ``service_factory`` (e.g. an unreachable
-    Google account) OR a SQLAlchemy error mid-flush rolls back just that connection and is logged,
-    while the shared session's transaction stays usable for the rest. Without the SAVEPOINT a single
-    flush would deactivate the transaction and abort every remaining connection too, silently
-    half-completing the batch (and leaving those busy caches stale, which the slots engine then has
-    to treat conservatively). Returns how many refreshed successfully. The per-connection writes are
-    flushed by :func:`refresh_busy_cache` into their SAVEPOINTs; the caller owns the outer commit.
+    .. rubric:: ==Rewritten: plan → bind per item → execute → settle. And deliberately NO claim.==
+
+    This used to be ONE transaction holding a cross-business ``SELECT``, with a loop inside it that
+    **decrypted each business's Google credential and called Google over the network**. Under RLS
+    that shape is not merely wrong, it is invisible: the select returns zero rows on the app role,
+    the loop runs zero times, the tick reports ``refreshed=0``, and every calendar on the instance
+    goes stale without one line of error.
+
+    So it is now three steps with three different authorities:
+
+    1. **plan**, on the bypass pool — the ids of the active connections across every business,
+       because that is the one thing which cannot be known per-business in advance;
+    2. **bind, per connection**, on the app pool — one ``tenant_scope`` each, so the credential is
+       decrypted and the calendar is called with exactly that business's authority and no other;
+    3. **settle**, inside that same bound transaction.
+
+    ==There is deliberately NO claim.== The claim/lease pattern exists in the outbox because
+    ``Outbox`` has the COLUMNS to hold it (``claimed_by``, ``lease_expires_at``).
+    ``ExternalConnection`` has neither, so demanding one here would mean new DDL, a lease and a
+    recovery pass — and this batch has to stay short and featureless, which is exactly what lets
+    every other wave run in parallel behind it. It is safe without one because the two facts it
+    rests
+    on are already true and already documented: the scheduler runs in **exactly one process**
+    (``deploy/README.md``), and the refresh is idempotent. ==The change is the pool and the GUC, not
+    the claim.==
+
+    A failure in one connection is isolated to it and logged; the rest of the batch continues.
+    Returns how many refreshed successfully.
     """
-    connections = list(
-        (
-            await session.scalars(
-                select(ExternalConnection).where(ExternalConnection.revoked_at.is_(None))
-            )
-        ).all()
-    )
+    connection_ids = await plan_active_connections(pools)
+
     refreshed = 0
-    for connection in connections:
+    for connection_id in connection_ids:
         try:
-            # A SAVEPOINT per connection: on any error inside, the nested transaction rolls back to
-            # the SAVEPOINT (recovering the outer transaction) and re-raises to the handler below.
-            async with session.begin_nested():
-                service = service_factory(connection)
-                await refresh_busy_cache(
-                    session, connection=connection, window=window, now=now, service=service
-                )
-            refreshed += 1
+            if await _refresh_one_busy_cache(
+                pools,
+                connection_id,
+                now=now,
+                window=window,
+                service_factory=service_factory,
+            ):
+                refreshed += 1
         except Exception:
             _logger.exception(
-                "busy-cache refresh failed for connection %s (tenant %s); continuing",
-                connection.id,
-                connection.tenant_id,
+                "busy-cache refresh failed for connection %s; continuing", connection_id
             )
     return refreshed
 
 
+async def _refresh_one_busy_cache(
+    pools: WorkerPools,
+    connection_id: uuid.UUID,
+    *,
+    now: datetime,
+    window: TimeInterval,
+    service_factory: ServiceFactory,
+) -> bool:
+    """Refresh ONE connection, under ITS OWN business. Returns whether it actually refreshed.
+
+    The connection's business is read on the bypass pool (it is the single fact this cannot know
+    yet), and then everything real — the row itself, the credential, the cache writes — is re-read
+    and written on the app pool inside that business's ``tenant_scope``. Nothing loaded under the
+    bypass crosses into the execution: only the two ids do.
+    """
+    async with pools.scan_session(BypassReason.PLAN_CALENDARS) as scan:
+        tenant_id = await scan.scalar(
+            select(ExternalConnection.tenant_id).where(ExternalConnection.id == connection_id)
+        )
+    if tenant_id is None:
+        # Revoked and deleted between the plan and now. Nothing to do, and not an error.
+        return False
+
+    with tenant_scope(tenant_id):
+        async with pools.exec_maker() as session, session.begin():
+            connection = await session.get(ExternalConnection, connection_id)
+            if connection is None or connection.revoked_at is not None:
+                return False
+            service = service_factory(connection)
+            await refresh_busy_cache(
+                session, connection=connection, window=window, now=now, service=service
+            )
+            return True
+
+
 async def run_busy_refresh_once(
     *,
-    sessionmaker: async_sessionmaker[AsyncSession],
+    pools: WorkerPools,
     service_factory: ServiceFactory,
     now: datetime | None = None,
     horizon: timedelta = BUSY_REFRESH_HORIZON,
 ) -> int | None:
-    """One busy-cache refresh pass over all active connections, in its own transaction. Returns the
-    number refreshed, or ``None`` if the whole tick failed (logged) — never propagates.
+    """One busy-cache refresh pass over all active connections. Returns the number refreshed, or
+    ``None`` if the whole tick failed (logged) — never propagates.
     """
     moment = now if now is not None else datetime.now(UTC)
     window = TimeInterval(start=moment, end=moment + horizon)
     try:
-        async with sessionmaker() as session, session.begin():
-            return await refresh_all_busy_caches(
-                session, now=moment, window=window, service_factory=service_factory
-            )
+        return await refresh_all_busy_caches(
+            pools, now=moment, window=window, service_factory=service_factory
+        )
     except Exception:
         _logger.exception("busy-refresh tick failed; scheduler continues")
         return None
@@ -293,16 +361,19 @@ async def run_busy_refresh_once(
 
 
 def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind a webhook-delivery tick to ``app.state`` (sessionmaker / http_client / fernet_key).
+    """Bind a webhook-delivery tick to the WORKER app's state (pools / http_client / fernet_key).
 
-    ``webhook_allowlist`` is put on ``app.state`` by ``create_app``, eagerly — not by the lifespan —
-    so it exists on every shape of the app, and the tick cannot fall back to "nothing allowed" for
-    an instance whose operator DID declare their network.
+    ``app`` here is the ``aethercal-worker`` process's app, never the web one — the web has no
+    ``pools`` on its state at all, because it holds no engine with ``BYPASSRLS``. That is not a
+    convention: an ``AttributeError`` at boot is what makes it a fact.
+
+    ``webhook_allowlist`` is put on the state eagerly by the worker factory, so the tick cannot fall
+    back to "nothing allowed" for an instance whose operator DID declare their network.
     """
 
     async def _tick() -> None:
         await run_webhook_delivery_once(
-            sessionmaker=app.state.sessionmaker,
+            pools=app.state.pools,
             http_client=app.state.http_client,
             fernet_key=app.state.fernet_key,
             allowlist=app.state.webhook_allowlist,
@@ -312,40 +383,45 @@ def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
 
 
 def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind a busy-cache refresh tick to ``app.state`` (sessionmaker + a Fernet-built factory)."""
+    """Bind a busy-cache refresh tick to the worker's state (pools + a Fernet-built factory)."""
 
     async def _tick() -> None:
         fernet = Fernet(app.state.fernet_key)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        await run_busy_refresh_once(
-            sessionmaker=app.state.sessionmaker, service_factory=service_factory
-        )
+        await run_busy_refresh_once(pools=app.state.pools, service_factory=service_factory)
 
     return _tick
 
 
 def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to ``app.state`` (sessionmaker + SMTP sender + a Fernet-built
-    Google factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+    """Bind an outbox-drain tick to the worker's state (pools + SMTP sender + a Fernet-built Google
+    factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+
+    ==The executor is built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers
+    read the booking, decrypt the business's credential and write the ledger, and every one of those
+    is a tenant-scoped table. They run inside the drain's per-item ``tenant_scope``, so under RLS
+    they see exactly that item's business — which is the whole point of splitting the pools: the one
+    place a cross-business leak would be *externally visible* is precisely here, in the process that
+    sends the guest's name and address to somebody's webhook.
     """
 
     async def _tick() -> None:
+        pools: WorkerPools = app.state.pools
         fernet = Fernet(app.state.fernet_key)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
         execute = make_booking_effect_executor(
-            sessionmaker=app.state.sessionmaker,
+            sessionmaker=pools.exec_maker,
             sender=app.state.email_sender,
             service_factory=service_factory,
-            # The non-email channel registry. EMPTY today, and that is not a gap: a step on a
-            # channel nobody registered is SKIPPED with its reason, never failed — a channel
-            # without credentials is a disabled feature, not an error. The channels cut registers
-            # its WhatsApp/SMS senders here and touches nothing else.
+            # The non-email channel registry. A step on a channel nobody registered is SKIPPED with
+            # its reason, never failed — a channel without credentials is a disabled feature, not an
+            # error.
             #
             # Email is deliberately NOT here: it goes through the full composer, which carries the
             # .ics invite that a plain-body ChannelSender cannot.
             channels=getattr(app.state, "channel_senders", None),
         )
-        await run_outbox_drain_once(sessionmaker=app.state.sessionmaker, execute=execute)
+        await run_outbox_drain_once(pools=pools, execute=execute)
 
     return _tick
 

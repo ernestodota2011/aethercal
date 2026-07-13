@@ -44,6 +44,22 @@ from aethercal.server.services.bookings import BookingParams, create_booking
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
+
+def _admin(maker: Sessionmaker) -> AdminRuntime:
+    """The session accessor the admin service layer takes, over the offline sessionmaker (B-01).
+
+    The service functions no longer accept a raw ``async_sessionmaker``. Under RLS a session opened
+    without a business bound reads ZERO rows — silently — so the factory is private to the runtime
+    and the only way in is ``admin_session``, which resolves the business and BINDS it before it
+    yields. The suite goes through the same door the panel does: a harness that kept the old
+    shortcut would be exercising a seam nobody ships.
+    """
+    return AdminRuntime(
+        sessionmaker=maker,
+        config=AdminConfig(username="admin", password_hash="x", tenant_slug=None),
+    )
+
+
 _WEEKLY_FORM = {
     "name": "Weekly",
     "timezone": "UTC",
@@ -266,7 +282,9 @@ async def test_load_bookings_excludes_cancelled_bookings_from_the_calendar(
     await _seed_event_type(state)
     event_type_id = uuid.UUID(state.event_types[0]["id"])
     booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
-    await service.cancel_booking_action(seeded_maker, tenant_slug=None, booking_id=booking_id)
+    await service.cancel_booking_action(
+        _admin(seeded_maker), tenant_slug=None, booking_id=booking_id
+    )
 
     await AdminState.load_bookings.fn(state)
     assert state.calendar_events == []
@@ -821,7 +839,7 @@ async def test_create_booking_action_reuses_the_domain_service(seeded_maker: Ses
     event_type_id = uuid.UUID(state.event_types[0]["id"])
 
     read = await service.create_booking_action(
-        seeded_maker,
+        _admin(seeded_maker),
         tenant_slug=None,
         form=service.BookingForm(
             event_type_id=event_type_id,
@@ -842,7 +860,7 @@ async def test_create_booking_action_maps_an_off_hours_slot_to_an_action_error(
     event_type_id = uuid.UUID(state.event_types[0]["id"])
     with pytest.raises(service.AdminActionError):
         await service.create_booking_action(
-            seeded_maker,
+            _admin(seeded_maker),
             tenant_slug=None,
             form=service.BookingForm(
                 event_type_id=event_type_id,

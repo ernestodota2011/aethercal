@@ -16,8 +16,10 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
+from aethercal.server.db.guc import bind_tenant
 from aethercal.server.deps import get_session
-from aethercal.server.services.api_keys import verify_api_key
+from aethercal.server.services.api_keys import parse_key, verify_api_key
+from aethercal.server.services.tenant_resolution import tenant_by_api_key_prefix
 
 
 class AuthenticationError(Exception):
@@ -52,9 +54,45 @@ async def require_api_key(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AuthContext:
-    """Authenticate the request by its API key, or raise :class:`AuthenticationError`."""
+    """Authenticate the request by its API key, ==and BIND its business to the session.==
+
+    This dependency is where the isolation belt is fastened for the whole request path. The order is
+    forced by the bootstrap paradox, and it is not negotiable:
+
+    1. **resolve** the business from the key's prefix, through the ``SECURITY DEFINER`` resolver.
+       ``api_keys`` is itself a tenant-scoped table, so under RLS with no GUC that read returns zero
+       rows — and every authenticated request in the product would 401. The resolver runs as its
+       owner, sees the row, and hands back a bare ``uuid``: nothing else, so nothing leaks.
+    2. **bind** the GUC (:func:`~aethercal.server.db.guc.bind_tenant`). From here on, every
+       transaction of this request — including the ones a mid-request commit or a post-commit lazy
+       load will open later — carries that business, stamped by the ``after_begin`` listener.
+    3. **verify** the key by RE-READING the row, now under RLS. The hash comparison and the
+       revocation check therefore happen against a row this business is genuinely allowed to see: a
+       prefix that somehow resolved to one business while its row belongs to another cannot
+       authenticate, because the second read finds nothing.
+
+    Any step failing raises :class:`AuthenticationError`, and the caller is never told which
+    (RF-16).
+    Binding BEFORE the verification is deliberate: the verification query is itself tenant-scoped,
+    so
+    without the GUC it would see nothing at all.
+    """
     presented = bearer_token(request)
-    api_key = await verify_api_key(session, presented) if presented is not None else None
+    if presented is None:
+        raise AuthenticationError
+
+    parsed = parse_key(presented)
+    if parsed is None:
+        raise AuthenticationError
+    prefix, _secret = parsed
+
+    tenant_id = await tenant_by_api_key_prefix(session, prefix)
+    if tenant_id is None:
+        raise AuthenticationError
+
+    await bind_tenant(session, tenant_id)
+
+    api_key = await verify_api_key(session, presented)
     if api_key is None:
         raise AuthenticationError
     return AuthContext(tenant_id=api_key.tenant_id, api_key_id=api_key.id)

@@ -35,6 +35,7 @@ from aethercal.server import scheduler as sched
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
 from aethercal.server.db.models import BusyCache, ExternalConnection, Tenant, User
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.scheduler import (
     BUSY_REFRESH_JOB_ID,
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
@@ -53,6 +54,29 @@ from aethercal.server.scheduler import (
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS, PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the worker pools over ONE offline sessionmaker.
+
+    Every tick takes :class:`WorkerPools` now, not a sessionmaker: on PostgreSQL each needs a
+    ``BYPASSRLS`` connection to FIND work whose business it cannot know until it has read the row,
+    and the app role to EXECUTE that work under row-level security, bound to that row own business.
+    SQLite has neither roles nor RLS, so here the two collapse back into one.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the worker pools over ONE offline sessionmaker.
+
+    Every tick takes :class:`WorkerPools` now, not a sessionmaker: on PostgreSQL each needs a
+    ``BYPASSRLS`` connection to FIND work whose business it cannot know until it has read the row,
+    and the app role to EXECUTE that work under row-level security, bound to that row own business.
+    SQLite has neither roles nor RLS, so here the two collapse back into one.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -250,7 +274,7 @@ async def test_run_webhook_delivery_once_reports_a_clean_empty_pass(
 ) -> None:
     async with httpx.AsyncClient() as http_client:
         report = await run_webhook_delivery_once(
-            sessionmaker=sqlite_sessionmaker,
+            pools=_pools(sqlite_sessionmaker),
             http_client=http_client,
             fernet_key=derive_fernet_key("test-app-secret"),
             allowlist=NO_PRIVATE_TARGETS,
@@ -272,7 +296,7 @@ async def test_run_webhook_delivery_once_swallows_a_failing_tick(
 
     async with httpx.AsyncClient() as http_client:
         report = await run_webhook_delivery_once(
-            sessionmaker=sqlite_sessionmaker,
+            pools=_pools(sqlite_sessionmaker),
             http_client=http_client,
             fernet_key=derive_fernet_key("test-app-secret"),
             allowlist=NO_PRIVATE_TARGETS,
@@ -308,7 +332,7 @@ async def test_the_tick_hands_the_operators_allowlist_to_the_worker(
 
     async with httpx.AsyncClient() as http_client:
         await run_webhook_delivery_once(
-            sessionmaker=sqlite_sessionmaker,
+            pools=_pools(sqlite_sessionmaker),
             http_client=http_client,
             fernet_key=derive_fernet_key("test-app-secret"),
             allowlist=declared,
@@ -331,7 +355,7 @@ async def test_run_outbox_drain_once_reports_a_clean_empty_pass(
     sqlite_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     report = await run_outbox_drain_once(
-        sessionmaker=sqlite_sessionmaker, execute=_noop_execute, now=NOW
+        pools=_pools(sqlite_sessionmaker), execute=_noop_execute, now=NOW
     )
 
     assert report is not None
@@ -348,7 +372,7 @@ async def test_run_outbox_drain_once_swallows_a_failing_tick(
     monkeypatch.setattr(sched, "drain_outbox", _boom)
 
     report = await run_outbox_drain_once(
-        sessionmaker=sqlite_sessionmaker, execute=_noop_execute, now=NOW
+        pools=_pools(sqlite_sessionmaker), execute=_noop_execute, now=NOW
     )
 
     # One bad tick must never propagate — it returns None so the scheduler keeps ticking.
@@ -361,14 +385,23 @@ async def test_run_outbox_drain_once_swallows_a_failing_tick(
 
 
 async def test_refresh_all_busy_caches_refreshes_every_active_connection(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory, fernet: Fernet
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
+    fernet: Fernet,
 ) -> None:
     a = await _connect(sqlite_session, tenant_factory, fernet=fernet, email="a@host.com")
     b = await _connect(sqlite_session, tenant_factory, fernet=fernet, email="b@host.com")
+    # ==Committed, not merely flushed.== The refresh no longer runs inside the caller's session: it
+    # PLANS on the bypass pool and re-reads each connection on the app pool, under that connection's
+    # own business. Those are different sessions, so uncommitted rows simply do not exist for them —
+    # which is exactly the property that makes the per-item binding possible in the first place.
+    await sqlite_session.commit()
+
     window = TimeInterval(start=NOW, end=NOW + timedelta(days=30))
 
     refreshed = await refresh_all_busy_caches(
-        sqlite_session,
+        _pools(sqlite_maker),
         now=NOW,
         window=window,
         service_factory=lambda _conn: _FakeGoogleService(),
@@ -382,10 +415,19 @@ async def test_refresh_all_busy_caches_refreshes_every_active_connection(
 
 
 async def test_refresh_all_busy_caches_skips_a_failing_connection(
-    sqlite_session: AsyncSession, tenant_factory: TenantFactory, fernet: Fernet
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: TenantFactory,
+    fernet: Fernet,
 ) -> None:
     good = await _connect(sqlite_session, tenant_factory, fernet=fernet, email="good@host.com")
     bad = await _connect(sqlite_session, tenant_factory, fernet=fernet, email="bad@host.com")
+    # ==Committed, not merely flushed.== The refresh no longer runs inside the caller's session: it
+    # PLANS on the bypass pool and re-reads each connection on the app pool, under that connection's
+    # own business. Those are different sessions, so uncommitted rows simply do not exist for them —
+    # which is exactly the property that makes the per-item binding possible in the first place.
+    await sqlite_session.commit()
+
     window = TimeInterval(start=NOW, end=NOW + timedelta(days=30))
 
     def _factory(connection: ExternalConnection) -> Any:
@@ -394,7 +436,7 @@ async def test_refresh_all_busy_caches_skips_a_failing_connection(
         return _FakeGoogleService()
 
     refreshed = await refresh_all_busy_caches(
-        sqlite_session, now=NOW, window=window, service_factory=_factory
+        _pools(sqlite_maker), now=NOW, window=window, service_factory=_factory
     )
 
     # The good connection still refreshed; the failing one is skipped, not fatal.
@@ -407,19 +449,35 @@ async def test_refresh_all_busy_caches_skips_a_failing_connection(
 
 async def test_refresh_all_busy_caches_isolates_a_flush_error_from_the_rest(
     sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
     tenant_factory: TenantFactory,
     fernet: Fernet,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A SQLAlchemy error mid-flush on ONE connection must not poison the whole batch.
 
-    Unlike a ``service_factory`` exception (which never touches the DB), a failing flush deactivates
-    the shared session's transaction: without per-connection SAVEPOINT isolation every remaining
-    connection would then abort too and the batch would silently half-complete. Each connection is
-    wrapped in ``session.begin_nested()`` so the poisoned flush rolls back just that connection.
+    ==The SAVEPOINT is gone, and what replaced it is stronger.== This used to be ONE transaction
+    over
+    every business, with each connection wrapped in a ``begin_nested()`` — because a failing flush
+    deactivates the shared transaction, and without that nesting every remaining connection aborted
+    with it and the batch half-completed in silence.
+
+    The refresh is no longer one transaction. Under row-level security it CANNOT be: the plan is
+    cross-business (only the bypass pool can see whose calendars are connected), while each refresh
+    must run bound to its own business, and one binding cannot be two businesses at once. So each
+    connection now gets its own session and its own transaction on the app pool. A poisoned flush
+    rolls back exactly that one — not a SAVEPOINT inside a shared transaction, but a transaction
+    that
+    was never shared to begin with.
+
+    The property being asserted is unchanged, and it is the one that matters: one bad connection,
+    and
+    the rest still refresh.
     """
     await _connect(sqlite_session, tenant_factory, fernet=fernet, email="a@host.com")
     await _connect(sqlite_session, tenant_factory, fernet=fernet, email="b@host.com")
+    # Committed, not merely flushed: the refresh opens its own sessions now (see above).
+    await sqlite_session.commit()
     window = TimeInterval(start=NOW, end=NOW + timedelta(days=30))
 
     real_refresh = sched.refresh_busy_cache
@@ -447,19 +505,20 @@ async def test_refresh_all_busy_caches_isolates_a_flush_error_from_the_rest(
     monkeypatch.setattr(sched, "refresh_busy_cache", _refresh)
 
     refreshed = await refresh_all_busy_caches(
-        sqlite_session,
+        _pools(sqlite_maker),
         now=NOW,
         window=window,
         service_factory=lambda _conn: _FakeGoogleService(),
     )
 
-    # The first connection's flush blew up; the OTHER still refreshed (SAVEPOINT isolation — one
-    # poisoned flush no longer aborts the whole batch).
+    # The first connection's flush blew up; the OTHER still refreshed. One poisoned transaction does
+    # not abort the batch — because it is not the batch's transaction any more, it is only its own.
     assert refreshed == 1
-    stamped = [
-        connection.busy_synced_at
-        for connection in (await sqlite_session.scalars(select(ExternalConnection))).all()
-    ]
+    async with sqlite_maker() as fresh:
+        stamped = [
+            connection.busy_synced_at
+            for connection in (await fresh.scalars(select(ExternalConnection))).all()
+        ]
     assert sum(stamp is not None for stamp in stamped) == 1
 
 
@@ -473,7 +532,7 @@ async def test_run_busy_refresh_once_swallows_a_failing_tick(
     monkeypatch.setattr(sched, "refresh_all_busy_caches", _boom)
 
     result = await run_busy_refresh_once(
-        sessionmaker=sqlite_sessionmaker,
+        pools=_pools(sqlite_sessionmaker),
         service_factory=lambda _conn: _FakeGoogleService(),
         now=NOW,
     )

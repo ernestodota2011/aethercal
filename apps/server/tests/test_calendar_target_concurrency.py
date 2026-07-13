@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.server.crypto import derive_fernet_key
+from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import ExternalCalendarLink, ExternalConnection, Tenant, User
 from aethercal.server.services.calendars import (
     GoogleCredential,
@@ -41,10 +42,15 @@ pytestmark = pytest.mark.db
 FERNET = Fernet(derive_fernet_key("test-app-secret"))
 
 
-async def _seed_two_connections(app: FastAPI) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
-    """One host with TWO connected Google accounts. Returns (tenant, host, connection_a, b)."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session, session.begin():
+async def _seed_two_connections(
+    owner_maker: async_sessionmaker[AsyncSession],
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    """One host with TWO connected Google accounts. Returns (tenant, host, connection_a, b).
+
+    ==On the OWNER engine== — arrangement, not behaviour. The RACE below is the behaviour, and it
+    runs on the app engine under RLS, with the business bound the way the product binds it.
+    """
+    async with owner_maker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Studio")
         session.add(tenant)
         await session.flush()
@@ -71,6 +77,7 @@ async def _seed_two_connections(app: FastAPI) -> tuple[uuid.UUID, uuid.UUID, uui
 async def _designate(
     app: FastAPI,
     *,
+    tenant_id: uuid.UUID,
     connection_id: uuid.UUID,
     calendar_id: str,
     barrier: asyncio.Barrier,
@@ -83,26 +90,40 @@ async def _designate(
     sometimes reproduces the bug is not a proof of anything.
     """
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session, session.begin():
-        connection = await session.get(ExternalConnection, connection_id)
-        assert connection is not None
-        await barrier.wait()
-        await link_booking_calendar(session, connection=connection, calendar_id=calendar_id)
+    with tenant_scope(tenant_id):
+        async with sessionmaker() as session, session.begin():
+            connection = await session.get(ExternalConnection, connection_id)
+            assert connection is not None
+            await barrier.wait()
+            await link_booking_calendar(session, connection=connection, calendar_id=calendar_id)
 
 
-async def test_two_concurrent_designations_leave_exactly_one_booking_target(app: FastAPI) -> None:
-    tenant_id, host_id, first, second = await _seed_two_connections(app)
+async def test_two_concurrent_designations_leave_exactly_one_booking_target(
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    tenant_id, host_id, first, second = await _seed_two_connections(owner_maker)
 
     # Two designations, fully concurrent, on DIFFERENT connections of the SAME host. The partial
     # unique index cannot catch this: the rows live on different connections.
     barrier = asyncio.Barrier(2)
     await asyncio.gather(
-        _designate(app, connection_id=first, calendar_id="work@cal", barrier=barrier),
-        _designate(app, connection_id=second, calendar_id="ops@cal", barrier=barrier),
+        _designate(
+            app,
+            tenant_id=tenant_id,
+            connection_id=first,
+            calendar_id="work@cal",
+            barrier=barrier,
+        ),
+        _designate(
+            app,
+            tenant_id=tenant_id,
+            connection_id=second,
+            calendar_id="ops@cal",
+            barrier=barrier,
+        ),
     )
 
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session:
+    async with owner_maker() as session:
         targets = (
             await session.scalars(
                 select(ExternalCalendarLink)
@@ -126,20 +147,31 @@ async def test_two_concurrent_designations_leave_exactly_one_booking_target(app:
 
 
 async def test_a_race_between_two_calendars_of_one_connection_also_settles(
-    app: FastAPI,
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]
 ) -> None:
     """The same race within a single connection, where the partial index DOES apply: it must resolve
     to one target rather than raising an IntegrityError at whoever clicked second."""
-    _tenant_id, host_id, first, _second = await _seed_two_connections(app)
+    tenant_id, host_id, first, _second = await _seed_two_connections(owner_maker)
 
     barrier = asyncio.Barrier(2)
     await asyncio.gather(
-        _designate(app, connection_id=first, calendar_id="one@cal", barrier=barrier),
-        _designate(app, connection_id=first, calendar_id="two@cal", barrier=barrier),
+        _designate(
+            app,
+            tenant_id=tenant_id,
+            connection_id=first,
+            calendar_id="one@cal",
+            barrier=barrier,
+        ),
+        _designate(
+            app,
+            tenant_id=tenant_id,
+            connection_id=first,
+            calendar_id="two@cal",
+            barrier=barrier,
+        ),
     )
 
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session:
+    async with owner_maker() as session:
         targets = (
             await session.scalars(
                 select(ExternalCalendarLink)

@@ -35,6 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import Tenant, User
 from aethercal.server.services import users as users_service
 from aethercal.server.services.users import (
@@ -47,9 +48,10 @@ from aethercal.server.services.users import (
 pytestmark = pytest.mark.db
 
 
-async def _seed_tenant(app: FastAPI) -> uuid.UUID:
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session, session.begin():
+async def _seed_tenant(owner_maker: async_sessionmaker[AsyncSession]) -> uuid.UUID:
+    """==On the OWNER engine.== A business is arrangement, and there is no business bound yet to
+    write it under: on the app role, under ``FORCE`` + ``WITH CHECK``, this INSERT is DENIED."""
+    async with owner_maker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Studio")
         session.add(tenant)
         await session.flush()
@@ -73,18 +75,21 @@ async def _create(
     made deterministic instead of left to scheduling luck.
     """
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session, session.begin():
-        await _ensure_email_available(session, tenant_id=tenant_id, email=email)
-        await barrier.wait()
-        return await create_user(
-            session,
-            tenant_id=tenant_id,
-            data=UserData(name=name, email=email, timezone="UTC"),
-        )
+    with tenant_scope(tenant_id):
+        async with sessionmaker() as session, session.begin():
+            await _ensure_email_available(session, tenant_id=tenant_id, email=email)
+            await barrier.wait()
+            return await create_user(
+                session,
+                tenant_id=tenant_id,
+                data=UserData(name=name, email=email, timezone="UTC"),
+            )
 
 
-async def test_two_concurrent_hosts_differing_only_in_case_leave_exactly_one(app: FastAPI) -> None:
-    tenant_id = await _seed_tenant(app)
+async def test_two_concurrent_hosts_differing_only_in_case_leave_exactly_one(
+    app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    tenant_id = await _seed_tenant(owner_maker)
     barrier = asyncio.Barrier(2)
 
     results = await asyncio.gather(
@@ -109,16 +114,18 @@ async def test_two_concurrent_hosts_differing_only_in_case_leave_exactly_one(app
     )
     assert "already exists" in str(refused[0])
 
-    # And the business has ONE host, which is the fact that actually matters.
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
-    async with sessionmaker() as session:
+    # And the business has ONE host, which is the fact that actually matters. Observed on the
+    # OWNER engine — it sees every business, so a second row is not hidden by a policy here.
+    async with owner_maker() as session:
         rows = list((await session.scalars(select(User).where(User.tenant_id == tenant_id))).all())
     assert len(rows) == 1, f"a case-variant pair landed: {[row.email for row in rows]}"
     assert rows[0].id == winners[0].id
 
 
 async def test_the_index_refusal_does_not_poison_the_callers_transaction(
-    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI,
+    owner_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The refusal is scoped to the ACTION, not to the caller's transaction.
 
@@ -133,38 +140,41 @@ async def test_the_index_refusal_does_not_poison_the_callers_transaction(
     the other transaction has not committed, so there is nothing for the guard to find — and it is
     the only way to make the INDEX be the thing that refuses, which is the path under test.
     """
-    tenant_id = await _seed_tenant(app)
+    tenant_id = await _seed_tenant(owner_maker)
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
 
     async def _blind(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async with sessionmaker() as session, session.begin():
-        await create_user(
-            session,
-            tenant_id=tenant_id,
-            data=UserData(name="Ana", email="Ana@example.com", timezone="UTC"),
-        )
-        await session.flush()
-
-        monkeypatch.setattr(users_service, "_ensure_email_available", _blind)
-        with pytest.raises(DuplicateUserEmailError):
+    # The SAVEPOINT is the system under test, so it runs where the product runs it: the app role,
+    # under RLS, with the business bound the way a request binds it.
+    with tenant_scope(tenant_id):
+        async with sessionmaker() as session, session.begin():
             await create_user(
                 session,
                 tenant_id=tenant_id,
-                data=UserData(name="Ana Ruiz", email="ana@example.com", timezone="UTC"),
+                data=UserData(name="Ana", email="Ana@example.com", timezone="UTC"),
             )
-        monkeypatch.undo()
+            await session.flush()
 
-        # The transaction is ALIVE: a DIFFERENT host still lands, in the SAME transaction — and it
-        # commits. Without the savepoint, PostgreSQL would have refused this write outright.
-        bruno = await create_user(
-            session,
-            tenant_id=tenant_id,
-            data=UserData(name="Bruno", email="bruno@example.com", timezone="UTC"),
-        )
+            monkeypatch.setattr(users_service, "_ensure_email_available", _blind)
+            with pytest.raises(DuplicateUserEmailError):
+                await create_user(
+                    session,
+                    tenant_id=tenant_id,
+                    data=UserData(name="Ana Ruiz", email="ana@example.com", timezone="UTC"),
+                )
+            monkeypatch.undo()
 
-    async with sessionmaker() as session:
+            # The transaction is ALIVE: a DIFFERENT host still lands, in the SAME transaction —
+            # and it commits. Without the savepoint, PostgreSQL would have refused this write.
+            bruno = await create_user(
+                session,
+                tenant_id=tenant_id,
+                data=UserData(name="Bruno", email="bruno@example.com", timezone="UTC"),
+            )
+
+    async with owner_maker() as session:
         emails = {
             row.email
             for row in (
@@ -191,11 +201,17 @@ async def test_an_integrity_error_that_is_not_a_duplicate_email_is_not_dressed_u
     particular violation cannot even be provoked offline.)
     """
     sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    ghost = uuid.uuid4()  # no such tenant -> a foreign-key violation
 
-    with pytest.raises(IntegrityError):
+    # The scope is bound TO the ghost business, and that is the point: with the GUC bound, the
+    # policy's WITH CHECK is SATISFIED (the row carries the bound business), so the write reaches
+    # the database and the FOREIGN KEY is what refuses it — which is the error under test. Left
+    # unbound, row-level security would refuse it first, and this would prove nothing about the
+    # translation.
+    with pytest.raises(IntegrityError), tenant_scope(ghost):
         async with sessionmaker() as session, session.begin():
             await create_user(
                 session,
-                tenant_id=uuid.uuid4(),  # no such tenant → a foreign-key violation
+                tenant_id=ghost,
                 data=UserData(name="Ana", email="ana@example.com", timezone="UTC"),
             )
