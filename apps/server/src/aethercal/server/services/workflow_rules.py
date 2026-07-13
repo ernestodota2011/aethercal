@@ -51,7 +51,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.workflows import (
     WorkflowCreate,
+    WorkflowRead,
     WorkflowStepIn,
+    WorkflowStepRead,
     WorkflowTemplateCreate,
     WorkflowTemplateUpdate,
     WorkflowUpdate,
@@ -208,6 +210,46 @@ async def _reload(session: AsyncSession, row: Workflow | WorkflowTemplate) -> No
     Why it never bit ``event_types``: ``EventTypeRead`` does not expose the timestamps at all, so
     nothing ever touched the expired attribute. ``WorkflowRead`` does."""
     await session.refresh(row)
+
+
+# --------------------------------------------------------------------------------------
+# Row → API read model (the ONE projection every read surface shares).
+# --------------------------------------------------------------------------------------
+
+
+def rule_to_read(rule: Rule) -> WorkflowRead:
+    """A :class:`Rule` (a workflow + its steps) → the :class:`WorkflowRead` every surface returns.
+
+    Lives here, next to the rows it projects, exactly like
+    :func:`~aethercal.server.services.schedules.schedule_to_read`. ==It used to live TWICE== —
+    hand-maintained field for field in ``api/workflows.py`` and again in ``admin/service.py``. Both
+    copies were type-checked, which is what made the duplication look survivable: a new REQUIRED
+    field on the schema breaks both at once, so pyright would have caught it.
+
+    It would not have caught the other half. A new field with a DEFAULT (``list``, ``None``, a flag)
+    breaks neither copy: whichever one nobody remembered to edit keeps type-checking and quietly
+    returns the default for ever. The API answers one thing, the panel shows another, and no test
+    that reads back only its own surface can tell. The projection is therefore ONE function, and
+    ``test_no_read_surface_re_projects_a_rule_by_hand`` asserts nothing outside this module builds a
+    ``WorkflowRead`` again.
+
+    Built field by field rather than ``model_validate``-d, because ``steps`` is not an attribute of
+    the ``Workflow`` row: it is loaded separately, on purpose (this codebase has no ORM
+    relationships — a lazy load on an :class:`AsyncSession` is a ``MissingGreenlet`` crash, raised
+    inside the serializer, far from here).
+    """
+    workflow = rule.workflow
+    return WorkflowRead(
+        id=workflow.id,
+        name=workflow.name,
+        trigger=workflow.trigger,  # type: ignore[arg-type]  # validated in; the set is test-locked
+        offset_minutes=workflow.offset_minutes,
+        event_type_id=workflow.event_type_id,
+        active=workflow.active,
+        steps=[WorkflowStepRead.model_validate(step) for step in rule.steps],
+        created_at=workflow.created_at,
+        updated_at=workflow.updated_at,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -773,6 +815,7 @@ __all__ = [
     "get_workflow",
     "list_templates",
     "list_workflows",
+    "rule_to_read",
     "set_workflow_active",
     "update_template",
     "update_workflow",

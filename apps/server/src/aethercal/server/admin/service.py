@@ -36,7 +36,6 @@ from aethercal.schemas.schedules import ScheduleCreate, ScheduleRead, ScheduleUp
 from aethercal.schemas.workflows import (
     WorkflowCreate,
     WorkflowRead,
-    WorkflowStepRead,
     WorkflowTemplateCreate,
     WorkflowTemplateRead,
     WorkflowTemplateUpdate,
@@ -896,33 +895,16 @@ async def designate_calendar_action(
 # admin therefore owns no rule logic of its own; it resolves the tenant, passes the clock down, and
 # lets that service do the arming.
 #
+# The READ side is the service's too (``rule_to_read``). The panel used to project a rule with its
+# own hand-written copy of the API's projection — nine fields, maintained twice. Both were
+# type-checked, which made the duplication look free; it is not, because a new field with a DEFAULT
+# breaks neither copy, and the panel then quietly stops showing what the API still returns.
+#
 # ``WorkflowRuleError`` is surfaced by its OWN message rather than remapped. Each one was written to
 # be read by the person who caused it ("the whatsapp step of kind 'reminder' has no template to
 # render its body ... without one the step is skipped at send time and the guest is never messaged,
 # silently"), and a hand-written table of replacements is precisely the thing that drifted into
 # lying about the booking errors above.
-
-
-def _rule_read(rule: workflow_rules_service.Rule) -> WorkflowRead:
-    """Project a rule + its steps for the panel (there is no ORM relationship — see ``Rule``).
-
-    Built field-by-field because ``steps`` is not an attribute of the ``Workflow`` row: it is loaded
-    separately, on purpose (a lazy load on an ``AsyncSession`` is a ``MissingGreenlet`` crash). The
-    field set is pyright-checked against ``WorkflowRead``, so a new field on the schema breaks this
-    projection at type-check rather than silently omitting itself from the panel.
-    """
-    workflow = rule.workflow
-    return WorkflowRead(
-        id=workflow.id,
-        name=workflow.name,
-        trigger=workflow.trigger,  # type: ignore[arg-type]  # validated in; the set is test-locked
-        offset_minutes=workflow.offset_minutes,
-        event_type_id=workflow.event_type_id,
-        active=workflow.active,
-        steps=[WorkflowStepRead.model_validate(step) for step in rule.steps],
-        created_at=workflow.created_at,
-        updated_at=workflow.updated_at,
-    )
 
 
 async def list_workflows_view(
@@ -932,7 +914,7 @@ async def list_workflows_view(
     async with maker() as session:
         ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
         rules = await workflow_rules_service.list_workflows(session, tenant_id=ctx.tenant_id)
-        return [_rule_read(rule) for rule in rules]
+        return [workflow_rules_service.rule_to_read(rule) for rule in rules]
 
 
 async def create_workflow_action(
@@ -951,7 +933,7 @@ async def create_workflow_action(
             )
         except workflow_rules_service.WorkflowRuleError as exc:
             raise AdminActionError(str(exc)) from exc
-        return _rule_read(rule)
+        return workflow_rules_service.rule_to_read(rule)
 
 
 async def update_workflow_action(
@@ -979,7 +961,7 @@ async def update_workflow_action(
             # The service returns ``None`` rather than raising for an absent row. Reported as a
             # success, that is the panel confirming a save that never touched anything.
             raise AdminActionError("Workflow not found")
-        return _rule_read(rule)
+        return workflow_rules_service.rule_to_read(rule)
 
 
 async def set_workflow_active_action(
@@ -1005,7 +987,7 @@ async def set_workflow_active_action(
             raise AdminActionError(str(exc)) from exc
         if rule is None:
             raise AdminActionError("Workflow not found")
-        return _rule_read(rule)
+        return workflow_rules_service.rule_to_read(rule)
 
 
 async def list_templates_view(

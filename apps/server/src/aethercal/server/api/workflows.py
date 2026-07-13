@@ -29,7 +29,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.schemas.workflows import (
     WorkflowCreate,
     WorkflowRead,
-    WorkflowStepRead,
     WorkflowTemplateCreate,
     WorkflowTemplateRead,
     WorkflowTemplateUpdate,
@@ -44,7 +43,6 @@ from aethercal.server.services.workflow_rules import (
     InvalidReferenceError,
     InvalidRuleError,
     InvalidTemplateError,
-    Rule,
     TemplateInUseError,
     create_template,
     create_workflow,
@@ -53,6 +51,7 @@ from aethercal.server.services.workflow_rules import (
     get_workflow,
     list_templates,
     list_workflows,
+    rule_to_read,
     set_workflow_active,
     update_template,
     update_workflow,
@@ -100,22 +99,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _read(rule: Rule) -> WorkflowRead:
-    """A rule + its steps as the API returns it (there is no ORM relationship — see ``Rule``)."""
-    workflow = rule.workflow
-    return WorkflowRead(
-        id=workflow.id,
-        name=workflow.name,
-        trigger=workflow.trigger,  # type: ignore[arg-type]  # validated in; the set is test-locked
-        offset_minutes=workflow.offset_minutes,
-        event_type_id=workflow.event_type_id,
-        active=workflow.active,
-        steps=[WorkflowStepRead.model_validate(step) for step in rule.steps],
-        created_at=workflow.created_at,
-        updated_at=workflow.updated_at,
-    )
-
-
 def _read_template(row: WorkflowTemplate) -> WorkflowTemplateRead:
     return WorkflowTemplateRead.model_validate(row)
 
@@ -139,13 +122,13 @@ async def create(payload: WorkflowCreate, session: SessionDep, ctx: AuthDep) -> 
         raise _unprocessable(_INVALID_REFERENCE, exc) from exc
     except InvalidRuleError as exc:
         raise _unprocessable(_INVALID_RULE, exc) from exc
-    return _read(rule)
+    return rule_to_read(rule)
 
 
 @router.get("/", response_model=list[WorkflowRead])
 async def list_all(session: SessionDep, ctx: AuthDep) -> list[WorkflowRead]:
     """Every rule of the tenant (active and inactive), each with its steps."""
-    return [_read(rule) for rule in await list_workflows(session, tenant_id=ctx.tenant_id)]
+    return [rule_to_read(rule) for rule in await list_workflows(session, tenant_id=ctx.tenant_id)]
 
 
 @router.get("/{workflow_id}", response_model=WorkflowRead)
@@ -154,7 +137,7 @@ async def retrieve(workflow_id: uuid.UUID, session: SessionDep, ctx: AuthDep) ->
     rule = await get_workflow(session, tenant_id=ctx.tenant_id, workflow_id=workflow_id)
     if rule is None:
         raise _not_found("Workflow")
-    return _read(rule)
+    return rule_to_read(rule)
 
 
 @router.patch("/{workflow_id}", response_model=WorkflowRead)
@@ -177,7 +160,7 @@ async def patch(
         raise _unprocessable(_INVALID_RULE, exc) from exc
     if rule is None:
         raise _not_found("Workflow")
-    return _read(rule)
+    return rule_to_read(rule)
 
 
 @router.post("/{workflow_id}/activate", response_model=WorkflowRead)
@@ -188,7 +171,7 @@ async def activate(workflow_id: uuid.UUID, session: SessionDep, ctx: AuthDep) ->
     )
     if rule is None:
         raise _not_found("Workflow")
-    return _read(rule)
+    return rule_to_read(rule)
 
 
 @router.post("/{workflow_id}/deactivate", response_model=WorkflowRead)
@@ -199,7 +182,7 @@ async def deactivate(workflow_id: uuid.UUID, session: SessionDep, ctx: AuthDep) 
     )
     if rule is None:
         raise _not_found("Workflow")
-    return _read(rule)
+    return rule_to_read(rule)
 
 
 @router.delete("/{workflow_id}", status_code=status.HTTP_204_NO_CONTENT)
