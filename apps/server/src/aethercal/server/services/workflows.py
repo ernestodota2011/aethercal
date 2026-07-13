@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Collection, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import assert_never
 
@@ -54,6 +54,7 @@ from aethercal.server.db.models import Booking, Workflow, WorkflowStep
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.services.outbox import (
     OutboxEffect,
+    as_utc,
     enqueue_effect,
     void_pending_steps,
     workflow_step_dedupe_key,
@@ -267,11 +268,6 @@ async def seed_default_workflows(session: AsyncSession, *, tenant_id: uuid.UUID)
     return workflow
 
 
-def _as_utc(moment: datetime) -> datetime:
-    """SQLite drops tzinfo on the round-trip; normalise before doing arithmetic on it."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
-
-
 def step_send_time(
     trigger: WorkflowTrigger, *, booking: Booking, offset: timedelta
 ) -> datetime | None:
@@ -290,9 +286,9 @@ def step_send_time(
     """
     match trigger:
         case WorkflowTrigger.BEFORE_START:
-            return _as_utc(booking.start_at) + offset
+            return as_utc(booking.start_at) + offset
         case WorkflowTrigger.AFTER_END:
-            return _as_utc(booking.end_at) + offset
+            return as_utc(booking.end_at) + offset
         case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
             return None
         case _ as unreachable:

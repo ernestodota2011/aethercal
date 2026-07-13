@@ -293,7 +293,9 @@ async def create_workflow(
     await session.flush()
 
     steps = await _load_steps(session, workflow.id)
-    await _reconcile(session, workflow=workflow, steps=steps, now=now)
+    # A brand-new rule has no queued rows to mistime, so the flag is moot — but it is stated, not
+    # defaulted: a rule that has just been written IS its own timing.
+    await _reconcile(session, workflow=workflow, steps=steps, now=now, timing_changed=True)
     return Rule(workflow=workflow, steps=steps)
 
 
@@ -321,6 +323,12 @@ async def update_workflow(
     steps_in: list[WorkflowStepIn] | None = data.steps if "steps" in fields else None
     fields.pop("steps", None)
 
+    # Did THIS edit move the rule's clock? Only then may a queued step whose send time now lies in
+    # the past be retired: otherwise that step is not mistimed, it is OVERDUE (it was paused while
+    # the rule was off), and retiring it would destroy the message on the very edit — the switch
+    # back ON — that exists to deliver it.
+    timing_changed = "trigger" in fields or "offset_minutes" in fields or steps_in is not None
+
     _check_offset(
         str(fields.get("trigger", workflow.trigger)),
         int(fields.get("offset_minutes", workflow.offset_minutes)),
@@ -346,7 +354,9 @@ async def update_workflow(
         await _sync_steps(session, workflow=workflow, wanted=steps_in)
 
     steps = await _load_steps(session, workflow.id)
-    await _reconcile(session, workflow=workflow, steps=steps, now=now)
+    await _reconcile(
+        session, workflow=workflow, steps=steps, now=now, timing_changed=timing_changed
+    )
     return Rule(workflow=workflow, steps=steps)
 
 
@@ -358,13 +368,20 @@ async def set_workflow_active(
     active: bool,
     now: datetime,
 ) -> Rule | None:
-    """Switch a rule on or off. Off stops the messages; on ARMS the bookings taken while it was off.
+    """Switch a rule on or off. Off PAUSES its messages; on delivers them.
 
-    The toggle is symmetric, deliberately. Switching OFF does not void the queued rows: the drain
-    refuses to deliver a step whose rule is inactive (``_require_a_live_rule``), so they simply go
-    inert. Voiding them would be terminal, their dedupe keys would stay occupied for ever, and
-    switching the rule back on could never re-queue them — the reminder would be gone, in silence.
-    Switching ON reconciles, so a booking taken while the rule was off is armed with the right time.
+    ==The toggle is symmetric, and nothing about it is terminal.== Switching OFF neither voids the
+    queued rows nor lets the drain retire them: a step whose rule is inactive is PAUSED
+    (``_gate_on_the_rule`` → ``OutboxDeferred``), so it stays ``pending``, consumes no attempt, and
+    survives. Anything terminal here — voiding the row, or skipping it at the drain — would destroy
+    a
+    message over a condition the tenant can undo with one click, and its dedupe key would stay
+    occupied for ever, so switching the rule back on could never restore it.
+
+    Switching ON reconciles: a booking taken while the rule was off is armed, and a step that came
+    due while it was off is made due NOW rather than mistaken for one the edit mistimed. What is no
+    longer worth sending is stopped at the send, by ``message_deadline`` — not here, and not for
+    ever.
     """
     return await update_workflow(
         session,
@@ -423,12 +440,23 @@ async def _sync_steps(
 
 
 async def _reconcile(
-    session: AsyncSession, *, workflow: Workflow, steps: Sequence[WorkflowStep], now: datetime
+    session: AsyncSession,
+    *,
+    workflow: Workflow,
+    steps: Sequence[WorkflowStep],
+    now: datetime,
+    timing_changed: bool,
 ) -> None:
     """Re-derive every governed booking's queued steps from the rule as it now stands.
 
-    An INACTIVE rule is skipped entirely — neither armed nor voided. Its queued rows are already
-    inert (the drain refuses a step whose rule is off), and voiding them would burn their dedupe
+    ``timing_changed`` says whether THIS operation moved the rule's clock (its trigger, its offset,
+    or its steps). It is what tells an OVERDUE row apart from a MISTIMED one, and the two must not
+    share a fate: an edit that drags a send time into the past retires the step (it would otherwise
+    fire at once, after the fact), whereas a step that is merely overdue — paused while the tenant
+    had the rule switched off — must be made DUE, not destroyed.
+
+    An INACTIVE rule is skipped entirely — neither armed nor voided. Its queued rows are inert while
+    it is off (the drain PAUSES them; it does not retire them), and voiding would burn their dedupe
     keys for ever, so switching the rule back on could never restore them. Everything is put right
     when it IS switched back on, which reconciles.
 
@@ -467,6 +495,7 @@ async def _reconcile(
             workflow_id=workflow.id,
             wanted=wanted,
             now=now,
+            timing_changed=timing_changed,
         )
 
 

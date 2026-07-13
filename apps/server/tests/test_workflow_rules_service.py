@@ -52,9 +52,9 @@ from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
     OutboxEffect,
-    OutboxSkipped,
-    OutboxWork,
-    run_notify_effect,
+    OutboxReport,
+    drain_outbox,
+    make_booking_effect_executor,
     workflow_step_dedupe_key,
 )
 from aethercal.server.services.workflow_rules import (
@@ -815,7 +815,9 @@ async def test_another_tenants_template_cannot_be_read_or_deleted(
 
 
 # --------------------------------------------------------------------------------------
-# "Off" has to mean off AT THE SEND — the only moment anybody outside can observe.
+# "Off" is a PAUSE, not a death. Driven through the REAL drain, because the bug this guards
+# against is invisible from the service: an inactive rule is a TEMPORARY condition, so a step it
+# holds may never be given a TERMINAL outcome — the tenant can switch the rule back on.
 # --------------------------------------------------------------------------------------
 
 
@@ -829,57 +831,117 @@ class _RecordingSender:
         self.sent.append(message)
 
 
-async def _work_for(row: Outbox) -> OutboxWork:
-    return OutboxWork(
-        id=row.id,
-        tenant_id=row.tenant_id,
-        booking_id=row.booking_id,
-        effect=OutboxEffect(row.effect),
-        dedupe_key=row.dedupe_key,
-        payload=dict(row.payload),
-        attempts=0,
-        claimed_by="test-worker",
-    )
+_STARTS = _NOW + timedelta(hours=30)
+"""The booking used by the pause tests. Its 24 h reminder is due 6 h after ``_NOW`` — a moment the
+drain can actually REACH, which is the whole point: a row the drain never reaches cannot be
+destroyed by it, and the bug would hide."""
+_DUE = _STARTS - timedelta(hours=24)
 
 
-async def test_a_step_queued_by_a_rule_that_is_now_OFF_is_not_delivered(
+async def _drain(
+    maker: async_sessionmaker[AsyncSession], sender: _RecordingSender, *, now: datetime
+) -> OutboxReport:
+    execute = make_booking_effect_executor(sessionmaker=maker, sender=sender, service_factory=None)
+    return await drain_outbox(maker, now=now, execute=execute)
+
+
+async def test_a_rule_switched_off_PAUSES_its_step_and_switching_it_back_on_DELIVERS_it(
     sqlite_session: AsyncSession,
     sqlite_maker: async_sessionmaker[AsyncSession],
     tenant: Tenant,
     reminder: WorkflowCreate,
 ) -> None:
-    """The step was queued days ago, when the rule was on. Switching the rule off this afternoon has
-    to stop TOMORROW's message — and the only place that can be enforced is the send itself, because
-    the row is already sitting in the outbox with its send time intact.
+    """==THE test the pause exists for.== Switch a rule off, let the drain PASS OVER the step,
+    switch
+    the rule back on — and the message still goes out.
 
-    Deliberately NOT done by voiding the row: that is terminal, its dedupe key would stay occupied
-    for ever, and switching the rule back on could never restore the reminder. So the row survives,
-    inert, and the drain asks the rule."""
+    Get this wrong and the damage is silent and total. An inactive rule is TEMPORARY, so retiring
+    the
+    step at the drain (``OutboxSkipped`` is TERMINAL — exactly as voiding the row is) would mean a
+    tenant who toggles a rule off for one afternoon has PERMANENTLY destroyed every message that
+    came
+    due in the meantime; and the dedupe key stays occupied, so nothing can ever re-queue it. The
+    step
+    must WAIT — and waiting is ``OutboxDeferred``: still ``pending``, no attempt burned."""
     event_type = await _event_type(sqlite_session, tenant)
-    booking = await _book(sqlite_session, tenant, event_type)
+    booking = await _book(sqlite_session, tenant, event_type, start=_STARTS)
     created = await create_workflow(sqlite_session, tenant_id=tenant.id, now=_NOW, data=reminder)
-    (row,) = await _live_steps_of(sqlite_session, booking)
-    work = await _work_for(row)
-
     await set_workflow_active(
         sqlite_session, tenant_id=tenant.id, workflow_id=created.workflow.id, active=False, now=_NOW
     )
     await sqlite_session.commit()
-
     sender = _RecordingSender()
-    with pytest.raises(OutboxSkipped, match="workflow-inactive"):
-        await run_notify_effect(sqlite_maker, work, _NOW, sender=sender, channels={})
-    assert sender.sent == []  # nothing reached the guest
 
-    # Switch it back on and the very same row sends: the toggle is symmetric.
+    # The step comes DUE while the rule is off. The drain reaches it — and must not kill it.
+    report = await _drain(sqlite_maker, sender, now=_DUE)
+
+    assert sender.sent == []  # the tenant switched it off: nothing reaches the guest
+    assert len(report.deferred) == 1, f"the paused step was not deferred: {report}"
+    assert report.skipped == [] and report.dead == [] and report.delivered == []
+    (row,) = await _live_steps_of(sqlite_session, booking)
+    assert row.status == "pending"  # ALIVE — not 'skipped', not 'voided'
+    assert row.attempts == 0  # a wait is not a failure
+
+    # The tenant changes their mind. The SAME row — same dedupe key, same exactly-once identity.
+    resumed = _DUE + timedelta(minutes=1)
     await set_workflow_active(
-        sqlite_session, tenant_id=tenant.id, workflow_id=created.workflow.id, active=True, now=_NOW
+        sqlite_session,
+        tenant_id=tenant.id,
+        workflow_id=created.workflow.id,
+        active=True,
+        now=resumed,
     )
     await sqlite_session.commit()
 
-    await run_notify_effect(sqlite_maker, work, _NOW, sender=sender, channels={})
-    assert len(sender.sent) == 1
+    report = await _drain(sqlite_maker, sender, now=resumed)
+
+    assert len(report.delivered) == 1, f"the resumed step never went out: {report}"
+    assert len(sender.sent) == 1, "the guest was never reminded — the pause destroyed the message"
     assert "ada@example.com" in str(sender.sent[0]["To"])
+
+
+async def test_the_pause_is_BOUNDED_and_never_delivers_a_reminder_after_the_meeting_began(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant: Tenant,
+    reminder: WorkflowCreate,
+) -> None:
+    """The other half of the pause, and the reason it is not simply "wait for ever".
+
+    A step that waits has to stop waiting once its message can no longer do its job. Switch the rule
+    back on a week late and "your meeting is tomorrow" is not a LATE message, it is a WRONG one —
+    and
+    a row that polls for ever is a leak. So the wait is bounded by the message's own deadline (for a
+    reminder: the booking's start), and past it the step is terminally retired, with its reason."""
+    event_type = await _event_type(sqlite_session, tenant)
+    booking = await _book(sqlite_session, tenant, event_type, start=_STARTS)
+    created = await create_workflow(sqlite_session, tenant_id=tenant.id, now=_NOW, data=reminder)
+    await set_workflow_active(
+        sqlite_session, tenant_id=tenant.id, workflow_id=created.workflow.id, active=False, now=_NOW
+    )
+    await sqlite_session.commit()
+    sender = _RecordingSender()
+
+    assert len((await _drain(sqlite_maker, sender, now=_DUE)).deferred) == 1  # paused, and alive
+
+    # …and the tenant only switches the rule back on AFTER the meeting has already started.
+    too_late = _STARTS + timedelta(hours=1)
+    await set_workflow_active(
+        sqlite_session,
+        tenant_id=tenant.id,
+        workflow_id=created.workflow.id,
+        active=True,
+        now=too_late,
+    )
+    await sqlite_session.commit()
+
+    report = await _drain(sqlite_maker, sender, now=too_late)
+
+    assert sender.sent == [], "a 'reminder' was delivered AFTER the meeting had already begun"
+    assert len(report.skipped) == 1, f"the step should be retired, not left polling: {report}"
+    assert report.delivered == []
+    (row,) = await _steps_of(sqlite_session, booking)
+    assert row.status == "skipped"  # terminal at last: its moment is irretrievably gone
 
 
 async def test_a_step_whose_rule_has_VANISHED_is_not_delivered(
@@ -889,21 +951,26 @@ async def test_a_step_whose_rule_has_VANISHED_is_not_delivered(
     reminder: WorkflowCreate,
 ) -> None:
     """An event type deleted with ``ON DELETE CASCADE`` takes its workflows with it. The steps it
-    had already queued would otherwise still be delivered — messages from a rule that exists
-    nowhere."""
+    had
+    already queued would otherwise still be delivered — messages from a rule that exists nowhere.
+
+    This one IS terminal, and that is the distinction the pause rests on: a deleted rule cannot be
+    switched back on, so there is nothing left to wait for."""
     event_type = await _event_type(sqlite_session, tenant)
-    booking = await _book(sqlite_session, tenant, event_type)
+    booking = await _book(sqlite_session, tenant, event_type, start=_STARTS)
     created = await create_workflow(sqlite_session, tenant_id=tenant.id, now=_NOW, data=reminder)
-    (row,) = await _live_steps_of(sqlite_session, booking)
-    work = await _work_for(row)
+    assert len(await _live_steps_of(sqlite_session, booking)) == 1
 
     await sqlite_session.delete(created.workflow)
     await sqlite_session.commit()
 
     sender = _RecordingSender()
-    with pytest.raises(OutboxSkipped, match="workflow-gone"):
-        await run_notify_effect(sqlite_maker, work, _NOW, sender=sender, channels={})
+    report = await _drain(sqlite_maker, sender, now=_DUE)
+
     assert sender.sent == []
+    assert len(report.skipped) == 1 and report.delivered == []
+    (row,) = await _steps_of(sqlite_session, booking)
+    assert row.status == "skipped"  # terminal: a deleted rule is not coming back
 
 
 # --------------------------------------------------------------------------------------
