@@ -119,9 +119,13 @@ def _build_effects(request: Request) -> BookingEffects:
     The guest-token signer + booking base URL are always present. The email notice is enqueued to
     the durable outbox unconditionally (the drain worker owns the live SMTP sender), so no sender is
     passed here. There is no reminder runner any more: the 24 h reminder is a workflow rule
-    materialised into that same outbox, so nothing is scheduled from the request path. Google sync
-    (F1-07) is not wired yet (resolving the host's ``ExternalConnection`` is the last step), so
-    ``connection`` stays ``None`` — a booking never attempts Google in this path.
+    materialised into that same outbox, so nothing is scheduled from the request path.
+
+    The Google sync (RF-11) is NOT assembled here either, and that is the fix rather than an
+    omission: the host is only known once the event type is loaded, which happens inside the booking
+    service. This bundle used to carry a ``connection`` field the API had no way to populate — so it
+    was always ``None``, and every booking skipped the calendar sync in silence. The service now
+    resolves the host's connected calendar from the database and enqueues the Google intent itself.
     """
     settings = _settings(request)
     return BookingEffects(

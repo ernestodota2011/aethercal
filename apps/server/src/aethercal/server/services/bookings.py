@@ -42,8 +42,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
-from aethercal.server.db.models import Booking, EventType, ExternalConnection
+from aethercal.server.db.models import Booking, EventType
 from aethercal.server.integrations.smtp.compose import NotificationKind
+from aethercal.server.services.calendars import load_active_connections
 from aethercal.server.services.event_types import get_event_type
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
@@ -124,20 +125,22 @@ class BookingEffects:
     ``booking_base_url`` are always present (the guest links are minted + built in-txn). The durable
     effects (email, Google sync) are NOT gated on a live client here — they are ENQUEUED to the
     outbox and the drain worker supplies the client, so a momentarily-absent SMTP/Google never drops
-    a domain-required effect. ``connection`` names the host's calendar link (its id rides in the
-    Google intent; the live client is built later by the executor's ``service_factory``); ``None``
-    means the host has no external calendar, so nothing to sync.
+    a domain-required effect.
 
     There is no ``reminder_runner`` any more. The 24 h reminder used to be scheduled here onto a
     SECOND scheduler (APScheduler, with a Postgres jobstore) that carried its own idempotency
     barrier. That is now a tenant-editable **workflow rule** materialised into this same outbox, so
     a booking has exactly ONE thing that can decide to send it a reminder — the alternative was a
     guest receiving two, since the ledger key and the outbox dedupe key never knew about each other.
+
+    And there is no ``connection`` field any more either. It used to be one, and the API layer had
+    no way to fill it — the host is only known once the event type is loaded, INSIDE this service —
+    so it was always ``None`` and every single booking skipped the Google sync without a word. The
+    host's calendar is now resolved from the database here, where the host is actually known.
     """
 
     signer: GuestTokenSigner
     booking_base_url: str
-    connection: ExternalConnection | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -405,7 +408,7 @@ async def cancel_booking(
     Google event and sends the cancellation email when ``effects`` is supplied. Raises
     :class:`BookingNotFoundError` (404) if the tenant has no such booking.
     """
-    booking, _event_type = await _lock_and_reload_booking(
+    booking, event_type = await _lock_and_reload_booking(
         session, tenant_id=tenant_id, booking_id=booking_id
     )
     if booking.status == BookingStatus.CANCELLED:
@@ -432,11 +435,7 @@ async def cancel_booking(
     )
     if effects is not None:
         await _enqueue_google(
-            session,
-            booking=booking,
-            effects=effects,
-            operation=GoogleOperation.DELETE,
-            external_event_id=booking.external_event_id,
+            session, booking=booking, event_type=event_type, operation=GoogleOperation.DELETE
         )
         await _enqueue_email(
             session,
@@ -735,11 +734,7 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
         session, booking=booking, effects=effects, now=now
     )
     await _enqueue_google(
-        session,
-        booking=booking,
-        effects=effects,
-        operation=GoogleOperation.UPSERT,
-        event_type=event_type,
+        session, booking=booking, event_type=event_type, operation=GoogleOperation.UPSERT
     )
     await _enqueue_email(
         session,
@@ -767,12 +762,7 @@ async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is par
         session, booking=new, effects=effects, now=now
     )
     await _enqueue_google(
-        session,
-        booking=new,
-        effects=effects,
-        operation=GoogleOperation.RESCHEDULE,
-        event_type=event_type,
-        external_event_id=old.external_event_id,
+        session, booking=new, event_type=event_type, operation=GoogleOperation.RESCHEDULE
     )
     await _enqueue_email(
         session,
@@ -820,30 +810,78 @@ async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking
     )
 
 
-async def _enqueue_google(  # noqa: PLR0913 - the sync operation + its event context are the contract
+async def _chain_has_external_event(session: AsyncSession, booking: Booking) -> bool:
+    """True when this booking — or an ancestor it was rescheduled from — already has a live event.
+
+    A reschedule successor holds no event of its own until its own sync drains, so the walk up the
+    ``rescheduled_from_id`` chain is what makes "this chain is already in someone's calendar"
+    answerable at ENQUEUE time, which is when the decision to sync at all gets made.
+    """
+    current: Booking | None = booking
+    seen: set[uuid.UUID] = set()
+    while current is not None and current.id not in seen:
+        if current.external_event_id is not None:
+            return True
+        seen.add(current.id)
+        if current.rescheduled_from_id is None:
+            return False
+        current = await session.get(Booking, current.rescheduled_from_id)
+    return False
+
+
+async def _enqueue_google(
     session: AsyncSession,
     *,
     booking: Booking,
-    effects: BookingEffects,
+    event_type: EventType,
     operation: GoogleOperation,
-    event_type: EventType | None = None,
-    external_event_id: str | None = None,
 ) -> None:
-    """Enqueue a Google-Calendar sync intent for the booking, when the host has a linked calendar.
+    """Enqueue a Google-Calendar sync intent for the booking — RF-11, the link that was missing.
 
-    Gated only on a persisted ``connection`` (its id rides in the intent) — NOT on a live client:
-    building the Google client is exclusively the executor's job (its ``service_factory``), so the
-    producer stays decoupled from momentary Google availability. ``None`` means the host has no
-    external calendar, so there is genuinely nothing to sync. The intent stores the primitives the
-    drain worker rebuilds the event request from; a DELETE needs only the ``external_event_id``."""
-    if effects.connection is None:
+    THE GATE IS THE EXISTENCE OF A CONNECTED CALENDAR, and the two ways that can read "no calendar"
+    are kept apart on purpose:
+
+    * The host has NO active connection → there is genuinely nothing to sync (the self-hoster who
+      never linked Google, RNF-9). No intent is enqueued; the booking is complete. Benign, logged at
+      debug.
+    * The host HAS a connection now, so the intent IS enqueued — and if the calendar cannot be
+      resolved LATER, at drain time, the effect raises (``CalendarTargetMissingError`` /
+      ``AmbiguousCalendarTargetError``): it retries, dead-letters, and lands in the outbox backlog
+      with an error log. It is never quietly marked delivered. Before this wave both cases collapsed
+      into one silent ``return``, which is precisely why no booking ever reached a calendar and no
+      one noticed.
+
+    ⚠️ **A CHAIN THAT ALREADY HAS AN EVENT IS ALWAYS SYNCED**, whatever the host's calendars look
+    like today. What a DELETE — or the move half of a RESCHEDULE — must act on is not the current
+    configuration; it is the event this booking ALREADY put in someone's calendar. A host who
+    revokes their Google account between the confirmation and the cancellation has no active
+    connection, so gating on that alone would drop the intent entirely: the guest is cancelled, the
+    meeting stays in the host's calendar forever, and nobody is ever told. The drain resolves the
+    event's RECORDED home (``_event_home``); if even that cannot be reached, the intent
+    dead-letters — which is a signal. Silence is not.
+
+    Only the HOST is captured here (``host_id``), never a specific connection id: the exact target
+    calendar is resolved at drain time from the live configuration, so there is one source of truth
+    for "where does this event go" instead of a snapshot that can rot between enqueue and drain. The
+    live client is exclusively the executor's job (its ``service_factory``), so the producer stays
+    decoupled from momentary Google availability. A DELETE carries no event data — the drain
+    resolves the event (and the calendar it lives in) from the booking chain.
+    """
+    host_id = event_type.host_id
+    connections = await load_active_connections(
+        session, tenant_id=booking.tenant_id, user_id=host_id
+    )
+    if not connections and not await _chain_has_external_event(session, booking):
+        _logger.debug(
+            "booking %s: host %s has no connected calendar and the chain has no external event; "
+            "nothing to sync",
+            booking.id,
+            host_id,
+        )
         return
-    payload: dict[str, object] = {
-        "operation": operation.value,
-        "connection_id": str(effects.connection.id),
-        "external_event_id": external_event_id,
-    }
-    if operation is not GoogleOperation.DELETE and event_type is not None:
+
+    payload: dict[str, object] = {"operation": operation.value, "host_id": str(host_id)}
+    if operation is not GoogleOperation.DELETE:
         payload.update(
             {
                 "summary": event_type.title,

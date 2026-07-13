@@ -22,7 +22,7 @@ from aethercal.server.cli import (
 )
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
-from aethercal.server.db.models import ExternalConnection
+from aethercal.server.db.models import ExternalCalendarLink, ExternalConnection
 from aethercal.server.services.api_keys import verify_api_key
 from aethercal.server.services.calendars import GoogleCredential, load_credentials
 
@@ -95,6 +95,73 @@ async def test_connect_google_stores_an_encrypted_connection(
         assert connection.provider == "google"
         assert connection.encrypted_credentials != token_json.encode("utf-8")
         assert load_credentials(connection, fernet=fernet) == token_json
+
+
+async def test_connect_google_can_designate_a_dedicated_booking_calendar(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The operator surface for the credential rule: bookings land in a DEDICATED secondary
+    calendar, never in the connected account's ``primary``. Without ``--calendar-id`` the account
+    default is used (zero-config); with it, the link row is written AND flagged as the booking
+    target — the row ``resolve_calendar_target`` actually reads."""
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+
+    connection_id = await run_connect_google(
+        maker,
+        tenant_slug="acme",
+        user_email="host@acme.test",
+        credential=GoogleCredential(account_email="agency@agency.test", token_json='{"t": "a"}'),
+        fernet=fernet,
+        calendar_id="bookings@group.calendar.google.com",
+    )
+
+    async with maker() as session:
+        link = (
+            await session.scalars(
+                select(ExternalCalendarLink).where(
+                    ExternalCalendarLink.connection_id == connection_id
+                )
+            )
+        ).one()
+        assert link.external_calendar_id == "bookings@group.calendar.google.com"
+        assert link.is_booking_target  # the event is written HERE, not into "primary"
+        assert link.busy  # and its freebusy blocks slots
+
+
+async def test_re_running_connect_google_with_the_same_calendar_is_idempotent(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Re-connecting (a token refresh, a re-run of the same command) must not pile up link rows or
+    trip the one-target-per-connection constraint."""
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+
+    for _ in range(2):
+        connection_id = await run_connect_google(
+            maker,
+            tenant_slug="acme",
+            user_email="host@acme.test",
+            credential=GoogleCredential(
+                account_email="agency@agency.test", token_json='{"t": "a"}'
+            ),
+            fernet=fernet,
+            calendar_id="bookings@group.calendar.google.com",
+        )
+
+    async with maker() as session:
+        links = (
+            await session.scalars(
+                select(ExternalCalendarLink).where(
+                    ExternalCalendarLink.connection_id == connection_id
+                )
+            )
+        ).all()
+        assert len(links) == 1
 
 
 async def test_connect_google_unknown_tenant_raises(

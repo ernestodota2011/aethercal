@@ -23,6 +23,7 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import BusyCache, ExternalConnection, Tenant, User
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.services.calendars import (
+    DEFAULT_CALENDAR_ID,
     BusyQuery,
     BusyStatus,
     CalendarSyncError,
@@ -688,12 +689,12 @@ async def test_create_event_for_booking_returns_id_and_meeting_url(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_result=_INSERT_RESULT)
 
     event_id, meeting_url = await create_event_for_booking(
-        connection=connection, request=_event(now), service=service
+        calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
     )
 
     assert event_id == "evt-123"
@@ -704,23 +705,25 @@ async def test_create_event_for_booking_google_failure_raises_calendar_sync_erro
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_error=RuntimeError("insert failed"))
 
     with pytest.raises(CalendarSyncError):
-        await create_event_for_booking(connection=connection, request=_event(now), service=service)
+        await create_event_for_booking(
+            calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
+        )
 
 
 async def test_delete_event_for_booking_calls_google(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     service = FakeGoogleService()
 
     await delete_event_for_booking(
-        connection=connection, external_event_id="evt-123", service=service
+        calendar_id=DEFAULT_CALENDAR_ID, external_event_id="evt-123", service=service
     )
 
     assert service.events().deleted == ["evt-123"]
@@ -730,12 +733,12 @@ async def test_delete_event_for_booking_google_failure_raises_calendar_sync_erro
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     service = FakeGoogleService(delete_error=RuntimeError("delete failed"))
 
     with pytest.raises(CalendarSyncError):
         await delete_event_for_booking(
-            connection=connection, external_event_id="evt-123", service=service
+            calendar_id=DEFAULT_CALENDAR_ID, external_event_id="evt-123", service=service
         )
 
 
@@ -743,15 +746,17 @@ async def test_reschedule_event_for_booking_replaces_the_event(
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_result=_INSERT_RESULT)
 
     event_id, meeting_url = await reschedule_event_for_booking(
-        connection=connection,
+        source_calendar_id=DEFAULT_CALENDAR_ID,
+        source_service=service,
+        target_calendar_id=DEFAULT_CALENDAR_ID,
+        target_service=service,
         external_event_id="old-evt",
         request=_event(now),
-        service=service,
     )
 
     assert event_id == "evt-123"
@@ -763,14 +768,16 @@ async def test_reschedule_event_for_booking_google_failure_raises_calendar_sync_
     sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
 ) -> None:
     tenant = await tenant_factory(sqlite_session)
-    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _connect(sqlite_session, tenant, fernet=fernet)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     service = FakeGoogleService(insert_error=RuntimeError("insert failed"))
 
     with pytest.raises(CalendarSyncError):
         await reschedule_event_for_booking(
-            connection=connection,
+            source_calendar_id=DEFAULT_CALENDAR_ID,
+            source_service=service,
+            target_calendar_id=DEFAULT_CALENDAR_ID,
+            target_service=service,
             external_event_id="old-evt",
             request=_event(now),
-            service=service,
         )

@@ -273,7 +273,13 @@ class _FakeGoogle:
 
 
 async def _google_effects(session: AsyncSession, tenant: Tenant) -> BookingEffects:
-    """A BookingEffects with a host calendar connection, so the Google sync intents are enqueued."""
+    """CONNECT a calendar to the host, so the booking service enqueues the Google sync intents.
+
+    The connection is a fact in the DATABASE, not a field handed to the service. It used to be the
+    latter (``BookingEffects.connection``), which is how the sync could be "tested" while production
+    — which had no way to populate that field — never synced anything at all. The test now sets up
+    the state production actually has, and the service resolves the host's calendar itself.
+    """
     host = await _first_user(session, tenant)
     connection = await store_google_connection(
         session,
@@ -292,7 +298,6 @@ async def _google_effects(session: AsyncSession, tenant: Tenant) -> BookingEffec
     return BookingEffects(
         signer=GuestTokenSigner("test-app-secret"),
         booking_base_url="https://book.example.com",
-        connection=connection,
     )
 
 

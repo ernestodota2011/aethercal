@@ -27,7 +27,11 @@ from aethercal.server.services.api_keys import (
     list_api_keys,
     revoke_api_key,
 )
-from aethercal.server.services.calendars import GoogleCredential, store_google_connection
+from aethercal.server.services.calendars import (
+    GoogleCredential,
+    link_booking_calendar,
+    store_google_connection,
+)
 from aethercal.server.services.workflows import seed_default_workflows
 from aethercal.server.settings import Settings
 
@@ -122,20 +126,26 @@ async def run_revoke_key(
         return await revoke_api_key(session, api_key_id=api_key_id, tenant_id=tenant.id)
 
 
-async def run_connect_google(
+async def run_connect_google(  # noqa: PLR0913 - the tenant/host pair + credential + target calendar
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
     tenant_slug: str,
     user_email: str,
     credential: GoogleCredential,
     fernet: Fernet,
+    calendar_id: str | None = None,
 ) -> uuid.UUID:
-    """Store a host's Google connection (F1-07) with the token JSON encrypted at rest.
+    """Store a host's Google connection (RF-11) with the token JSON encrypted at rest.
 
     Resolves the tenant by slug and the host user by email, then delegates to
     ``store_google_connection`` (Fernet-encrypts before persisting). Returns the connection id. The
     ``credential`` (account email + token JSON) argument keeps this coroutine offline-testable; the
     live OAuth consent that produces it lives in the Typer command below.
+
+    ``calendar_id`` designates the calendar this host's bookings are WRITTEN to (and whose freebusy
+    blocks their slots) — the way to book into a dedicated secondary calendar rather than the
+    account's ``primary``, which is what connecting a real account should always do. Omitted, the
+    account's default calendar is used (zero-config, unchanged behaviour).
     """
     async with sessionmaker() as session, session.begin():
         tenant = (
@@ -157,6 +167,8 @@ async def run_connect_google(
             credential=credential,
             fernet=fernet,
         )
+        if calendar_id is not None:
+            await link_booking_calendar(session, connection=connection, calendar_id=calendar_id)
         return connection.id
 
 
@@ -243,12 +255,25 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
         Path,
         typer.Option(help="Where the OAuth token JSON is cached during the consent flow."),
     ] = _DEFAULT_GOOGLE_TOKEN_PATH,
+    calendar_id: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Calendar the bookings are written to (e.g. a dedicated secondary calendar). "
+                "Omit to use the account's default calendar."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Run the loopback Google OAuth consent and store the encrypted connection (RF-11).
 
     Opens a browser once for consent (or refreshes a cached token), then persists the token JSON
-    encrypted with the app-secret-derived Fernet key. The consent flow requires the agency OAuth
-    Desktop client env vars (``AETHERCAL_GOOGLE_CLIENT_ID`` / ``_SECRET``).
+    encrypted with the app-secret-derived Fernet key. The consent flow requires the OAuth Desktop
+    client env vars (``AETHERCAL_GOOGLE_CLIENT_ID`` / ``_SECRET``).
+
+    Pass ``--calendar-id`` to send this host's bookings to a DEDICATED calendar instead of the
+    account's ``primary`` — the recommended setup for any real account, and a hard rule for the
+    agency's own instance.
     """
     settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
     credentials = get_credentials(token_path)
@@ -261,6 +286,7 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
                 account_email=account_email, token_json=credentials.to_json()
             ),
             fernet=Fernet(settings.fernet_key()),
+            calendar_id=calendar_id,
         )
     )
     typer.echo(f"connection_id={connection_id}")

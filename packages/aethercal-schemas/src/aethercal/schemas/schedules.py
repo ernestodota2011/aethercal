@@ -46,6 +46,12 @@ class ScheduleBase(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     timezone: str = Field(min_length=1, max_length=64, examples=["America/New_York"])
     rules: Rules = Field(default_factory=dict)
+    # RF-30 — who owns this weekly pattern. ``None`` = shared by the whole business (any host may
+    # use it): the default, and the only case a single-host business ever sees. Set it, and only
+    # that host's event types may bind to the schedule; the service enforces that both ways.
+    user_id: UUID | None = Field(
+        default=None, description="Owning host; null means a schedule shared across the business."
+    )
 
 
 class ScheduleCreate(ScheduleBase):
@@ -61,12 +67,18 @@ class ScheduleRead(ScheduleBase):
 class ScheduleUpdate(BaseModel):
     """Partial (PATCH) update of a weekly schedule; every field is optional.
 
-    A field left unset (``None``) is not touched; ``rules`` set to ``{}`` clears all availability.
+    A field left unset is not touched; ``rules`` set to ``{}`` clears all availability. ``user_id``
+    is three-valued and therefore read through ``model_fields_set``, not through ``None``: unset =
+    leave the owner alone, ``null`` = hand the schedule back to the whole business, a uuid = give it
+    to that host (RF-30).
     """
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     rules: Rules | None = None
+    user_id: UUID | None = Field(
+        default=None, description="Owning host; null means a schedule shared across the business."
+    )
 
 
 class DateOverrideCreate(BaseModel):
