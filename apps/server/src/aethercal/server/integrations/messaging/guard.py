@@ -100,9 +100,34 @@ class PermanentSendError(SendRefused):
 
 
 class ChannelUnavailable(Exception):
-    """The provider could not be reached, or failed transiently (429 / 5xx / network).
+    """The provider failed transiently, AND we know the message was not delivered.
 
-    RETRYABLE: it goes back on the queue with backoff, exactly like any other transient failure."""
+    Both halves matter. "Transient" is what makes it retryable; "we know nothing was delivered" is
+    what makes the retry SAFE. It covers a status the provider actually answered with (429, a 5xx,
+    an unclassified 4xx) and a transport failure proving the request never left this machine (a
+    refused connection, a connect timeout, an exhausted pool).
+
+    RETRYABLE: back on the queue with backoff, like any other transient failure."""
+
+
+class SendOutcomeUnknown(Exception):
+    """==We do not know whether the guest got the message.== Neither retry nor retire is safe.
+
+    The request left this machine and the answer was then lost — a read timeout, a connection
+    dropped mid-response, a worker killed between the provider accepting and the ledger committing.
+    The provider may have sent it. It may not have.
+
+    Deliberately NOT a :class:`ChannelUnavailable` and NOT a :class:`SendRefused`, because both of
+    the safe-looking options are wrong here:
+
+    * **retry** and the guest can be messaged twice — and worse, the per-phone daily cap is DERIVED
+      from the ledger, so a send nobody recorded also UNDER-COUNTS the very quota that protects that
+      person from being messaged repeatedly;
+    * **retire** and a message the guest never received is written off as handled, in silence.
+
+    So the step is PARKED as ``unknown``: no automatic retry, an error-level log, and a status the
+    ``/metrics`` backlog counts. A human checks the provider and resolves it
+    (``aethercal-admin outbox resolve-unknown``). Guessing is the one thing this does not do."""
 
 
 @runtime_checkable
@@ -284,6 +309,7 @@ __all__ = [
     "PermanentSendError",
     "PhoneChannelSender",
     "QuotaExceeded",
+    "SendOutcomeUnknown",
     "SendRefused",
     "enforce_phone_cap",
     "phone_sends_in_window",

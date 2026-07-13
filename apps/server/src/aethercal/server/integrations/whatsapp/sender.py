@@ -16,11 +16,14 @@ Two details that are decisions, not incidentals:
   any link inside it, and this makes sure the provider does not go and render a preview card for
   anything that slipped through. Belt and braces on the phishing surface.
 
-The HTTP status is CLASSIFIED, never merely "not 2xx → raise": a 4xx (a malformed number, an
-unknown instance) can never succeed, so it is a :class:`SendRefused` and the step is retired; a 429,
-a 5xx or a network error is :class:`ChannelUnavailable`, and retries with backoff. Collapsing
-the two either fills the dead-letter with noise or throws away a message the provider would have
-accepted thirty seconds later.
+The provider's answer is CLASSIFIED by the ONE shared rule in
+:mod:`aethercal.server.integrations.messaging.status`: an explicit allow-list of permanent statuses,
+and **everything else retries**. That default is the point — a needless retry costs a duplicate, a
+needless retirement costs the message.
+
+And the outcome has THREE cases, not two: a request we wrote and whose answer we then lost is a
+:class:`SendOutcomeUnknown`, because the provider may well have sent it, and neither retrying nor
+retiring is safe blind.
 """
 
 from __future__ import annotations
@@ -35,16 +38,18 @@ from aethercal.server.integrations.messaging.guard import (
     ChannelUnavailable,
     DailyCaps,
     PermanentSendError,
+    SendOutcomeUnknown,
     warn_if_ip_cap_unenforceable,
+)
+from aethercal.server.integrations.messaging.status import (
+    is_definitely_undelivered,
+    raise_for_send_status,
 )
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 
 _logger = logging.getLogger(__name__)
 
 _NON_DIGITS = re.compile(r"\D")
-
-_TOO_MANY_REQUESTS = 429
-_SERVER_ERROR_FLOOR = 500
 
 SEND_TIMEOUT_SECONDS = 15.0
 """Bounded per request. The drain also caps every provider call below the lease TTL, but a client
@@ -89,27 +94,17 @@ class EvolutionWhatsAppSender:
                 timeout=SEND_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
-            raise ChannelUnavailable(f"the Evolution API could not be reached: {exc}") from exc
+            if is_definitely_undelivered(exc):
+                # We never connected: the request was never transmitted, so a retry is safe.
+                raise ChannelUnavailable(f"the Evolution API could not be reached: {exc}") from exc
+            # We wrote the request and then lost the answer. The provider MAY have sent it. Do not
+            # guess — neither a retry nor a retirement is safe, so escalate the ambiguity.
+            raise SendOutcomeUnknown(
+                f"the Evolution API took the request and the answer was lost ({exc!r}); whether "
+                "the guest was messaged is UNKNOWN"
+            ) from exc
 
-        _raise_for_status(response)
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    """Classify the provider's answer. Permanent → retire the step; transient → retry it."""
-    if response.is_success:
-        return
-
-    status = response.status_code
-    detail = response.text[:200]
-    if status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR_FLOOR:
-        raise ChannelUnavailable(
-            f"the Evolution API answered {status} (transient); the step retries with backoff: "
-            f"{detail}"
-        )
-    raise PermanentSendError(
-        f"provider-rejected: the Evolution API answered {status}, which a retry cannot fix "
-        f"(a malformed number, or an unknown instance): {detail}"
-    )
+        raise_for_send_status(response, provider="the Evolution API")
 
 
 __all__ = ["SEND_TIMEOUT_SECONDS", "EvolutionWhatsAppSender"]

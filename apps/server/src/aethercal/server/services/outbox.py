@@ -79,7 +79,9 @@ from aethercal.server.db.models.outbox import OutboxStatus, due_filter
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.messaging.guard import (
+    ChannelUnavailable,
     PhoneChannelSender,
+    SendOutcomeUnknown,
     SendRefused,
     enforce_phone_cap,
 )
@@ -175,6 +177,8 @@ A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a
 reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
 noise in the backlog, and the message still does not arrive. The step is retired with its reason
 instead, loudly in the log and visibly in the row. """
+_UNKNOWN = OutboxStatus.UNKNOWN.value
+"""Handed to the provider; the answer was lost. Terminal, and NOT retried — see OutboxStatus."""
 _VOIDED = OutboxStatus.VOIDED.value
 """Retired before it ever ran: the booking's life changed under it (see
 :func:`void_pending_steps`)."""
@@ -318,6 +322,17 @@ class OutboxDeferred(Exception):
         )
 
 
+class OutboxUnknownOutcome(Exception):
+    """The provider was given this message and we never learned whether it went out.
+
+    Raised either by the sender (a lost answer, mid-flight) or by the READ phase of a LATER drain,
+    which finds the in-flight marker still set on a row whose ledger entry never landed — i.e. the
+    worker died in the window between "the provider accepted" and "the ledger committed".
+
+    The drain parks it as :attr:`OutboxStatus.UNKNOWN`: no retry, an error log, a metric. ==It is
+    never re-sent blind.=="""
+
+
 class OutboxSkipped(Exception):
     """Raised by a handler when its effect can NEVER run, so retrying it is meaningless.
 
@@ -394,6 +409,13 @@ class OutboxReport:
     """Planned, but claimed by somebody else (or voided) before we reached them.
 
     Not ours, and not errors.
+    """
+    unknown: list[uuid.UUID] = field(default_factory=list)
+    """Handed to the provider; the answer was lost. ==THE bucket to alarm on.==
+
+    Each one is a message that may or may not have reached a real person, and which this system will
+    NOT resend on its own. It is neither noise nor routine: a non-empty ``unknown`` is a human task,
+    and the entire point of the state is that it cannot be ignored quietly.
     """
     skipped: list[uuid.UUID] = field(default_factory=list)
     """Steps that could never run (an unconfigured channel, a kind with no template).
@@ -905,6 +927,7 @@ class _Outcome(StrEnum):
     FAILED = "failed"
     DEFERRED = "deferred"
     SKIPPED = "skipped"
+    UNKNOWN = "unknown"
 
 
 async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well-defined pass
@@ -993,6 +1016,17 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
             _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
             outcome = _Outcome.DEFERRED
             defer_for = deferred.retry_after
+        except OutboxUnknownOutcome as unknown:
+            # NOT a failure (a retry could duplicate) and NOT a skip (the guest may never have got
+            # it). It is the third thing, and it is the one a human has to resolve.
+            _logger.error(
+                "outbox intent %s (%s) for booking %s: OUTCOME UNKNOWN - %s",
+                work.id,
+                work.effect,
+                work.booking_id,
+                unknown,
+            )
+            outcome = _Outcome.UNKNOWN
         except OutboxSkipped as skipped:
             # NOT a failure: this effect can never run, so retrying it would only burn the backoff
             # budget and dead-letter. Loud, terminal, and out of the queue.
@@ -1081,6 +1115,18 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             row.status = _SKIPPED
             row.next_retry_at = None
             report.skipped.append(row.id)
+            return
+
+        if outcome is _Outcome.UNKNOWN:
+            # Terminal, and it DID cost an attempt: we really did call the provider. Parked for a
+            # human and never auto-retried - a retry could message the guest twice and under-count
+            # the cap protecting them. The in-flight marker is left standing on the row on purpose:
+            # it is the evidence of what happened, and `outbox resolve-unknown` is what clears it.
+            row.attempts += 1
+            row.last_attempt_at = now
+            row.status = _UNKNOWN
+            row.next_retry_at = None
+            report.unknown.append(row.id)
             return
 
         row.attempts += 1
@@ -1666,6 +1712,53 @@ class _NotifyPlan:
     recipient: str
 
 
+PROVIDER_CALL_MARKER = "provider_call_started_at"
+"""Payload key: "this step was handed to a PHONE provider, and we have not recorded the answer yet".
+
+Committed BEFORE the network call and cleared only once the outcome is KNOWN. If a later drain finds
+it still set on a row whose ledger entry never landed, the worker died inside the window between
+"the provider accepted" and "the ledger committed" - so the message may already be with the guest,
+and re-sending it blind would both duplicate it AND under-count the daily cap that protects them
+(the cap is derived from the very ledger row we failed to write). See
+:class:`OutboxUnknownOutcome`.
+
+PHONE channels only, deliberately. Email keeps its long-standing at-least-once residual: its
+failure modes surface from ``aiosmtplib`` as an undifferentiated ``Exception``, so there is no
+honest way to tell "the relay never took it" from "the relay took it and we lost the answer".
+Marking email would park a step on every ordinary SMTP blip - a rare duplicate traded for a common
+outage,
+which is the worse deal.
+"""
+
+
+async def _mark_provider_call_started(
+    sessionmaker: Sessionmaker, work: OutboxWork, now: datetime
+) -> None:
+    """Record, in its OWN committed transaction, that this step is about to reach the provider.
+
+    It has to be committed BEFORE the I/O - that is the entire point. A marker written in the same
+    transaction as the result would vanish along with the crash it exists to detect."""
+    async with sessionmaker() as session, session.begin():
+        row = await session.get(Outbox, work.id)
+        if row is None:  # pragma: no cover - defensive: cascade-deleted mid-flight
+            return
+        # A NEW dict: SQLAlchemy does not track in-place mutation of a plain JSON column, so
+        # mutating the existing one would flush nothing and leave the marker unwritten - the silent
+        # no-op, sitting in the middle of the machinery built to catch one.
+        row.payload = {**row.payload, PROVIDER_CALL_MARKER: now.isoformat()}
+
+
+async def _clear_provider_call_marker(sessionmaker: Sessionmaker, work: OutboxWork) -> None:
+    """Drop the marker: the outcome is KNOWN, and it is "the guest did not get this message"."""
+    async with sessionmaker() as session, session.begin():
+        row = await session.get(Outbox, work.id)
+        if row is None:  # pragma: no cover - defensive
+            return
+        row.payload = {
+            key: value for key, value in row.payload.items() if key != PROVIDER_CALL_MARKER
+        }
+
+
 async def run_notify_effect(
     sessionmaker: Sessionmaker,
     work: OutboxWork,
@@ -1701,20 +1794,61 @@ async def run_notify_effect(
     if plan is None:
         return
 
-    try:
-        if plan.channel is Channel.EMAIL:
-            if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
-                raise RuntimeError("an email step reached the send with no configured SMTP sender")
+    if plan.channel is Channel.EMAIL:
+        if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
+            raise RuntimeError("an email step reached the send with no configured SMTP sender")
+        try:
             await sender.send(plan.message)
-        else:
-            await channels[plan.channel].send(
-                to=plan.recipient, subject=None, body=str(plan.message)
-            )
-    except SendRefused as refused:
-        # The provider will never take this one. Retrying burns six attempts of backoff and
-        # dead-letters, and the message still does not arrive.
-        raise OutboxSkipped(str(refused)) from refused
+        except SendRefused as refused:
+            raise OutboxSkipped(str(refused)) from refused
+        await _record_notify_sent(sessionmaker, work, plan, now)
+        return
 
+    # A PHONE send. Everything below exists because the window between "the provider accepted" and
+    # "the ledger committed" is not free: a crash inside it means the guest may already have the
+    # message while nothing records it - so a blind retry would send it TWICE and under-count the
+    # daily cap that protects them, because that cap is derived from the very ledger row we failed
+    # to write. The two failures compound. So the intent to call the provider is PERSISTED first.
+    await _mark_provider_call_started(sessionmaker, work, now)
+    try:
+        await channels[plan.channel].send(to=plan.recipient, subject=None, body=str(plan.message))
+    except SendOutcomeUnknown as unknown:
+        # The request left this machine and the answer was lost. LEAVE the marker standing: we do
+        # not know what happened, and the drain must park this rather than guess.
+        raise OutboxUnknownOutcome(
+            f"{_UNKNOWN_OUTCOME}: the {plan.channel.value} send for booking {plan.booking_id} "
+            f"reached the provider and the answer was lost ({unknown}). It is NOT retried - that "
+            "could message the guest twice and under-count the cap protecting them. A human checks "
+            "the provider, then runs: aethercal-admin outbox resolve-unknown"
+        ) from unknown
+    except (SendRefused, ChannelUnavailable):
+        # A KNOWN non-delivery: the provider answered, or we never connected at all. Nothing is in
+        # flight, so drop the marker and let the normal machinery retire it (SendRefused) or retry
+        # it (ChannelUnavailable).
+        await _clear_provider_call_marker(sessionmaker, work)
+        raise
+    except BaseException:
+        # Anything else - including the CancelledError raised when the drain's PROVIDER_TIMEOUT
+        # aborts the call mid-flight. We do NOT know whether the provider saw it, so the marker
+        # STAYS and the next drain treats it as unknown instead of re-sending blind.
+        raise
+
+    await _record_notify_sent(sessionmaker, work, plan, now, clear_marker=True)
+
+
+async def _record_notify_sent(
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    plan: _NotifyPlan,
+    now: datetime,
+    *,
+    clear_marker: bool = False,
+) -> None:
+    """Write the ledger row - and clear the in-flight marker in the SAME transaction.
+
+    Atomic on purpose. Clear the marker in a separate transaction and a crash between the two puts
+    the row straight back into the ambiguous state this whole mechanism exists to remove: no marker,
+    no ledger row, and a message that may well already be on the guest's phone."""
     async with sessionmaker() as session, session.begin():
         booking = await session.get(Booking, plan.booking_id)
         if booking is None:  # pragma: no cover - defensive: cascade-deleted mid-send
@@ -1727,6 +1861,12 @@ async def run_notify_effect(
             channel=plan.channel,
             step_id=plan.step_id,
         )
+        if clear_marker:
+            row = await session.get(Outbox, work.id)
+            if row is not None:
+                row.payload = {
+                    key: value for key, value in row.payload.items() if key != PROVIDER_CALL_MARKER
+                }
 
 
 # The skip reasons, as distinct machine-greppable prefixes. "We could not send" and "we were not
@@ -1735,6 +1875,8 @@ async def run_notify_effect(
 _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
+_UNKNOWN_OUTCOME = "unknown-outcome"
+"""The provider was given the message and the answer was lost. NEVER re-sent blind."""
 _NO_TEMPLATE = "no-template"
 """The kind has no body: no tenant ``workflow_templates`` row, and no built-in fallback for it."""
 _BAD_TEMPLATE = "bad-template"
@@ -1922,6 +2064,24 @@ async def _prepare_notify(
             session, booking=booking, kind=kind, step_id=step_id, locale=locale, sender=sender
         )
 
+    # ==THE CRASH WE CANNOT SEE FROM ANYWHERE ELSE.== The marker was committed before the previous
+    # attempt called the provider, and the ledger check above says the send was never recorded. So a
+    # worker died (or its call was aborted) inside the window between "the provider accepted" and
+    # "the ledger committed" - and the guest may ALREADY have this message.
+    #
+    # Retrying is the intuitive move and it is wrong twice over: it can message a real person a
+    # second time, and because the per-phone daily cap is DERIVED from that same unwritten ledger
+    # row, it also under-counts the ceiling that protects them from exactly that. Park it, shout,
+    # and let a human look at the provider.
+    if work.payload.get(PROVIDER_CALL_MARKER):
+        raise OutboxUnknownOutcome(
+            f"{_UNKNOWN_OUTCOME}: a previous attempt handed this {channel.value} step to the "
+            f"provider at {work.payload[PROVIDER_CALL_MARKER]} and never recorded the outcome - "
+            "the worker died in the window between the provider accepting and the ledger "
+            "committing. The guest may already have this message, so it is NOT re-sent. A human "
+            "checks the provider, then runs: aethercal-admin outbox resolve-unknown"
+        )
+
     # THE CONSENT GATE, and it comes FIRST — before the channel registry, before the cap, before the
     # template. Not as a nicety of ordering: it must be impossible to reach a send plan for a phone
     # we have no permission to message, however the checks below are later reordered.
@@ -2086,6 +2246,7 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFER_DELAY_SECONDS",
     "PAUSED_RULE_RECHECK",
+    "PROVIDER_CALL_MARKER",
     "PROVIDER_TIMEOUT_CEILING",
     "TERMINAL_MESSAGE_GRACE",
     "Clock",
@@ -2095,6 +2256,7 @@ __all__ = [
     "OutboxExecutor",
     "OutboxReport",
     "OutboxSkipped",
+    "OutboxUnknownOutcome",
     "OutboxWork",
     "ReconcileReport",
     "Staleness",

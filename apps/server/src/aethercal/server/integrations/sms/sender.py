@@ -18,8 +18,11 @@ Form-encoded (Twilio does not take JSON here), HTTP Basic auth, and E.164 with t
 the opposite of Evolution's bare digits, which is precisely why each provider gets its own adapter
 instead of one "send a message" helper with an if-statement in it.
 
-The response is classified the same way as every other channel: 4xx → :class:`SendRefused`
-(terminal, retire the step), 429/5xx/network → :class:`ChannelUnavailable` (retry with backoff).
+The response is classified by the ONE shared rule in
+:mod:`aethercal.server.integrations.messaging.status`: an explicit allow-list of permanent statuses,
+and **everything else retries** (a needless retry costs a duplicate; a needless retirement costs the
+message). A request we wrote and whose answer we then lost is :class:`SendOutcomeUnknown` — neither
+retry nor retire is safe blind.
 """
 
 from __future__ import annotations
@@ -33,14 +36,16 @@ from aethercal.server.integrations.messaging.guard import (
     ChannelUnavailable,
     DailyCaps,
     PermanentSendError,
+    SendOutcomeUnknown,
     warn_if_ip_cap_unenforceable,
+)
+from aethercal.server.integrations.messaging.status import (
+    is_definitely_undelivered,
+    raise_for_send_status,
 )
 from aethercal.server.integrations.sms.config import TwilioConfig
 
 _logger = logging.getLogger(__name__)
-
-_TOO_MANY_REQUESTS = 429
-_SERVER_ERROR_FLOOR = 500
 
 SEND_TIMEOUT_SECONDS = 15.0
 """Bounded per request; the drain's provider ceiling is the outer backstop, not the only one."""
@@ -77,26 +82,16 @@ class TwilioSmsSender:
                 timeout=SEND_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
-            raise ChannelUnavailable(f"the Twilio API could not be reached: {exc}") from exc
+            if is_definitely_undelivered(exc):
+                # We never connected: the request was never transmitted, so a retry is safe.
+                raise ChannelUnavailable(f"the Twilio API could not be reached: {exc}") from exc
+            # We wrote the request and then lost the answer. Twilio MAY have sent it. Do not guess.
+            raise SendOutcomeUnknown(
+                f"Twilio took the request and the answer was lost ({exc!r}); whether the guest was "
+                "messaged is UNKNOWN"
+            ) from exc
 
-        _raise_for_status(response)
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    """Classify Twilio's answer. Permanent → retire the step; transient → retry it."""
-    if response.is_success:
-        return
-
-    status = response.status_code
-    detail = response.text[:200]
-    if status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR_FLOOR:
-        raise ChannelUnavailable(
-            f"Twilio answered {status} (transient); the step retries with backoff: {detail}"
-        )
-    raise PermanentSendError(
-        f"provider-rejected: Twilio answered {status}, which a retry cannot fix (an unreachable "
-        f"or unroutable number, or bad credentials): {detail}"
-    )
+        raise_for_send_status(response, provider="Twilio")
 
 
 __all__ = ["SEND_TIMEOUT_SECONDS", "TwilioSmsSender"]

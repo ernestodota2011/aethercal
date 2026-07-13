@@ -37,7 +37,8 @@ class OutboxStatus(StrEnum):
     holds its lease, mid-flight), ``FAILED`` (a transient failure, parked for a backoff retry — and
     still completely alive). Terminal: ``DELIVERED``; ``DEAD`` (attempts exhausted, parked for a
     human); ``SKIPPED`` (it could NEVER run — an unconfigured channel — so retrying is meaningless,
-    and it is not a failure); ``VOIDED`` (a booking transition retired it before it ran).
+    and it is not a failure); ``VOIDED`` (a booking transition retired it before it ran);
+    ``UNKNOWN`` (see below).
     """
 
     PENDING = "pending"
@@ -47,6 +48,25 @@ class OutboxStatus(StrEnum):
     DEAD = "dead"
     SKIPPED = "skipped"
     VOIDED = "voided"
+    UNKNOWN = "unknown"
+    """==We handed it to the provider and never learned what happened.== Parked for a HUMAN.
+
+    A read timeout, a connection dropped mid-response, or a worker killed between "the provider
+    accepted" and "the ledger committed". The message may have gone out. It may not have.
+
+    It is its OWN status because the two states it would otherwise be filed under are both lies:
+
+    * ``failed`` would retry it — and a retry can message a real person a second time. Worse: the
+      per-phone daily cap is DERIVED from the ``sent_notifications`` ledger, so a send nobody
+      recorded ALSO under-counts the very quota protecting that person from being messaged on
+      repeat. The duplicate and the broken ceiling compound each other;
+    * ``skipped`` / ``dead`` would write it off — a message the guest may never have received,
+      closed as handled, in silence.
+
+    So: no automatic retry, an error-level log, and a status the ``/metrics`` backlog counts, so a
+    human can go and look at the provider. ``aethercal-admin outbox resolve-unknown`` is how they
+    then tell the system what actually happened. Guessing is the one thing this does not do.
+    """
 
 
 class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
