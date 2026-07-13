@@ -16,13 +16,14 @@ from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeRead
 from aethercal.schemas.schedules import Rules, ScheduleRead, TimeRangeSchema
 from aethercal.schemas.workflows import WorkflowRead, WorkflowTemplateRead
+from aethercal.server.db.models.outbox import OutboxStatus
 
 if TYPE_CHECKING:
     # Imported for the ANNOTATIONS only; the runtime values are plain objects, so this module keeps
     # its "pure, no reflex/db dependency" property. ``aethercal.ui`` would otherwise trigger the
     # component's ``rx.asset`` side effect, and ``admin.service`` would drag SQLAlchemy and the ORM
     # models into what is meant to be a leaf of pure functions.
-    from aethercal.server.admin.service import ConnectionRead, HostRead
+    from aethercal.server.admin.service import AdminMetrics, ConnectionRead, HostRead
     from aethercal.ui import CalendarEvent, CalendarResource
 
 _MIN_WEEKDAY = 0
@@ -46,6 +47,14 @@ widest and most consequential setting. It is also the sentinel the scope ``selec
 handler can tell "every event type" (a value) from "leave the scope alone" (an absence)."""
 
 _PREVIEW_CHARS = 60
+
+# The outbox vocabulary, read from the MODEL rather than re-typed. The drain writes these states and
+# the panel reports them; a literal copied by hand here would go on reading a reassuring 0 the day a
+# status is renamed.
+OUTBOX_PENDING = OutboxStatus.PENDING.value
+OUTBOX_FAILED = OutboxStatus.FAILED.value
+OUTBOX_DEAD = OutboxStatus.DEAD.value
+OUTBOX_DELIVERED = OutboxStatus.DELIVERED.value
 
 # A muted grey chip for a booking that is not an editable, confirmed slot (e.g. a pending one), so
 # the calendar visibly distinguishes it from a live, draggable booking. Neutral by design — no
@@ -145,6 +154,73 @@ def schedule_row(schedule: ScheduleRead) -> dict[str, str]:
         "weekdays": ",".join(str(day) for day in sorted(schedule.rules)),
         "owner": str(schedule.user_id) if schedule.user_id else SHARED_SCHEDULE,
     }
+
+
+def _duration(seconds: float) -> str:
+    """A waiting time a human reads at a glance: "3 h 12 min", not "11520.0"."""
+    total = int(seconds)
+    if total <= 0:
+        return "—"
+    hours, remainder = divmod(total, 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min"
+    return f"{total} s"
+
+
+def metrics_rows(metrics: AdminMetrics) -> list[dict[str, str]]:
+    """The health panel, as label/value rows (RF-25 / R9).
+
+    ``outbox_due`` leads, and ``pending`` is reported beside it rather than as the headline: the
+    outbox doubles as the durable scheduler, so a reminder queued for a booking three weeks out is
+    ``pending`` and perfectly healthy. A panel that called that "backlog" would show a red number on
+    a healthy business, and an alarm that cries wolf gets ignored — which is how the real one is
+    missed.
+
+    The oldest DUE age is the dead-man switch: flat while the drain lives, growing without bound
+    from the moment it dies. Nothing else reports that death — the bookings keep confirming, and
+    only the messages stop.
+    """
+    outbox = metrics.outbox_by_status
+    return [
+        {
+            "label": "Mensajes vencidos sin enviar",
+            "value": str(metrics.outbox_due),
+            "hint": "Debería ser 0. Si crece, nada está despachando la cola.",
+        },
+        {
+            "label": "El más antiguo lleva esperando",
+            "value": _duration(metrics.outbox_oldest_due_age_seconds),
+            "hint": "Si esto crece sin parar, el planificador está caído.",
+        },
+        {
+            "label": "En cola (programados)",
+            "value": str(outbox.get(OUTBOX_PENDING, 0)),
+            "hint": "Normal: un recordatorio para dentro de tres semanas vive aquí.",
+        },
+        {
+            "label": "Reintentando",
+            "value": str(outbox.get(OUTBOX_FAILED, 0)),
+            "hint": "Fallos transitorios; siguen vivos.",
+        },
+        {
+            "label": "Descartados (agotaron reintentos)",
+            "value": str(outbox.get(OUTBOX_DEAD, 0)),
+            "hint": "Requieren una persona: aethercal-admin outbox replay.",
+        },
+        {
+            "label": "Entregados",
+            "value": str(outbox.get(OUTBOX_DELIVERED, 0)),
+            "hint": "",
+        },
+        {
+            "label": "Tasa de no-show",
+            "value": f"{metrics.no_show_ratio:.0%}",
+            "hint": "No-shows sobre las citas que iban a ocurrir (las canceladas no cuentan).",
+        },
+    ]
 
 
 def host_row(host: HostRead) -> dict[str, str]:
@@ -253,6 +329,7 @@ __all__ = [
     "event_type_row",
     "host_resource",
     "host_row",
+    "metrics_rows",
     "parse_weekdays",
     "schedule_row",
     "template_row",

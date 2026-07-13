@@ -45,6 +45,12 @@ def build_admin_app(runtime: AdminRuntime) -> rx.App:
         title="Agenda · AetherCal admin",
     )
     app.add_page(
+        pages.health_page,
+        route="/health",
+        on_load=[AdminState.require_auth, AdminState.load_metrics],
+        title="Health · AetherCal admin",
+    )
+    app.add_page(
         pages.hosts_page,
         route="/hosts",
         on_load=[AdminState.require_auth, AdminState.load_hosts],

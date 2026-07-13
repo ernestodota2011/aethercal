@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -43,13 +43,17 @@ from aethercal.schemas.workflows import (
     WorkflowUpdate,
 )
 from aethercal.server.db.models import (
+    Booking,
     EventType,
     ExternalCalendarLink,
     ExternalConnection,
+    Outbox,
+    OutboxStatus,
     Schedule,
     Tenant,
     User,
 )
+from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
@@ -550,6 +554,136 @@ async def delete_schedule_action(
 
 
 # --------------------------------------------------------------------------------------
+# The health panel (RF-25 / R9) — THIS business's outbox and no-show rate.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AdminMetrics:
+    """One read of the operating state of ONE business.
+
+    .. rubric:: Why this is not :func:`~aethercal.server.observability.collect_metrics`
+
+    That snapshot is INSTANCE-WIDE on purpose — "no tenant id, no slug; not in a label, not in a
+    value" — because it feeds ``GET /metrics``, the OPERATOR's view, guarded by an operator token
+    precisely so that one business's API key can never read the numbers of all of them.
+
+    The admin is the mirror image: it is scoped to ONE tenant, and this module's contract is that
+    administering tenant A can never see tenant B's rows. Rendering the instance-wide snapshot in a
+    tenant's panel would hand that business the pipeline volume of every other business on the box —
+    the very leak ``/metrics`` is locked down to prevent, walked back in through the front door.
+
+    So the facts are the same and the query is not: every count below carries a ``tenant_id``. What
+    is NOT re-typed is the VOCABULARY — :class:`OutboxStatus` and :func:`due_filter` are imported,
+    because the drain WRITES those states and this COUNTS them, and a backlog gauge that counts a
+    status nobody writes any more reports a reassuring ``0`` for ever.
+
+    .. rubric:: What is deliberately absent
+
+    ``lost`` and ``voided_midflight`` are PROCESS-local drain counters with no tenant dimension at
+    all. Shown on a tenant's panel they would present instance-wide numbers as if they were this
+    business's — apparent state, not effective state, which is the one thing this batch is about.
+    They stay where they mean something: the operator's ``/metrics``.
+    """
+
+    outbox_by_status: dict[str, int]
+    """Every member of :class:`OutboxStatus`, whether or not it has rows. ==Absent and zero must
+    never look the same== — nobody can alert on a series that does not exist, and "no dead intents"
+    is not the same news as "we stopped counting dead intents"."""
+    outbox_due: int
+    """Intents whose send time has PASSED and which are still undelivered. ==The alertable one.==
+
+    Not ``pending``: the outbox doubles as the durable scheduler, so a 24 h reminder for a booking
+    three weeks out sits ``pending`` for three weeks and is in perfect health. A panel that called
+    that backlog would make a healthy business look sick, and the operator would learn to ignore
+    the number that was supposed to warn them."""
+    outbox_oldest_due_age_seconds: float
+    """How long the oldest DUE intent has been waiting. ==The dead-man switch.== Flat on a healthy
+    instance; unbounded growth from the moment nothing drains — which is the failure nobody sees,
+    because the bookings keep confirming and only the messages stop."""
+    bookings_by_status: dict[str, int]
+    no_show_ratio: float
+    """No-shows over the appointments that were SUPPOSED to happen (no-show + confirmed).
+
+    ==Cancelled bookings are not in the denominator.== Nobody was ever expected to attend them, and
+    counting them would make a host's no-show rate improve simply because more people cancelled."""
+
+
+def _age_seconds(moment: datetime | None, *, now: datetime) -> float:
+    """Seconds since ``moment``, never negative; ``None`` — nothing is due — is ``0``.
+
+    SQLite hands timestamps back naive, so it is normalised before the arithmetic: subtracting a
+    naive from an aware datetime raises, and a health panel that crashes during an incident is worse
+    than no health panel at all.
+    """
+    if moment is None:
+        return 0.0
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return max((now - aware).total_seconds(), 0.0)
+
+
+async def metrics_view(
+    maker: Sessionmaker, *, tenant_slug: str | None, now: datetime | None = None
+) -> AdminMetrics:
+    """Read this business's operational state: the outbox backlog and the no-show rate (RF-25/R9).
+
+    This is what makes a dead scheduler visible to the person who would otherwise never find out:
+    today, if the drain dies, every booking still confirms, every intent is still queued, and no
+    guest ever hears from the system again — in silence.
+    """
+    moment = _now(now)
+    async with maker() as session:
+        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+
+        by_status = {status.value: 0 for status in OutboxStatus}
+        for status, count in await session.execute(
+            select(Outbox.status, func.count())
+            .where(Outbox.tenant_id == ctx.tenant_id)
+            .group_by(Outbox.status)
+        ):
+            if status not in by_status:
+                # A status the table holds but the enum does not know is a real divergence, not a
+                # rounding error — and silently dropping those rows would make the backlog read
+                # reassuringly low. It is the operator's ``/metrics`` that logs it loudly; the panel
+                # simply refuses to pretend it counted them.
+                continue
+            by_status[status] = count
+
+        due = due_filter(moment)
+        outbox_due = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Outbox)
+                .where(Outbox.tenant_id == ctx.tenant_id, due)
+            )
+        ) or 0
+        due_at = func.coalesce(Outbox.next_retry_at, Outbox.created_at)
+        oldest_due = await session.scalar(
+            select(due_at)
+            .where(Outbox.tenant_id == ctx.tenant_id, due)
+            .order_by(due_at.asc())
+            .limit(1)
+        )
+
+        bookings = {status.value: 0 for status in BookingStatus}
+        for status, count in await session.execute(
+            select(Booking.status, func.count())
+            .where(Booking.tenant_id == ctx.tenant_id)
+            .group_by(Booking.status)
+        ):
+            bookings[BookingStatus(status).value] = count
+
+        expected = bookings[BookingStatus.NO_SHOW.value] + bookings[BookingStatus.CONFIRMED.value]
+        return AdminMetrics(
+            outbox_by_status=by_status,
+            outbox_due=outbox_due,
+            outbox_oldest_due_age_seconds=_age_seconds(oldest_due, now=moment),
+            bookings_by_status=bookings,
+            no_show_ratio=(bookings[BookingStatus.NO_SHOW.value] / expected) if expected else 0.0,
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Hosts, and where a host's bookings are written (RF-30).
 # --------------------------------------------------------------------------------------
 #
@@ -945,6 +1079,7 @@ __all__ = [
     "AdminActionError",
     "AdminContext",
     "AdminError",
+    "AdminMetrics",
     "AdminSetupError",
     "BookingForm",
     "ConnectionRead",
@@ -971,6 +1106,7 @@ __all__ = [
     "list_templates_view",
     "list_workflows_view",
     "mark_no_show_action",
+    "metrics_view",
     "reschedule_booking_action",
     "resolve_admin_context",
     "set_workflow_active_action",

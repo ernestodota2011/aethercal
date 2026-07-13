@@ -26,6 +26,7 @@ from aethercal.ui import Calendar
 
 _NAV = (
     ("Agenda", "/"),
+    ("Health", "/health"),
     ("Hosts", "/hosts"),
     ("Event types", "/event-types"),
     ("Schedules", "/schedules"),
@@ -274,6 +275,54 @@ def bookings_page() -> rx.Component:
             ),
             on_submit=AdminState.reschedule,
             reset_on_submit=True,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# The health panel (RF-25 / R9).
+# --------------------------------------------------------------------------------------
+
+
+def _metric_row(row: ObjectVar[dict[str, str]]) -> rx.Component:
+    return rx.table.row(
+        rx.table.cell(row["label"]),
+        rx.table.cell(rx.text(row["value"], weight="bold")),
+        rx.table.cell(rx.text(row["hint"], size="1", color_scheme="gray")),
+    )
+
+
+def health_page() -> rx.Component:
+    """The health panel (RF-25 / R9): the outbox backlog and the no-show rate of THIS business.
+
+    ==This is what makes a dead scheduler visible.== If the drain process dies, every booking still
+    confirms, every intent is still queued, and no guest ever hears from the system again — in
+    silence. The number to watch is not "pending" (a reminder for a booking three weeks out is
+    pending and perfectly healthy) but how long the OLDEST DUE message has been waiting.
+
+    The numbers are tenant-scoped. The operator's instance-wide view is ``GET /metrics``, which
+    carries its own token precisely so that a business can never read the volume of its neighbours.
+    """
+    return _shell(
+        "Health",
+        _error(AdminState.error),
+        rx.text(
+            "Si los mensajes vencidos crecen y el más antiguo lleva horas esperando, nada está "
+            "despachando la cola: las reservas se siguen confirmando y los avisos dejan de salir, "
+            "sin ningún error.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.table.root(
+            rx.table.header(
+                rx.table.row(
+                    rx.table.column_header_cell("Indicador"),
+                    rx.table.column_header_cell("Valor"),
+                    rx.table.column_header_cell("Qué significa"),
+                )
+            ),
+            rx.table.body(rx.foreach(AdminState.metrics, _metric_row)),
+            width="100%",
         ),
     )
 
@@ -905,6 +954,7 @@ def workflows_page() -> rx.Component:
 __all__ = [
     "bookings_page",
     "event_types_page",
+    "health_page",
     "hosts_page",
     "login_page",
     "schedules_page",

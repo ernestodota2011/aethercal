@@ -55,6 +55,7 @@ from aethercal.server.admin.format import (
     event_type_row,
     host_resource,
     host_row,
+    metrics_rows,
     parse_weekdays,
     schedule_row,
     template_row,
@@ -661,6 +662,8 @@ class AdminState(rx.State):
     # ``hosts`` feeds the host SELECTOR on the event-type form (whose absence was the RF-30 defect)
     # and the schedule-owner select, as well as the hosts table itself.
     hosts: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- the health panel (RF-25 / R9) ------------------------------------------------
+    metrics: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     # The connections of the host the operator is currently inspecting (they are per-host, so they
     # are loaded on demand rather than for everybody).
     connections: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
@@ -1211,6 +1214,28 @@ class AdminState(rx.State):
             self.schedules = await _fetch_schedules(runtime)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+
+    # -- the health panel (RF-25 / R9) ------------------------------------------------
+
+    @rx.event
+    async def load_metrics(self) -> None:
+        """Read this BUSINESS's outbox backlog and no-show rate (``on_load`` of the health page).
+
+        Tenant-scoped, deliberately: ``observability.collect_metrics`` is instance-wide because it
+        feeds the operator's ``/metrics``, and rendering that here would show this business the
+        pipeline volume of every other business on the instance.
+        """
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            runtime = current_runtime()
+            snapshot = await service.metrics_view(
+                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
+            )
+            self.metrics = metrics_rows(snapshot)
+        except service.AdminError as exc:
             self.error = _error_text(exc)
 
     # -- hosts + their connected calendars (RF-30) -----------------------------------
