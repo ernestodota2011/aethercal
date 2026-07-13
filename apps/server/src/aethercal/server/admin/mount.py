@@ -57,7 +57,13 @@ def _mount_admin_app(
     config: AdminConfig,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:  # pragma: no cover - live (needs the built frontend + a running server)
-    """Build the Reflex ASGI admin over the given sessionmaker and mount it at ``/admin``."""
+    """Build the Reflex ASGI admin over the given sessionmaker and mount it at ``/admin``.
+
+    ==This is the last place the raw factory is passed by hand.== The runtime keeps it PRIVATE
+    (B-01): from here on, the admin reaches the database only through ``admin_session``, which binds
+    the business before it yields — because a Reflex handler has no request scope to inherit a
+    binding from, and an unbound transaction under RLS reads zero rows in perfect silence.
+    """
     # Imported lazily on purpose: keeps reflex out of the import graph when the admin is disabled.
     from aethercal.server.admin.app import build_admin_asgi  # noqa: PLC0415
     from aethercal.server.admin.runtime import AdminRuntime  # noqa: PLC0415

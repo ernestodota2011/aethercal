@@ -29,6 +29,8 @@ from sqlalchemy.pool import StaticPool
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.schedules import ScheduleCreate, TimeRangeSchema
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.admin.service import (
     EventTypeForm,
     HostForm,
@@ -38,8 +40,6 @@ from aethercal.server.admin.service import (
     mark_no_show_action,
     metrics_view,
 )
-from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import Outbox, OutboxStatus, Tenant
 from aethercal.server.services.bookings import BookingParams, create_booking

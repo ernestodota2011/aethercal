@@ -61,6 +61,7 @@ from collections.abc import Sequence
 from alembic import op
 
 from aethercal.server.db.rls import (
+    TENANT_ROOT,
     default_privileges,
     disable_rls,
     drop_resolver_functions,
@@ -117,6 +118,14 @@ def upgrade() -> None:
     for table in TENANT_SCOPED_TABLES:
         for statement in (*enable_rls(table), *grant_table(table)):
             op.execute(statement)
+
+    # `tenants` gets the GRANT but NOT the policy. Both halves are deliberate, and the grant is easy
+    # to forget precisely because the policy loop above is where the attention goes: the app role
+    # reads this table on every admin boot (`resolve_admin_context`, by slug, before any GUC can
+    # exist) and the public router will resolve businesses from it by slug. Without SELECT on it, the
+    # admin cannot start at all.
+    for statement in grant_table(TENANT_ROOT):
+        op.execute(statement)
 
     # `current_schema()` rather than a hardcoded `public`: the db suite gives each run a private
     # schema of its own, and a SECURITY DEFINER function whose search_path pointed at `public` would

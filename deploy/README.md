@@ -101,22 +101,71 @@ shadow/MVP deployment; only the public booking page (`book.<domain>`) needs a ro
 > per-IP rate-limiting + fail2ban on the reverse proxy in front of `/admin`. The stored password is
 > hashed with a slow PBKDF2, but that is not a substitute for proxy-level rate limiting.
 
-## The scheduler: exactly one process
+## The three database roles — create them BEFORE the first boot
+
+AetherCal isolates the businesses sharing one instance with PostgreSQL **row-level security**. That
+needs three roles, three URLs, and one thing you have to do by hand, exactly once:
+
+| Role | URL | Who connects as it | RLS |
+|---|---|---|---|
+| `aethercal_app` | `AETHERCAL_DATABASE_URL` | the API + the admin (`app`) | **subject to it** |
+| `aethercal_owner` | `AETHERCAL_OWNER_DATABASE_URL` | Alembic + the CLI (`migrate`) | owns the tables; `BYPASSRLS` |
+| `aethercal_worker` | `AETHERCAL_WORKER_DATABASE_URL` | the worker's *scan* pool only | `BYPASSRLS` |
+
+```sh
+psql "$SUPERUSER_URL" -v ON_ERROR_STOP=1 -v db=aethercal \
+     -v pw_owner=... -v pw_app=... -v pw_worker=... \
+     -f deploy/sql/provision_roles.sql
+```
 
 > [!IMPORTANT]
-> The background scheduler must run in **exactly one process** across the whole deployment.
+> `CREATE ROLE ... BYPASSRLS` needs **superuser**, so it cannot live in a migration (Alembic runs as
+> the owner). It must not live in the `postgres` image's init scripts either: those only run when the
+> data volume is **empty**, so they would work perfectly in CI and never run on the instance that
+> matters. It is a runbook step, executed once, with the smoke output pasted back.
 
-The scheduler fires per-booking reminders (persisted in a PostgreSQL jobstore so they survive a
-restart) and runs the recurring webhook-delivery + busy-cache-refresh jobs. Running it in more than
-one process means duplicate ticks and duplicate reminder pollers.
+The two new URLs are **fail-closed**: without the worker's, the worker does not start; without the
+owner's, the CLI and Alembic do not run. There is no fallback to `AETHERCAL_DATABASE_URL`, and that is
+deliberate — under RLS a connection on the wrong role does not *fail*, it reads **zero rows**. A CLI
+that quietly fell back would run `guest purge --tenant X` against nothing and exit **0**: erasure of
+personal data, reporting success, having erased nothing. So every process runs `SELECT current_user`
+on every engine it builds, at startup, and **refuses to boot** on the wrong answer.
 
-- **Single container (the default here):** the image sets `AETHERCAL_RUN_SCHEDULER=1` and runs one
-  uvicorn worker — the scheduler and the request path share that one process. Nothing to do.
-- **Scaling out:** if you run multiple uvicorn workers or replicas, keep `AETHERCAL_RUN_SCHEDULER=1`
-  on **one** of them and set it to `0` on every other. Note that reminders are *scheduled* into the
-  jobstore only by a process whose scheduler is started, so in a scaled-out topology run the web
-  tier and the single scheduler in the **same** process (one worker) or give the scheduler process
-  its own path to the booking flow. For the MVP, one container is the supported, tested shape.
+## Migrations: a one-shot step, as the owner
+
+`AETHERCAL_AUTO_MIGRATE` is **retired**, and a truthy value now fails the boot. It used to run Alembic
+inside the web process, on the web process's own URL — which is exactly why the app had to be the
+table owner, and therefore why row-level security on this product would have been a placebo.
+
+Compose runs the `migrate` service (`aethercal-admin db upgrade`) to completion first; `app` and
+`worker` both wait on it. The web process then **refuses to serve a schema behind head**, so "running
+on a stale schema" is not a state this deployment can reach.
+
+## The worker: exactly ONE process
+
+> [!IMPORTANT]
+> `aethercal-worker` must run in **exactly one process** across the whole deployment. The compose file
+> pins `replicas: 1`, and that line is load-bearing.
+
+The worker drains the transactional outbox, delivers the outbound webhooks, and refreshes the busy
+caches of the connected calendars. It is a **separate process**, not a flag: `AETHERCAL_RUN_SCHEDULER`
+is retired and now fails the boot, because it never separated anything — it left the API and the admin
+mounted and bound every tick to the *request path's* sessionmaker. A background tick carries no
+request, therefore no bound business, therefore an empty GUC — and under RLS an empty GUC selects
+**zero rows**. Every outbound effect would have stopped, in silence.
+
+It holds two pools: a `BYPASSRLS` one to *find* work whose business cannot be known until the row has
+been read, and the app role to *execute* each item under RLS, bound to that item's own business.
+
+**Why exactly one matters:** the webhook delivery and the busy-cache refresh carry no claim/lease.
+Only `outbox` has the columns to hold one (`claimed_by`, `lease_expires_at`), and adding them to the
+other tables would have meant new DDL in the batch every other wave is queued behind. What makes going
+without one safe is precisely this invariant. **Run two workers and those two passes will double-send.**
+
+The worker also serves the operator surface — `GET /metrics` and the `GET /health/ready` that reports
+the outbox backlog (port `8001`, guarded by `AETHERCAL_METRICS_TOKEN`; unset means the endpoint is
+CLOSED, not open). Both used to be served by the web process, where, under RLS, they could only ever
+have reported **zeros**: a permanently green readiness probe over a permanently burning queue.
 
 ## Notes for the integrator / CI
 

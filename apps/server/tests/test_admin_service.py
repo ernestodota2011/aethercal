@@ -31,6 +31,8 @@ from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate, TimeRangeSchema
 from aethercal.server.admin import service
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.admin.service import (
     AdminActionError,
     AdminSetupError,
@@ -49,8 +51,6 @@ from aethercal.server.admin.service import (
     update_event_type_action,
     update_schedule_action,
 )
-from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant, User
 from aethercal.server.services import bookings as bookings_service

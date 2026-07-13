@@ -29,6 +29,8 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateUpdate,
     WorkflowUpdate,
 )
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.admin.service import (
     AdminActionError,
     EventTypeForm,
@@ -43,8 +45,6 @@ from aethercal.server.admin.service import (
     update_template_action,
     update_workflow_action,
 )
-from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import Outbox, Tenant, User, Workflow, WorkflowTemplate
 from aethercal.server.services.bookings import BookingParams, create_booking

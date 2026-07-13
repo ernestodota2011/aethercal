@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from aethercal.schemas.schedules import ScheduleCreate, TimeRangeSchema
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.admin.service import (
     AdminActionError,
     EventTypeForm,
@@ -37,8 +39,6 @@ from aethercal.server.admin.service import (
     list_hosts_view,
     update_host_action,
 )
-from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import EventType, ExternalCalendarLink, ExternalConnection, Tenant
 from aethercal.server.services.calendars import resolve_calendar_target
