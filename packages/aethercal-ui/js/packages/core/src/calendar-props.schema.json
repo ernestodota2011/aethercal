@@ -18,6 +18,9 @@
         "id": {
           "type": "string"
         },
+        "resourceId": {
+          "type": "string"
+        },
         "revision": {
           "type": "integer"
         },
@@ -32,6 +35,28 @@
         "end",
         "id",
         "start",
+        "title"
+      ],
+      "type": "object"
+    },
+    "CalendarResource": {
+      "additionalProperties": false,
+      "properties": {
+        "color": {
+          "type": "string"
+        },
+        "groupId": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
         "title"
       ],
       "type": "object"
@@ -71,6 +96,9 @@
           "type": "string"
         },
         "id": {
+          "type": "string"
+        },
+        "resourceId": {
           "type": "string"
         },
         "revision": {
@@ -120,6 +148,9 @@
           "type": "boolean"
         },
         "end": {
+          "type": "string"
+        },
+        "resourceId": {
           "type": "string"
         },
         "start": {

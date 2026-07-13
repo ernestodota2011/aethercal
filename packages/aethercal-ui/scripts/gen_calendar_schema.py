@@ -23,6 +23,7 @@ os.environ.setdefault("REFLEX_BACKEND_ONLY", "1")
 
 from aethercal.ui.calendar import (
     CalendarEvent,
+    CalendarResource,
     ContextMenuPayload,
     EventClickPayload,
     EventDropPayload,
@@ -113,9 +114,12 @@ def _schema_for(td: Any) -> dict[str, Any]:
     return schema
 
 
-# The payload types, in the order they appear in the schema's ``$defs``.
+# The payload types, in the order they appear in the schema's ``$defs``. ``CalendarResource`` is a
+# PROP type rather than an event payload (like ``CalendarEvent``), but it crosses the same
+# Python↔TS boundary, so it is locked by the same contract.
 _PAYLOAD_TYPES: tuple[Any, ...] = (
     CalendarEvent,
+    CalendarResource,
     EventDropPayload,
     EventResizePayload,
     RangeSelectPayload,

@@ -26,6 +26,13 @@ export interface OptimisticOverride {
   readonly end: string;
   /** Optimistic (base) revision while pending; the server-assigned revision once committed. */
   readonly revision?: number;
+  /**
+   * The resource row the mutation moved the event to (RF-28), when it moved it at all. Absent for a
+   * mutation with no resource dimension (any month/week/day drop, and every resize) — which is why
+   * it must stay OPTIONAL rather than be defaulted: overriding an event's resource with `undefined`
+   * would blank the row of an event that was never moved between rows.
+   */
+  readonly resourceId?: string;
 }
 
 export interface ReconcileState {
@@ -44,6 +51,8 @@ export type ReconcileAction =
       readonly start: string;
       readonly end: string;
       readonly baseRevision?: number;
+      /** Target resource row, when the mutation moved the event across rows (RF-28). */
+      readonly resourceId?: string;
     }
   | {
       readonly type: "RESOLVE";
@@ -52,6 +61,8 @@ export type ReconcileAction =
       readonly start: string;
       readonly end: string;
       readonly revision: number;
+      /** The resource the server confirmed. Omitted => keep the row we optimistically applied. */
+      readonly resourceId?: string;
     }
   | { readonly type: "REJECT"; readonly id: string; readonly clientMutationId: string }
   | { readonly type: "TIMEOUT"; readonly id: string; readonly clientMutationId: string }
@@ -77,6 +88,7 @@ export function reconcileReducer(state: ReconcileState, action: ReconcileAction)
             start: action.start,
             end: action.end,
             ...(action.baseRevision !== undefined ? { revision: action.baseRevision } : {}),
+            ...(action.resourceId !== undefined ? { resourceId: action.resourceId } : {}),
           },
         },
         appliedRevision: { ...state.appliedRevision, [action.id]: Math.max(priorApplied, seed) },
@@ -95,6 +107,9 @@ export function reconcileReducer(state: ReconcileState, action: ReconcileAction)
         existing !== undefined &&
         existing.clientMutationId === action.clientMutationId &&
         existing.status === "pending";
+      // The server may confirm the move without restating the resource; that is an acceptance, not a
+      // move back, so we keep the row we optimistically applied rather than dropping it.
+      const confirmedResourceId = action.resourceId ?? existing?.resourceId;
       const overrides = canCommit
         ? {
             ...state.overrides,
@@ -104,6 +119,7 @@ export function reconcileReducer(state: ReconcileState, action: ReconcileAction)
               start: action.start,
               end: action.end,
               revision: action.revision,
+              ...(confirmedResourceId !== undefined ? { resourceId: confirmedResourceId } : {}),
             },
           }
         : state.overrides;
@@ -149,12 +165,17 @@ export function applyOverrides(
 ): AppliedEvents {
   const pendingIds = new Set<string>();
   const rolledBackIds = new Set<string>();
+  // An override only re-homes the event when the mutation actually carried a resource (a timeline
+  // move). Spreading an absent one would blank the row of an event that never moved between rows.
+  const resourceOf = (ov: OptimisticOverride): Pick<CalendarEvent, "resourceId"> | undefined =>
+    ov.resourceId !== undefined ? { resourceId: ov.resourceId } : undefined;
+
   const projected = events.map((event) => {
     const ov = state.overrides[event.id];
     if (!ov) return event;
     if (ov.status === "pending") {
       pendingIds.add(event.id);
-      return { ...event, start: ov.start, end: ov.end };
+      return { ...event, start: ov.start, end: ov.end, ...resourceOf(ov) };
     }
     if (ov.status === "rolledback") {
       rolledBackIds.add(event.id);
@@ -169,6 +190,7 @@ export function applyOverrides(
       start: ov.start,
       end: ov.end,
       ...(ov.revision !== undefined ? { revision: ov.revision } : {}),
+      ...resourceOf(ov),
     };
   });
   return { events: projected, pendingIds, rolledBackIds };

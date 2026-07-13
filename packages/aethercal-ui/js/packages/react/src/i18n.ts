@@ -56,6 +56,20 @@ export interface CalendarMessages {
   navToday: string;
   /** Display name of each view, for the toolbar's view switcher. */
   viewNames: Record<CalendarView, string>;
+  /** Header of the timeline's resource column (RF-28). */
+  timelineResources: string;
+  /** Row label for events whose resource is missing or unknown (never silently dropped). */
+  timelineUnassigned: string;
+  /** Empty state: the timeline has no rows at all (no resources, and nothing unassigned). */
+  timelineEmpty: string;
+  /** How many resources a timeline group holds, shown on its header. */
+  timelineGroupCount: (count: number) => string;
+  /** Announced when a timeline group is expanded. */
+  groupExpanded: (group: string) => string;
+  /** Announced when a timeline group is collapsed. */
+  groupCollapsed: (group: string) => string;
+  /** Keyboard usage hint for the timeline (rows of resources, not columns of days). */
+  timelineKeyboardHint: string;
 }
 
 const en: CalendarMessages = {
@@ -83,7 +97,18 @@ const en: CalendarMessages = {
   navPrevious: "Previous",
   navNext: "Next",
   navToday: "Today",
-  viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda" },
+  viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda", timeline: "Timeline" },
+  timelineResources: "Resources",
+  timelineUnassigned: "Unassigned",
+  timelineEmpty: "No resources to show",
+  timelineGroupCount: (n) => (n === 1 ? "1 resource" : `${n} resources`),
+  groupExpanded: (group) => `${group} expanded`,
+  groupCollapsed: (group) => `${group} collapsed`,
+  timelineKeyboardHint:
+    "Use the up and down arrow keys to move between resources and the left and right arrow keys to " +
+    "move between days. Press Enter on a group to expand or collapse it, or on an event to grab it; " +
+    "then use the left and right arrow keys to change its time, the up and down arrow keys to move " +
+    "it to another resource, Enter to drop it, and Escape to cancel.",
 };
 
 // Neutral Spanish ("tú"). Reviewed to avoid voseo (usá/pulsá/agarrá/soltá…) — a locked test guards it.
@@ -113,7 +138,19 @@ const es: CalendarMessages = {
   navPrevious: "Anterior",
   navNext: "Siguiente",
   navToday: "Hoy",
-  viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda" },
+  viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda", timeline: "Cronograma" },
+  timelineResources: "Recursos",
+  timelineUnassigned: "Sin asignar",
+  timelineEmpty: "No hay recursos para mostrar",
+  timelineGroupCount: (n) => (n === 1 ? "1 recurso" : `${n} recursos`),
+  groupExpanded: (group) => `${group} desplegado`,
+  groupCollapsed: (group) => `${group} plegado`,
+  timelineKeyboardHint:
+    "Usa las flechas hacia arriba y abajo para moverte entre los recursos, y las flechas izquierda " +
+    "y derecha para moverte entre los días. Pulsa Enter sobre un grupo para desplegarlo o plegarlo, " +
+    "o sobre un evento para agarrarlo; luego usa las flechas izquierda y derecha para cambiar su " +
+    "hora, las flechas hacia arriba y abajo para moverlo a otro recurso, Enter para soltarlo y " +
+    "Escape para cancelar.",
 };
 
 /** The built-in locale registry. Extend it by passing your own to `resolveMessages`. */

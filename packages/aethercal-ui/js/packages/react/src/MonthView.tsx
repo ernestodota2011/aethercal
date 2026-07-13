@@ -456,6 +456,7 @@ export function MonthView(props: MonthViewProps): React.JSX.Element {
                           isActive={isEvtActive}
                           isGrabbed={grab?.eventId === event.id}
                           timeLabel={event.allDay ? null : formatEventTime(event.start, locale)}
+                          canDrag={dropEnabled}
                           onDragStart={(id) => dispatch({ type: "DRAG_START", eventId: id })}
                           onDragEnd={() => dispatch({ type: "DRAG_CANCEL" })}
                           isPending={pendingIds.has(event.id)}

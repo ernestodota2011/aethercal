@@ -22,6 +22,7 @@
  *   not a rolled-over Mar 3).
  */
 import { formatLocalDateTime, startOfWeek } from "./dateMath";
+import { resolveTimelineDays } from "./timeline";
 import type { CalendarView, FirstDayOfWeek, ViewChangePayload } from "./types";
 
 /** Default first day of the week (Monday), matching the rest of the core. */
@@ -31,12 +32,18 @@ const DEFAULT_FIRST_DAY_OF_WEEK = 1;
  * The visible date range for `view` anchored at `anchor`, as `{ view, from, to }` naive-local ISO
  * strings. `from` is inclusive (period start at midnight); `to` is exclusive (start of the day after
  * the period's last visible day). `month` and `list` span the calendar month; `week` spans the
- * `firstDayOfWeek`-aligned week; `day` spans the single day.
+ * `firstDayOfWeek`-aligned week; `day` spans the single day; `timeline` spans `timelineDays` days
+ * starting AT the anchor.
+ *
+ * The timeline is deliberately NOT week-aligned: its span is configurable, and only a 7-day window
+ * could be week-aligned coherently. Starting at the anchor keeps the controlled round-trip intact for
+ * ANY window size — `from` is always itself a valid anchor that reproduces the identical range.
  */
 export function getVisibleRange(
   view: CalendarView,
   anchor: Date,
   firstDayOfWeek: FirstDayOfWeek = DEFAULT_FIRST_DAY_OF_WEEK,
+  timelineDays?: number,
 ): ViewChangePayload {
   const y = anchor.getFullYear();
   const m = anchor.getMonth();
@@ -54,6 +61,11 @@ export function getVisibleRange(
       to = new Date(y, m, d + 1);
       break;
     }
+    case "timeline": {
+      from = new Date(y, m, d);
+      to = new Date(y, m, d + resolveTimelineDays(timelineDays));
+      break;
+    }
     // month + list (agenda over the visible month) share the calendar-month range.
     default: {
       from = new Date(y, m, 1);
@@ -67,9 +79,16 @@ export function getVisibleRange(
 /**
  * The anchor one period (`delta` = -1 previous / +1 next) from `anchor`, at midnight. `month`/`list`
  * step to the first of the adjacent month (overflow-safe); `week` steps by exactly 7 days; `day` by
- * one day. DST-safe (component arithmetic). The result is a valid anchor for `getVisibleRange`.
+ * one day; `timeline` by exactly its own window (`timelineDays`), so consecutive periods tile with no
+ * gap and no overlap. DST-safe (component arithmetic). The result is a valid anchor for
+ * `getVisibleRange`.
  */
-export function stepAnchor(anchor: Date, view: CalendarView, delta: number): Date {
+export function stepAnchor(
+  anchor: Date,
+  view: CalendarView,
+  delta: number,
+  timelineDays?: number,
+): Date {
   const y = anchor.getFullYear();
   const m = anchor.getMonth();
   const d = anchor.getDate();
@@ -78,6 +97,8 @@ export function stepAnchor(anchor: Date, view: CalendarView, delta: number): Dat
       return new Date(y, m, d + 7 * delta);
     case "day":
       return new Date(y, m, d + delta);
+    case "timeline":
+      return new Date(y, m, d + resolveTimelineDays(timelineDays) * delta);
     // month + list step a whole month; anchoring on day 1 avoids short-month overflow.
     default:
       return new Date(y, m + delta, 1);

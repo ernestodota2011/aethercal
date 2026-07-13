@@ -5,7 +5,13 @@
  * user-facing string is derived from the caller's `locale` via `Intl`, or overridable by prop —
  * so nothing is hardcoded in English. The default locale is "en" only as a fallback.
  */
-import { type CalendarView, parseLocalDateTime, startOfWeek } from "@aethercal/calendar-core";
+import {
+  type CalendarView,
+  DEFAULT_TIMELINE_DAYS,
+  parseLocalDateTime,
+  resolveTimelineDays,
+  startOfWeek,
+} from "@aethercal/calendar-core";
 
 // A known Sunday (2023-01-01 has getDay() === 0), used as the base for weekday-name generation.
 const REFERENCE_SUNDAY = new Date(2023, 0, 1);
@@ -30,16 +36,34 @@ export function formatMonthTitle(anchor: Date, locale: string): string {
 }
 
 /**
+ * A compact "Jul 13 – Jul 20, 2026" day range. Both endpoints are localized via `Intl`, and the year
+ * lives on the END endpoint so a range straddling a month/year boundary still reads correctly.
+ */
+function formatDayRange(start: Date, end: Date, locale: string): string {
+  const startLabel = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(
+    start,
+  );
+  const endLabel = new Intl.DateTimeFormat(locale, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(end);
+  return `${startLabel} – ${endLabel}`;
+}
+
+/**
  * The visible-period title for the navigation toolbar (F2-NAV), in the caller's locale:
  * month/list → "July 2026"; week → "Jul 13 – 19, 2026" (a compact day range); day →
- * "Wednesday, July 15, 2026". Purely presentational — everything is derived from `Intl`, nothing
- * hardcoded, so it localizes with `locale` like every other label.
+ * "Wednesday, July 15, 2026"; timeline → its own N-day window, starting at the anchor. Purely
+ * presentational — everything is derived from `Intl`, nothing hardcoded, so it localizes with
+ * `locale` like every other label.
  */
 export function formatPeriodTitle(
   view: CalendarView,
   anchor: Date,
   locale: string,
   firstDayOfWeek: number,
+  timelineDays: number = DEFAULT_TIMELINE_DAYS,
 ): string {
   if (view === "day") {
     return new Intl.DateTimeFormat(locale, { dateStyle: "full" }).format(anchor);
@@ -47,17 +71,16 @@ export function formatPeriodTitle(
   if (view === "week") {
     const start = startOfWeek(anchor, firstDayOfWeek);
     const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6);
-    // A compact "Jul 13 – Jul 20, 2026" range; both endpoints localized via Intl (the year lives on
-    // the end so a week that straddles a month/year reads correctly).
-    const startLabel = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(
-      start,
-    );
-    const endLabel = new Intl.DateTimeFormat(locale, {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    }).format(end);
-    return `${startLabel} – ${endLabel}`;
+    return formatDayRange(start, end, locale);
+  }
+  if (view === "timeline") {
+    // The timeline's window starts AT the anchor and runs N days (never week-aligned), so its title
+    // must report THAT window — falling through to a month title would misname the visible period.
+    const days = resolveTimelineDays(timelineDays);
+    const start = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+    const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + days - 1);
+    if (days === 1) return new Intl.DateTimeFormat(locale, { dateStyle: "full" }).format(start);
+    return formatDayRange(start, end, locale);
   }
   // month + list.
   return formatMonthTitle(anchor, locale);

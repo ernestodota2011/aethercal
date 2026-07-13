@@ -105,6 +105,44 @@ describe("computeMovedRange", () => {
   });
 });
 
+describe("computeMovedRange — resource dimension (RF-28)", () => {
+  const event: CalendarEvent = {
+    id: "e1",
+    title: "Consult",
+    start: "2026-07-15T10:00:00",
+    end: "2026-07-15T11:00:00",
+    resourceId: "h1",
+  };
+
+  it("names the TARGET resource when an event is dragged onto another row", () => {
+    // The whole point of dragging between rows: the backend must learn which host it landed on.
+    const payload = computeMovedRange(event, "2026-07-16", 600, "h2");
+    expect(payload.resourceId).toBe("h2");
+    expect(payload.start).toBe("2026-07-16T10:00:00");
+  });
+
+  it("still names the resource when the event is dropped back on its own row", () => {
+    // Idempotent: the payload states where the event now IS, not merely what changed.
+    expect(computeMovedRange(event, "2026-07-16", 600, "h1").resourceId).toBe("h1");
+  });
+
+  it("omits resourceId entirely on the views with no resource dimension", () => {
+    // A month/week/day drop must not invent a resource — the key is simply absent.
+    expect("resourceId" in computeMovedRange(event, "2026-07-16", 600)).toBe(false);
+    expect("resourceId" in computeMovedRange(event, "2026-07-16", null)).toBe(false);
+  });
+
+  it("omits resourceId when the target row has no resource (null)", () => {
+    expect("resourceId" in computeMovedRange(event, "2026-07-16", 600, null)).toBe(false);
+  });
+
+  it("still echoes revision alongside the resource", () => {
+    const versioned: CalendarEvent = { ...event, revision: 7 };
+    const payload = computeMovedRange(versioned, "2026-07-16", 600, "h2");
+    expect(payload).toMatchObject({ revision: 7, resourceId: "h2" });
+  });
+});
+
 describe("computeResize", () => {
   const e = evt({ id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", revision: 7 });
 
@@ -148,6 +186,34 @@ describe("computeResize", () => {
     const dst = evt({ id: "e", start: "2026-03-08T01:00:00", end: "2026-03-08T04:00:00" });
     const out = computeResize(dst, "end", "2026-03-08", 60); // drag end down to 01:00 == start
     expect(out).toMatchObject({ start: "2026-03-08T01:00:00", end: "2026-03-08T01:15:00" });
+  });
+});
+
+describe("computeRangeSelection — resource dimension (RF-28)", () => {
+  it("carries the resource row the selection was drawn on", () => {
+    // Creating on a timeline row is meaningless unless the payload says WHICH row.
+    const anchor: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 540, resourceId: "h1" };
+    const current: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 600, resourceId: "h1" };
+    expect(computeRangeSelection(anchor, current)).toEqual({
+      start: "2026-07-15T09:00:00",
+      end: "2026-07-15T10:00:00",
+      allDay: false,
+      resourceId: "h1",
+    });
+  });
+
+  it("keeps the ANCHOR's resource when a drag strays across rows", () => {
+    // One new event belongs to one resource: the row you started on wins, so a sloppy diagonal drag
+    // cannot silently create the event against a host you merely passed over.
+    const anchor: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 540, resourceId: "h1" };
+    const current: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 600, resourceId: "h2" };
+    expect(computeRangeSelection(anchor, current).resourceId).toBe("h1");
+  });
+
+  it("omits resourceId on the views with no resource dimension", () => {
+    const anchor: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 540 };
+    const current: GridPoint = { dateOnly: "2026-07-15", minuteOfDay: 600 };
+    expect("resourceId" in computeRangeSelection(anchor, current)).toBe(false);
   });
 });
 

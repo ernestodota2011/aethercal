@@ -129,6 +129,15 @@ export function getMonthGridDays(
 }
 
 /**
+ * The `count` date-only strings of the resource timeline's window (RF-28), starting AT `anchor`'s
+ * day. Unlike the week/month grids this is NOT week-aligned: the timeline's span is configurable, and
+ * only a 7-day window could be week-aligned coherently — so it simply starts where it is anchored.
+ */
+export function getTimelineGridDays(anchor: Date, count: number): string[] {
+  return dateRange(new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate()), count);
+}
+
+/**
  * Add (or subtract) whole calendar days to a "YYYY-MM-DD" key, returning a "YYYY-MM-DD" key.
  *
  * Component-based (never a raw millisecond add) so it is DST-safe and rolls correctly across month

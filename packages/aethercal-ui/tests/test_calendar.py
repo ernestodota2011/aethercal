@@ -82,6 +82,11 @@ def test_day_and_list_views_are_accepted_contract_values() -> None:
         assert str(component._render().props["view"]) == f'"{view}"'
 
 
+def test_timeline_is_an_accepted_contract_view() -> None:
+    # RF-28: the resource timeline is the fifth surface, on the same contract footing as the others.
+    assert str(Calendar.create(view="timeline")._render().props["view"]) == '"timeline"'
+
+
 def test_invalid_view_literal_raises() -> None:
     with pytest.raises(ValueError, match=r"Calendar\.view must be one of"):
         Calendar.create(view="year")
@@ -273,3 +278,64 @@ def test_nav_handlers_wire_into_the_rendered_props(handler: str, jsx_prop: str) 
 @pytest.mark.parametrize("jsx_prop", ["onViewChange", "onRangeChange"])
 def test_nav_handlers_are_omitted_when_not_supplied(jsx_prop: str) -> None:
     assert jsx_prop not in Calendar.create()._render().props
+
+
+# --- RF-28 resource timeline ----------------------------------------------------------------------
+
+
+def test_resources_prop_flows_into_the_rendered_props() -> None:
+    resources = [
+        {"id": "host-1", "title": "Dr. Rivas", "groupId": "Clinic A", "color": "#64748b"},
+        {"id": "host-2", "title": "Dr. Sosa"},
+    ]
+    tag = Calendar.create(resources=resources)._render()
+    assert "resources" in tag.props
+    rendered = str(tag.props["resources"])
+    assert "host-1" in rendered
+    assert "Dr. Rivas" in rendered
+    # `groupId` is camelCase to match the JS prop the bundle reads (never snake_cased).
+    assert "groupId" in rendered
+    assert "Clinic A" in rendered
+
+
+def test_resources_default_to_an_empty_list() -> None:
+    # The timeline is generic: with no resources it renders no resource rows (never crashes).
+    assert str(Calendar.create()._render().props["resources"]) == "[]"
+
+
+def test_event_carries_an_optional_resource_id() -> None:
+    events = [
+        {
+            "id": "evt-1",
+            "title": "Consult",
+            "start": "2026-07-09T14:00:00",
+            "end": "2026-07-09T14:30:00",
+            "resourceId": "host-1",
+        }
+    ]
+    rendered = str(Calendar.create(events=events)._render().props["events"])
+    assert "resourceId" in rendered
+    assert "host-1" in rendered
+
+
+def test_timeline_days_flows_into_the_rendered_props_camelcased() -> None:
+    tag = Calendar.create(timeline_days=3)._render()
+    # Reflex camel-cases Python prop names for the JSX tag; the bundle reads `timelineDays`.
+    assert "timelineDays" in tag.props
+    assert str(tag.props["timelineDays"]) == "3"
+
+
+def test_timeline_days_defaults_to_seven() -> None:
+    assert str(Calendar.create()._render().props["timelineDays"]) == "7"
+
+
+def test_timeline_days_boundary_values_are_accepted() -> None:
+    for good in (1, 7, 31):
+        assert str(Calendar.create(timeline_days=good)._render().props["timelineDays"]) == str(good)
+
+
+def test_invalid_timeline_days_literal_raises() -> None:
+    # bool is an int subclass; True/False must be rejected too (not a valid day count).
+    for bad in (0, -1, 32, True, False):
+        with pytest.raises(ValueError, match=r"timeline_days must be 1\.\.31"):
+            Calendar.create(timeline_days=bad)

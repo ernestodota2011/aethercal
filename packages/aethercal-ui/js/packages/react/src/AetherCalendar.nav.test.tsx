@@ -113,6 +113,83 @@ describe("AetherCalendar — period navigation emits onRangeChange", () => {
     });
   });
 
+  it("steps by the timeline's OWN window, not by a hardcoded week", () => {
+    // The timeline's period IS its window, so a 3-day timeline must step by 3 days. Stepping by the
+    // 7-day default would skip four whole days on every click — and would contradict the range the
+    // toolbar then emits, which already honours `timelineDays`.
+    const onRangeChange = vi.fn();
+    const { getByRole } = render(
+      <AetherCalendar
+        view="timeline"
+        anchor={ANCHOR} // 2026-07-15
+        now={NOW}
+        events={[]}
+        resources={[{ id: "h1", title: "Dr. Rivas" }]}
+        timelineDays={3}
+        navigation
+        locale="en"
+        onRangeChange={onRangeChange}
+      />,
+    );
+
+    fireEvent.click(getByRole("button", { name: /next/i }));
+    expect(onRangeChange).toHaveBeenLastCalledWith({
+      view: "timeline",
+      from: "2026-07-18T00:00:00", // +3 days, not +7
+      to: "2026-07-21T00:00:00",
+    });
+
+    fireEvent.click(getByRole("button", { name: /previous/i }));
+    expect(onRangeChange).toHaveBeenLastCalledWith({
+      view: "timeline",
+      from: "2026-07-12T00:00:00", // -3 days from the anchor
+      to: "2026-07-15T00:00:00",
+    });
+  });
+
+  it("tiles the timeline's periods with no gap and no overlap as you step", () => {
+    // `from` doubles as the next anchor, so consecutive periods must abut exactly: the `to` of one
+    // period is the `from` of the next. A wrong step size shows up here as a hole or a repeat.
+    const onRangeChange = vi.fn();
+    const { getByRole, rerender } = render(
+      <AetherCalendar
+        view="timeline"
+        anchor={ANCHOR}
+        now={NOW}
+        events={[]}
+        resources={[{ id: "h1", title: "Dr. Rivas" }]}
+        timelineDays={5}
+        navigation
+        locale="en"
+        onRangeChange={onRangeChange}
+      />,
+    );
+
+    fireEvent.click(getByRole("button", { name: /next/i }));
+    const first = onRangeChange.mock.calls[0]![0];
+    expect(first).toMatchObject({ from: "2026-07-20T00:00:00", to: "2026-07-25T00:00:00" });
+
+    // Feed the emitted anchor back in (the controlled loop) and step again.
+    rerender(
+      <AetherCalendar
+        view="timeline"
+        anchor={first.from}
+        now={NOW}
+        events={[]}
+        resources={[{ id: "h1", title: "Dr. Rivas" }]}
+        timelineDays={5}
+        navigation
+        locale="en"
+        onRangeChange={onRangeChange}
+      />,
+    );
+    fireEvent.click(getByRole("button", { name: /next/i }));
+    const second = onRangeChange.mock.calls[1]![0];
+
+    expect(second.from).toBe(first.to); // abuts exactly: no day skipped, none shown twice
+    expect(second).toMatchObject({ from: "2026-07-25T00:00:00", to: "2026-07-30T00:00:00" });
+  });
+
   it("steps by a DAY in day view", () => {
     const onRangeChange = vi.fn();
     const { getByRole } = render(
