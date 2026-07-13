@@ -69,6 +69,7 @@ from aethercal.server.services.outbox import (
     staleness_policy,
     trigger_staleness,
 )
+from aethercal.server.services.workflows import seed_default_workflows
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 _SLOT = datetime(2026, 7, 13, 15, 0, tzinfo=UTC)
@@ -591,6 +592,13 @@ async def test_a_notify_step_never_falls_through_into_the_google_handler(
     type-check time by ``assert_never`` — pyright fails the build if an effect has no branch.)
     """
     tenant_id, booking_id = await _seed_booking(maker)
+    # A step is only delivered while the RULE that queued it is still switched on, so its payload
+    # names the workflow it came from — exactly as the materialiser writes it. A NOTIFY row with no
+    # workflow_id is one no rule can vouch for, and the drain retires it rather than send it.
+    async with maker() as session, session.begin():
+        workflow = await seed_default_workflows(session, tenant_id=tenant_id)
+        assert workflow is not None
+        workflow_id = workflow.id
     google = _FakeGoogleService(insert_result={"id": "evt-1", "hangoutLink": "https://meet/x"})
     sender = _RecordingEmailSender()
     execute = make_booking_effect_executor(
@@ -601,9 +609,10 @@ async def test_a_notify_step_never_falls_through_into_the_google_handler(
         tenant_id=tenant_id,
         booking_id=booking_id,
         effect=OutboxEffect.NOTIFY,
-        dedupe_key="wf:1:2:whatsapp",
+        dedupe_key=f"wf:{workflow_id}:2:whatsapp",
         payload={
             "trigger": WorkflowTrigger.BEFORE_START.value,
+            "workflow_id": str(workflow_id),
             # Nothing on this instance can send WhatsApp.
             "channel": "whatsapp",
             "step_id": str(uuid.uuid4()),

@@ -74,7 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel, ChannelSender
-from aethercal.server.db.models import Booking, ExternalConnection, Outbox
+from aethercal.server.db.models import Booking, ExternalConnection, Outbox, Workflow
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.smtp.compose import NotificationKind
@@ -514,10 +514,20 @@ async def void_pending_steps(
             .with_for_update()
         )
     ).all()
+    voided = _retire([row for row in rows if row.payload.get("trigger") in wanted])
+    await session.flush()
+    return voided
+
+
+def _retire(rows: Collection[Outbox]) -> list[uuid.UUID]:
+    """Mark every row ``voided`` — the ONE place a live step is retired. Returns the ids.
+
+    Extracted rather than repeated: :func:`void_pending_steps` (the BOOKING's life changed) and
+    :func:`reconcile_workflow_steps` (the RULE changed) both need it, and a second copy of "which
+    fields have to be cleared" is how a claimed row keeps its lease and gets silently retried later.
+    """
     voided: list[uuid.UUID] = []
     for row in rows:
-        if row.payload.get("trigger") not in wanted:
-            continue
         if row.status == _CLAIMED:
             # In flight. We cannot un-send it — we can only guarantee it is never retried, and that
             # its worker's result is discarded rather than written. Say so, out loud.
@@ -533,8 +543,141 @@ async def void_pending_steps(
         row.claimed_by = None
         row.lease_expires_at = None
         voided.append(row.id)
-    await session.flush()
     return voided
+
+
+def workflow_key_prefix(workflow_id: uuid.UUID) -> str:
+    """The dedupe-key prefix every step of ``workflow_id`` shares (see
+    :func:`workflow_step_dedupe_key`).
+
+    A UUID carries no LIKE wildcard, so the prefix match is exact — and it finds a rule's queued
+    rows without querying INSIDE the payload JSON, which SQLite and PostgreSQL spell
+    differently."""
+    return f"wf:{workflow_id}:"
+
+
+@dataclass(frozen=True, slots=True)
+class StepSchedule:
+    """What ONE workflow step's queued row ought to look like, per the rule as it stands NOW.
+
+    Produced by ``services/workflow_rules.py`` (which owns what a rule MEANS) and executed by
+    :func:`reconcile_workflow_steps` (which owns what an outbox row may DO). ``send_at`` is ``None``
+    for the event-shaped triggers — they fire on the next drain, so there is nothing to re-time."""
+
+    dedupe_key: str
+    payload: dict[str, Any]
+    send_at: datetime | None
+
+
+@dataclass
+class ReconcileReport:
+    """What a rule change did to one booking's queue."""
+
+    materialised: list[uuid.UUID] = field(default_factory=list)
+    retimed: list[uuid.UUID] = field(default_factory=list)
+    voided: list[uuid.UUID] = field(default_factory=list)
+    left: list[uuid.UUID] = field(default_factory=list)
+    """Mid-flight (``claimed``), or event-shaped: not a rule edit's business to move."""
+
+
+async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    booking_id: uuid.UUID,
+    workflow_id: uuid.UUID,
+    wanted: Collection[StepSchedule],
+    now: datetime,
+) -> ReconcileReport:
+    """Bring ONE booking's queued steps for ONE workflow in line with ``wanted``.
+
+    This is what makes an edit to a rule TRUE. Without it, changing "remind 24 h before" to "2 h
+    before" rewrites a row in ``workflows`` and changes nothing a guest can perceive: every booking
+    already on the books keeps its step queued at ``start - 24h``, because the send time lives in
+    the outbox row's ``next_retry_at``, not in the rule. The rule would say one thing and the queue
+    would do another, with no error anywhere — the silent no-op, one layer up.
+
+    It is emphatically **not an upsert**. ``ON CONFLICT ... DO UPDATE`` expresses none of the
+    outcomes below, and the UNIQUE constraint on ``(tenant_id, booking_id, dedupe_key)`` is also why
+    a naive "just re-materialise it" fails: a key that already exists — even on a ``voided`` or
+    ``delivered`` row — makes :func:`enqueue_effect` return ``None``, silently. So every row is
+    decided explicitly:
+
+    * **not in** ``wanted`` → **voided**. The step was removed from the rule; its message must not
+      still arrive next Tuesday.
+    * **in** ``wanted``, live, send time **in the future** → **re-timed in place**: the SAME row
+      (so the message stays exactly-once), carrying the rule's new instant and payload.
+    * **in** ``wanted``, but its new send time is **already past** → **voided**, not re-timed. A
+      ``next_retry_at`` in the past drains IMMEDIATELY, so re-timing it there would fire the
+      "reminder" at once, after the fact. The same rule the materialiser obeys, for the same reason.
+    * **in** ``wanted``, with **no live row** → **materialised**, but only when its send time is a
+      real future instant. An event-shaped step (``send_at is None``) is never back-filled: it
+      reports something that has already happened, and queueing it now would tell somebody who
+      booked last week that their booking is confirmed.
+
+    A ``claimed`` row is left alone: a worker is sending it right now, and re-timing a message that
+    is already in the provider's hands is meaningless.
+    """
+    by_key = {schedule.dedupe_key: schedule for schedule in wanted}
+    rows = (
+        await session.scalars(
+            select(Outbox)
+            .where(
+                Outbox.tenant_id == tenant_id,
+                Outbox.booking_id == booking_id,
+                Outbox.effect == OutboxEffect.NOTIFY.value,
+                Outbox.status.in_(_NON_TERMINAL),
+                Outbox.dedupe_key.startswith(workflow_key_prefix(workflow_id)),
+            )
+            .with_for_update()
+        )
+    ).all()
+
+    report = ReconcileReport()
+    to_void: list[Outbox] = []
+    seen: set[str] = set()
+    for row in rows:
+        seen.add(row.dedupe_key)
+        schedule = by_key.get(row.dedupe_key)
+        if schedule is None:
+            to_void.append(row)  # this step is gone from the rule
+        elif row.status == _CLAIMED or schedule.send_at is None:
+            # Mid-flight, or event-shaped (due on the next drain anyway). Nothing to move.
+            report.left.append(row.id)
+        elif schedule.send_at <= now:
+            _logger.info(
+                "outbox intent %s (booking %s): the rule moved its send time to %s, which is "
+                "already past — retiring it rather than firing it late",
+                row.id,
+                booking_id,
+                schedule.send_at.isoformat(),
+            )
+            to_void.append(row)
+        else:
+            row.payload = dict(schedule.payload)
+            row.next_retry_at = schedule.send_at
+            report.retimed.append(row.id)
+    report.voided.extend(_retire(to_void))
+
+    for schedule in by_key.values():
+        if schedule.dedupe_key in seen or schedule.send_at is None or schedule.send_at <= now:
+            continue
+        created = await enqueue_effect(
+            session,
+            tenant_id=tenant_id,
+            booking_id=booking_id,
+            effect=OutboxEffect.NOTIFY,
+            dedupe_key=schedule.dedupe_key,
+            payload=dict(schedule.payload),
+            next_retry_at=schedule.send_at,
+        )
+        if created is not None:
+            report.materialised.append(created.id)
+        # ``None`` = a TERMINAL row already owns this key (delivered / skipped / voided). That
+        # message has had its moment, and the UNIQUE constraint is what stops a rule edit re-sending
+        # it. Deliberately not an error: reconciling a rule is not a request to re-send anything.
+    await session.flush()
+    return report
 
 
 # --------------------------------------------------------------------------------------
@@ -1316,6 +1459,47 @@ _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
 _NO_RENDERER = "no-template-renderer"
+_RULE_GONE = "workflow-gone"
+_RULE_OFF = "workflow-inactive"
+
+
+async def _require_a_live_rule(session: AsyncSession, work: OutboxWork) -> None:
+    """Refuse to send a step whose RULE is no longer switched on. Checked HERE, at the send.
+
+    ``active`` is already honoured when a booking's steps are QUEUED (``_active_workflows``), and
+    that is not enough: a step is queued days before it is sent. Switch the rule off this afternoon
+    and every reminder queued before lunch is still sitting in the outbox with its send time intact
+    — so "off" would send tomorrow's messages anyway, and the tenant who turned it off would have no
+    way to explain them. The flag has to govern at the moment of the SEND, which is the only moment
+    that can be observed from outside.
+
+    Checking it here (rather than voiding the rows when the rule is switched off) also keeps the
+    toggle SYMMETRIC: the rows are untouched, so switching the rule back on before the send time
+    arrives simply arms them again. Voiding is terminal, and their dedupe keys would then be
+    occupied for ever — the reminder could never be re-queued, in silence.
+
+    It closes a second hole on the way: an event type deleted with ``ON DELETE CASCADE`` takes its
+    workflows with it, and today the steps it had already queued would still be delivered — messages
+    from a rule that no longer exists anywhere.
+
+    Fail-closed on a malformed row: a NOTIFY payload with no ``workflow_id`` cannot be attributed to
+    any rule, so it is retired with its reason rather than sent to a real guest on a hunch."""
+    raw = work.payload.get("workflow_id")
+    if raw is None:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: this workflow step carries no workflow_id, so no rule can vouch for it"
+        )
+    workflow = await session.get(Workflow, uuid.UUID(str(raw)))
+    if workflow is None or workflow.tenant_id != work.tenant_id:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: workflow {raw} no longer exists for this tenant, so the step it queued "
+            "must not be delivered"
+        )
+    if not workflow.active:
+        raise OutboxSkipped(
+            f"{_RULE_OFF}: workflow {raw} ({workflow.name!r}) is switched off, so its queued step "
+            "must not be delivered"
+        )
 
 
 def _require_phone_consent(booking: Booking, channel: Channel) -> None:
@@ -1367,6 +1551,9 @@ async def _prepare_notify(
     if await _should_skip_as_stale(session, booking, work):
         # A later transition overtook the booking, and this step's trigger is not a terminal one.
         return None
+
+    # The rule that queued this step must still be switched on NOW — not merely when it was queued.
+    await _require_a_live_rule(session, work)
 
     try:
         kind = NotificationKind(raw_kind)
@@ -1483,7 +1670,9 @@ __all__ = [
     "OutboxReport",
     "OutboxSkipped",
     "OutboxWork",
+    "ReconcileReport",
     "Staleness",
+    "StepSchedule",
     "backoff_delay",
     "claim_one",
     "drain_outbox",
@@ -1492,6 +1681,7 @@ __all__ = [
     "google_dedupe_key",
     "make_booking_effect_executor",
     "new_worker_id",
+    "reconcile_workflow_steps",
     "recover_expired_leases",
     "run_email_effect",
     "run_google_effect",
@@ -1500,5 +1690,6 @@ __all__ = [
     "staleness_policy",
     "trigger_staleness",
     "void_pending_steps",
+    "workflow_key_prefix",
     "workflow_step_dedupe_key",
 ]
