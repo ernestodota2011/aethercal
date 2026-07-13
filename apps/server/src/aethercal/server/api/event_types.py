@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.schemas.event_types import EventTypeCreate, EventTypeRead, EventTypeUpdate
 from aethercal.server.api.auth import AuthContext, require_api_key
+from aethercal.server.db.models import EventType
 from aethercal.server.deps import get_session
 from aethercal.server.services.event_types import (
     DuplicateSlugError,
@@ -29,6 +30,7 @@ from aethercal.server.services.event_types import (
     list_event_types,
     update_event_type,
 )
+from aethercal.server.services.workflow_rules import PhoneChannelScope, phone_channel_scope
 
 router = APIRouter(prefix="/event-types", tags=["event-types"])
 
@@ -61,6 +63,20 @@ def _not_found() -> HTTPException:
     )
 
 
+def _read(row: EventType, scope: PhoneChannelScope) -> EventTypeRead:
+    """The wire model for ``row``, with ``collects_phone`` RESOLVED against the tenant's rules.
+
+    Every route that returns an ``EventTypeRead`` goes through here, on purpose. ``collects_phone``
+    is not a column — it defaults to ``False`` on the model — so a route that skipped this step
+    would answer "no phone needed" with total confidence while an active WhatsApp rule sat in the
+    database, and the booking page would never ask. Computing it in exactly one place is what stops
+    the flag from meaning different things on different endpoints.
+    """
+    return EventTypeRead.model_validate(row).model_copy(
+        update={"collects_phone": scope.covers(row.id)}
+    )
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=EventTypeRead)
 async def create(payload: EventTypeCreate, session: SessionDep, ctx: AuthDep) -> EventTypeRead:
     """Create an event type for the authenticated tenant (409 duplicate slug, 422 bad reference)."""
@@ -70,14 +86,15 @@ async def create(payload: EventTypeCreate, session: SessionDep, ctx: AuthDep) ->
         raise _duplicate_slug(exc) from exc
     except InvalidReferenceError as exc:
         raise _invalid_reference(exc) from exc
-    return EventTypeRead.model_validate(row)
+    return _read(row, await phone_channel_scope(session, tenant_id=ctx.tenant_id))
 
 
 @router.get("/", response_model=list[EventTypeRead])
 async def list_all(session: SessionDep, ctx: AuthDep) -> list[EventTypeRead]:
     """List the tenant's event types (active and inactive)."""
     rows = await list_event_types(session, tenant_id=ctx.tenant_id)
-    return [EventTypeRead.model_validate(row) for row in rows]
+    scope = await phone_channel_scope(session, tenant_id=ctx.tenant_id)
+    return [_read(row, scope) for row in rows]
 
 
 @router.get("/{event_type_id}", response_model=EventTypeRead)
@@ -86,7 +103,7 @@ async def retrieve(event_type_id: uuid.UUID, session: SessionDep, ctx: AuthDep) 
     row = await get_event_type(session, tenant_id=ctx.tenant_id, event_type_id=event_type_id)
     if row is None:
         raise _not_found()
-    return EventTypeRead.model_validate(row)
+    return _read(row, await phone_channel_scope(session, tenant_id=ctx.tenant_id))
 
 
 @router.patch("/{event_type_id}", response_model=EventTypeRead)
@@ -107,7 +124,7 @@ async def patch(
         raise _invalid_reference(exc) from exc
     if row is None:
         raise _not_found()
-    return EventTypeRead.model_validate(row)
+    return _read(row, await phone_channel_scope(session, tenant_id=ctx.tenant_id))
 
 
 @router.delete("/{event_type_id}", status_code=status.HTTP_204_NO_CONTENT)

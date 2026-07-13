@@ -891,7 +891,15 @@ class _BookingApp:
         booking_request = BookingRequest(
             event_type_id=event.id, start_iso=start, guest_timezone=tz, locale=locale
         )
-        result = build_booking(booking_request, questions=questions, form=form)
+        # `collects_phone` is the server's answer to "will anything actually message this number?"
+        # It gates BOTH the rendering of the field (views) and the reading of it here — so a phone
+        # POSTed against an event type no active rule messages is dropped, never stored (RNF-8).
+        result = build_booking(
+            booking_request,
+            questions=questions,
+            form=form,
+            collects_phone=event.collects_phone,
+        )
         booking_create = result.booking
         if booking_create is None:
             return views.booking_form_page(

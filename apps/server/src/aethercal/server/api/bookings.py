@@ -206,6 +206,10 @@ async def create(
         guest_notes=payload.guest_notes,
         answers=payload.answers,
         locale=payload.locale or "es",
+        # RF-24: carried all the way down to the column. A consent the API accepts and then drops
+        # on the floor is not a consent — it is a checkbox, and it can never be evidenced later.
+        guest_phone=payload.guest_phone,
+        guest_phone_consent=payload.guest_phone_consent,
     )
     try:
         booking = await create_booking(

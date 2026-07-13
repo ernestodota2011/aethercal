@@ -154,6 +154,8 @@ def _params(event_type_id: uuid.UUID, start: datetime, **over: Any) -> BookingPa
         guest_timezone=over.get("guest_timezone", "UTC"),
         answers=over.get("answers"),
         locale=over.get("locale", "es"),
+        guest_phone=over.get("guest_phone"),
+        guest_phone_consent=over.get("guest_phone_consent", False),
     )
 
 
@@ -330,6 +332,118 @@ async def test_create_on_offered_slot_confirms_and_queues_created_webhook(
     assert len(created) == 1  # queued in the SAME transaction as the booking
     json.dumps(created[0].payload)  # the envelope's data must be JSON-serializable
     assert created[0].payload["data"]["id"] == str(booking.id)
+
+
+# --------------------------------------------------------------------------------------
+# Guest phone + consent (RF-24). These assert the EFFECTIVE state — the row re-read from the
+# database — never the apparent one. A consent the service accepts and does not persist is the
+# exact silent no-op this batch exists to kill: the form submits, nothing errors, and the column
+# the outbox gate reads is still NULL.
+# --------------------------------------------------------------------------------------
+
+
+async def _reread(session: AsyncSession, booking_id: uuid.UUID) -> Booking:
+    """Re-read the booking from storage (never the identity-mapped instance we just wrote)."""
+    row = await session.scalar(
+        select(Booking).where(Booking.id == booking_id).execution_options(populate_existing=True)
+    )
+    assert row is not None
+    return row
+
+
+async def test_create_with_consent_seals_the_consent_column(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(
+            event_type.id, _SLOT_9, guest_phone="+13054131728", guest_phone_consent=True
+        ),
+        now=_BEFORE,
+    )
+
+    stored = await _reread(sqlite_session, booking.id)
+    assert stored.guest_phone == "+13054131728"
+    # The stamp is the SERVER's clock, not a client-supplied timestamp — it is evidence.
+    # SQLite has no tz-aware type and hands the instant back naive; Postgres (the real backend,
+    # ``DateTime(timezone=True)``) returns it aware — `test_booking_page_consent_pg.py` asserts it
+    # there. Same convention as `no_show_at` in `test_booking_state_machine.py`.
+    assert stored.guest_phone_consent_at is not None
+    assert stored.guest_phone_consent_at.replace(tzinfo=UTC) == _BEFORE
+
+
+async def test_create_without_consent_leaves_the_consent_column_null(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """A number typed with the box left unticked: held, but never consented to. The gate refuses it.
+
+    This is the state the outbox's ``_require_phone_consent`` exists to skip — so it must stay
+    REACHABLE, not be normalized away into a stamped consent nobody actually gave.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(
+            event_type.id, _SLOT_9, guest_phone="+13054131728", guest_phone_consent=False
+        ),
+        now=_BEFORE,
+    )
+
+    stored = await _reread(sqlite_session, booking.id)
+    assert stored.guest_phone == "+13054131728"
+    assert stored.guest_phone_consent_at is None
+
+
+async def test_create_without_a_phone_books_normally(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """Booking without a phone must always work — the field is optional, and so is the consent."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    stored = await _reread(sqlite_session, booking.id)
+    assert stored.status == BookingStatus.CONFIRMED
+    assert stored.guest_phone is None
+    assert stored.guest_phone_consent_at is None
+
+
+async def test_consent_is_never_stamped_without_a_number(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """Consent with no number consents to nothing: never stamp a column that proves nothing.
+
+    The schema layer rejects this payload outright (422). The service is the second belt: a caller
+    that builds ``BookingParams`` directly (the admin does) must not be able to mint a consent
+    stamp for a booking that has no phone to message.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9, guest_phone=None, guest_phone_consent=True),
+        now=_BEFORE,
+    )
+
+    stored = await _reread(sqlite_session, booking.id)
+    assert stored.guest_phone is None
+    assert stored.guest_phone_consent_at is None
 
 
 async def test_second_booking_on_the_same_slot_is_refused(

@@ -15,6 +15,7 @@ from fasthtml.common import to_xml
 
 from aethercal.booking import views
 from aethercal.booking.forms import FieldError, parse_questions
+from aethercal.booking.i18n import Locale
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, SlotChoice
 from aethercal.schemas.bookings import BookingRead
@@ -741,3 +742,72 @@ def test_confirmation_page_lang_switcher_marks_active_locale() -> None:
     )
     assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
     assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+# --------------------------------------------------------------------------------------
+# The phone field + consent checkbox (RF-24). Rendered ONLY where an active WhatsApp/SMS rule will
+# actually use the number; never pre-ticked; never required.
+# --------------------------------------------------------------------------------------
+
+
+def _form_html(locale: Locale = "es", **overrides: Any) -> str:
+    kwargs: dict[str, Any] = {
+        "event": _event(),
+        "start_iso": "2026-07-14T13:00:00+00:00",
+        "tz": "UTC",
+        "when_label": "martes 14 de julio, 13:00",
+        "questions": [],
+        "values": {},
+        "errors": [],
+        "action": "/e/intro/book",
+        "lang_urls": LANG_URLS,
+    }
+    kwargs.update(overrides)
+    return to_xml(views.booking_form_page(locale, **kwargs))
+
+
+def test_no_phone_field_when_nothing_would_message_it() -> None:
+    """No active WhatsApp/SMS rule: the guest is never even asked. NOT asking is the feature."""
+    html = _form_html(event=_event(collects_phone=False))
+    assert 'name="phone"' not in html
+    assert 'name="phone_consent"' not in html
+    assert "WhatsApp" not in html
+
+
+def test_phone_field_and_consent_box_appear_when_a_phone_rule_is_active() -> None:
+    html = _form_html(event=_event(collects_phone=True))
+    assert 'name="phone"' in html
+    assert 'type="tel"' in html
+    assert 'name="phone_consent"' in html
+    assert 'type="checkbox"' in html
+
+
+def test_the_consent_box_is_never_pre_ticked() -> None:
+    """A pre-ticked box is not consent — it is a default the guest never chose."""
+    html = _form_html(event=_event(collects_phone=True))
+    assert "checked" not in html
+
+
+def test_neither_the_phone_nor_the_consent_is_required() -> None:
+    """Booking without a phone must always work, so neither control may carry ``required``."""
+    html = _form_html(event=_event(collects_phone=True))
+    start = html.index('name="phone"')
+    assert "required" not in html[start : start + 220]
+
+
+def test_the_guests_own_tick_survives_a_re_render() -> None:
+    """A validation error elsewhere must not silently discard a consent the guest DID give."""
+    html = _form_html(
+        event=_event(collects_phone=True),
+        values={"phone": "+13054131728", "phone_consent": "on", "name": ""},
+        errors=[FieldError("name", "Escribe tu nombre.")],
+    )
+    assert "checked" in html
+    assert 'value="+13054131728"' in html
+
+
+def test_the_consent_copy_is_bilingual() -> None:
+    spanish = _form_html("es", event=_event(collects_phone=True))
+    english = _form_html("en", event=_event(collects_phone=True))
+    assert "Acepto recibir recordatorios" in spanish
+    assert "I agree to receive reminders" in english

@@ -61,7 +61,15 @@ from fasthtml.common import (
     to_xml,
 )
 
-from aethercal.booking.forms import FieldError, QuestionSpec, question_field_name
+from aethercal.booking.forms import (
+    CONSENT_SUBMITTED_VALUE,
+    PHONE_CONSENT_FIELD_NAME,
+    PHONE_FIELD_NAME,
+    FieldError,
+    QuestionSpec,
+    is_consent_ticked,
+    question_field_name,
+)
 from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
@@ -151,6 +159,15 @@ textarea { min-height: 5rem; resize: vertical; }
 .slot:hover { border-color: var(--accent); }
 .field { margin-bottom: 1.1rem; }
 .field-error { color: var(--danger); font-size: .85rem; margin-top: .35rem; }
+.hint { color: var(--muted); font-size: .85rem; margin: .35rem 0 0; }
+/* The consent control (RF-24). The `input {width:100%}` rule above would stretch a checkbox right
+   across the column, so it is reset here. The label WRAPS the box — a large, obvious hit target,
+   with no `for=`/`id=` pair that can drift apart — and sits beside it, never above: the reading
+   order of a checkbox is "[ ] I agree to ...", not "I agree to ... [ ]". */
+.consent label { display: flex; align-items: flex-start; gap: .6rem; font-weight: 400;
+  margin: 0; cursor: pointer; }
+.consent input[type="checkbox"] { width: 1.05rem; height: 1.05rem; flex: 0 0 auto;
+  margin-top: .28rem; accent-color: var(--accent); cursor: pointer; }
 .notice { border: 1px solid var(--border); border-left: 3px solid var(--accent);
   padding: .9rem 1rem; border-radius: var(--radius); color: var(--muted); }
 .notice.error { border-left-color: var(--danger); color: var(--text); }
@@ -682,6 +699,65 @@ def _labelled_field(
     return Div(*parts, cls="field")
 
 
+def _phone_fields(locale: Locale, *, values: Mapping[str, str], error: str | None) -> list[Any]:
+    """The optional phone input + its EXPLICIT consent checkbox (RF-24).
+
+    Only ever called when ``event.collects_phone`` is true — i.e. when an active WhatsApp/SMS rule
+    would actually message the number. Where nothing would, this markup does not exist at all: the
+    guest is not asked, so there is no PII to protect (RNF-8).
+
+    Three properties this markup must never lose:
+
+    * the checkbox is **not** ``checked`` unless the GUEST ticked it (``values``, echoed back on a
+      re-render). A pre-ticked box is a default the guest never chose, and it is not consent;
+    * neither control is ``required`` — booking without a phone has to keep working;
+    * the consent is a real ``<input type="checkbox">`` whose value is submitted and read. It is
+      the thing the server stamps into ``guest_phone_consent_at``, not decoration.
+    """
+    ticked = is_consent_ticked(values.get(PHONE_CONSENT_FIELD_NAME))
+    hint_id = f"{PHONE_FIELD_NAME}-hint"
+    error_id = f"{PHONE_FIELD_NAME}-error"
+    # The error (when present) is announced FIRST, then the "include the country code" hint — the
+    # order a screen reader reads them, and the order that is useful when you just got it wrong.
+    described_by = " ".join(([error_id] if error else []) + [hint_id])
+
+    phone_parts: list[Any] = [
+        Label(t(locale, "phone_label"), fr=PHONE_FIELD_NAME),
+        Input(
+            type="tel",
+            id=PHONE_FIELD_NAME,
+            name=PHONE_FIELD_NAME,
+            value=values.get(PHONE_FIELD_NAME, ""),
+            autocomplete="tel",
+            inputmode="tel",
+            aria_describedby=described_by,
+        ),
+    ]
+    if error:
+        phone_parts.append(P(error, id=error_id, cls="field-error"))
+    phone_parts.append(P(t(locale, "phone_hint"), id=hint_id, cls="hint"))
+
+    consent_hint_id = f"{PHONE_CONSENT_FIELD_NAME}-hint"
+    consent_box = Input(
+        type="checkbox",
+        id=PHONE_CONSENT_FIELD_NAME,
+        name=PHONE_CONSENT_FIELD_NAME,
+        value=CONSENT_SUBMITTED_VALUE,
+        aria_describedby=consent_hint_id,
+        # `checked` is emitted ONLY from the guest's own prior answer. FastHTML renders a boolean
+        # attribute only when truthy, so an unticked box carries no `checked` at all.
+        checked=ticked,
+    )
+    return [
+        Div(*phone_parts, cls="field"),
+        Div(
+            Label(consent_box, Span(t(locale, "phone_consent_label"))),
+            P(t(locale, "phone_consent_hint"), id=consent_hint_id, cls="hint"),
+            cls="field consent",
+        ),
+    ]
+
+
 def booking_form_page(
     locale: Locale,
     *,
@@ -736,6 +812,13 @@ def booking_form_page(
                 options=spec.options,
                 error=field_errors.get(name),
             )
+        )
+    # RF-24: asked ONLY where an active WhatsApp/SMS rule would actually use the number. Where none
+    # is active this block is absent entirely — the guest is never asked for a phone the system has
+    # no way to message (RNF-8: minimal data).
+    if event.collects_phone:
+        fields.extend(
+            _phone_fields(locale, values=values, error=field_errors.get(PHONE_FIELD_NAME))
         )
     fields.append(
         _labelled_field(

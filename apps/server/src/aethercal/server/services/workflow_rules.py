@@ -256,6 +256,62 @@ async def list_workflows(session: AsyncSession, *, tenant_id: uuid.UUID) -> list
     ]
 
 
+#: The channels that message a PHONE — the only reason to ever ask a guest for one.
+PHONE_CHANNELS: frozenset[Channel] = frozenset({Channel.WHATSAPP, Channel.SMS})
+
+
+@dataclass(frozen=True, slots=True)
+class PhoneChannelScope:
+    """Which of a tenant's event types are governed by an ACTIVE WhatsApp/SMS rule.
+
+    This answers the only question the public booking form is allowed to ask itself before it puts
+    a phone field on screen: *will anything actually message this number?* If nothing will, the
+    field must not exist — a phone collected "just in case" is PII taken from a stranger for a
+    message that will never be sent (RNF-8: minimal data).
+    """
+
+    #: A rule with ``event_type_id = NULL`` governs EVERY event type of the tenant.
+    tenant_wide: bool
+    #: The event types named explicitly by an active phone rule.
+    event_type_ids: frozenset[uuid.UUID]
+
+    def covers(self, event_type_id: uuid.UUID) -> bool:
+        """Whether a booking for ``event_type_id`` may be asked for a phone + consent."""
+        return self.tenant_wide or event_type_id in self.event_type_ids
+
+
+async def phone_channel_scope(session: AsyncSession, *, tenant_id: uuid.UUID) -> PhoneChannelScope:
+    """Where an ACTIVE WhatsApp/SMS rule exists for this tenant — i.e. where a phone gets used.
+
+    Three conditions, and every one of them is load-bearing. ``active`` is: a paused rule sends
+    nothing, so it may collect nothing. The channel filter is: the seeded 24 h **e-mail** reminder
+    governs every tenant on the instance, so reading "has a rule" as "wants a phone" would put a
+    phone field in front of every guest of every business here. And ``tenant_id`` is: a neighbour's
+    WhatsApp rule is not a licence to collect our guests' numbers.
+    """
+    rows = await session.scalars(
+        select(Workflow.event_type_id)
+        .join(
+            WorkflowStep,
+            (WorkflowStep.workflow_id == Workflow.id)
+            & (WorkflowStep.tenant_id == Workflow.tenant_id),
+        )
+        .where(
+            Workflow.tenant_id == tenant_id,
+            Workflow.active.is_(True),
+            WorkflowStep.channel.in_(sorted(channel.value for channel in PHONE_CHANNELS)),
+        )
+        .distinct()
+    )
+    scoped = list(rows.all())
+    return PhoneChannelScope(
+        tenant_wide=any(event_type_id is None for event_type_id in scoped),
+        event_type_ids=frozenset(
+            event_type_id for event_type_id in scoped if event_type_id is not None
+        ),
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Writes.
 # --------------------------------------------------------------------------------------

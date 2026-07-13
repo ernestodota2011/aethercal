@@ -141,6 +141,16 @@ class EventTypeRead(BaseModel):
     max_per_day: int | None
     questions: list[Any]
     active: bool
+    #: Whether an ACTIVE WhatsApp/SMS rule governs this event type — i.e. whether a phone number
+    #: given here would ever actually be messaged (RF-24). This is NOT a column: the server derives
+    #: it per request from the tenant's workflow rules
+    #: (``services/workflow_rules.phone_channel_scope``), because the answer changes the moment a
+    #: rule is switched on or off.
+    #:
+    #: The booking page asks for a phone + consent ONLY when this is true. The default is ``False``
+    #: — deliberately the safe direction: a server that failed to compute it collects NO personal
+    #: data, rather than harvesting phone numbers nothing will ever send to (RNF-8: minimal data).
+    collects_phone: bool = False
 
 
 @overload
