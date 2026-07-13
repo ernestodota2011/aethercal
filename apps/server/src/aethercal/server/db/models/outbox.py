@@ -9,8 +9,7 @@ intent commits atomically with (or not at all with) the booking.
 
 ``dedupe_key`` (e.g. ``email:confirmation`` / ``google:upsert``) makes the enqueue idempotent per
 booking, and ``status``/``attempts``/``next_retry_at`` drive the same exponential-backoff retry the
-webhook queue uses.
-"""
+webhook queue uses."""
 
 from __future__ import annotations
 
@@ -46,10 +45,10 @@ class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     last_attempt_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     next_retry_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
-    # --- Lease (R8) -------------------------------------------------------------------------
-    # A drain worker CLAIMS a row (status='claimed') in a short transaction, then runs its network
-    # I/O with NO transaction open, so a slow SMTP/Google/WhatsApp call can no longer pin a row lock
-    # and a pool connection for the length of the send. The claim is only safe if a worker that dies
+    # --- Lease (R8) ------------------------------------------------------------------------- A
+    # drain worker CLAIMS a row (status='claimed') in a short transaction, then runs its network I/O
+    # with NO transaction open, so a slow SMTP/Google/WhatsApp call can no longer pin a row lock and
+    # a pool connection for the length of the send. The claim is only safe if a worker that dies
     # mid-send cannot strand the row forever — hence the LEASE: ``claimed_by`` says who holds it,
     # ``lease_expires_at`` says until when. A recovery pass returns any row whose lease elapsed to
     # ``pending`` WITHOUT consuming an attempt (the worker died; the effect did not fail). Both NULL

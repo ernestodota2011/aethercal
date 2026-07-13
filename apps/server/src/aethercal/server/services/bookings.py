@@ -58,6 +58,7 @@ from aethercal.server.services.outbox import (
 )
 from aethercal.server.services.slots import SlotsResult, compute_slots
 from aethercal.server.services.webhooks import enqueue_event
+from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
 
 _logger = logging.getLogger(__name__)
 
@@ -343,6 +344,17 @@ async def create_booking(
         data=_serialize_booking(booking),
         now=now,
     )
+    # The booking's workflow steps are materialised IN THIS TRANSACTION, exactly like the webhook
+    # above: they are tenant-configured domain behaviour, not a runtime effect, so they are NOT
+    # gated on the `effects` bundle. This is what carries RF-10 now that the APScheduler reminder is
+    # gone — without it, every new booking would silently have no reminder at all.
+    await apply_booking_transition(
+        session,
+        booking=booking,
+        transition=BookingTransition.CONFIRM,
+        now=now,
+        locale=params.locale,
+    )
     if effects is not None:
         await _apply_create_effects(
             session,
@@ -410,6 +422,12 @@ async def cancel_booking(
         event="booking.cancelled",
         data=_serialize_booking(booking),
         now=now,
+    )
+    # CANCEL, not RESCHEDULE_PREDECESSOR: this is the OPERATION the guest asked for, so the
+    # `on_cancel` step is materialised and everything else still queued is retired. A reschedule's
+    # swap also leaves a booking cancelled, but it is NOT this transition — see services/workflows.
+    await apply_booking_transition(
+        session, booking=booking, transition=BookingTransition.CANCEL, now=now
     )
     if effects is not None:
         await _enqueue_google(
@@ -501,6 +519,16 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         data=_serialize_booking(new),
         now=now,
     )
+    # Two transitions, and the FIRST is the one that is easy to forget: the predecessor's still-
+    # pending steps are retired — including the staleness-EXEMPT ones, or its `after_end` follow-up
+    # would still fire, at the hour of a meeting that never happened. Then the successor (a NEW row,
+    # so a plain INSERT: nothing can conflict) gets its own fresh steps.
+    await apply_booking_transition(
+        session, booking=old, transition=BookingTransition.RESCHEDULE_PREDECESSOR, now=now
+    )
+    await apply_booking_transition(
+        session, booking=new, transition=BookingTransition.RESCHEDULE_SUCCESSOR, now=now
+    )
     if effects is not None:
         await _apply_reschedule_effects(
             session, old=old, new=new, event_type=event_type, effects=effects, now=now
@@ -566,6 +594,11 @@ async def mark_no_show(
     booking.status = BookingStatus.NO_SHOW
     booking.no_show_at = now
     await session.flush()
+    # Materialise the `on_no_show` step and VOID the pending `after_end` follow-up — otherwise the
+    # guest who did not show up receives "thanks for meeting with us".
+    await apply_booking_transition(
+        session, booking=booking, transition=BookingTransition.NO_SHOW, now=now
+    )
     return booking
 
 

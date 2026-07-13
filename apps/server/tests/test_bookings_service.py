@@ -1170,6 +1170,7 @@ def _as_work(row: Outbox) -> OutboxWork:
         dedupe_key=row.dedupe_key,
         payload=dict(row.payload),
         attempts=row.attempts,
+        claimed_by="test-worker",
     )
 
 

@@ -11,9 +11,9 @@ be, say, a ``follow_up``. So the identity is now ``(tenant, booking, kind, chann
 
 ``step_id`` is NULL for a message no workflow step produced (the confirmation, the cancellation —
 and every reminder already in the table). In BOTH PostgreSQL and SQLite, NULLs inside a UNIQUE
-constraint compare as DISTINCT, so a plain ``UNIQUE`` over all five of those columns
-would admit *unlimited* duplicate rows whenever ``step_id IS NULL`` — it would silently switch OFF
-the very idempotency guarantee it appears to provide, for exactly the messages that exist today.
+constraint compare as DISTINCT, so a plain ``UNIQUE`` over all five of those columns would admit
+*unlimited* duplicate rows whenever ``step_id IS NULL`` — it would silently switch OFF the very
+idempotency guarantee it appears to provide, for exactly the messages that exist today.
 (PostgreSQL 15+ could say ``NULLS NOT DISTINCT``; SQLite cannot, so the offline suite would lose the
 ability to prove the guarantee at all.)
 

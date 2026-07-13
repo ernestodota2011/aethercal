@@ -45,17 +45,24 @@ from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
+    DEFAULT_LEASE,
     DEFAULT_MAX_ATTEMPTS,
+    PROVIDER_TIMEOUT_CEILING,
     GoogleOperation,
     OutboxEffect,
+    OutboxReport,
     OutboxWork,
     Staleness,
+    _Outcome,
+    _settle,
     backoff_delay,
+    claim_batch,
     drain_outbox,
     email_dedupe_key,
     enqueue_effect,
     google_dedupe_key,
     make_booking_effect_executor,
+    recover_expired_leases,
     run_google_effect,
     staleness_policy,
     trigger_staleness,
@@ -569,6 +576,7 @@ async def test_an_unimplemented_effect_raises_instead_of_becoming_a_google_call(
         dedupe_key="wf:1:2:email",
         payload={},
         attempts=0,
+        claimed_by="test-worker",
     )
 
     with pytest.raises(NotImplementedError, match="notify"):
@@ -628,6 +636,7 @@ async def test_google_effect_creates_the_event_and_writes_it_back_to_the_booking
         dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
         payload=payload,
         attempts=0,
+        claimed_by="test-worker",
     )
 
     await run_google_effect(maker, work, NOW, service_factory=lambda _conn: service)
@@ -637,3 +646,79 @@ async def test_google_effect_creates_the_event_and_writes_it_back_to_the_booking
     assert booking is not None
     assert booking.external_event_id == "evt-42"
     assert booking.meeting_url == "https://meet.google.com/abc-defg-hij"
+
+
+# --------------------------------------------------------------------------------------
+# The lease is only half a mechanism without an OWNERSHIP check at settle time.
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_worker_that_lost_its_lease_DISCARDS_its_result_instead_of_stomping(
+    maker: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The race the lease alone does not close.
+
+    Worker A claims a row. Its network I/O overruns the TTL. The recovery pass hands the row back to
+    ``pending`` and worker B claims it. Now A finishes and settles — and without an ownership check
+    it writes its stale result ON TOP of B's live claim, marking ``delivered`` an intent B is still
+    executing.
+
+    So the settle is a CONDITIONAL update. A no longer matches ``claimed_by``, so its result is
+    DISCARDED — and said out loud, because writing where you have lost the right is the same silent
+    no-op as before, just pointed the other way."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id)
+
+    # Worker A claims the row (and then "hangs" in its send for longer than the TTL).
+    async with maker() as session, session.begin():
+        claimed = await claim_batch(session, now=NOW, worker_id="A", lease=_LEASE)
+    work_a = claimed[0]
+    assert work_a.claimed_by == "A"
+
+    # The lease elapses; the recovery pass returns the row, and worker B claims it.
+    later = NOW + _LEASE + timedelta(seconds=1)
+    async with maker() as session, session.begin():
+        assert await recover_expired_leases(session, now=later) == [intent_id]
+    async with maker() as session, session.begin():
+        reclaimed = await claim_batch(session, now=later, worker_id="B", lease=_LEASE)
+    assert [w.id for w in reclaimed] == [intent_id]
+
+    # NOW worker A comes back from its send and tries to settle. It must not be able to.
+    report = OutboxReport()
+    with caplog.at_level("ERROR"):
+        await _settle(maker, work_a, now=later, outcome=_Outcome.DELIVERED, report=report)
+
+    assert report.delivered == [], "the stale worker marked the intent delivered"
+    assert report.lost == [intent_id]
+    assert any("LEASE LOST" in record.getMessage() for record in caplog.records)
+
+    # B's claim is untouched: still claimed, still B's, still zero attempts.
+    row = await _row(maker, intent_id)
+    assert row.status == "claimed"
+    assert row.claimed_by == "B"
+    assert row.attempts == 0
+
+
+async def test_the_lease_holder_settles_normally(maker: Sessionmaker) -> None:
+    """The other side of the same coin: the worker that still holds the lease writes as usual."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id)
+    async with maker() as session, session.begin():
+        claimed = await claim_batch(session, now=NOW, worker_id="A", lease=_LEASE)
+
+    report = OutboxReport()
+    await _settle(maker, claimed[0], now=NOW, outcome=_Outcome.DELIVERED, report=report)
+
+    assert report.delivered == [intent_id]
+    assert report.lost == []
+    row = await _row(maker, intent_id)
+    assert row.status == "delivered"
+    assert row.claimed_by is None  # the lease is released
+
+
+def test_the_provider_timeout_ceiling_is_strictly_under_the_lease() -> None:
+    """The invariant that keeps the race above from ever happening in the first place. The lease
+    does not renew itself, so a send that outlives the TTL loses its claim AFTER the provider
+    already did the work — and the guest can be messaged twice. Bounding every provider call below
+    the TTL is what makes that unreachable rather than merely unlikely."""
+    assert PROVIDER_TIMEOUT_CEILING < DEFAULT_LEASE

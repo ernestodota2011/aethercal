@@ -28,6 +28,7 @@ from aethercal.server.services.api_keys import (
     revoke_api_key,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
+from aethercal.server.services.workflows import seed_default_workflows
 from aethercal.server.settings import Settings
 
 app = typer.Typer(help="AetherCal admin CLI.", no_args_is_help=True)
@@ -57,6 +58,10 @@ async def run_create_tenant(
         user = User(tenant_id=tenant.id, email=email, name=name, timezone=timezone)
         session.add(user)
         await session.flush()
+        # A tenant with no workflow rules has no reminders. Migration 0005 seeds the default rule
+        # for the tenants that already existed; this is the other half — every tenant created
+        # AFTERWARDS. Miss it and a brand-new self-host silently never reminds anybody.
+        await seed_default_workflows(session, tenant_id=tenant.id)
         return tenant.id, user.id
 
 

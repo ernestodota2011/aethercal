@@ -23,7 +23,13 @@ slow channels (WhatsApp, SMS) that is a pool-exhaustion bug waiting to happen. T
 3. **execute** — the network I/O runs with **no transaction open at all**. Each handler is phased
    (read → send → record) precisely so that holds.
 4. **settle** — a second short transaction records the outcome (``delivered`` / ``failed`` + backoff
-   / ``dead``).
+   / ``dead``) — but **only if the lease is still ours**. The write is a conditional update gated on
+   ``status = 'claimed' AND claimed_by = <this worker>``. A lease is not a lock, so it can be lost:
+   if our send overran the TTL, the recovery pass has already handed the row back and another worker
+   owns it. Then our result is stale, and we DISCARD it loudly instead of stomping theirs. Writing
+   where you no longer have the right is the same silent no-op, just pointed the other way. To keep
+   that from happening at all, every provider call is bounded by
+   :data:`PROVIDER_TIMEOUT_CEILING` < :data:`DEFAULT_LEASE`.
 
 Delivery stays **at-least-once**: a crash after a provider accepts but before the settle commits
 replays the effect. That errs toward a duplicate rather than a lost message, which is the deliberate
@@ -42,10 +48,11 @@ marked delivered and **never sent**: the guest is never told that their booking 
 
 So the guard is not a scattered ``if``. :data:`_STALENESS` is an explicit table, and for a workflow
 step it classifies **by trigger** (:func:`trigger_staleness`), exhaustively — ``assert_never`` makes
-a newly added trigger a type error rather than a silent default. Likewise :func:`conflict_policy`
-declares, per effect, whether re-enqueueing an already-queued intent RE-TIMES it: a ``before_start``
-step whose booking moved must move with it, or the unique constraint swallows the update and the
-reminder still fires 24 h before the OLD start."""
+a newly added trigger a type error rather than a silent default.
+
+A step whose booking is replaced is not "moved" by an upsert (that would match zero rows — a
+reschedule opens a NEW booking id): it is retired with :func:`void_pending_steps`, driven by the
+transition table in ``services/workflows.py``."""
 
 from __future__ import annotations
 
@@ -96,12 +103,27 @@ DEFAULT_MAX_ATTEMPTS = 6
 DEFAULT_DRAIN_BATCH_SIZE = 100
 """Max intents one drain pass claims + processes."""
 
+PROVIDER_TIMEOUT_CEILING = timedelta(minutes=2)
+"""The hard ceiling every provider call must respect: **strictly less than** :data:`DEFAULT_LEASE`.
+
+The lease is not self-renewing. A worker whose send outlives the TTL loses its claim, and its result
+is discarded at settle (see :func:`_settle`) — after the provider has already done the work, so the
+guest can be messaged twice. The only two ways out are lease RENEWAL or provider timeouts bounded
+below the TTL, and this codebase takes the second: it is one number to get right instead of a
+heartbeat to keep alive, and every client here already takes a timeout.
+
+2 min vs a 5 min TTL leaves a 3 min margin for the DB round-trips either side of the call. The
+``lost`` counter on :class:`OutboxReport` is what proves the assumption in production: if it is ever
+non-zero, this ceiling (or the TTL) is wrong.
+"""
+
 DEFAULT_LEASE = timedelta(minutes=5)
 """The lease TTL: how long a claim is honoured before another worker may take the row over.
 
-Bounded from BELOW by the slowest single provider round-trip — a lease shorter than a send would let
-a second worker take a row a healthy worker is still working on, and send the message twice. Five
-minutes clears any SMTP/Google/WhatsApp call with room to spare.
+Bounded from BELOW by the slowest single provider round-trip — a lease shorter than a send lets a
+second worker take a row a healthy worker is still working on, and the message goes out twice. That
+bound is not left to hope: :data:`PROVIDER_TIMEOUT_CEILING` (2 min) is the contract every provider
+call must honour, and it is strictly under this TTL.
 
 Bounded from ABOVE by how long a dead worker's rows may sit idle. Which is why the recovery pass
 runs
@@ -250,6 +272,14 @@ class OutboxWork:
     dedupe_key: str
     payload: dict[str, Any]
     attempts: int
+    claimed_by: str
+    """The worker holding this row's lease. The settle REFUSES to write without it.
+
+    Without this, the lease is only half a mechanism. A worker claims a row, its network I/O
+    overruns the TTL, the recovery pass hands the row back to ``pending``, a SECOND worker claims it
+    — and then the first worker settles its own stale result on top, marking ``delivered`` an intent
+    the second worker is still executing. So the settle is a CONDITIONAL update, gated on this
+    value. """
 
 
 # The injected effect runner. It receives NO session: it opens its own short-lived ones around the
@@ -269,6 +299,12 @@ class OutboxReport:
     deferred: list[uuid.UUID] = field(default_factory=list)
     recovered: list[uuid.UUID] = field(default_factory=list)
     """Rows a dead worker had claimed, returned to ``pending`` by this pass's lease recovery."""
+    lost: list[uuid.UUID] = field(default_factory=list)
+    """Rows whose lease expired mid-send, so this worker's result was DISCARDED at settle time.
+
+    Never silent: each one is an error-level log line. A non-empty ``lost`` means the lease TTL is
+    too short for the provider timeouts actually in play, and it is the metric to alert on — the
+    effect may well have been executed twice. """
 
     @property
     def attempted(self) -> int:
@@ -499,6 +535,7 @@ async def claim_batch(
                 dedupe_key=row.dedupe_key,
                 payload=dict(row.payload),
                 attempts=row.attempts,
+                claimed_by=worker_id,
             )
         )
     await session.flush()
@@ -570,10 +607,29 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
     report: OutboxReport,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> None:
-    """Record one intent's outcome in its OWN short transaction, releasing the lease."""
+    """Record one intent's outcome in its OWN short transaction, releasing the lease.
+
+    ==Only if the lease is still OURS.== The write is gated on
+    ``status = 'claimed' AND claimed_by = <this worker>``, re-checked in this transaction. If the
+    row no longer matches, our lease expired mid-send, the recovery pass returned the row to
+    ``pending``, and somebody else now owns it — so our result is STALE. We discard it and say so;
+    applying it would let us mark ``delivered`` an intent another worker is still executing, or
+    stomp its bookkeeping. Writing where you no longer have the right is the same silent no-op as
+    before, just pointed the other way."""
     async with sessionmaker() as session, session.begin():
-        row = await session.get(Outbox, work.id)
-        if row is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        row = await _lock_if_still_ours(session, work)
+        if row is None:
+            report.lost.append(work.id)
+            _logger.error(
+                "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (held by %s). The "
+                "result is discarded, not applied — another worker owns this row now. The send may "
+                "have happened, so it can be delivered twice: shorten the provider timeout or "
+                "lengthen the lease (see DEFAULT_LEASE)",
+                work.id,
+                work.effect,
+                work.booking_id,
+                work.claimed_by,
+            )
             return
         row.claimed_by = None
         row.lease_expires_at = None
@@ -606,6 +662,29 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             return
 
         assert_never(outcome)
+
+
+async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
+    """Re-read the row under a row lock, but ONLY while this worker still holds its lease.
+
+    The predicate is the whole point: ``status = 'claimed' AND claimed_by = <us>``. A row that has
+    been recovered (back to ``pending``) or re-claimed by somebody else matches nothing, and we get
+    ``None`` — which the caller turns into "discard the result, loudly".
+
+    ``FOR UPDATE`` (a no-op on SQLite, which serialises writers) makes the check-then-write atomic:
+    without it, a recovery pass could slip between our SELECT and our UPDATE and we would be writing
+    on a row we had just proven was ours a moment ago."""
+    return (
+        await session.scalars(
+            select(Outbox)
+            .where(
+                Outbox.id == work.id,
+                Outbox.status == _CLAIMED,
+                Outbox.claimed_by == work.claimed_by,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
 
 
 def _park_dead(row: Outbox) -> None:
@@ -973,6 +1052,7 @@ __all__ = [
     "DEFAULT_LEASE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFER_DELAY_SECONDS",
+    "PROVIDER_TIMEOUT_CEILING",
     "GoogleOperation",
     "OutboxDeferred",
     "OutboxEffect",

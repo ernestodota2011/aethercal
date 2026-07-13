@@ -71,6 +71,18 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
         sa.String(255), server_default=sa.text("''"), default=_new_ical_uid, nullable=False
     )
     external_event_id: Mapped[str | None] = mapped_column(sa.String(255))
+    # WHERE that external event actually lives. The booking knew the event's ID but not its home, so
+    # a cancel could only GUESS the calendar. Re-designate the booking target and the delete goes to
+    # the wrong calendar, Google answers 404, and the original event is left orphaned in the host's
+    # calendar — in silence. Recording the connection + calendar at write time is what makes the
+    # delete address the same place the create wrote to.
+    #
+    # SET NULL, not CASCADE: revoking a Google connection must never delete the BOOKING. The guest
+    # still has an appointment; all that is lost is our handle on the mirrored calendar event.
+    external_connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("external_connections.id", ondelete="SET NULL")
+    )
+    external_calendar_id: Mapped[str | None] = mapped_column(sa.String(255))
     meeting_url: Mapped[str | None] = mapped_column(sa.String(1024))
     rescheduled_from_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("bookings.id", ondelete="SET NULL")

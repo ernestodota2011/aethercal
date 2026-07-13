@@ -42,6 +42,13 @@ What lands here, and why:
         booking whose reminder ALREADY went out is skipped (the ``NOT EXISTS`` on the ledger below).
     After this, the idempotency of a reminder lives in exactly one place.
 
+(G) ``schedules.user_id`` (RF-30). (H) ``external_calendar_links.busy`` /
+    ``is_booking_target``, plus the partial unique index that turns "two write targets on one
+    connection" into a DATABASE error instead of an arbitrary choice by whichever row was read
+    first. (I) ``bookings.external_connection_id`` / ``external_calendar_id`` — so a cancel
+    deletes the event where it was actually written, instead of guessing the calendar, getting a
+    404, and silently orphaning the original in the host's calendar.
+
 Revision ID: 0005_workflows_and_noshow
 Revises: 0004_event_type_translations
 Create Date: 2026-07-12 10:00:00.000000
@@ -337,6 +344,49 @@ def upgrade() -> None:
         )
     op.create_index(op.f('ix_schedules_user_id'), 'schedules', ['user_id'], unique=False)
 
+    # (H) external_calendar_links comes ALIVE (RF-11/12/13). The table existed but carried no
+    # semantics, so the code fell back to a hard-coded 'primary' calendar.
+    #   busy              — is this calendar READ when computing the host's busy time? Default true:
+    #                       a newly linked calendar counts against availability, which is the safe
+    #                       direction (we offer too few slots, never double-book the host).
+    #   is_booking_target — is this the calendar events are WRITTEN to? Default false.
+    # Both NOT NULL with a server_default so the ADD COLUMN needs no backfill; the defaults are then
+    # dropped so the Python-side default= is the only source of truth.
+    op.add_column(
+        'external_calendar_links',
+        sa.Column('busy', sa.Boolean(), server_default=sa.text('true'), nullable=False),
+    )
+    op.add_column(
+        'external_calendar_links',
+        sa.Column(
+            'is_booking_target', sa.Boolean(), server_default=sa.text('false'), nullable=False
+        ),
+    )
+    with op.batch_alter_table('external_calendar_links') as batch_op:
+        batch_op.alter_column('busy', server_default=None)
+        batch_op.alter_column('is_booking_target', server_default=None)
+    # At most ONE write target per connection — enforced by the DATABASE, not by whichever row the
+    # code happened to read first. Partial: only the targets are constrained.
+    op.create_index(
+        'uq_external_calendar_links_target',
+        'external_calendar_links', ['tenant_id', 'connection_id'],
+        unique=True,
+        postgresql_where=sa.text('is_booking_target'),
+        sqlite_where=sa.text('is_booking_target'),
+    )
+
+    # (I) A booking must know WHERE its external event lives, not just its id. Without this a cancel
+    # can only GUESS the calendar: re-designate the booking target and the delete lands on the wrong
+    # one, Google answers 404, and the original event is orphaned in the host's calendar in silence.
+    # SET NULL, never CASCADE — revoking a Google connection must not delete the BOOKING.
+    with op.batch_alter_table('bookings') as batch_op:
+        batch_op.add_column(sa.Column('external_connection_id', sa.Uuid(), nullable=True))
+        batch_op.add_column(sa.Column('external_calendar_id', sa.String(length=255), nullable=True))
+        batch_op.create_foreign_key(
+            op.f('fk_bookings_external_connection_id_external_connections'),
+            'external_connections', ['external_connection_id'], ['id'], ondelete='SET NULL',
+        )
+
     # (E) Outbox lease columns (R8).
     op.add_column('outbox', sa.Column('claimed_by', sa.String(length=64), nullable=True))
     op.add_column('outbox', sa.Column('lease_expires_at', sa.DateTime(timezone=True), nullable=True))
@@ -402,6 +452,18 @@ def downgrade() -> None:
     op.drop_index('ix_outbox_lease', table_name='outbox')
     op.drop_column('outbox', 'lease_expires_at')
     op.drop_column('outbox', 'claimed_by')
+
+    with op.batch_alter_table('bookings') as batch_op:
+        batch_op.drop_constraint(
+            op.f('fk_bookings_external_connection_id_external_connections'), type_='foreignkey'
+        )
+        batch_op.drop_column('external_calendar_id')
+        batch_op.drop_column('external_connection_id')
+
+    op.drop_index('uq_external_calendar_links_target', table_name='external_calendar_links')
+    with op.batch_alter_table('external_calendar_links') as batch_op:
+        batch_op.drop_column('is_booking_target')
+        batch_op.drop_column('busy')
 
     op.drop_index(op.f('ix_schedules_user_id'), table_name='schedules')
     with op.batch_alter_table('schedules') as batch_op:

@@ -39,18 +39,40 @@ delivered, to a real guest. That is why :class:`BookingTransition` keeps ``CANCE
 
 from __future__ import annotations
 
+import logging
+import uuid
+from collections.abc import Collection, Sequence
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import assert_never
 
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from aethercal.server.channels import Channel
+from aethercal.server.db.models import Booking, Workflow, WorkflowStep
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.services.outbox import (
+    OutboxEffect,
+    enqueue_effect,
+    void_pending_steps,
+    workflow_step_dedupe_key,
+)
+
+_logger = logging.getLogger(__name__)
 
 # ``WorkflowTrigger`` is re-exported so the shared contract's import path holds. It is DEFINED in
 # the leaf model module: the outbox classifies staleness by trigger, and the engine will import the
 # outbox to enqueue — declaring the vocabulary here would close that into an import cycle.
 __all__ = [
+    "DEFAULT_REMINDER_KIND",
+    "DEFAULT_REMINDER_NAME",
+    "DEFAULT_REMINDER_OFFSET_MINUTES",
     "BookingTransition",
     "StepAction",
     "WorkflowTrigger",
+    "apply_booking_transition",
+    "seed_default_workflows",
     "step_action",
     "triggers_to_materialise",
     "triggers_to_void",
@@ -157,3 +179,183 @@ def triggers_to_void(transition: BookingTransition) -> tuple[WorkflowTrigger, ..
         for trigger in WorkflowTrigger
         if step_action(transition, trigger) is StepAction.VOID
     )
+
+
+# --------------------------------------------------------------------------------------
+# The step PRODUCER. The engine that renders bodies and drives the channels lands in a later cut;
+# what has to exist NOW is the thing that puts a booking's steps into the outbox, inside the
+# booking's OWN transaction. Without it, retiring the APScheduler reminder would leave every NEW
+# booking with no reminder at all — a real regression.
+# --------------------------------------------------------------------------------------
+
+# The default rule every tenant gets: remind the guest 24 h before the start. It is DATA, not code
+# (a row the tenant can edit or switch off), and it is seeded in exactly TWO places — migration 0005
+# for the tenants that already existed, and :func:`seed_default_workflows` for every tenant created
+# afterwards. Miss the second and a brand-new tenant silently has no reminders at all.
+DEFAULT_REMINDER_NAME = "24h reminder"
+DEFAULT_REMINDER_OFFSET_MINUTES = -1440
+DEFAULT_REMINDER_KIND = "reminder"
+
+
+async def seed_default_workflows(session: AsyncSession, *, tenant_id: uuid.UUID) -> Workflow | None:
+    """Give a new tenant the default 24 h reminder rule. ``None`` if it already has one.
+
+    Idempotent on the workflow's ``(tenant_id, name)`` unique constraint, so calling it twice is a
+    no-op rather than a second rule — which would remind the guest twice."""
+    existing = (
+        await session.scalars(
+            select(Workflow).where(
+                Workflow.tenant_id == tenant_id, Workflow.name == DEFAULT_REMINDER_NAME
+            )
+        )
+    ).first()
+    if existing is not None:
+        return None
+
+    workflow = Workflow(
+        tenant_id=tenant_id,
+        event_type_id=None,  # applies to every event type of the tenant
+        name=DEFAULT_REMINDER_NAME,
+        trigger=WorkflowTrigger.BEFORE_START.value,
+        offset_minutes=DEFAULT_REMINDER_OFFSET_MINUTES,
+        active=True,
+    )
+    session.add(workflow)
+    await session.flush()
+    session.add(
+        WorkflowStep(
+            tenant_id=tenant_id,
+            workflow_id=workflow.id,
+            channel=Channel.EMAIL.value,
+            kind=DEFAULT_REMINDER_KIND,
+            position=0,
+        )
+    )
+    await session.flush()
+    return workflow
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """SQLite drops tzinfo on the round-trip; normalise before doing arithmetic on it."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _send_time(trigger: WorkflowTrigger, *, booking: Booking, offset: timedelta) -> datetime | None:
+    """When a step for ``trigger`` is due. ``None`` = as soon as the next drain runs.
+
+    The anchor is the trigger's own moment, and ``offset_minutes`` is SIGNED — ``before_start``
+    carries ``-1440``, so the addition just works. The event-shaped triggers (``on_booking``,
+    ``on_cancel``, ``on_no_show``) fire now: they report something that has just happened.
+    """
+    match trigger:
+        case WorkflowTrigger.BEFORE_START:
+            return _as_utc(booking.start_at) + offset
+        case WorkflowTrigger.AFTER_END:
+            return _as_utc(booking.end_at) + offset
+        case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
+            return None
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+async def _active_workflows(
+    session: AsyncSession, *, booking: Booking, triggers: Collection[WorkflowTrigger]
+) -> Sequence[Workflow]:
+    """The tenant's active rules for ``triggers`` that apply to this booking's event type."""
+    if not triggers:
+        return []
+    return (
+        await session.scalars(
+            select(Workflow).where(
+                Workflow.tenant_id == booking.tenant_id,
+                Workflow.active.is_(True),
+                Workflow.trigger.in_([trigger.value for trigger in triggers]),
+                # NULL = the rule applies to every event type of the tenant.
+                or_(
+                    Workflow.event_type_id.is_(None),
+                    Workflow.event_type_id == booking.event_type_id,
+                ),
+            )
+        )
+    ).all()
+
+
+async def apply_booking_transition(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    transition: BookingTransition,
+    now: datetime,
+    locale: str = "es",
+) -> list[uuid.UUID]:
+    """Bring a booking's queued steps in line with ``transition``. Returns the ids materialised.
+
+    Runs INSIDE the booking's own transaction — exactly like the webhook and the email intent — so a
+    step can never be queued for a booking whose transaction later rolls back, and a booking can
+    never commit without its steps.
+
+    Voids first, then materialises, both read straight off the transition table. Never an ad-hoc
+    ``if``: the table is the only place that decides what a transition does to a step."""
+    voided = await void_pending_steps(
+        session,
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
+        triggers=triggers_to_void(transition),
+    )
+    if voided:
+        _logger.info(
+            "booking %s (%s): voided %d pending workflow step(s)",
+            booking.id,
+            transition.value,
+            len(voided),
+        )
+
+    materialised: list[uuid.UUID] = []
+    wanted = triggers_to_materialise(transition)
+    for workflow in await _active_workflows(session, booking=booking, triggers=wanted):
+        trigger = WorkflowTrigger(workflow.trigger)
+        send_at = _send_time(
+            trigger, booking=booking, offset=timedelta(minutes=workflow.offset_minutes)
+        )
+        if send_at is not None and send_at <= now:
+            # Its moment has already passed — booked inside the reminder window, or rescheduled into
+            # it. A "reminder" that lands after the fact is noise, and a `next_retry_at` in the past
+            # drains IMMEDIATELY, so it has to be skipped rather than queued. Recorded, because a
+            # message that is silently absent is exactly the kind of thing nobody ever notices.
+            _logger.info(
+                "booking %s: skipping workflow %s (%s) — its send time %s is already past",
+                booking.id,
+                workflow.id,
+                trigger.value,
+                send_at.isoformat(),
+            )
+            continue
+
+        steps = (
+            await session.scalars(
+                select(WorkflowStep)
+                .where(WorkflowStep.workflow_id == workflow.id)
+                .order_by(WorkflowStep.position)
+            )
+        ).all()
+        for step in steps:
+            channel = Channel(step.channel)
+            row = await enqueue_effect(
+                session,
+                tenant_id=booking.tenant_id,
+                booking_id=booking.id,
+                effect=OutboxEffect.NOTIFY,
+                dedupe_key=workflow_step_dedupe_key(workflow.id, step.id, channel),
+                payload={
+                    "trigger": trigger.value,
+                    "workflow_id": str(workflow.id),
+                    "step_id": str(step.id),
+                    "channel": channel.value,
+                    "kind": step.kind,
+                    "locale": locale,
+                },
+                next_retry_at=send_at,
+            )
+            if row is not None:
+                materialised.append(row.id)
+    return materialised
