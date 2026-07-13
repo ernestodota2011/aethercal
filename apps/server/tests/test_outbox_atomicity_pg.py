@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.core.model import BookingStatus
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Booking, EventType, Outbox, Schedule, Tenant, User
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.scheduler import run_outbox_drain_once
 from aethercal.server.services.bookings import BookingEffects, BookingParams, create_booking
@@ -40,6 +41,21 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE PostgreSQL sessionmaker.
+
+    ==This test is about ATOMICITY, not isolation, and it keeps its own harness.== It drives two
+    CONCURRENT drains over a schema built from ``Base.metadata`` (so no policies) on the ordinary
+    test role (so no BYPASSRLS): what it proves is that the claim's conditional UPDATE lets exactly
+    one worker win a row — a fact about PostgreSQL's row locks, orthogonal to the belt.
+
+    The isolation belt has a harness of its own — ``tests/rls/`` — with three real roles, a schema
+    built by the real migrations, and the seeding deliberately kept off the app engine.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 pytestmark = pytest.mark.db
 
@@ -267,8 +283,8 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(app
         sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
     )
     await asyncio.gather(
-        run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
-        run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
+        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
+        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
     )
 
     # Exactly one event created (never two), and the booking points at it.
@@ -355,8 +371,8 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
         sessionmaker=sessionmaker, sender=_RecordingSender(), service_factory=lambda _c: google
     )
     await asyncio.gather(
-        run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
-        run_outbox_drain_once(sessionmaker=sessionmaker, execute=execute, now=now),
+        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
+        run_outbox_drain_once(pools=_pools(sessionmaker), execute=execute, now=now),
     )
 
     # Exactly one event — for the current booking b2 — and the replaced one is never recreated.

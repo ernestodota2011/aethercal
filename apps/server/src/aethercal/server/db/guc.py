@@ -126,6 +126,41 @@ def tenant_scope(tenant_id: uuid.UUID) -> Generator[None]:
         _current_tenant.reset(token)
 
 
+@contextmanager
+def request_scope() -> Generator[None]:
+    """Open an EMPTY binding scope and tear it down on the way out. ==The web's unit: ONE REQUEST.==
+
+    The binding starts at ``None`` — nothing bound, therefore nothing visible — and the auth
+    dependency (or the guest-token path) is what fills it. On the way out it is reset, whatever
+    happened in between.
+
+    .. rubric:: Why this is EXPLICIT, and not left to the task boundary
+
+    A ``ContextVar`` set inside an asyncio Task does not escape it, and under uvicorn every
+    request IS its own Task — so in production the request boundary and the ContextVar boundary
+    coincide, and it is tempting to lean on that and write nothing at all.
+
+    ==Leaning on it is exactly the kind of implicit assumption this batch exists to destroy.== It is
+    not true everywhere. An ASGI app called directly runs *in the caller's task* — which is what
+    ``httpx.ASGITransport`` does, and therefore what this product's entire test suite does. There, a
+    binding survives from one request into the next, and a second request for a different business
+    hits the immutability rule and RAISES.
+
+    That is the FRIENDLY failure. The unfriendly one is the same bug in the shape where it does NOT
+    raise: a request that never binds at all, silently inheriting the previous request's business
+    and reading rows it has no authority over. An ASGI middleware, a background task, or simply the
+    next framework's idea of task boundaries is all it would take.
+
+    So the scope is declared HERE, in the one seam every request already passes through
+    (:func:`~aethercal.server.deps.get_session`), and it depends on nobody's task semantics.
+    """
+    token = _current_tenant.set(None)
+    try:
+        yield
+    finally:
+        _current_tenant.reset(token)
+
+
 def _stamp_tenant_guc(
     session: Session,
     transaction: SessionTransaction,

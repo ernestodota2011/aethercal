@@ -1,4 +1,16 @@
-"""R9 over HTTP: ``GET /metrics`` (authenticated) and ``GET /health/ready`` (the backlog).
+"""R9 over HTTP - ==now served by the WORKER, and that move IS the point.==
+
+``GET /metrics`` and the ``GET /health/ready`` that reports the backlog used to live in the WEB
+process. Under row-level security they could only ever have reported **zeros** there: every
+query in ``collect_metrics`` is cross-business, the web holds ``aethercal_app`` under RLS, and a
+scrape carries no business to bind - so the endpoint whose entire job is to make a dead drain
+VISIBLE would have answered ``200 OK``, ``outbox.due 0``, for ever, with the queue on fire.
+
+They are served by ``aethercal-worker`` now (``api/operator.py``), which holds the ``BYPASSRLS``
+scan pool that makes those numbers true. The app is assembled here by hand over the offline
+SQLite sessionmaker - wrapped in ``WorkerPools.for_offline_tests``, because SQLite has no RLS
+and so nothing to bypass - which keeps these in the default matrix rather than only in the
+Postgres job.
 
 Offline, over the same in-memory SQLite the rest of the service-layer suite uses: the app is
 assembled by hand (sessionmaker + settings on ``app.state``) so these run in the default matrix
@@ -27,7 +39,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.api import health, metrics
+from aethercal.server.api import health, operator
 from aethercal.server.db.models import (
     Booking,
     EventType,
@@ -37,6 +49,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.services.api_keys import issue_api_key
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.settings import Settings
@@ -48,12 +61,25 @@ ClientFactory = Callable[..., Awaitable[AsyncClient]]
 
 
 def _app(maker: async_sessionmaker[AsyncSession], **overrides: Any) -> FastAPI:
+    """The WORKER shape: ``state.pools``, and NOT ``state.sessionmaker``.
+
+    ``operator.router`` reads ``app.state.pools``, with no fallback - the web process has no
+    pools at all, because it holds no engine with ``BYPASSRLS``. An ``AttributeError`` at boot
+    is what turns that into a fact rather than a convention.
+    """
     application = FastAPI()
-    application.state.sessionmaker = maker
+    application.state.pools = WorkerPools.for_offline_tests(maker)
     application.state.settings = Settings(
         database_url="postgresql://unused/db", app_secret="test-app-secret", **overrides
     )
-    application.include_router(metrics.router, prefix="/api/v1")
+    application.include_router(operator.router, prefix="/api/v1")
+    return application
+
+
+def _web_app(maker: async_sessionmaker[AsyncSession]) -> FastAPI:
+    """The WEB health surface - which deliberately no longer carries the backlog."""
+    application = FastAPI()
+    application.state.sessionmaker = maker
     application.include_router(health.router, prefix="/api/v1")
     return application
 
@@ -305,7 +331,9 @@ async def test_readiness_is_503_when_the_database_is_unreachable(
     """
     client = await client_factory()
     dead_engine = create_async_engine("sqlite+aiosqlite:////nonexistent-directory/aethercal.db")
-    client.app.state.sessionmaker = async_sessionmaker(dead_engine)  # type: ignore[attr-defined]
+    client.app.state.pools = WorkerPools.for_offline_tests(  # type: ignore[attr-defined]
+        async_sessionmaker(dead_engine)
+    )
 
     resp = await client.get("/api/v1/health/ready")
 
@@ -328,3 +356,58 @@ async def test_readiness_carries_no_per_business_data(
 
     assert tenant.slug not in resp.text
     assert "ada@example.com" not in resp.text
+
+
+# --------------------------------------------------------------------------------------
+# ==Criterion 12c - the WEB /health/ready lost the backlog. The second dead-man switch.==
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_webs_readiness_no_longer_serves_the_backlog(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==It was very nearly left behind, lying in green.==
+
+    ``GET /health/ready`` on the WEB process is unauthenticated (a container healthcheck carries no
+    credentials), so it can hold no tenant authority and bind no business. It used to call the same
+    cross-business ``collect_metrics`` as ``/metrics`` - which fills with zeros by construction and
+    never raises. Under RLS that reads:
+
+        ``status: "ready"``, ``database: "up"``, ``outbox.due = 0`` - for ever, with the outbox on
+        fire, on the very probe the deployment uses to decide this instance is healthy.
+
+    ``/metrics`` was rescued by moving it to the worker. This one would have stayed exactly where it
+    was. So the web keeps only the half it can answer truthfully - *can I reach the database* - and
+    the backlog goes to the worker, where a bypass pool exists to measure it.
+    """
+    await _seed(sqlite_maker)
+    application = _web_app(sqlite_maker)
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://testserver"
+    ) as http:
+        resp = await http.get("/api/v1/health/ready")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"status": "ready", "database": "up"}
+    assert "outbox" not in body, (
+        "the web process cannot report the backlog truthfully - under RLS it would report zeros"
+    )
+
+
+async def test_the_webs_readiness_still_fails_loudly_when_the_database_is_gone() -> None:
+    """Losing the backlog must not cost the probe its ONE honest property: it still has to BREAK.
+
+    ``SELECT 1`` was chosen precisely because it raises when the database is unreachable - which is
+    exactly what the zero-filling backlog block could never do.
+    """
+    dead_engine = create_async_engine("sqlite+aiosqlite:////nonexistent-directory/aethercal.db")
+    application = _web_app(async_sessionmaker(dead_engine))
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://testserver"
+    ) as http:
+        resp = await http.get("/api/v1/health/ready")
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["database"] == "down"
+    await dead_engine.dispose()

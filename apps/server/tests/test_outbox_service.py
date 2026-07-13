@@ -42,6 +42,7 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Outbox, Schedule, Tenant, User
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.event_types import create_event_type
@@ -70,6 +71,23 @@ from aethercal.server.services.outbox import (
     trigger_staleness,
 )
 from aethercal.server.services.workflows import seed_default_workflows
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 _SLOT = datetime(2026, 7, 13, 15, 0, tzinfo=UTC)
@@ -319,10 +337,10 @@ async def test_a_future_next_retry_at_makes_the_outbox_a_scheduler(maker: Sessio
         assert row is not None
 
     executor = _RecordingExecutor()
-    assert (await drain_outbox(maker, now=NOW, execute=executor)).attempted == 0
+    assert (await drain_outbox(_pools(maker), now=NOW, execute=executor)).attempted == 0
     assert executor.calls == []  # not due yet
 
-    later = await drain_outbox(maker, now=NOW + timedelta(days=3), execute=executor)
+    later = await drain_outbox(_pools(maker), now=NOW + timedelta(days=3), execute=executor)
     assert len(later.delivered) == 1
 
 
@@ -338,7 +356,7 @@ async def test_drain_runs_a_due_intent_once_and_a_re_drain_runs_nothing(
     intent_id = await _enqueue(maker, tenant_id, booking_id)
     executor = _RecordingExecutor()
 
-    report = await drain_outbox(maker, now=NOW, execute=executor)
+    report = await drain_outbox(_pools(maker), now=NOW, execute=executor)
 
     assert executor.calls == [intent_id]
     assert report.delivered == [intent_id]
@@ -349,7 +367,7 @@ async def test_drain_runs_a_due_intent_once_and_a_re_drain_runs_nothing(
     # The lease is released on settle — a delivered row is not still "held" by a worker.
     assert row.claimed_by is None and row.lease_expires_at is None
 
-    again = await drain_outbox(maker, now=NOW, execute=executor)
+    again = await drain_outbox(_pools(maker), now=NOW, execute=executor)
     assert again.attempted == 0
     assert executor.calls == [intent_id]  # a delivered intent is never re-run
 
@@ -371,7 +389,7 @@ async def test_the_row_is_claimed_and_committed_before_the_effect_runs(maker: Se
             observed["claimed_by"] = row.claimed_by
             observed["lease_expires_at"] = row.lease_expires_at
 
-    await drain_outbox(maker, now=NOW, execute=_execute, worker_id="worker-1", lease=_LEASE)
+    await drain_outbox(_pools(maker), now=NOW, execute=_execute, worker_id="worker-1", lease=_LEASE)
 
     assert observed["status"] == "claimed"
     assert observed["claimed_by"] == "worker-1"
@@ -388,7 +406,7 @@ async def test_a_transient_failure_retries_after_backoff_then_delivers(maker: Se
     intent_id = await _enqueue(maker, tenant_id, booking_id)
     executor = _RecordingExecutor(fail_first=1)
 
-    first = await drain_outbox(maker, now=NOW, execute=executor)
+    first = await drain_outbox(_pools(maker), now=NOW, execute=executor)
     assert first.failed == [intent_id]
     row = await _row(maker, intent_id)
     assert row.status == "failed"
@@ -397,7 +415,7 @@ async def test_a_transient_failure_retries_after_backoff_then_delivers(maker: Se
     assert row.claimed_by is None  # the lease is released even on a failure
 
     # Not due before next_retry_at: a drain at the failure instant runs nothing.
-    early = await drain_outbox(maker, now=NOW, execute=executor)
+    early = await drain_outbox(_pools(maker), now=NOW, execute=executor)
     assert early.attempted == 0
     assert executor.calls == [intent_id]
 
@@ -407,7 +425,7 @@ async def test_a_transient_failure_retries_after_backoff_then_delivers(maker: Se
     # instant. Sitting exactly ON the boundary would make this flaky for a reason that has nothing
     # to do with backoff.
     later = await drain_outbox(
-        maker, now=NOW + backoff_delay(1) + timedelta(minutes=1), execute=executor
+        _pools(maker), now=NOW + backoff_delay(1) + timedelta(minutes=1), execute=executor
     )
     assert later.delivered == [intent_id]
     row = await _row(maker, intent_id)
@@ -421,10 +439,10 @@ async def test_drain_processes_at_most_batch_size_intents_per_pass(maker: Sessio
         await _enqueue(maker, tenant_id, booking_id, dedupe_key=f"email:k{i}")
     executor = _RecordingExecutor()
 
-    first = await drain_outbox(maker, now=NOW, execute=executor, batch_size=2)
+    first = await drain_outbox(_pools(maker), now=NOW, execute=executor, batch_size=2)
     assert first.attempted == 2  # only two of the three due intents ran this pass
 
-    second = await drain_outbox(maker, now=NOW, execute=executor, batch_size=2)
+    second = await drain_outbox(_pools(maker), now=NOW, execute=executor, batch_size=2)
     assert second.attempted == 1  # the remainder drains on the next pass
     assert len(executor.calls) == 3
 
@@ -438,7 +456,7 @@ async def test_a_persistently_failing_intent_is_dead_lettered_after_max_attempts
 
     now = NOW
     for _ in range(DEFAULT_MAX_ATTEMPTS):
-        await drain_outbox(maker, now=now, execute=executor)
+        await drain_outbox(_pools(maker), now=now, execute=executor)
         now = now + timedelta(hours=2)  # always past the capped backoff, so the intent is due again
 
     row = await _row(maker, intent_id)
@@ -446,7 +464,7 @@ async def test_a_persistently_failing_intent_is_dead_lettered_after_max_attempts
     assert row.attempts == DEFAULT_MAX_ATTEMPTS
     assert row.next_retry_at is None
     # A dead intent is terminal — a further drain never touches it again.
-    assert (await drain_outbox(maker, now=now, execute=executor)).attempted == 0
+    assert (await drain_outbox(_pools(maker), now=now, execute=executor)).attempted == 0
 
 
 # --------------------------------------------------------------------------------------
@@ -466,7 +484,7 @@ async def test_an_expired_lease_is_recovered_without_consuming_an_attempt(
         raise KeyboardInterrupt  # the process vanishes mid-send; the row is never settled
 
     with pytest.raises(KeyboardInterrupt):
-        await drain_outbox(maker, now=NOW, execute=_die, worker_id="doomed", lease=_LEASE)
+        await drain_outbox(_pools(maker), now=NOW, execute=_die, worker_id="doomed", lease=_LEASE)
 
     stranded = await _row(maker, intent_id)
     assert stranded.status == "claimed"
@@ -475,12 +493,12 @@ async def test_an_expired_lease_is_recovered_without_consuming_an_attempt(
 
     # While the lease is still valid, nobody may steal the row.
     executor = _RecordingExecutor()
-    early = await drain_outbox(maker, now=NOW + timedelta(minutes=1), execute=executor)
+    early = await drain_outbox(_pools(maker), now=NOW + timedelta(minutes=1), execute=executor)
     assert early.attempted == 0
     assert executor.calls == []
 
     # Once it expires, the next pass recovers it and a healthy worker delivers it.
-    report = await drain_outbox(maker, now=NOW + timedelta(minutes=6), execute=executor)
+    report = await drain_outbox(_pools(maker), now=NOW + timedelta(minutes=6), execute=executor)
     assert report.recovered == [intent_id]
     assert report.delivered == [intent_id]
     row = await _row(maker, intent_id)
@@ -502,10 +520,10 @@ async def test_a_slow_worker_does_not_block_another_worker(maker: Sessionmaker) 
     async def _slow_a(_work: OutboxWork, _now: datetime) -> None:
         # A is mid-"network call" for its intent. While it hangs here, B runs a whole pass.
         b = _RecordingExecutor()
-        report = await drain_outbox(maker, now=NOW, execute=b, worker_id="B", batch_size=1)
+        report = await drain_outbox(_pools(maker), now=NOW, execute=b, worker_id="B", batch_size=1)
         drained_by_b.extend(report.delivered)
 
-    await drain_outbox(maker, now=NOW, execute=_slow_a, worker_id="A", batch_size=1)
+    await drain_outbox(_pools(maker), now=NOW, execute=_slow_a, worker_id="A", batch_size=1)
 
     # B got a DIFFERENT intent (never A's claimed one) and carried it all the way to delivered while
     # A was still "sending".
@@ -822,7 +840,7 @@ async def test_a_slow_batch_never_sends_anything_twice(maker: Sessionmaker) -> N
             # and re-send them under A's feet.
             b_has_run = True
             await drain_outbox(
-                maker,
+                _pools(maker),
                 now=clock(),
                 execute=_slow_execute,
                 worker_id="B",
@@ -831,7 +849,7 @@ async def test_a_slow_batch_never_sends_anything_twice(maker: Sessionmaker) -> N
             )
 
     await drain_outbox(
-        maker, now=clock(), execute=_slow_execute, worker_id="A", lease=lease, clock=clock
+        _pools(maker), now=clock(), execute=_slow_execute, worker_id="A", lease=lease, clock=clock
     )
 
     # EVERY intent ran exactly once. Not "no exception" — a real count of real sends.
@@ -857,7 +875,9 @@ async def test_an_item_is_only_claimed_when_its_turn_comes(maker: Sessionmaker) 
                 assert other is not None
                 observed[second] = other.status
 
-    await drain_outbox(maker, now=NOW, execute=_look_at_the_others, worker_id="A", batch_size=2)
+    await drain_outbox(
+        _pools(maker), now=NOW, execute=_look_at_the_others, worker_id="A", batch_size=2
+    )
 
     assert observed[second] == "pending", (
         "the second item was claimed while the first was still sending — its lease burns down "
@@ -895,7 +915,7 @@ async def test_a_send_that_overruns_the_ceiling_is_aborted_and_retried(
 
     with caplog.at_level("ERROR"):
         report = await drain_outbox(
-            maker,
+            _pools(maker),
             now=NOW,
             execute=_hangs,
             lease=timedelta(seconds=5),
@@ -945,7 +965,7 @@ async def test_an_overrunning_send_can_never_run_twice_at_once(maker: Sessionmak
         """A second worker doing its best to steal the row for a concurrent second execution."""
         for _ in range(12):
             await drain_outbox(
-                maker,
+                _pools(maker),
                 now=NOW,
                 execute=_hangs,
                 worker_id="B",
@@ -956,7 +976,7 @@ async def test_an_overrunning_send_can_never_run_twice_at_once(maker: Sessionmak
 
     await asyncio.gather(
         drain_outbox(
-            maker,
+            _pools(maker),
             now=NOW,
             execute=_hangs,
             worker_id="A",

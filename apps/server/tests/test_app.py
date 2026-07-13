@@ -6,7 +6,6 @@ proving the eagerly-built engine/sessionmaker on ``app.state`` are what serve re
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -18,14 +17,8 @@ from httpx import ASGITransport, AsyncClient
 
 from aethercal.server import app as app_module
 from aethercal.server.api.auth import AuthContext, require_api_key
-from aethercal.server.app import (
-    build_email_sender,
-    create_app,
-    create_app_from_env,
-    scheduler_intervals,
-)
+from aethercal.server.app import build_email_sender, create_app, create_app_from_env
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
-from aethercal.server.scheduler import start_scheduler
 from aethercal.server.settings import Settings
 
 
@@ -126,54 +119,82 @@ def test_build_email_sender_builds_a_sender_when_smtp_is_configured() -> None:
 # --------------------------------------------------------------------------------------
 
 
-async def test_lifespan_attaches_runtime_effects_without_a_scheduler(
+async def test_lifespan_attaches_the_runtime_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No SMTP env and the scheduler off: http_client + fernet_key are present, the two optional
-    # effects are None, and nothing is hard-failed on the missing SMTP/Google config.
+    # No SMTP env: http_client + fernet_key are present, the two optional effects are None, and
+    # nothing hard-fails on the missing SMTP/Google config. There is no scheduler to assert on
+    # any more - it lives in `aethercal-worker` now, on its own two pools.
     for var in ("AETHERCAL_SMTP_HOST", "AETHERCAL_SMTP_FROM"):
         monkeypatch.delenv(var, raising=False)
-    settings = Settings(
-        database_url="sqlite+aiosqlite://",
-        app_secret="test-secret",
-        auto_migrate=False,
-        run_scheduler=False,
-    )
+    settings = Settings(database_url="sqlite+aiosqlite://", app_secret="test-secret")
     app = create_app(settings)
 
     async with app.router.lifespan_context(app):
         assert isinstance(app.state.http_client, httpx.AsyncClient)
         assert app.state.fernet_key == settings.fernet_key()
         assert app.state.email_sender is None
-        assert app.state.scheduler is None
 
     # The HTTP client is closed cleanly on shutdown (no leaked resources under filterwarnings).
     assert app.state.http_client.is_closed is True
 
 
-async def test_lifespan_unwinds_every_started_resource_on_partial_boot_failure(
+async def test_the_retired_scheduler_flag_fails_the_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``AETHERCAL_RUN_SCHEDULER=1`` starts no scheduler here - ==it refuses to build Settings.==
+
+    The flag never separated anything: the process it produced was still a full API with the admin
+    mounted, and it bound all three ticks to the REQUEST PATH sessionmaker. A background tick has no
+    request, therefore no ContextVar, therefore an empty GUC - and under row-level security an empty
+    GUC selects **zero rows**. ``select_due`` -> 0. ``deliver_due`` -> 0. Every outbound effect
+    stops, and ``/metrics`` no longer lives in this process to say so.
+
+    Honouring it would be worse than ignoring it, and ignoring it would be worse than refusing: the
+    shipped image used to SET it, so an operator upgrading would be running a web process they
+    believe is draining. It is not. (Criterion 13g.)
+    """
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "sqlite+aiosqlite://")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "test-secret")
+    monkeypatch.setenv("AETHERCAL_RUN_SCHEDULER", "1")
+
+    with pytest.raises(ValueError, match="aethercal-worker"):
+        create_app_from_env()
+
+
+async def test_the_retired_auto_migrate_flag_fails_the_boot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failure PART-WAY through startup must still tear down everything already acquired.
+    """``AETHERCAL_AUTO_MIGRATE=1`` does not migrate here either - ==the web cannot run DDL.==
 
-    The scheduler wiring is exercised with fakes (the live APScheduler objects stay behind their
-    ``# pragma: no cover - live`` seam). ``start_scheduler`` blows up AFTER the reminder runner has
-    started, so the ``AsyncExitStack`` must unwind every resource registered up to that point — the
-    reminder runner is shut down, the HTTP client closed, and the engine disposed — rather than
-    leaking them (the old normal-shutdown-only path never ran cleanup on a partial boot).
+    It holds ``aethercal_app``, which owns no tables. Migrating is ``aethercal-admin db upgrade``,
+    run as the OWNER - and this process then refuses to serve a schema behind head, so serving on a
+    stale schema is not a state it can reach.
+
+    Both flags survive as FIELDS purely so that they can refuse. ``extra="ignore"`` means a DELETED
+    field would let the shipped image own default go on being set and silently dropped, leaving the
+    operator certain that something is happening which is not. (Criterion 13.)
     """
-    for var in ("AETHERCAL_SMTP_HOST", "AETHERCAL_SMTP_FROM"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "sqlite+aiosqlite://")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "test-secret")
+    monkeypatch.setenv("AETHERCAL_AUTO_MIGRATE", "1")
 
-    settings = Settings(
-        database_url="sqlite+aiosqlite://",
-        app_secret="test-secret",
-        auto_migrate=False,
-        run_scheduler=True,
-    )
+    with pytest.raises(ValueError, match="db upgrade"):
+        create_app_from_env()
+
+
+async def test_the_lifespan_disposes_the_engine_when_the_boot_assertion_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused boot must not strand the engine connection pool.
+
+    The boot assertion (``SELECT current_user``) is now the EARLIEST startup step that can fail,
+    which is exactly why the engine teardown is registered on the ``AsyncExitStack`` ahead of it.
+    Register it afterwards and the one startup path most likely to blow up in production leaks the
+    pool.
+    """
+    settings = Settings(database_url="sqlite+aiosqlite://", app_secret="test-secret")
 
     class _FakeEngine:
-        """Records disposal so the test can prove the engine's cleanup ran on partial boot."""
+        """Records disposal, so the test can prove the async engine cleanup ran."""
 
         def __init__(self) -> None:
             self.disposed = False
@@ -183,148 +204,17 @@ async def test_lifespan_unwinds_every_started_resource_on_partial_boot_failure(
 
     fake_engine = _FakeEngine()
 
-    def _boom_start_scheduler(*_args: Any, **_kwargs: Any) -> None:
-        raise RuntimeError("scheduler failed to start")
+    async def _refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("this engine connects as the wrong role")
 
     monkeypatch.setattr(app_module, "build_async_engine", lambda _config: fake_engine)
     monkeypatch.setattr(app_module, "build_sessionmaker", lambda _engine: object())
-    monkeypatch.setattr(app_module, "build_interval_scheduler", object)
-    monkeypatch.setattr(app_module, "start_scheduler", _boom_start_scheduler)
+    monkeypatch.setattr(app_module, "assert_engine_role", _refuse)
 
     app = create_app(settings)
 
-    # Startup raises before the lifespan yields; the AsyncExitStack must still unwind on exit.
-    with pytest.raises(RuntimeError, match="scheduler failed to start"):
+    with pytest.raises(RuntimeError, match="wrong role"):
         async with app.router.lifespan_context(app):
-            pass  # unreachable — the failure happens during startup
+            pass  # unreachable - the failure happens during startup
 
-    # The engine and the HTTP client were BOTH acquired before the scheduler blew up, and the
-    # AsyncExitStack still unwound every one of them: client closed, engine disposed. (There is no
-    # reminder runner to unwind any more — the outbox is the durable scheduler now.)
-    assert app.state.http_client.is_closed is True
     assert fake_engine.disposed is True
-
-
-async def test_lifespan_disposes_the_async_engine_when_the_boot_migration_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A boot migration that raises must not strand the async engine's connection pool.
-
-    The async engine is built eagerly in ``create_app`` (before the lifespan runs), so its teardown
-    has to be registered on the ``AsyncExitStack`` BEFORE the boot migration — the earliest startup
-    step that can fail. Registering it only after the migration leaks the pool on the one startup
-    path most likely to blow up in production: a bad or blocked Alembic upgrade.
-    """
-    settings = Settings(
-        database_url="sqlite+aiosqlite://",
-        app_secret="test-secret",
-        auto_migrate=True,
-        run_scheduler=False,
-    )
-
-    class _FakeEngine:
-        """Records disposal so the test can prove the async engine's cleanup ran."""
-
-        def __init__(self) -> None:
-            self.disposed = False
-
-        async def dispose(self) -> None:
-            self.disposed = True
-
-    class _FakeSyncEngine:
-        """The throwaway sync engine the Alembic boot migrator runs on."""
-
-        def __init__(self) -> None:
-            self.disposed = False
-
-        def dispose(self) -> None:
-            self.disposed = True
-
-    fake_engine = _FakeEngine()
-    fake_sync_engine = _FakeSyncEngine()
-
-    def _boom_run_migrations(_sync_engine: Any) -> None:
-        raise RuntimeError("alembic upgrade failed")
-
-    monkeypatch.setattr(app_module, "build_async_engine", lambda _config: fake_engine)
-    monkeypatch.setattr(app_module, "build_sessionmaker", lambda _engine: object())
-    monkeypatch.setattr(app_module, "build_sync_engine", lambda _config: fake_sync_engine)
-    monkeypatch.setattr(app_module, "run_migrations", _boom_run_migrations)
-
-    app = create_app(settings)
-
-    # The boot migration is the FIRST startup step; it raises before anything else is acquired.
-    with pytest.raises(RuntimeError, match="alembic upgrade failed"):
-        async with app.router.lifespan_context(app):
-            pass  # unreachable — the failure happens during startup
-
-    # The throwaway sync engine was always disposed (its own try/finally), but the async engine's
-    # pool must be released too — that is the leak this guards against.
-    assert fake_sync_engine.disposed is True
-    assert fake_engine.disposed is True
-
-
-# --------------------------------------------------------------------------------------
-# Scheduler tick intervals: the environment must actually REACH the scheduler.
-# --------------------------------------------------------------------------------------
-def test_scheduler_intervals_are_exactly_the_kwargs_start_scheduler_accepts() -> None:
-    settings = Settings(
-        database_url="sqlite+aiosqlite://",
-        app_secret="test-secret",
-        auto_migrate=False,
-        webhook_interval_seconds=7,
-        busy_refresh_interval_seconds=11,
-        outbox_drain_interval_seconds=5,
-    )
-    intervals = scheduler_intervals(settings)
-    assert intervals == {
-        "webhook_interval_seconds": 7,
-        "busy_refresh_interval_seconds": 11,
-        "outbox_drain_interval_seconds": 5,
-    }
-    # A key that is not a keyword of start_scheduler would be a knob that DOES NOTHING: the variable
-    # would be read from the environment, documented, and silently dropped on the floor.
-    accepted = set(inspect.signature(start_scheduler).parameters)
-    assert set(intervals) <= accepted
-
-
-async def test_the_lifespan_starts_the_scheduler_with_the_configured_intervals(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The live branch, exercised: an interval set in the environment reaches start_scheduler.
-
-    Without this, `AETHERCAL_OUTBOX_DRAIN_INTERVAL_SECONDS` could be a setting nobody passes on —
-    read, validated, and never used. The scheduler would keep ticking at 60 s while the operator
-    believed otherwise, and no test would notice.
-    """
-    settings = Settings(
-        database_url="sqlite+aiosqlite://",
-        app_secret="test-secret",
-        auto_migrate=False,
-        run_scheduler=True,
-        webhook_interval_seconds=3,
-        busy_refresh_interval_seconds=9,
-        outbox_drain_interval_seconds=4,
-    )
-    captured: dict[str, Any] = {}
-
-    def _fake_start(scheduler: Any, **kwargs: Any) -> None:
-        captured.update(kwargs)
-
-    def _fake_build() -> object:
-        return object()
-
-    def _fake_stop(_scheduler: Any) -> None:
-        return None
-
-    monkeypatch.setattr(app_module, "build_interval_scheduler", _fake_build)
-    monkeypatch.setattr(app_module, "start_scheduler", _fake_start)
-    monkeypatch.setattr(app_module, "stop_scheduler", _fake_stop)
-
-    app = create_app(settings)
-    async with app.router.lifespan_context(app):
-        pass
-
-    assert captured["webhook_interval_seconds"] == 3
-    assert captured["busy_refresh_interval_seconds"] == 9
-    assert captured["outbox_drain_interval_seconds"] == 4

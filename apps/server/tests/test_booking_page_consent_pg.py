@@ -49,6 +49,7 @@ from aethercal.server.db.models import (
     WorkflowTemplate,
 )
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.messaging.guard import DailyCaps
 from aethercal.server.services.api_keys import issue_api_key
 from aethercal.server.services.outbox import (
@@ -57,6 +58,23 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 pytestmark = pytest.mark.db
 
@@ -219,7 +237,7 @@ async def _drain(app: FastAPI, *, start: datetime) -> tuple[_RecordingWhatsAppSe
         service_factory=None,
         channels={Channel.WHATSAPP: whatsapp},
     )
-    await drain_outbox(sessionmaker, now=start - timedelta(hours=24), execute=execute)
+    await drain_outbox(_pools(sessionmaker), now=start - timedelta(hours=24), execute=execute)
     async with sessionmaker() as session:
         rows = list(
             (

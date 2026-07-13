@@ -23,6 +23,23 @@ _SLOT_END = _SLOT_START + timedelta(minutes=30)
 
 
 def _insert(conn: sa.Connection, table: sa.Table, **values: object) -> object:
+    """Insert one row on a RAW connection - and bind the business first when the table is scoped.
+
+    ==Migration 0008 turns FORCE ROW LEVEL SECURITY on, and FORCE binds the OWNER too.== This test
+    migrates as whatever role owns the test database and then writes through a plain connection, so
+    without a GUC every one of these inserts is refused by the ``WITH CHECK`` - which is the policy
+    doing precisely its job, and is worth seeing here rather than only in the isolation suite.
+
+    What this file is actually about is the PARTIAL UNIQUE INDEX (one active booking per slot), so
+    it
+    binds the business it is writing for and gets on with it.
+    """
+    tenant_id = values.get("tenant_id")
+    if tenant_id is not None:
+        conn.execute(
+            sa.text("SELECT set_config('aethercal.tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
+        )
     return conn.execute(sa.insert(table).values(**values).returning(table.c.id)).scalar_one()
 
 

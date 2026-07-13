@@ -12,8 +12,8 @@ So the rule is enforced against the SOURCE, not against anybody's memory:
 
 * the ``BYPASSRLS`` engine is private to :class:`~aethercal.server.db.pools.WorkerPools`, and
   ``scan_session(reason)`` is its only door;
-* every call to it passes a **literal** ``BypassReason`` member, so the reason is visible at the call
-  site and greppable — never a variable that could be anything at run time;
+* every call to it passes a **literal** ``BypassReason`` member, so the reason is visible at the
+  call site and greppable — never a variable that could be anything at run time;
 * :func:`~aethercal.server.db.pools.why_bypass` is exhaustive over the enum (``assert_never``), so a
   new member with no branch fails the type check;
 * and the escape hatch that exists for the offline harness (``WorkerPools.for_offline_tests``) is
@@ -45,7 +45,7 @@ _OFFLINE_HATCH = "for_offline_tests"
 
 
 def _modules() -> list[Path]:
-    """Every module of the shipped server source. The Alembic versions are generated, and excluded."""
+    """Every module of the shipped server source. The Alembic versions are generated: excluded."""
     return [
         path
         for path in sorted(_SRC.rglob("*.py"))
@@ -127,8 +127,8 @@ class TestTheBypassEngineHasExactlyOneDoor:
             if isinstance(node, ast.Attribute) and node.attr == _OFFLINE_HATCH
         }
         assert users == set(), (
-            f"{sorted(users)} call `WorkerPools.for_offline_tests` inside the shipped source. It is "
-            "for the offline SQLite harness, and for nothing else."
+            f"{sorted(users)} call `WorkerPools.for_offline_tests` inside the shipped source. It "
+            "is for the offline SQLite harness, and for nothing else."
         )
 
 
@@ -161,8 +161,8 @@ class TestEveryConsumerDeclaresItsReason:
 
         assert found > 0, "the AST walk found no scan_session call at all — the guard is vacuous"
         assert bad == [], (
-            f"these calls take the BYPASSRLS pool without a literal BypassReason: {bad}. The reason "
-            "must be visible at the call site."
+            f"these calls take the BYPASSRLS pool without a literal BypassReason: {bad}. The "
+            "reason must be visible at the call site."
         )
 
     def test_every_declared_reason_is_handled(self) -> None:
@@ -202,7 +202,8 @@ class TestTheMarkerIsSetInOneAndOnlyOnePlace:
         strong as the marker being impossible to forge.
 
         Test fixtures may set it. That is the entire reason the detection is a marker rather than
-        ``SELECT current_user``, which would have forced eleven offline ``collect_metrics`` tests off
+        ``SELECT current_user``, which would have forced eleven offline ``collect_metrics`` tests
+        off
         SQLite and cost real coverage. But nothing in the SHIPPED source may.
         """
         setters: dict[str, list[int]] = {}

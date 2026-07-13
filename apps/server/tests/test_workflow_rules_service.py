@@ -53,6 +53,7 @@ from aethercal.server.db.models import (
     WorkflowStep,
 )
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.services import workflow_rules
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
@@ -81,6 +82,23 @@ from aethercal.server.services.workflow_rules import (
     update_workflow,
 )
 from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker.
+
+    ``drain_outbox`` takes :class:`WorkerPools` now, not a sessionmaker, because on PostgreSQL it
+    needs TWO connections: a ``BYPASSRLS`` one to find work whose business it cannot know until it
+    has read the row (``select_due``, ``recover_expired_leases``, and — the one nearly missed —
+    ``claim_one``, an UPDATE on a row whose ``tenant_id`` is only knowable by reading it), and the
+    app role to EXECUTE each item under row-level security, bound to that item's own business.
+
+    SQLite has neither roles nor RLS, so the two collapse back into one here and the drain behaves
+    exactly as it always did. ``tests/test_bypass_belt.py`` asserts this constructor is never
+    reached from the shipped source.
+    """
+    return WorkerPools.for_offline_tests(maker)
+
 
 _NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 _FAR = datetime(2026, 7, 20, 15, 0, tzinfo=UTC)  # two weeks out: outside every window used here
@@ -849,7 +867,7 @@ async def _drain(
     maker: async_sessionmaker[AsyncSession], sender: _RecordingSender, *, now: datetime
 ) -> OutboxReport:
     execute = make_booking_effect_executor(sessionmaker=maker, sender=sender, service_factory=None)
-    return await drain_outbox(maker, now=now, execute=execute)
+    return await drain_outbox(_pools(maker), now=now, execute=execute)
 
 
 async def test_a_rule_switched_off_PAUSES_its_step_and_switching_it_back_on_DELIVERS_it(

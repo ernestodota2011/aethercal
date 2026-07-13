@@ -74,8 +74,23 @@ def check_role(actual: str, expected: DbRole, *, url_env: str) -> None:
     )
 
 
+def _is_postgres(dialect: str) -> bool:
+    """Roles, ``BYPASSRLS`` and ``current_user`` are PostgreSQL facts. SQLite has none of them.
+
+    ==A narrow exemption, and it is worth stating exactly how narrow.== The only thing in this
+    product that runs on a non-PostgreSQL dialect is the OFFLINE test harness: an in-memory SQLite
+    built straight from ``Base.metadata``, holding one test's rows, with no roles, no policies and
+    no GUC — and therefore nothing whatsoever to protect. Every shipped artefact
+    (``deploy/docker-compose.yml``, the migrations, the models' partial indexes) is PostgreSQL.
+    There is no "self-host on SQLite" path for this exemption to hide behind.
+    """
+    return dialect == "postgresql"
+
+
 async def assert_engine_role(engine: AsyncEngine, expected: DbRole, *, url_env: str) -> None:
-    """``SELECT current_user`` over ``engine`` and refuse if it is not ``expected``."""
+    """``SELECT current_user`` over ``engine``, and refuse if it is not ``expected``."""
+    if not _is_postgres(engine.dialect.name):
+        return
     async with engine.connect() as connection:
         actual = (await connection.execute(_CURRENT_USER)).scalar_one()
     check_role(str(actual), expected, url_env=url_env)
@@ -83,6 +98,8 @@ async def assert_engine_role(engine: AsyncEngine, expected: DbRole, *, url_env: 
 
 def assert_sync_engine_role(engine: Engine, expected: DbRole, *, url_env: str) -> None:
     """The synchronous twin, for Alembic's engine (which is not async)."""
+    if not _is_postgres(engine.dialect.name):
+        return
     with engine.connect() as connection:
         actual = connection.execute(_CURRENT_USER).scalar_one()
     check_role(str(actual), expected, url_env=url_env)
