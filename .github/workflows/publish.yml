@@ -1,0 +1,198 @@
+name: Publish
+
+# Releases every package at the tagged version: five Python distributions to PyPI, two packages to
+# npm. Triggered by pushing a `v*` tag, or by hand (which defaults to a dry run).
+#
+# Nothing here can publish silently or by accident:
+#   * `verify` refuses to go on unless the tag equals the version in EVERY manifest and the
+#     CHANGELOG has an entry for it — a half-bumped release cannot reach a registry, where a version
+#     number can never be reused.
+#   * both publish jobs sit behind a protected GitHub Environment, so they wait for the reviewer
+#     configured there.
+#   * PyPI uses Trusted Publishing (OIDC): there is no API token in this repository to leak.
+#   * npm publishes with provenance, cryptographically linking the tarball to this workflow, this
+#     commit and this repository.
+#
+# Supply chain: only the two actions the CI already pins, both by commit SHA. Everything else runs
+# from tools preinstalled on the runner. Each job builds what it publishes (rather than passing
+# artifacts between jobs), which keeps the action surface at exactly those two.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check everything, publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the tag matches every manifest
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve the version being released
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(grep -m1 '^version = ' packages/aethercal-core/pyproject.toml | cut -d'"' -f2)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${version}"
+
+      # A release where one manifest was left behind ships a package that nobody can resolve. Fail
+      # here, loudly, rather than discover it on the registry.
+      - name: Every manifest must carry that exact version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          status=0
+          for pkg in aethercal-core aethercal-schemas aethercal-client aethercal-ui aethercal; do
+            found=$(grep -m1 '^version = ' "packages/${pkg}/pyproject.toml" | cut -d'"' -f2)
+            if [ "$found" != "$VERSION" ]; then
+              echo "::error::${pkg} is ${found}, expected ${VERSION}"
+              status=1
+            fi
+          done
+
+          for pkg in core react; do
+            found=$(node -p "require('./packages/aethercal-ui/js/packages/${pkg}/package.json').version")
+            if [ "$found" != "$VERSION" ]; then
+              echo "::error::@aethercal/calendar-${pkg} is ${found}, expected ${VERSION}"
+              status=1
+            fi
+          done
+
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for ${VERSION}"
+            status=1
+          fi
+          exit $status
+
+  pypi:
+    name: Publish to PyPI
+    needs: verify
+    runs-on: ubuntu-latest
+    # Configure this environment with required reviewers: the publish then waits for a human.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aethercal/
+    permissions:
+      contents: read
+      id-token: write # mints the OIDC token PyPI exchanges for a short-lived upload token
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync workspace (locked)
+        run: uv sync --locked
+
+      # aethercal-ui's wheel MUST contain the JS bundle. hatchling will happily build a VALID wheel
+      # without it, and that failure only surfaces at import time inside a user's app — so this
+      # script builds the wheel and re-opens it to assert the asset is really inside. It is the same
+      # guard the `calendar-release` CI job runs on every push.
+      - name: Build aethercal-ui (asserting the wheel ships the JS bundle)
+        run: uv run python packages/aethercal-ui/scripts/build_release.py --out-dir dist
+
+      - name: Build the other Python distributions
+        run: |
+          for pkg in aethercal-core aethercal-schemas aethercal-client aethercal; do
+            uv build --package "$pkg" --out-dir dist
+          done
+          ls -l dist
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run — these would be uploaded to PyPI:"
+          ls -1 dist
+
+      # Trusted Publishing: no API token exists to steal. Each of the five PyPI projects must first
+      # have this repository + this workflow registered as a trusted publisher.
+      - name: Publish to PyPI
+        if: github.event_name == 'push' || !inputs.dry_run
+        run: uv publish --trusted-publishing always dist/*
+
+  npm:
+    name: Publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@aethercal/calendar-react
+    permissions:
+      contents: read
+      id-token: write # required to attach a provenance attestation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pnpm (Node is preinstalled on the runner)
+        run: npm install -g pnpm@10.32.1
+
+      - name: Install (frozen lockfile)
+        working-directory: packages/aethercal-ui/js
+        run: pnpm install --frozen-lockfile
+
+      # npm consumers get compiled JS + type declarations, never the raw TypeScript sources.
+      - name: Build the distribution artifacts
+        working-directory: packages/aethercal-ui/js
+        run: pnpm build:libs
+
+      # `pnpm pack` applies each package's `publishConfig` — re-pointing exports/main/types at
+      # dist/ — and rewrites the `workspace:*` dependency to the concrete version.
+      - name: Pack the tarballs
+        working-directory: packages/aethercal-ui/js
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/npm-dist"
+          for pkg in core react; do
+            (cd "packages/${pkg}" && pnpm pack --pack-destination "${GITHUB_WORKSPACE}/npm-dist")
+          done
+          ls -l "${GITHUB_WORKSPACE}/npm-dist"
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run — these would be published to npm:"
+          ls -1 npm-dist
+          tar -xzOf npm-dist/aethercal-calendar-react-*.tgz package/package.json
+
+      - name: Authenticate to npm
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is not set"
+            exit 1
+          fi
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+
+      # calendar-core goes FIRST: calendar-react depends on it at this exact version, so publishing
+      # the dependent first would leave a window in which it cannot be installed.
+      - name: Publish to npm (with provenance)
+        if: github.event_name == 'push' || !inputs.dry_run
+        run: |
+          npm publish npm-dist/aethercal-calendar-core-*.tgz --provenance --access public
+          npm publish npm-dist/aethercal-calendar-react-*.tgz --provenance --access public
+
+      - name: Scrub credentials
+        if: always()
+        run: rm -f ~/.npmrc
