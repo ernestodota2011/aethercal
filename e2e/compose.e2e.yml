@@ -1,0 +1,105 @@
+# The E2E stack = the SHIPPING stack + the two things a test needs in order to observe it.
+#
+# Used as an OVERLAY, never alone, so what runs is the artifact users actually deploy:
+#
+#   docker compose -f deploy/docker-compose.yml -f e2e/compose.e2e.yml up -d
+#
+# It adds:
+#   * mailpit — the SMTP server the app sends to, with an HTTP API the suite reads the guest's
+#     confirmation email from (the ONLY place the cancel/reschedule links ever reach a guest);
+#   * hooks   — a stdlib webhook sink that records each delivery byte for byte, so the suite can
+#     verify the HMAC over the exact bytes the server signed.
+#
+# Relative paths resolve against the project directory (the first `-f` file's directory, `deploy/`),
+# so the sink script is mounted as `../e2e/sink/receiver.py`. `deploy/` and `e2e/` are siblings, so
+# that path is also correct if a future Compose resolves paths per-file instead — either way it
+# lands on the same file.
+
+services:
+  app:
+    environment:
+      # ---- SMTP → Mailpit. Without it the app degrades gracefully (no email; the booking still
+      # succeeds) and the guest never receives their signed links — so the suite would be asserting
+      # against a crippled product.
+      AETHERCAL_SMTP_HOST: mailpit
+      AETHERCAL_SMTP_PORT: "1025"
+      AETHERCAL_SMTP_FROM: bookings@e2e.test
+      AETHERCAL_SMTP_USE_TLS: "false"
+      AETHERCAL_SMTP_USERNAME: ""
+      AETHERCAL_SMTP_PASSWORD: ""
+      # The links the app mints must be openable BY THE TEST RUNNER (outside the compose network),
+      # so they carry the published address of the booking page, not its container name.
+      AETHERCAL_BOOKING_BASE_URL: http://localhost:5001
+      AETHERCAL_ENVIRONMENT: e2e
+    networks:
+      # Declaring networks here REPLACES the implicit `default`, so it must be listed again — or the
+      # app loses Postgres.
+      - default
+      - hooks
+
+  booking:
+    environment:
+      AETHERCAL_ENVIRONMENT: e2e
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_MAX_MESSAGES: "500"
+    ports:
+      # 8025 = the HTTP API the suite reads. 1025 = SMTP, reached over the compose network only.
+      - "${MAILPIT_HOST_PORT:-8025}:8025"
+
+  hooks:
+    # The same base image the app is built on, so the E2E pulls nothing exotic. The sink is
+    # stdlib-only (see ../e2e/sink/receiver.py).
+    image: python:3.12-slim-bookworm
+    restart: unless-stopped
+    command: ["python", "/srv/receiver.py"]
+    volumes:
+      - ../e2e/sink/receiver.py:/srv/receiver.py:ro
+    environment:
+      SINK_PORT: "9099"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9099/_health', timeout=3).status ==
+          200 else 1)
+      interval: 5s
+      timeout: 4s
+      retries: 5
+      start_period: 5s
+    networks:
+      hooks:
+        # ⚠️ READ THIS BEFORE "SIMPLIFYING" THE SUBNET BELOW.
+        #
+        # The delivery worker refuses to POST to any address that is not globally routable
+        # (`webhooks/ssrf.py::ip_is_public` — an SSRF egress guard, plus a connect-time IP pin). A
+        # sink on Docker's usual 172.16/12 bridge resolves to a PRIVATE address, so every delivery
+        # would be parked `dead` without one request leaving the container — and a suite that merely
+        # waited for a webhook would time out blaming itself instead of the product.
+        #
+        # So the sink sits on its own bridge whose subnet is public IPv4 space (44.0.0.0/8, AMPRNet)
+        # that nothing in CI routes to. It cannot be a documentation range (192.0.2/24,
+        # 198.51.100/24, 203.0.113/24): Python marks those `is_private`, so the guard rejects them.
+        #
+        # This is TEST TACKLE, not a fix. The product limitation is real and filed as debt: a
+        # self-hoster whose n8n/Make/CRM sits on the same Docker network or LAN CANNOT receive
+        # webhooks today. The root fix belongs in the server — an operator-configured, env-only,
+        # fail-closed allowlist of private targets, never derived from inbound data — not here.
+        ipv4_address: 44.44.44.10
+    ports:
+      - "${SINK_HOST_PORT:-9099}:9099"
+
+networks:
+  hooks:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 44.44.44.0/24
+          gateway: 44.44.44.1

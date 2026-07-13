@@ -1,0 +1,22 @@
+{
+  "name": "@aethercal/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "End-to-end tests (Playwright): the golden booking flow against the shipping container stack.",
+  "type": "module",
+  "scripts": {
+    "stack:up": "bash scripts/stack-up.sh",
+    "stack:down": "bash scripts/stack-down.sh",
+    "test": "playwright test",
+    "test:golden": "playwright test --project=golden",
+    "test:a11y": "playwright test --project=a11y",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.10.2",
+    "@playwright/test": "1.56.1",
+    "@types/node": "22.10.2",
+    "axe-core": "4.10.3",
+    "typescript": "5.9.3"
+  }
+}
