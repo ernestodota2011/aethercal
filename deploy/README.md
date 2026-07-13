@@ -27,15 +27,18 @@ Verify it is up:
 curl http://localhost:8000/api/v1/health      # -> {"status":"ok"}
 ```
 
-Open the booking surface / API at `http://localhost:8000` (change the published port with
-`HOST_PORT` in `.env`). Create a tenant and issue an API key with the bundled admin CLI:
+Open the API at `http://localhost:8000` (change the published port with `HOST_PORT` in `.env`).
+Create a tenant and issue an API key with the bundled admin CLI:
 
 ```bash
 docker compose exec app aethercal-admin --help
 ```
 
-> The public booking **page** (`apps/booking`, FastHTML) lands in a later F1 wave; this unit ships
-> the API + the background scheduler. The health endpoint above is the "it's up" check today.
+> The public booking **page** (`apps/booking`, FastHTML) runs as its own `booking` service in the
+> compose file: the same image with a different command (`python -m aethercal.booking`), reaching the
+> API over the compose network. It is published on `http://localhost:5001` (change the port with
+> `BOOKING_HOST_PORT` in `.env`) — and it is the only surface a reverse proxy should expose publicly
+> (`book.<domain>`).
 
 ## Running without Docker
 
@@ -102,9 +105,10 @@ one process means duplicate ticks and duplicate reminder pollers.
 
 ## Notes for the integrator / CI
 
-- **The Dockerfile is not build-verified in this change** (Docker was unavailable on the authoring
-  machine). CI / the integrator should run `docker build -f deploy/Dockerfile -t aethercal-server .`
-  from the **repository root** (the build context needs `uv.lock` + every workspace member).
+- **The Dockerfile is build-verified in CI.** The `docker-build` job runs
+  `docker build -f deploy/Dockerfile -t aethercal-server .` from the **repository root** on every
+  push and pull request, so a broken image fails the build. Build it the same way by hand — the
+  context must be the repo root (it needs `uv.lock` + every workspace member).
 - The build re-creates the venv from `uv.lock` inside the image; `.dockerignore` keeps the host
   `.venv` and caches out of the context.
 - Data persists in the `aethercal-pgdata` named volume. Back it up like any PostgreSQL data dir.

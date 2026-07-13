@@ -86,21 +86,25 @@ def create_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-        if settings.auto_migrate:
-            # The boot migrator is synchronous (Alembic); run it on a throwaway sync engine.
-            sync_engine = build_sync_engine(settings.database_config())
-            try:
-                run_migrations(sync_engine)
-            finally:
-                sync_engine.dispose()
-
         # An AsyncExitStack registers each resource's teardown the instant it is acquired, so a
         # failure at ANY later startup step unwinds everything already started (in reverse order)
         # instead of leaking it — a partial boot no longer skips cleanup. On the normal path the
         # stack unwinds at shutdown in the same order the old try/finally did: interval scheduler →
         # reminder runner → HTTP client → engine.
         async with AsyncExitStack() as stack:
+            # The async engine is built eagerly in create_app (above), so its teardown is registered
+            # FIRST — ahead of the boot migration, the earliest startup step that can fail. Register
+            # it after the migration and a bad or blocked Alembic upgrade (the startup path most
+            # likely to blow up in production) strands the engine's connection pool.
             stack.push_async_callback(engine.dispose)
+
+            if settings.auto_migrate:
+                # The boot migrator is synchronous (Alembic); run it on a throwaway sync engine.
+                sync_engine = build_sync_engine(settings.database_config())
+                try:
+                    run_migrations(sync_engine)
+                finally:
+                    sync_engine.dispose()
 
             # Shared runtime effects the booking flow (and the webhook job) read best-effort. Absent
             # SMTP/Google config → the effect is None and the request path degrades gracefully.

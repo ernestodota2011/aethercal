@@ -133,10 +133,11 @@ class Theme(BaseModel):
         return cls(
             fg="#e6e8eb",
             muted="#9aa1ab",
-            # Tertiary text (hour axis, "all day" rowheader, out-of-month numbers, demo legends/footer).
-            # Lightened from #6b7280 (3.6:1, < AA) to clear WCAG AA (>= 4.5:1) on every dark surface it
-            # renders on — the same AA bar the light preset already holds muted/faint to. Stays a neutral
-            # cool slate (no cyan/violet) and dimmer than `muted`, preserving the tertiary hierarchy.
+            # Tertiary text (hour axis, "all day" rowheader, out-of-month numbers,
+            # demo legends/footer). Lightened from #6b7280 (3.6:1, < AA) to clear WCAG
+            # AA (>= 4.5:1) on every dark surface it renders on — the same AA bar the
+            # light preset already holds muted/faint to. Stays a neutral cool slate
+            # (no cyan/violet) and dimmer than `muted`, preserving the tertiary hierarchy.
             faint="#868e99",
             bg="#14161a",
             header_fg="#b3b9c2",
@@ -160,8 +161,9 @@ class Theme(BaseModel):
         return cls(
             fg="#dfe4ea",
             muted="#8b95a1",
-            # Lightened from #5b6675 (3.2:1, < AA) to clear WCAG AA on midnight's darker surfaces —
-            # same rationale as the dark preset's `faint` (neutral cool slate, still dimmer than muted).
+            # Lightened from #5b6675 (3.2:1, < AA) to clear WCAG AA on midnight's darker
+            # surfaces — same rationale as the dark preset's `faint` (neutral cool slate,
+            # still dimmer than muted).
             faint="#828a95",
             bg="#0b0f14",
             header_fg="#a7b0bd",
