@@ -48,11 +48,23 @@ GuestTimezone = Annotated[str, Field(min_length=1, max_length=64)]
 GuestPhone = Annotated[str, Field(min_length=2, max_length=32)]
 
 #: The canonical E.164 form — the ONLY shape that reaches the database.
-_E164 = re.compile(r"^\+[1-9]\d{1,14}$")
+#:
+#: ``[0-9]``, never ``\d``: in Python ``\d`` matches every Unicode decimal digit, so it would wave
+#: through a number whose body is written in Arabic-Indic (U+0660-U+0669), Devanagari (U+0966-
+#: U+096F) or fullwidth (U+FF10-U+FF19) numerals as a "valid E.164 number". Those are not phone
+#: numbers. They would be stored, and then handed to the WhatsApp/SMS provider, which rejects them
+#: — or, worse, interprets them as some other number. E.164 is ASCII digits, and this pattern now
+#: says so. (The cases live in ``test_normalize_phone_rejects_anything_that_is_not_e164``.)
+#:
+#: Matched with ``fullmatch``, never ``match``: Python's ``$`` also matches BEFORE a trailing
+#: newline, so ``re.match(r"...$", "+13054131728\n")`` SUCCEEDS. Today the punctuation strip below
+#: happens to remove that newline first — which means the anchor is already unsound and only a
+#: refactor away from being exploitable. ``fullmatch`` anchors both ends with no such exception.
+_E164 = re.compile(r"\+[1-9][0-9]{1,14}")
 #: Punctuation a human sprinkles through a phone number. It is stripped before matching; anything
-#: left over that is not a digit (a letter, an "ext", a second ``+``) makes the number INVALID
-#: rather than being quietly discarded — deleting characters until a string parses is how you end
-#: up messaging a stranger's phone.
+#: left over that is not an ASCII digit (a letter, a Unicode numeral, an "ext", a second ``+``)
+#: makes the number INVALID rather than being quietly discarded — deleting characters until a
+#: string parses is how you end up messaging a stranger's phone.
 _PHONE_PUNCTUATION = re.compile(r"[\s\-().]")
 
 
@@ -63,9 +75,12 @@ def normalize_phone(value: str) -> str | None:
     NOT. A bare ``3054131728`` could belong to a dozen countries, and guessing one means a
     WhatsApp message sent to a stranger. The caller decides what ``None`` means: the booking form
     turns it into a friendly field error, the API contract into a 422.
+
+    The result is guaranteed ASCII (see ``_E164``): a string that merely *looks* like digits to a
+    human, but is not the digits a phone network understands, never reaches the database.
     """
     candidate = _PHONE_PUNCTUATION.sub("", value.strip())
-    return candidate if _E164.match(candidate) else None
+    return candidate if _E164.fullmatch(candidate) else None
 
 
 def require_emailish(value: str) -> str:
@@ -90,10 +105,14 @@ def require_emailish(value: str) -> str:
 class BookingCreate(BaseModel):
     """Request body to book a slot (RF-07). Only ``start`` is sent; ``end`` is server-derived.
 
-    ``guest_phone`` / ``guest_phone_consent`` carry RF-24's consent across the wire. The consent is
-    a **boolean the guest actively set**, not a timestamp the client invents: the SERVER stamps
-    ``bookings.guest_phone_consent_at`` from its own clock, so a client can neither back-date a
-    consent nor forge one for a booking it did not just make.
+    ``guest_phone`` / ``guest_phone_consent`` carry RF-24's consent box across the wire. The consent
+    is a **boolean whoever fills the form actively set**, not a timestamp the client invents: the
+    SERVER stamps ``bookings.guest_phone_consent_at`` from its own clock, so a client can neither
+    back-date a tick nor forge one for a booking it did not just make.
+
+    ⚠️ ``guest_phone_consent`` means "the box on the form was ticked" — **not** "the owner of this
+    number agreed". The number is typed into a PUBLIC form by whoever is booking, and nothing here
+    verifies they possess it. Verifying possession is a declared gap (``docs/phone-channels.md``).
     """
 
     event_type_id: uuid.UUID
@@ -104,10 +123,12 @@ class BookingCreate(BaseModel):
     guest_notes: Annotated[str | None, Field(max_length=2000)] = None
     answers: dict[str, Any] | None = None
     locale: Annotated[str | None, Field(max_length=16)] = None
-    #: The guest's phone in E.164 — ``None`` when they gave none. Booking without one always works.
+    #: The phone typed into the booking form, in E.164 — ``None`` when none was given. Booking
+    #: without one always works. Whoever is booking typed it in; nobody verified they own it.
     guest_phone: GuestPhone | None = None
-    #: Whether the guest EXPLICITLY agreed to be messaged on that number. Defaults to ``False``:
-    #: consent is opted INTO, never assumed, and never pre-ticked.
+    #: Whether the consent box was EXPLICITLY ticked on the form. Defaults to ``False``: it is
+    #: opted INTO, never assumed, never pre-ticked. It records a TICK — not verified permission
+    #: from the number's owner (see the class docstring, and ``docs/phone-channels.md``).
     guest_phone_consent: bool = False
 
     @field_validator("guest_timezone")

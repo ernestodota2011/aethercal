@@ -809,5 +809,20 @@ def test_the_guests_own_tick_survives_a_re_render() -> None:
 def test_the_consent_copy_is_bilingual() -> None:
     spanish = _form_html("es", event=_event(collects_phone=True))
     english = _form_html("en", event=_event(collects_phone=True))
-    assert "Acepto recibir recordatorios" in spanish
+    assert "acepto recibir recordatorios" in spanish
     assert "I agree to receive reminders" in english
+
+
+def test_the_consent_box_asks_the_booker_to_claim_the_number_as_their_own() -> None:
+    """The box must state WHAT is being claimed, because nothing verifies it (RF-24 declared gap).
+
+    The number is typed into a PUBLIC form and possession of it is never checked, so a label that
+    only said "I agree to be messaged" would record nothing beyond the fact that somebody ticked a
+    box. Asking the booker to assert the number is theirs makes the stamp record the claim they
+    actually made. It is NOT verification (see ``docs/phone-channels.md``) — and this test exists so
+    that the claim cannot be quietly dropped from the copy later.
+    """
+    spanish = _form_html("es", event=_event(collects_phone=True))
+    english = _form_html("en", event=_event(collects_phone=True))
+    assert "Este número es mío" in spanish
+    assert "This is my own number" in english

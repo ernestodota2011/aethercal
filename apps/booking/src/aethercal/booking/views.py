@@ -708,11 +708,18 @@ def _phone_fields(locale: Locale, *, values: Mapping[str, str], error: str | Non
 
     Three properties this markup must never lose:
 
-    * the checkbox is **not** ``checked`` unless the GUEST ticked it (``values``, echoed back on a
-      re-render). A pre-ticked box is a default the guest never chose, and it is not consent;
+    * the checkbox is **not** ``checked`` unless the person filling the form ticked it (``values``,
+      echoed back on a re-render). A pre-ticked box is a default nobody chose, and is not consent;
     * neither control is ``required`` — booking without a phone has to keep working;
     * the consent is a real ``<input type="checkbox">`` whose value is submitted and read. It is
       the thing the server stamps into ``guest_phone_consent_at``, not decoration.
+
+    ⚠️ What this box can and cannot establish: it records that WHOEVER IS BOOKING ticked it. This is
+    a PUBLIC form, so that is not necessarily the owner of the number they typed — a third party can
+    book using someone else's phone. Possession of the number is verified nowhere in this product;
+    that is a declared gap (``docs/phone-channels.md``), not something this checkbox quietly solves.
+    The copy is therefore written in the first person about THIS booking, and promises nothing about
+    whom the number belongs to.
     """
     ticked = is_consent_ticked(values.get(PHONE_CONSENT_FIELD_NAME))
     hint_id = f"{PHONE_FIELD_NAME}-hint"

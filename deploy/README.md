@@ -72,9 +72,21 @@ with per-line comments. The essentials:
 | `AETHERCAL_BOOKING_TRUSTED_PROXIES` | — | CIDRs of reverse proxies trusted to set `CF-Connecting-IP` for the rate limiter. Blank → use the transport peer address |
 | `AETHERCAL_SMTP_*` | — | Transactional email (absent → email skipped, app still boots) |
 | `AETHERCAL_GOOGLE_*` | — | Google Calendar busy-check + Meet (absent → skipped) |
+| `AETHERCAL_WHATSAPP_*` | — | WhatsApp (Evolution API). Off unless set — **read [phone channels](../docs/phone-channels.md) first** |
+| `AETHERCAL_SMS_*` | — | SMS (Twilio). Off unless set — **read [phone channels](../docs/phone-channels.md) first** |
 
 Unconfigured SMTP or Google **never** hard-fails boot: those effects degrade gracefully (a booking
 still succeeds, it just skips the email / calendar sync).
+
+> [!WARNING]
+> **The phone channels are different, and there is a decision to make before you enable one.** A
+> phone channel refuses to activate without its daily caps (`*_DAILY_CAP_PER_PHONE` /
+> `*_DAILY_CAP_PER_IP` — fail-closed by design). More importantly: the guest's number is typed into
+> a **public** form, and **nothing verifies that it belongs to the person booking**. The consent
+> checkbox proves somebody ticked it — not that the number's **owner** agreed. So a stranger can
+> make your business message a third party, under your brand. Verifying possession of the number is
+> a **declared gap**.
+> ==Read [docs/phone-channels.md](../docs/phone-channels.md) before you switch one on.==
 
 ## The admin surface (`/admin`)
 

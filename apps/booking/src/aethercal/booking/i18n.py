@@ -47,8 +47,12 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "notes_label": "Notas (opcional)",
         "phone_label": "Teléfono (opcional)",
         "phone_hint": "Incluye el código de país. Ejemplo: +1 305 413 1728.",
+        # The box asserts TWO things, and the first is deliberate: the person booking states the
+        # number is THEIRS. Nothing verifies that (docs/phone-channels.md) — but a box reading only
+        # "I agree to be messaged" records merely that somebody ticked it, whereas this one records
+        # what they actually claimed. It is the most an unverified checkbox can honestly do.
         "phone_consent_label": (
-            "Acepto recibir recordatorios de esta cita por WhatsApp o SMS en este número."
+            "Este número es mío y acepto recibir recordatorios de esta cita por WhatsApp o SMS."
         ),
         "phone_consent_hint": (
             "Puedes reservar sin dar tu teléfono. Solo te escribiremos si marcas esta casilla."
@@ -131,7 +135,8 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "phone_label": "Phone (optional)",
         "phone_hint": "Include the country code. Example: +1 305 413 1728.",
         "phone_consent_label": (
-            "I agree to receive reminders about this booking by WhatsApp or SMS at this number."
+            "This is my own number, and I agree to receive reminders about this booking by "
+            "WhatsApp or SMS."
         ),
         "phone_consent_hint": (
             "You can book without giving your phone. We'll only message you if you tick this box."
