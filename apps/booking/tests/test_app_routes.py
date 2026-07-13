@@ -17,11 +17,12 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
+import pytest
 from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from aethercal.booking import app as booking_app
-from aethercal.booking.app import create_app
+from aethercal.booking.app import DEFAULT_TZ, _valid_tz, create_app
 from aethercal.booking.settings import DEFAULT_BASE_URL, BookingSettings
 from aethercal.client import AetherCalClient
 
@@ -284,6 +285,38 @@ def test_event_page_shows_times_and_is_accessible() -> None:
     assert "09:00" in response.text
     assert 'id="main"' in response.text  # accessible landmark
     assert "Saltar al contenido" in response.text
+
+
+# --------------------------------------------------------------------------------------
+# The guest's `tz` is a QUERY PARAM — attacker-reachable, and the page must never crash on it.
+# `_valid_tz` is the booking app's edge: it answers the ONE shared rule
+# (`aethercal.core.tz.require_iana_zone`) and degrades an unusable answer to the default zone.
+# It used to keep its own `ZoneInfo(...)` + `except (ZoneInfoNotFoundError, ValueError)`, which
+# `?tz=America` (a DIRECTORY of the tz database) walked straight past as a raw OSError — a 500 on
+# a public page, from a single query string.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("zone", ["America/New_York", "UTC", "Etc/GMT+5", "US/Eastern"])
+def test_valid_tz_keeps_a_real_zone(zone: str) -> None:
+    assert _valid_tz(zone) == zone
+
+
+@pytest.mark.parametrize(
+    "zone", ["Mars/Phobos", "America", "Etc", " ", "UTC\n", "A" * 300, "utc", "UTC ", "", None]
+)
+def test_valid_tz_refuses_anything_that_is_not_a_zone(zone: str | None) -> None:
+    """Refused — not crashed, and not accepted because the developer's filesystem ignores case."""
+    assert _valid_tz(zone) is None
+
+
+@pytest.mark.parametrize("zone", ["America", "Etc", "utc", "UTC "])
+def test_event_page_falls_back_to_the_default_zone_instead_of_crashing(zone: str) -> None:
+    """``GET /e/intro?tz=America`` renders the page in UTC. It used to raise ``OSError`` → 500."""
+    client, _ = _make_client()
+    response = client.get("/e/intro", params={"tz": zone})
+    assert response.status_code == 200
+    assert f"tz={DEFAULT_TZ}" in response.text
 
 
 def test_event_page_pager_prev_disabled_at_the_floor() -> None:

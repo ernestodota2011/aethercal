@@ -56,6 +56,18 @@ def test_schedule_rejects_unknown_timezone() -> None:
         Schedule(timezone="Mars/Olympus_Mons", by_weekday={Weekday.MONDAY: (_NINE_TO_FIVE,)})
 
 
+@pytest.mark.parametrize("zone", ["America", "Etc", " ", "UTC\n", "A" * 300, "utc", "UTC "])
+def test_schedule_refuses_a_zone_the_shared_rule_refuses(zone: str) -> None:
+    """A host's weekly availability answers to the same rule as everything else.
+
+    The copy that used to live here caught only ``(ZoneInfoNotFoundError, ValueError)``, so a key
+    naming a tz-database DIRECTORY escaped as an ``OSError`` — a crash, not a refusal — and a
+    case-insensitive filesystem quietly widened what counted as a zone.
+    """
+    with pytest.raises(ValidationError):
+        Schedule(timezone=zone, by_weekday={Weekday.MONDAY: (_NINE_TO_FIVE,)})
+
+
 def test_schedule_rejects_overlapping_ranges_within_a_weekday() -> None:
     with pytest.raises(ValidationError):
         Schedule(

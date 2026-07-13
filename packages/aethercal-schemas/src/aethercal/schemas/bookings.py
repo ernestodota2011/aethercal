@@ -17,11 +17,25 @@ import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from aethercal.core.model import BookingStatus
+
+# The IANA-zone rule, CONSUMED and re-exported (see ``__all__``) — this layer does not own it.
+#
+# "Is this a real timezone" is domain logic about time, so it lives in ``aethercal.core.tz``: a zone
+# is a MEMBER of the set IANA publishes, not a filename that happens to open. It could not live
+# here even if we wanted it to — ``core.model.Event`` and ``core.model.Schedule`` need the same
+# rule, and ``core`` may not import ``schemas`` (the "core is pure" import contract). A rule owned
+# by this layer is therefore a rule the domain must re-implement, which is exactly how four copies
+# of it came to exist: three carrying the same broken ``except``, and two OS-dependent answers
+# between them.
+#
+# The name stays exported here because it is what this layer's consumers already import — the guest
+# booking contract below, ``server/services/users.py`` for the host's timezone, ``api/slots.py`` for
+# the ``tz`` query param. They get the one function, not a copy of it.
+from aethercal.core.tz import require_iana_zone
 
 GuestName = Annotated[str, Field(min_length=1, max_length=255)]
 GuestEmail = Annotated[str, Field(min_length=3, max_length=320)]
@@ -52,40 +66,6 @@ def normalize_phone(value: str) -> str | None:
     """
     candidate = _PHONE_PUNCTUATION.sub("", value.strip())
     return candidate if _E164.match(candidate) else None
-
-
-def require_iana_zone(value: str) -> str:
-    """Reject a timezone that is not a real IANA zone (so email/ICS rendering never fails).
-
-    ==Public, and deliberately not "the guest's".== The HOST's timezone is the same string, rendered
-    into the same messages, and ``server/services/users.py`` holds it to this very function; the
-    ``GET /slots`` endpoint translates its refusal into that contract's 422. A second copy of "what
-    a real zone is" is precisely how two write surfaces come to disagree about it — which is what
-    happened to the host CRUD before it had a service.
-
-    ==``OSError`` is in the tuple on purpose, and it is not defensive padding.== ``ZoneInfo`` does
-    not always refuse a bad key with ``ZoneInfoNotFoundError``: it resolves the key to a PATH and
-    opens it, so a key the filesystem cannot answer for escapes as a raw ``OSError`` instead. The
-    reachable shapes are all still just "this is not a zone":
-
-    * a key naming a DIRECTORY of the tz database — ``"America"`` and ``"Etc"`` are folders, not
-      zones — which ``open()`` refuses with ``IsADirectoryError`` (Linux) or ``PermissionError``
-      (Windows); ``zoneinfo`` converts only ``(ImportError, FileNotFoundError, UnicodeEncodeError)``
-      on that path, so neither one becomes a ``ZoneInfoNotFoundError``;
-    * a key the filesystem cannot even name: whitespace, an embedded newline, 300 characters
-      (``EINVAL`` / ``ENAMETOOLONG``).
-
-    Uncaught, each of those is an unhandled crash — a 500 on ``GET /slots?tz=America``, and on a
-    booking whose ``guest_timezone`` is ``"Etc"`` — where every caller was promised a clean refusal.
-    Whether it bites depends on where the zones come from (the ``tzdata`` wheel raises it; a system
-    tz tree without that wheel installed masks it behind an ``ImportError``), which is exactly what
-    kept it latent. A zone this function cannot resolve is refused — by every road, in one currency.
-    """
-    try:
-        ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
-        raise ValueError(f"unknown timezone: {value!r}") from exc
-    return value
 
 
 def require_emailish(value: str) -> str:
