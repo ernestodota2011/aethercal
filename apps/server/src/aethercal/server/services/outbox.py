@@ -80,10 +80,13 @@ from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.integrations.smtp.sender import EmailSender
 from aethercal.server.services.calendars import (
+    CalendarTarget,
+    CalendarTargetMissingError,
     ServiceFactory,
     create_event_for_booking,
     delete_event_for_booking,
     reschedule_event_for_booking,
+    resolve_calendar_target,
 )
 from aethercal.server.services.notifications import (
     compose_booking_notification,
@@ -1079,14 +1082,36 @@ async def _prepare_email(session: AsyncSession, work: OutboxWork) -> _EmailPlan 
 
 @dataclass(frozen=True, slots=True)
 class _GooglePlan:
-    """What the Google call needs, snapshotted so the I/O touches no session."""
+    """What the Google call needs, snapshotted so the I/O touches no session.
+
+    TWO calendars, deliberately, because they are not always the same one (RF-11):
+
+    * ``home`` — where the chain's event ACTUALLY lives, read from the columns the create wrote onto
+      the booking. A delete or a move must act HERE, on the calendar the event really went to.
+    * ``target`` — where a NEW event belongs, resolved from the host's configuration right now.
+
+    They diverge the moment an operator re-designates the booking calendar between the confirmation
+    and the cancellation. Aiming the delete at ``target`` would hit a calendar the event was never
+    written to: Google answers 404, the (correct) idempotent delete counts that as a success, and the
+    real event sits in the host's original calendar forever while the system reports it deleted.
+    """
 
     booking_id: uuid.UUID
-    connection: ExternalConnection
-    service: Any
     operation: GoogleOperation
     external_event_id: str | None
     request: MeetEventRequest | None
+    # PRIMITIVES ONLY across the I/O boundary. The plan outlives its session (the connection is
+    # released before the network call, R8), so an ORM object here would be detached and reading
+    # even its id — in a write-back, or merely to name it in an error — would raise
+    # DetachedInstanceError instead of the CalendarSyncError the retry logic expects.
+    #
+    # Where the event LIVES; a delete/move acts here. ``None`` = the chain has no event yet.
+    home_calendar_id: str | None
+    home_service: Any
+    # Where a NEW event goes; a create/move lands here. ``None`` only for a DELETE.
+    target_connection_id: uuid.UUID | None
+    target_calendar_id: str | None
+    target_service: Any
 
 
 async def run_google_effect(
@@ -1114,27 +1139,35 @@ async def run_google_effect(
         return
 
     if plan.operation is GoogleOperation.DELETE:
-        if plan.external_event_id is not None:
+        if plan.home_calendar_id is not None and plan.external_event_id is not None:
+            # Delete where the event LIVES, never where the host is configured now.
             await delete_event_for_booking(
-                connection=plan.connection,
+                calendar_id=plan.home_calendar_id,
                 external_event_id=plan.external_event_id,
-                service=plan.service,
+                service=plan.home_service,
             )
         return
 
     request = plan.request
-    if request is None:  # pragma: no cover - _prepare_google always builds one for a non-DELETE
+    target_calendar_id = plan.target_calendar_id
+    if request is None or target_calendar_id is None:  # pragma: no cover - prepare builds both
         return
-    if plan.operation is GoogleOperation.RESCHEDULE and plan.external_event_id is not None:
+    if (
+        plan.operation is GoogleOperation.RESCHEDULE
+        and plan.home_calendar_id is not None
+        and plan.external_event_id is not None
+    ):
         new_id, meeting_url = await reschedule_event_for_booking(
-            connection=plan.connection,
+            source_calendar_id=plan.home_calendar_id,
+            source_service=plan.home_service,
+            target_calendar_id=target_calendar_id,
+            target_service=plan.target_service,
             external_event_id=plan.external_event_id,
             request=request,
-            service=plan.service,
         )
     else:
         new_id, meeting_url = await create_event_for_booking(
-            connection=plan.connection, request=request, service=plan.service
+            calendar_id=target_calendar_id, request=request, service=plan.target_service
         )
 
     async with sessionmaker() as session, session.begin():
@@ -1143,26 +1176,45 @@ async def run_google_effect(
             return
         booking.external_event_id = new_id
         booking.meeting_url = meeting_url
+        # WHERE it landed, written in the SAME transaction as the id itself. Without this pair a
+        # later cancel can only guess the calendar, and a guess that misses is indistinguishable
+        # from an event that was already deleted — a silent orphan (RF-11).
+        booking.external_connection_id = plan.target_connection_id
+        booking.external_calendar_id = target_calendar_id
 
 
 async def _prepare_google(
     session: AsyncSession, work: OutboxWork, service_factory: ServiceFactory
 ) -> _GooglePlan | None:
-    """The Google effect's READ phase: resolve, decide, build the client. ``None`` = skip."""
+    """The Google effect's READ phase: resolve, decide, build the client. ``None`` = skip.
+
+    The intent names the HOST, not a connection: the calendar is resolved HERE, from the live
+    configuration, so there is one source of truth for "where does this event go" rather than a
+    snapshot taken at enqueue time that can rot before the drain.
+
+    This raises rather than skipping when the host's calendar cannot be resolved, and the difference
+    matters: the intent exists ONLY because the host had an active connection when the booking was
+    taken (:func:`aethercal.server.services.bookings._enqueue_google` enqueues nothing otherwise).
+    So "no calendar now" is not the self-hoster — it is a real failure with a real victim: the guest
+    is confirmed and the host's calendar is empty. It retries, then dead-letters into the visible
+    backlog, instead of passing as a delivered no-op.
+    """
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
     payload = work.payload
-    connection = await session.get(ExternalConnection, uuid.UUID(str(payload["connection_id"])))
-    if connection is None:  # pragma: no cover - defensive: revoked between enqueue and drain
-        return None
-
+    host_id = uuid.UUID(str(payload["host_id"]))
     operation = GoogleOperation(payload["operation"])
-    # Resolve the target event id from CURRENT DB state, never from the enqueue-time snapshot: an
-    # intent queued before the booking's CREATE drained captured a NULL id (the event did not exist
-    # yet); by now the create (or the reschedule predecessor) has populated ``external_event_id``.
+
+    # Resolve the event id from CURRENT DB state, never from the enqueue-time snapshot: an intent
+    # queued before the booking's CREATE drained captured nothing (the event did not exist yet); by
+    # now the create — or the reschedule predecessor — has populated ``external_event_id``.
     external_event_id = await _resolve_event_id(session, booking, payload)
-    service = service_factory(connection)
+    home = (
+        await _event_home(session, booking, host_id=host_id)
+        if external_event_id is not None
+        else None
+    )
 
     if operation is GoogleOperation.DELETE:
         if external_event_id is None and await _chain_awaits_meeting_link(session, booking):
@@ -1175,11 +1227,14 @@ async def _prepare_google(
             )
         return _GooglePlan(
             booking_id=booking.id,
-            connection=connection,
-            service=service,
             operation=operation,
             external_event_id=external_event_id,
             request=None,
+            home_calendar_id=home.calendar_id if home is not None else None,
+            home_service=service_factory(home.connection) if home is not None else None,
+            target_connection_id=None,
+            target_calendar_id=None,
+            target_service=None,
         )
 
     # Reconcile to the chain's CURRENT desired state rather than trusting drain order: a create/move
@@ -1193,14 +1248,90 @@ async def _prepare_google(
         # write-back committed). Creating again would duplicate the event in the host's calendar.
         return None
 
+    target = await _require_calendar_target(session, booking=booking, host_id=host_id)
     return _GooglePlan(
         booking_id=booking.id,
-        connection=connection,
-        service=service,
         operation=operation,
         external_event_id=external_event_id,
         request=_meet_request_from_payload(payload),
+        home_calendar_id=home.calendar_id if home is not None else None,
+        home_service=service_factory(home.connection) if home is not None else None,
+        target_connection_id=target.connection.id,
+        target_calendar_id=target.calendar_id,
+        target_service=service_factory(target.connection),
     )
+
+
+async def _require_calendar_target(
+    session: AsyncSession, *, booking: Booking, host_id: uuid.UUID
+) -> CalendarTarget:
+    """The host's booking calendar, or a LOUD failure — never a silent skip.
+
+    ``resolve_calendar_target`` itself raises :class:`AmbiguousCalendarTargetError` when the host's
+    configuration does not name exactly ONE calendar (several connected accounts, or several linked
+    calendars, with no designated target). Guessing there is what the old ``.first()`` did: it wrote
+    a real client's meeting into an arbitrary calendar and reported success.
+    """
+    target = await resolve_calendar_target(session, tenant_id=booking.tenant_id, user_id=host_id)
+    if target is None:
+        _logger.error(
+            "booking %s: host %s had a connected calendar when the booking was taken and none "
+            "resolves now; the event was NOT synced",
+            booking.id,
+            host_id,
+        )
+        raise CalendarTargetMissingError(
+            f"booking {booking.id}: no active calendar connection for host {host_id}"
+        )
+    return target
+
+
+async def _event_home(
+    session: AsyncSession, booking: Booking, *, host_id: uuid.UUID
+) -> CalendarTarget:
+    """The calendar the chain's existing event ACTUALLY lives in — read, never guessed.
+
+    The create wrote ``external_connection_id`` / ``external_calendar_id`` in the same transaction
+    as the event id, and this reads them back (walking the ``rescheduled_from_id`` chain, because a
+    successor whose own sync has not drained yet inherits its predecessor's event).
+
+    Two edge cases, kept apart:
+
+    * **No recorded calendar** — reachable only for a booking whose event predates these columns.
+      There is no other information to act on, so it falls back to the host's current target —
+      EXPLICITLY, with a warning naming the booking, because it IS a guess: if the host has since
+      moved their booking calendar, the legacy event is not there. An operator can act on a log line;
+      they cannot act on a guess made quietly.
+    * **The recorded connection row is gone** — the calendar the event lives in is unreachable by
+      definition, and guessing another would report success while the event lives on. Raise.
+    """
+    owner = booking
+    seen: set[uuid.UUID] = set()
+    while owner.external_event_id is None and owner.rescheduled_from_id is not None:
+        if owner.id in seen:  # pragma: no cover - defensive: the chain is acyclic by construction
+            break
+        seen.add(owner.id)
+        ancestor = await session.get(Booking, owner.rescheduled_from_id)
+        if ancestor is None:  # pragma: no cover - defensive: SET NULL only on a parent-row delete
+            break
+        owner = ancestor
+
+    if owner.external_connection_id is None or owner.external_calendar_id is None:
+        _logger.warning(
+            "booking %s holds external event %s but no recorded calendar (it predates the column); "
+            "falling back to host %s's currently configured booking calendar",
+            owner.id,
+            owner.external_event_id,
+            host_id,
+        )
+        return await _require_calendar_target(session, booking=booking, host_id=host_id)
+
+    connection = await session.get(ExternalConnection, owner.external_connection_id)
+    if connection is None:
+        raise CalendarTargetMissingError(
+            f"booking {owner.id}: the connection its calendar event lives in is gone"
+        )
+    return CalendarTarget(connection=connection, calendar_id=owner.external_calendar_id)
 
 
 async def _resolve_event_id(

@@ -633,7 +633,7 @@ async def test_google_effect_creates_the_event_and_writes_it_back_to_the_booking
     tenant_id, booking_id = await _seed_booking(maker)
     async with maker() as session, session.begin():
         host = (await session.scalars(select(User).where(User.tenant_id == tenant_id))).one()
-        connection = await store_google_connection(
+        await store_google_connection(
             session,
             tenant_id=tenant_id,
             user_id=host.id,
@@ -642,12 +642,13 @@ async def test_google_effect_creates_the_event_and_writes_it_back_to_the_booking
             ),
             fernet=fernet,
         )
-        connection_id = connection.id
+        host_id = host.id
 
     payload: dict[str, Any] = {
         "operation": GoogleOperation.UPSERT.value,
-        "connection_id": str(connection_id),
-        "external_event_id": None,
+        # The intent names the HOST; the exact calendar is resolved at drain time from live
+        # configuration, so there is one source of truth for "where does this event go".
+        "host_id": str(host_id),
         "summary": "Intro",
         "start": _SLOT.isoformat(),
         "end": (_SLOT + _HALF_HOUR).isoformat(),
