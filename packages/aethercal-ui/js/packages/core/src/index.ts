@@ -75,6 +75,7 @@ export {
 } from "./timeGrid";
 export type {
   CalendarEvent,
+  CalendarResource,
   CalendarView,
   ContextMenuPayload,
   Edge,

@@ -42,10 +42,16 @@ from aethercal.ui.theme import PRESET_NAMES
 
 _BUNDLE = rx.asset(path="assets/aethercal-calendar.js", shared=True)
 
-# The four calendar surfaces (AetherCal-06 §5). Only ``month`` renders in F2-A; the rest are the
-# forward-looking contract (F2-B/C). Kept in sync with the TS ``CalendarView`` union
-# (js/packages/core/src/types.ts).
-_VALID_VIEWS = frozenset({"month", "week", "day", "list"})
+# The calendar surfaces (AetherCal-06 §5) — the four original views plus the RF-28 resource
+# ``timeline`` (resources in rows, time on the horizontal axis). Kept in sync with the TS
+# ``CalendarView`` union (js/packages/core/src/types.ts).
+_VALID_VIEWS = frozenset({"month", "week", "day", "list", "timeline"})
+
+# How many days the timeline's horizontal axis may span (RF-28). Bounded on both ends: a 0-day
+# window has nothing to render, and an unbounded one would build an unusably dense axis. The React
+# layer clamps into this same range, so a dynamic ``Var`` degrades instead of breaking the axis.
+_MIN_TIMELINE_DAYS = 1
+_MAX_TIMELINE_DAYS = 31
 
 # The four theme presets (F2-E, AetherCal-06 §7). A literal ``theme`` string must be one of these;
 # a dict of ``--ac-*`` token overrides (e.g. ``Theme.dark().to_css_vars()``) is also accepted, and a
@@ -78,6 +84,25 @@ def _is_valid_anchor(value: str) -> bool:
     return True
 
 
+class CalendarResource(TypedDict):
+    """One row of the RF-28 resource timeline, matching the JS ``CalendarResource`` type.
+
+    Deliberately GENERIC: the component knows nothing about what a resource *is*. AetherCal's
+    backend maps resource → host, but the component takes an arbitrary array so the same timeline
+    serves rooms, chairs, or machines without a code change.
+
+    ``groupId`` is both the grouping KEY and the group's display LABEL (there is no separate title
+    field): a collapsible group is exactly "the resources that share this string", so a host passes
+    a human-readable value ("Clinic A") and gets a human-readable header for free.
+    """
+
+    id: str
+    title: str
+    # `groupId` is camelCase to match the JS prop the bundle reads (js/packages/core types).
+    groupId: NotRequired[str]
+    color: NotRequired[str]
+
+
 class CalendarEvent(TypedDict):
     """One calendar event, matching the JS ``CalendarEvent`` type (calendar-core types.ts)."""
 
@@ -92,6 +117,10 @@ class CalendarEvent(TypedDict):
     # Monotonic-increasing per-event integer, server-assigned (§4). Optional in F2-A; the
     # reconciliation that makes it load-bearing is F2-D.
     revision: NotRequired[int]
+    # Which timeline resource row this event belongs to (RF-28). Optional: the other four views
+    # have no resource dimension, and an event may legitimately be unassigned (the timeline
+    # surfaces those in their own row rather than silently dropping them).
+    resourceId: NotRequired[str]
 
 
 class EventDropPayload(TypedDict):
@@ -99,6 +128,10 @@ class EventDropPayload(TypedDict):
 
     ``client_mutation_id`` is set by the F2-D reconciliation layer so the server can dedupe a
     retried mutation idempotently; ``revision`` is echoed from the dragged event.
+
+    ``resourceId`` names the TARGET resource row when the drop happened on the timeline (RF-28) —
+    the whole point of dragging between rows is that the backend learns which host the event was
+    moved to. It is absent for the month/week/day views, which have no resource dimension.
     """
 
     id: str
@@ -106,6 +139,7 @@ class EventDropPayload(TypedDict):
     end: str
     revision: NotRequired[int]
     client_mutation_id: NotRequired[str]
+    resourceId: NotRequired[str]
 
 
 class EventResizePayload(TypedDict):
@@ -123,12 +157,15 @@ class RangeSelectPayload(TypedDict):
     """The payload for ``on_range_select`` — a new-event range created by dragging empty space.
 
     No ``id``/``revision`` (nothing exists yet); ``allDay`` distinguishes an all-day/date-granular
-    selection from a timed one (F2-D).
+    selection from a timed one (F2-D). ``resourceId`` names the resource row the selection was
+    drawn on (RF-28) so the host can create the event against the right resource — without it, a
+    "create" gesture on a timeline row could not say WHICH row it meant.
     """
 
     start: str
     end: str
     allDay: bool
+    resourceId: NotRequired[str]
 
 
 class EventClickPayload(TypedDict):
@@ -238,6 +275,23 @@ class Calendar(rx.NoSSRComponent):
         doc="Events to render, grouped onto the grid by each event's calendar day.",
     )
 
+    resources: rx.Var[list[CalendarResource]] = rx_field(
+        default=rx.Var.create([]),
+        doc=(
+            "Rows of the timeline view (RF-28), each {id, title, groupId?, color?}. Generic by "
+            "design — AetherCal maps a resource to a host, but any array works. Events join a row "
+            "by their resourceId. Ignored by the other four views; empty renders no rows."
+        ),
+    )
+
+    timeline_days: rx.Var[int] = rx_field(
+        default=rx.Var.create(7),
+        doc=(
+            "How many days the timeline's horizontal axis spans, starting AT the anchor (1..31). "
+            "Defaults to 7. Only the timeline view reads this."
+        ),
+    )
+
     locale: rx.Var[str] = rx_field(
         default=rx.Var.create("en"),
         doc="BCP-47 locale that drives weekday/date/time labels (i18n-ready; nothing hardcoded).",
@@ -327,9 +381,10 @@ class Calendar(rx.NoSSRComponent):
 
         Raises:
             ValueError: If `view` is a literal string outside the calendar-view contract
-                (`month`/`week`/`day`/`list`), or if `first_day_of_week` is a literal int outside
-                0..6. Dynamic `Var`-valued props (e.g. bound to backend state) are not checked
-                here — that's a frontend contract enforced by the React layer's own defaults.
+                (`month`/`week`/`day`/`list`/`timeline`), if `first_day_of_week` is a literal int
+                outside 0..6, or if `timeline_days` is a literal int outside 1..31. Dynamic
+                `Var`-valued props (e.g. bound to backend state) are not checked here — that's a
+                frontend contract enforced by the React layer's own defaults.
         """
         view = props.get("view")
         if isinstance(view, str) and view not in _VALID_VIEWS:
@@ -341,6 +396,16 @@ class Calendar(rx.NoSSRComponent):
         # valid weekday index) and reject any literal int outside 0..6. A dynamic `Var` is skipped.
         if isinstance(fdow, bool) or (isinstance(fdow, int) and fdow not in range(7)):
             msg = f"Calendar.first_day_of_week must be 0..6 (0=Sunday), got {fdow!r}"
+            raise ValueError(msg)
+        days = props.get("timeline_days")
+        # Same `bool`-is-an-`int` trap as above: a stray True/False is not a day count.
+        if isinstance(days, bool) or (
+            isinstance(days, int) and not _MIN_TIMELINE_DAYS <= days <= _MAX_TIMELINE_DAYS
+        ):
+            msg = (
+                f"Calendar.timeline_days must be {_MIN_TIMELINE_DAYS}..{_MAX_TIMELINE_DAYS}, "
+                f"got {days!r}"
+            )
             raise ValueError(msg)
         theme = props.get("theme")
         # A literal theme string must be a known preset; a dict of --ac-* overrides or a dynamic Var

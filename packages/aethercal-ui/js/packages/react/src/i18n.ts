@@ -83,7 +83,7 @@ const en: CalendarMessages = {
   navPrevious: "Previous",
   navNext: "Next",
   navToday: "Today",
-  viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda" },
+  viewNames: { month: "Month", week: "Week", day: "Day", list: "Agenda", timeline: "Timeline" },
 };
 
 // Neutral Spanish ("tú"). Reviewed to avoid voseo (usá/pulsá/agarrá/soltá…) — a locked test guards it.
@@ -113,7 +113,7 @@ const es: CalendarMessages = {
   navPrevious: "Anterior",
   navNext: "Siguiente",
   navToday: "Hoy",
-  viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda" },
+  viewNames: { month: "Mes", week: "Semana", day: "Día", list: "Agenda", timeline: "Cronograma" },
 };
 
 /** The built-in locale registry. Extend it by passing your own to `resolveMessages`. */

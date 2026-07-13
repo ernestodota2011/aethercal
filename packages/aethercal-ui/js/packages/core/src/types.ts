@@ -11,8 +11,32 @@
  * month view simply echoes an event's `revision` through a drop payload when present.
  */
 
-/** The four calendar surfaces (AetherCal-06 §5). Only `month` renders in F2-A; the rest are F2-B/C. */
-export type CalendarView = "month" | "week" | "day" | "list";
+/**
+ * The calendar surfaces (AetherCal-06 §5): the four original views plus the RF-28 resource
+ * `timeline` (resources in rows, time on the horizontal axis).
+ */
+export type CalendarView = "month" | "week" | "day" | "list" | "timeline";
+
+/**
+ * One row of the resource timeline (RF-28).
+ *
+ * Deliberately GENERIC: the component knows nothing about what a resource *is*. AetherCal's backend
+ * maps resource → host, but the component takes an arbitrary array, so the same timeline serves
+ * rooms, chairs, or machines without a code change.
+ *
+ * `groupId` is both the grouping KEY and the group's display LABEL (there is no separate title
+ * field): a collapsible group is exactly "the resources that share this string", so a host passes a
+ * human-readable value ("Clinic A") and gets a human-readable header for free.
+ */
+export interface CalendarResource {
+  /** Stable identifier; an event joins this row via its `resourceId`. */
+  id: string;
+  title: string;
+  /** Groups this resource under a collapsible header. The string doubles as the header label. */
+  groupId?: string;
+  /** Optional CSS color for the row's accent. */
+  color?: string;
+}
 
 /** One calendar event as rendered by a view. */
 export interface CalendarEvent {
@@ -34,6 +58,12 @@ export interface CalendarEvent {
    * (AetherCal-06 §4). Optional in F2-A; the reconciliation that requires it is F2-D.
    */
   revision?: number;
+  /**
+   * Which timeline resource row this event belongs to (RF-28). Optional: the other four views have
+   * no resource dimension, and an event may legitimately be unassigned — the timeline surfaces
+   * those in their own row rather than silently dropping them.
+   */
+  resourceId?: string;
 }
 
 /**
@@ -47,6 +77,12 @@ export interface EventDropPayload {
   end: string;
   revision?: number;
   client_mutation_id?: string;
+  /**
+   * The TARGET resource row, when the drop landed on the timeline (RF-28) — the whole point of
+   * dragging between rows is that the host learns which resource the event was moved to. Absent for
+   * the month/week/day views, which have no resource dimension.
+   */
+  resourceId?: string;
 }
 
 /**
@@ -73,6 +109,12 @@ export interface RangeSelectPayload {
   start: string;
   end: string;
   allDay: boolean;
+  /**
+   * The resource row the selection was drawn on (RF-28), so the host can create the event against
+   * the right resource. A selection that spans rows keeps the ANCHOR row's resource — one new event
+   * belongs to one resource. Absent on the views with no resource dimension.
+   */
+  resourceId?: string;
 }
 
 /** Payload emitted when an event is clicked (`on_event_click`, §4). */
@@ -106,14 +148,20 @@ export interface ViewChangePayload {
 export type Edge = "start" | "end";
 
 /**
- * A point on a calendar surface, as the interaction machine sees it — a day plus an optional
- * minute-of-day. `minuteOfDay` is `null` for a date-granular surface (month cell / all-day rail)
- * and a 0..1440 minute for the time grid. Framework-agnostic: the React layer maps a pointer
- * position to one of these; the core never touches the DOM (RF-23).
+ * A point on a calendar surface, as the interaction machine sees it — a day, an optional
+ * minute-of-day, and (on the timeline) the resource row it lands on. `minuteOfDay` is `null` for a
+ * date-granular surface (month cell / all-day rail) and a 0..1440 minute for the time grid.
+ * Framework-agnostic: the React layer maps a pointer position to one of these; the core never
+ * touches the DOM (RF-23).
+ *
+ * `resourceId` is what lets a gesture express "I dragged from one resource to another" (RF-28) —
+ * without it a grid point could only ever name a day and a time, so the machines had no way to
+ * represent a move ACROSS rows. It is `undefined` on the four views that have no resource axis.
  */
 export interface GridPoint {
   dateOnly: string;
   minuteOfDay: number | null;
+  resourceId?: string;
 }
 
 /** The two mutation gestures the optimistic reconciliation layer tracks (§4/RF-21). */
