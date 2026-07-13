@@ -35,6 +35,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from urllib.parse import urlencode
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -653,9 +654,26 @@ async def list_bookings(
 # fire time (self-healing against a rolled-back booking).
 
 
-def _guest_link(base_url: str, action: str, token: str) -> str:
-    """Build a public self-serve link carrying the signed guest ``token`` (F1-06/10)."""
-    return f"{base_url.rstrip('/')}/{action}?token={token}"
+def _guest_link(
+    base_url: str,
+    action: str,
+    token: str,
+    *,
+    booking_id: uuid.UUID,
+    event_type_id: uuid.UUID | None = None,
+) -> str:
+    """Build the public self-serve link we email the guest (F1-06/09/10).
+
+    The signed token *authorises* the action; ``booking`` (and ``event_type``, for a reschedule) are
+    the context the page needs to render anything at all. Minting the token without them produced a
+    link that always answered "missing context", so no guest could ever cancel or reschedule from
+    their email. Each half was internally consistent and unit-tested, which is exactly why only a
+    test crossing the seam could see it.
+    """
+    params = {"token": token, "booking": str(booking_id)}
+    if event_type_id is not None:
+        params["event_type"] = str(event_type_id)
+    return f"{base_url.rstrip('/')}/{action}?{urlencode(params)}"
 
 
 def _guest_token_ttl(start: datetime, now: datetime) -> timedelta:
@@ -685,8 +703,19 @@ async def _mint_guest_links(
         ttl=ttl,
     )
     return (
-        _guest_link(effects.booking_base_url, "cancel", cancel),
-        _guest_link(effects.booking_base_url, "reschedule", reschedule),
+        _guest_link(
+            effects.booking_base_url,
+            "cancel",
+            cancel,
+            booking_id=booking.id,
+        ),
+        _guest_link(
+            effects.booking_base_url,
+            "reschedule",
+            reschedule,
+            booking_id=booking.id,
+            event_type_id=booking.event_type_id,
+        ),
     )
 
 

@@ -35,6 +35,7 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from email.message import EmailMessage
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from cryptography.fernet import Fernet
@@ -65,6 +66,7 @@ from aethercal.server.services.bookings import (
     BookingParams,
     EventTypeNotFoundError,
     SlotUnavailableError,
+    _mint_guest_links,
     cancel_booking,
     create_booking,
     get_booking,
@@ -1304,3 +1306,41 @@ async def test_email_defers_without_consuming_attempts_until_google_delivers_the
     assert len(sender.sent) == 1
     assert booking.meeting_url in _email_body(sender.sent[0])
     assert email.attempts == 1
+
+
+async def test_the_guest_link_we_email_carries_what_the_booking_page_reads(
+    sqlite_session: AsyncSession,
+    tenant_factory: Any,
+) -> None:
+    """RF-09: a guest with no account cancels or reschedules from the link in their email.
+
+    This crosses a seam, and that is the whole point. The signed token authorises the action, but
+    the public page renders from ``booking`` (and ``event_type``, to re-offer slots). Both halves
+    were internally consistent and unit-tested while the link they formed always answered "missing
+    context" — no assertion on either side of the seam could see it, so the guest could never
+    self-serve. Assert the URL the guest actually receives.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+
+    booking = await create_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        params=_params(event_type.id, _SLOT_9),
+        now=_BEFORE,
+        effects=_effects(),
+    )
+
+    cancel_url, reschedule_url = await _mint_guest_links(
+        sqlite_session, booking=booking, effects=_effects(), now=_BEFORE
+    )
+
+    # The parameter names below are the ones the booking page reads; they are the contract.
+    cancel = parse_qs(urlsplit(cancel_url).query)
+    assert cancel["booking"] == [str(booking.id)]
+    assert cancel["token"], "the link must still carry the signed token that authorises the action"
+
+    reschedule = parse_qs(urlsplit(reschedule_url).query)
+    assert reschedule["booking"] == [str(booking.id)]
+    # Rescheduling has to re-offer slots, so it needs the event type as well as the booking.
+    assert reschedule["event_type"] == [str(event_type.id)]
+    assert reschedule["token"]
