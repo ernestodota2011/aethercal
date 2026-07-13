@@ -32,12 +32,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.schemas.event_types import resolve_translation
 from aethercal.server.channels import Channel
 from aethercal.server.db.models import Booking, EventType, SentNotification, User
 from aethercal.server.integrations.smtp.compose import (
     BookingEmailContext,
     NotificationKind,
     build_notification_email,
+    normalize_locale,
 )
 from aethercal.server.integrations.smtp.sender import EmailSender
 
@@ -110,7 +112,12 @@ async def compose_booking_notification(  # noqa: PLR0913 - the composer needs th
     transition (F1-08); ``None`` falls back to the booking's current ``sequence``.
     """
     context = await _build_context(
-        session, booking, cancel_url=cancel_url, reschedule_url=reschedule_url, sequence=sequence
+        session,
+        booking,
+        cancel_url=cancel_url,
+        reschedule_url=reschedule_url,
+        sequence=sequence,
+        locale=locale,
     )
     return build_notification_email(context, kind=kind, locale=locale)
 
@@ -154,23 +161,37 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
     return True
 
 
-async def _build_context(
+async def _build_context(  # noqa: PLR0913 - the context needs the booking, the links, and the locale
     session: AsyncSession,
     booking: Booking,
     *,
     cancel_url: str | None,
     reschedule_url: str | None,
     sequence: int | None = None,
+    locale: str = "es",
 ) -> BookingEmailContext:
     """Resolve the event title + host (organizer) from the booking's FKs into a composer context.
 
     The foreign keys guarantee the event type and its host exist; the fallbacks are purely defensive
-    so a notification can never hard-fail a booking flow on an unexpectedly missing row."""
+    so a notification can never hard-fail a booking flow on an unexpectedly missing row.
+
+    ==The title is resolved for ``locale``==, through the same :func:`resolve_translation` rule the
+    booking page uses. It used to be a bare ``event_type.title`` — the tenant's base-locale text —
+    while the surrounding copy WAS localised, so an English guest got "Booking confirmed: Consulta
+    30 min", and the ``.ics`` SUMMARY carried the Spanish title into their calendar permanently. The
+    translations were in the database the whole time (migration 0004); this was the only surface
+    that never read them."""
     event_type = await session.get(EventType, booking.event_type_id)
     host = await session.get(User, event_type.host_id) if event_type is not None else None
+    # Normalised by the SAME rule as the copy: a browser sends "en-US", the tenant stored "en".
+    language = normalize_locale(locale)
     return BookingEmailContext(
         uid=booking.ical_uid,
-        event_title=event_type.title if event_type is not None else "",
+        event_title=(
+            resolve_translation(event_type.title, event_type.title_translations, language)
+            if event_type is not None
+            else ""
+        ),
         guest_name=booking.guest_name,
         guest_email=booking.guest_email,
         host_name=host.name if host is not None else "",
