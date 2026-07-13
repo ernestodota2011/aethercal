@@ -136,6 +136,22 @@ jobs:
           AETHERCAL_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aethercal_test
         run: uv run pytest -m db
 
+  docker-build:
+    name: Docker image (deploy/Dockerfile builds)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # The deploy image is the shipping artifact for BOTH compose services — the API (`app`) and the
+      # public booking page (`booking`), which reuse the same image with a different command — so a
+      # broken Dockerfile breaks the entire self-host path. Build it exactly the way deploy/README.md
+      # documents: from the REPOSITORY ROOT, because the context needs uv.lock + every workspace
+      # member. Docker is preinstalled on ubuntu-latest, so a plain `docker build` keeps the CI
+      # supply-chain surface to the single SHA-pinned action above (no buildx / build-push actions),
+      # the same rationale as the calendar-js job. Precondition for the E2E job that follows.
+      - name: Build the deploy image
+        run: docker build -f deploy/Dockerfile -t aethercal-server .
+
   calendar-release:
     name: Calendar release (wheel ships the JS bundle)
     runs-on: ubuntu-latest
