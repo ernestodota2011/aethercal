@@ -13,7 +13,15 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from aethercal.server.api import bookings, event_types, health, schedules, slots, webhooks
+from aethercal.server.api import (
+    bookings,
+    event_types,
+    health,
+    metrics,
+    schedules,
+    slots,
+    webhooks,
+)
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(health.router)
@@ -22,5 +30,6 @@ api_router.include_router(schedules.router)
 api_router.include_router(slots.router)
 api_router.include_router(bookings.router)
 api_router.include_router(webhooks.router)
+api_router.include_router(metrics.router)
 
 __all__ = ["api_router"]

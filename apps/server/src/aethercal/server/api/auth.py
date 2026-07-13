@@ -32,8 +32,12 @@ class AuthContext:
     api_key_id: uuid.UUID
 
 
-def _bearer_token(request: Request) -> str | None:
-    """Extract the token from an ``Authorization: Bearer <token>`` header, or ``None``."""
+def bearer_token(request: Request) -> str | None:
+    """Extract the token from an ``Authorization: Bearer <token>`` header, or ``None``.
+
+    Public because ``GET /metrics`` guards itself with a different secret (the OPERATOR token, never
+    a tenant API key) but parses the header exactly the same way. Two hand-rolled copies of this is
+    how one of them ends up accepting a header the other rejects."""
     header = request.headers.get("Authorization")
     if not header:
         return None
@@ -49,7 +53,7 @@ async def require_api_key(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> AuthContext:
     """Authenticate the request by its API key, or raise :class:`AuthenticationError`."""
-    presented = _bearer_token(request)
+    presented = bearer_token(request)
     api_key = await verify_api_key(session, presented) if presented is not None else None
     if api_key is None:
         raise AuthenticationError

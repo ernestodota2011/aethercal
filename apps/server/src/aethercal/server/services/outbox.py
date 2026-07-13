@@ -75,10 +75,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel, ChannelSender
 from aethercal.server.db.models import Booking, ExternalConnection, Outbox
+from aethercal.server.db.models.outbox import OutboxStatus, due_filter
 from aethercal.server.db.models.workflows import WorkflowTrigger
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.integrations.smtp.sender import EmailSender
+from aethercal.server.observability import observe_drain
 from aethercal.server.services.calendars import (
     ServiceFactory,
     create_event_for_booking,
@@ -143,19 +145,23 @@ Get that relationship backwards and a crashed worker turns into hours of silence
 TTL``, and the worst-case delay a crash can add is ``lease TTL + one drain interval`` ≈ 6 minutes.
 """
 
-_PENDING = "pending"
-_CLAIMED = "claimed"
-_FAILED = "failed"
-_DELIVERED = "delivered"
-_DEAD = "dead"
-_SKIPPED = "skipped"
+# The status vocabulary is DECLARED ONCE, on the row itself (``db/models/outbox.OutboxStatus``), and
+# merely re-bound here for terse internal use. It used to be seven private literals living only in
+# this module, which left every other reader of these rows — the metrics endpoint, the readiness
+# probe, the replay CLI — free to re-type them and drift.
+_PENDING = OutboxStatus.PENDING.value
+_CLAIMED = OutboxStatus.CLAIMED.value
+_FAILED = OutboxStatus.FAILED.value
+_DELIVERED = OutboxStatus.DELIVERED.value
+_DEAD = OutboxStatus.DEAD.value
+_SKIPPED = OutboxStatus.SKIPPED.value
 """Terminal, and NOT a failure: the step could never run, so retrying it is pointless.
 
 A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
 reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
 noise in the backlog, and the message still does not arrive. The step is retired with its reason
 instead, loudly in the log and visibly in the row. """
-_VOIDED = "voided"
+_VOIDED = OutboxStatus.VOIDED.value
 """Retired before it ever ran: the booking's life changed under it (see
 :func:`void_pending_steps`)."""
 
@@ -584,18 +590,19 @@ async def select_due(
 ) -> list[uuid.UUID]:
     """The ids of the intents that are due, in the order they must run. It claims NOTHING.
 
-    "Due" = ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now``. Deliberately no
-    lock and no claim: this is a *plan*, and a plan made now can already be stale by the time the
-    tenth item of it actually runs. :func:`claim_one` is what arbitrates, item by item, at the
-    moment each one begins."""
+    "Due" = ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now`` — the predicate is
+    :func:`due_filter`, declared once on the model, because observability COUNTS the same rows and
+    two hand-written copies of the rule would drift invisibly (the drain would go on sending exactly
+    the right intents while the backlog alarm quietly measured something else).
+
+    Deliberately no lock and no claim: this is a *plan*, and a plan made now can already be stale by
+    the time the tenth item of it actually runs. :func:`claim_one` is what arbitrates, item by item,
+    at the moment each one begins."""
     return list(
         (
             await session.scalars(
                 select(Outbox.id)
-                .where(
-                    Outbox.status.in_((_PENDING, _FAILED)),
-                    or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
-                )
+                .where(due_filter(now))
                 .order_by(
                     Outbox.created_at,
                     # Within one instant (intents enqueued in the same transaction share a stamp),
@@ -791,6 +798,12 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
             max_attempts=max_attempts,
         )
 
+    # R9. Recorded HERE, not by the scheduler tick: a counter that only moves when the caller
+    # remembers to report it reads zero for whichever path somebody forgot — and a zero meaning
+    # "never measured" is indistinguishable from a zero meaning "nothing went wrong". `lost` is the
+    # signal that a send outran its lease and a guest may have been messaged twice; it is worth
+    # nothing if it can silently fail to be counted.
+    observe_drain(report)
     return report
 
 
