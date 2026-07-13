@@ -1,11 +1,13 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { formatLocalDateTime, parseLocalDateTime } from "./dateMath";
+import { formatLocalDateTime, occupiedDayBounds, parseLocalDateTime } from "./dateMath";
 import { resolveTimeGridConfig } from "./timeGrid";
 import { buildResourceTimeline } from "./timeline";
 import type { CalendarEvent, CalendarResource } from "./types";
 
 const DAYS = ["2026-07-13", "2026-07-14", "2026-07-15"];
+const FIRST_DAY = DAYS[0]!;
+const LAST_DAY = DAYS[DAYS.length - 1]!;
 const ORIGIN = parseLocalDateTime(`${DAYS[0]}T00:00:00`).getTime();
 const AXIS_END_MIN = DAYS.length * 24 * 60;
 const FULL_DAY = resolveTimeGridConfig();
@@ -138,14 +140,21 @@ describe("buildResourceTimeline invariants", () => {
           ),
         );
         for (const event of evts) {
-          const startMin = minutesOf(event.start);
-          const endMin = minutesOf(event.end);
           // An event overlapping the window must be rendered somewhere — in its resource's row, or
           // (when its resourceId is absent/unknown) in the unassigned row. Nothing vanishes.
-          // An all-day event is normalized to whole days, so a zero-length one still occupies a day.
-          const overlapsWindow = event.allDay
-            ? startMin < AXIS_END_MIN && endMin >= 0
-            : startMin < AXIS_END_MIN && endMin > 0;
+          let overlapsWindow: boolean;
+          if (event.allDay) {
+            // An all-day event is laid out on the whole local days it OCCUPIES, under the shared
+            // exclusive-end rule (`occupiedDayBounds`). One ending exactly at the window's first
+            // midnight therefore occupies only the day BEFORE the window and is legitimately out of
+            // view — demanding `end >= window start` here would assert the timeline renders a day the
+            // event does not occupy. Use the codebase's canonical day-span rule, never a re-derivation.
+            const { startKey, lastKey } = occupiedDayBounds(event);
+            overlapsWindow = startKey <= LAST_DAY && lastKey >= FIRST_DAY;
+          } else {
+            // A timed event is visible iff it has any extent inside the axis (half-open [start, end)).
+            overlapsWindow = minutesOf(event.start) < AXIS_END_MIN && minutesOf(event.end) > 0;
+          }
           if (overlapsWindow) expect(placed.has(event.id)).toBe(true);
         }
       }),

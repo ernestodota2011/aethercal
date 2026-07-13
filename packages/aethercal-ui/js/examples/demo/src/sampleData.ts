@@ -10,7 +10,7 @@
  * Pure, framework-free, and exhaustively testable (sampleData.test.ts): no DOM, no Date.now inside —
  * `today` is injected so the output is deterministic for a given input.
  */
-import type { CalendarEvent } from "@aethercal/calendar-react";
+import type { CalendarEvent, CalendarResource } from "@aethercal/calendar-react";
 
 /** Format a Date as the calendar's naive local wall-time ISO ("YYYY-MM-DDTHH:MM:SS", no offset). */
 export function toLocalIso(date: Date): string {
@@ -50,6 +50,44 @@ const ACCENT = {
  * cross-midnight timed event, single- and multi-day all-day events, a `+N more` overflow day, and a
  * mix of editable/non-editable and colored/neutral chips.
  */
+/**
+ * The timeline's rows (RF-28). Two grouped teams plus an ungrouped one, so the demo shows grouping,
+ * collapse, AND an ungrouped resource keeping its own place — and `buildSampleEvents` leaves one
+ * event unassigned on purpose, so the "unassigned" row is visible rather than a claim in a docstring.
+ */
+export function buildSampleResources(): CalendarResource[] {
+  return [
+    { id: "ana", title: "Ana Rivas", groupId: "Consultoría", color: ACCENT.slate },
+    { id: "beto", title: "Beto Sosa", groupId: "Consultoría", color: ACCENT.olive },
+    { id: "cami", title: "Cami Duarte", groupId: "Producto", color: ACCENT.taupe },
+    { id: "dani", title: "Dani Peña", groupId: "Producto", color: ACCENT.rose },
+    { id: "sala", title: "Sala de juntas" },
+  ];
+}
+
+/** Which resource each sample event sits on. Anything absent here rides the "unassigned" row. */
+const EVENT_RESOURCE: Readonly<Record<string, string>> = {
+  standup: "sala",
+  design: "cami",
+  oneonone: "ana",
+  lunch: "beto",
+  onboarding: "ana",
+  release: "dani",
+  focus: "cami",
+  conf: "beto",
+  planning: "cami",
+  call: "beto",
+  webinar: "dani",
+  retro: "sala",
+  "m-kickoff": "ana",
+  "m-workshop": "cami",
+  "m-a": "ana",
+  "m-b": "beto",
+  "m-c": "dani",
+  "m-d": "cami",
+  // "m-e" is deliberately left out — it demonstrates the unassigned row.
+};
+
 export function buildSampleEvents(today: Date): CalendarEvent[] {
   const base = startOfDay(today);
   const timed = (
@@ -94,7 +132,14 @@ export function buildSampleEvents(today: Date): CalendarEvent[] {
     ...extra,
   });
 
-  return [
+  // One place assigns the resources, so the map above and the events below cannot drift apart.
+  const onResources = (list: readonly CalendarEvent[]): CalendarEvent[] =>
+    list.map((event) => {
+      const resourceId = EVENT_RESOURCE[event.id];
+      return resourceId === undefined ? event : { ...event, resourceId };
+    });
+
+  return onResources([
     // --- This-week cluster (anchored to today) — drives week/day + the now line ---
     timed("standup", "Standup del equipo", 0, 9, 0, 9, 30, { color: ACCENT.slate }),
     // Overlaps the standup -> exercises the overlap lanes in week/day.
@@ -130,5 +175,5 @@ export function buildSampleEvents(today: Date): CalendarEvent[] {
     monthTimed("m-e", "Cierre de la semana", 12, 16, 17),
     monthTimed("m-launch", "Lanzamiento", 18, 9, 10, { color: ACCENT.olive }),
     { id: "m-holiday", title: "Feriado", start: toLocalIso(monthDay(22, 0)), end: toLocalIso(monthDay(23, 0)), allDay: true, revision: 1 },
-  ];
+  ]);
 }

@@ -22,12 +22,15 @@ import {
   type ViewChangePayload,
 } from "@aethercal/calendar-react";
 import * as React from "react";
-import { buildSampleEvents } from "./sampleData";
+import { buildSampleEvents, buildSampleResources } from "./sampleData";
 
 const REPO_URL = "https://github.com/ernestodota2011/aethercal";
 
+/** The timeline's rows (RF-28) — static, so they are built once rather than per render. */
+const RESOURCES = buildSampleResources();
+
 type Locale = "es" | "en";
-const VIEWS: readonly CalendarView[] = ["month", "week", "day", "list"];
+const VIEWS: readonly CalendarView[] = ["month", "week", "day", "list", "timeline"];
 
 /** Demo-chrome copy, localized alongside the calendar itself (neutral Spanish "tú", no voseo). */
 const UI = {
@@ -35,7 +38,7 @@ const UI = {
     docTitle: "AetherCal — Demo del calendario",
     tagline: "Infraestructura de calendario y agendamiento, de código abierto (MIT).",
     lead:
-      "Un componente headless-first: motor de geometría puro + capa React. Cuatro vistas, " +
+      "Un componente headless-first: motor de geometría puro + capa React. Cinco vistas, " +
       "arrastrar / redimensionar / seleccionar, reconciliación optimista, temas por tokens e i18n.",
     view: "Vista",
     theme: "Tema",
@@ -72,7 +75,7 @@ const UI = {
     docTitle: "AetherCal — Calendar demo",
     tagline: "Open-source calendar and appointment-scheduling infrastructure (MIT).",
     lead:
-      "A headless-first component: a pure geometry engine + a React layer. Four views, " +
+      "A headless-first component: a pure geometry engine + a React layer. Five views, " +
       "drag / resize / select, optimistic reconciliation, token theming, and i18n.",
     view: "View",
     theme: "Theme",
@@ -215,14 +218,20 @@ export function App(): React.JSX.Element {
     const revision = (revRef.current += 1);
     // If the board was reset while this mutation was in flight, drop the write: the calendar was
     // remounted with fresh data, so committing a stale move here would silently relocate an event.
+    // A timeline drop also moves the event to another RESOURCE. The mock server has to apply and
+    // echo that, exactly as a real one would — otherwise the bar would commit its new time and snap
+    // straight back to the row it came from.
+    const moved = payload.resourceId !== undefined ? { resourceId: payload.resourceId } : {};
     if (genRef.current === gen) {
       setEvents((prev) =>
         prev.map((e) =>
-          e.id === payload.id ? { ...e, start: payload.start, end: payload.end, revision } : e,
+          e.id === payload.id
+            ? { ...e, start: payload.start, end: payload.end, revision, ...moved }
+            : e,
         ),
       );
     }
-    return { id: payload.id, start: payload.start, end: payload.end, revision };
+    return { id: payload.id, start: payload.start, end: payload.end, revision, ...moved };
   }, []);
 
   // Deterministic idempotency ids (avoids crypto.randomUUID's secure-context requirement on plain http).
@@ -346,6 +355,8 @@ export function App(): React.JSX.Element {
               <OptimisticCalendar
                 key={resetNonce}
                 events={events}
+                resources={RESOURCES}
+                timelineDays={3}
                 mutate={mutate}
                 generateId={generateId}
                 view={view}
