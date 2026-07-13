@@ -53,7 +53,11 @@ def _require_http_scheme(url: str) -> str:
     """Reject any non ``http``/``https`` webhook URL at registration (RF-17 / RNF-5).
 
     Scheme-only fast fail — the authoritative egress/IP check runs at send time in the delivery
-    worker (:func:`aethercal.server.webhooks.ssrf.assert_public_url`).
+    worker (:func:`aethercal.server.webhooks.ssrf.assert_target_allowed`), which is also where the
+    operator's private-target allowlist is applied. Deliberately NOT here: a URL that is legal on
+    one instance (an operator who declared their LAN) is illegal on another, so a registration-time
+    address check would either lie to the self-hoster or hard-code one deployment's policy into the
+    shared schema package.
     """
     if urlsplit(url).scheme not in _ALLOWED_URL_SCHEMES:
         raise ValueError("webhook url scheme must be http or https")

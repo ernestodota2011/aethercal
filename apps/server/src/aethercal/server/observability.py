@@ -53,8 +53,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.db.models import Booking, Outbox, OutboxStatus
+from aethercal.server.db.models import Booking, Outbox, OutboxStatus, WebhookDelivery
 from aethercal.server.db.models.outbox import due_filter
+from aethercal.server.webhooks.delivery import DELIVERY_FAILURE_REASONS
 
 if TYPE_CHECKING:  # pragma: no cover - the drain imports THIS module, so the type is deferred
     from aethercal.server.services.outbox import OutboxReport
@@ -63,6 +64,9 @@ _logger = logging.getLogger(__name__)
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 """The Prometheus text-exposition content type (the format Prometheus scrapes by default)."""
+
+_WEBHOOK_STATUSES = ("pending", "delivered", "failed", "dead")
+"""The lifecycle of a ``webhook_deliveries`` row. Every one gets a gauge, zeroes included."""
 
 
 # --------------------------------------------------------------------------------------
@@ -160,6 +164,19 @@ class MetricsSnapshot:
 
     Cancelled bookings are not in the denominator: nobody was ever expected to attend them, and
     counting them would make a host's no-show rate improve simply because more people cancelled."""
+    webhook_deliveries_by_status: dict[str, int] = field(default_factory=dict)
+    """Outbound webhook deliveries by status. The webhook worker had NO instrumentation at all."""
+    webhook_deliveries_by_reason: dict[str, int] = field(default_factory=dict)
+    """Undelivered webhooks by WHY — every member of ``DELIVERY_FAILURE_REASONS``, zeroes included.
+
+    ==This is the number that makes the silent failure visible.== A self-hoster whose n8n is on the
+    LAN, with no allowlist declared, sees ``blocked-private-target`` climb — and the fix is one
+    environment variable away. Before it existed, that instance was indistinguishable from a healthy
+    one: no error, no metric, no log, and no events.
+
+    ``blocked-*`` is worth an alarm; ``http-error`` mostly is not (a consumer having a bad day is
+    ordinary). Keeping them in one series with a bounded ``reason`` label — never a URL, never a
+    tenant — is what lets a dashboard tell those apart on a public, scrapeable endpoint."""
 
 
 async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSnapshot:
@@ -205,6 +222,32 @@ async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSna
     ):
         bookings[BookingStatus(status).value] = count
 
+    webhooks_by_status: dict[str, int] = dict.fromkeys(_WEBHOOK_STATUSES, 0)
+    for status, count in await session.execute(
+        sa.select(WebhookDelivery.status, sa.func.count()).group_by(WebhookDelivery.status)
+    ):
+        webhooks_by_status[status] = count
+
+    # Every reason gets a series, whether or not any row carries it: a dashboard cannot alert on a
+    # series that does not exist, and "absent" must never be mistaken for "zero".
+    webhooks_by_reason: dict[str, int] = dict.fromkeys(DELIVERY_FAILURE_REASONS, 0)
+    for reason, count in await session.execute(
+        sa.select(WebhookDelivery.error_reason, sa.func.count())
+        .where(WebhookDelivery.error_reason.is_not(None))
+        .group_by(WebhookDelivery.error_reason)
+    ):
+        if reason not in webhooks_by_reason:
+            # A token the table holds but the code does not know is a real divergence — an older
+            # binary, or a reason somebody added without extending DELIVERY_FAILURE_REASONS. Say so
+            # rather than dropping those rows out of a gauge that then reads reassuringly low.
+            _logger.error(
+                "webhook_deliveries holds error_reason %r, which is not a known delivery reason; "
+                "it is not accounted for in the metrics",
+                reason,
+            )
+            continue
+        webhooks_by_reason[reason] = count
+
     attended = bookings[BookingStatus.NO_SHOW.value] + bookings[BookingStatus.CONFIRMED.value]
     return MetricsSnapshot(
         outbox_by_status=by_status,
@@ -213,6 +256,8 @@ async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSna
         outbox_expired_leases=expired_leases,
         bookings_by_status=bookings,
         no_show_ratio=(bookings[BookingStatus.NO_SHOW.value] / attended) if attended else 0.0,
+        webhook_deliveries_by_status=webhooks_by_status,
+        webhook_deliveries_by_reason=webhooks_by_reason,
     )
 
 
@@ -360,6 +405,30 @@ def render_prometheus(
         "Cancelled bookings are excluded: nobody was ever expected to attend them.",
         "gauge",
         [("", snapshot.no_show_ratio)],
+    )
+    _series(
+        lines,
+        "aethercal_webhook_deliveries",
+        "Outbound webhook deliveries by status.",
+        "gauge",
+        [
+            (f'{{status="{_escape(status)}"}}', count)
+            for status, count in sorted(snapshot.webhook_deliveries_by_status.items())
+        ],
+    )
+    _series(
+        lines,
+        "aethercal_webhook_deliveries_failed",
+        "Undelivered webhooks by REASON. Alert on the 'blocked-*' reasons: they mean this instance "
+        "REFUSED to send, and 'blocked-private-target' on a self-host almost always means the "
+        "operator's own service (n8n/CRM/ERP) is on a network they have not declared in "
+        "AETHERCAL_WEBHOOK_PRIVATE_TARGET_CIDRS — the events are not late, they are never coming. "
+        "'http-error' and 'transport-error' are the ordinary bad day of a consumer.",
+        "gauge",
+        [
+            (f'{{reason="{_escape(reason)}"}}', count)
+            for reason, count in sorted(snapshot.webhook_deliveries_by_reason.items())
+        ],
     )
     return "\n".join(lines) + "\n"
 

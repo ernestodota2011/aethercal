@@ -58,6 +58,7 @@ from aethercal.server.scheduler import (
     stop_scheduler,
 )
 from aethercal.server.settings import Settings
+from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
 
 async def _handle_authentication_error(request: Request, exc: Exception) -> JSONResponse:
@@ -202,6 +203,15 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
+    # The private networks outbound webhooks may reach (empty unless the operator declared any).
+    # Built EAGERLY here, like the sessionmaker, rather than inside the lifespan: the delivery tick
+    # reads it off app.state, and an app shape that never runs its lifespan would otherwise hand the
+    # worker nothing — which reads exactly like "no private target is allowed" and would silently
+    # un-declare the operator's LAN. A bad CIDR has already failed the boot, inside Settings.
+    app.state.webhook_allowlist = settings.private_target_allowlist()
+    # Loopback is a legitimate choice on a single-box self-host, and the widest one available. Say
+    # so once, at boot, rather than letting it be a default nobody noticed.
+    warn_if_loopback_is_allowlisted(app.state.webhook_allowlist)
 
     app.include_router(api_router)
     app.add_exception_handler(AuthenticationError, _handle_authentication_error)

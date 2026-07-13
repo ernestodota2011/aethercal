@@ -111,3 +111,61 @@ def test_a_non_positive_interval_is_refused(value: int) -> None:
     # rather than boot a scheduler that ticks wrong or not at all.
     with pytest.raises(ValidationError):
         _settings(outbox_drain_interval_seconds=value)
+
+
+# --------------------------------------------------------------------------------------
+# The private-target allowlist: read from the ENVIRONMENT, fail-closed, fail-loud at BOOT.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_private_target_allowlist_is_empty_by_default() -> None:
+    """==Fail-closed.== Upgrading to a build that CAN reach private networks must not reach any."""
+    settings = _settings()
+    assert settings.webhook_private_target_cidrs == ""
+    assert settings.private_target_allowlist().is_empty
+    assert settings.private_target_allowlist().permits("192.168.1.50") is False
+
+
+def test_the_private_target_allowlist_reads_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==The ONE property the whole feature rests on: the operator declares it, and nobody else.==
+
+    A webhook URL is caller-supplied; the networks it may reach come from the process environment.
+    An attacker who controls a subscription URL cannot widen this list, because there is no code
+    path from a request, a row or an API response into it.
+    """
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "postgres://u:p@h/db")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "from-env")
+    monkeypatch.setenv("AETHERCAL_WEBHOOK_PRIVATE_TARGET_CIDRS", "192.168.1.0/24,172.17.0.0/16")
+
+    settings = Settings()  # type: ignore[call-arg]
+    allowlist = settings.private_target_allowlist()
+
+    assert allowlist.permits("192.168.1.50") is True  # the operator's n8n
+    assert allowlist.permits("172.17.0.2") is True  # the Docker bridge
+    assert allowlist.permits("10.0.0.1") is False  # never declared
+    assert allowlist.permits("169.254.169.254") is False  # cloud metadata, and undeclarable
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0.0.0.0/0",  # the default route — would allowlist loopback and metadata in one token
+        "169.254.0.0/16",  # link-local — the cloud metadata endpoint
+        "8.8.8.0/24",  # public space
+        "10.0.0.0",  # no prefix — silently means /32, i.e. "nothing"
+        "192.168.1.5/24",  # host bits set — a typo for 192.168.1.0/24
+        "not-a-cidr",
+    ],
+)
+def test_a_misconfigured_allowlist_fails_the_BOOT(value: str) -> None:
+    """==A misconfiguration must not come up quietly permitting nothing.==
+
+    That is the failure mode this project is named after: the operator declares their LAN, the app
+    starts, and every delivery keeps dying exactly as before — now with a "configured" allowlist to
+    prove it should have worked. Pydantic turns the AllowlistConfigError into a ValidationError, so
+    the process refuses to start and says which token it choked on.
+    """
+    with pytest.raises(ValidationError):
+        _settings(webhook_private_target_cidrs=value)
