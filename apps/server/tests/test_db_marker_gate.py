@@ -44,27 +44,43 @@ def _env_without_the_database_url() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "AETHERCAL_TEST_DATABASE_URL"}
 
 
+# One flag per SELECTED test: was it db-marked? These are the shapes pytest really hands over.
+_ONLY_DB = [True, True, True]
+_ONLY_OFFLINE = [False, False, False]
+_EVERYTHING = [True, False, True, False]
+_NOTHING: list[bool] = []
+
+
 @pytest.mark.parametrize(
-    ("markexpr", "requested"),
+    ("markexpr", "db_marked", "targets"),
     [
-        ("db", True),
-        (" db ", True),
-        ("db and slow", True),
-        ("slow and db", True),
-        ("not db", False),
-        ("not  db", False),
-        ("", False),
-        ("slow", False),
-        # `db` as a SUBSTRING of another marker is not a request for the database suite: a word
-        # boundary, not an `in` test — otherwise `-m dbt` would start demanding a Postgres server.
-        ("dbt", False),
-        ("nodb", False),
+        # Asking for the db suite: every selected test is db-marked.
+        ("db", _ONLY_DB, True),
+        (" db ", _ONLY_DB, True),
+        ("db and slow", _ONLY_DB, True),
+        # ==The expressions a text-matching guard gets WRONG.== Both of these SELECT EVERYTHING, so
+        # they are plain runs however they are spelled — and a plain run on a laptop with no
+        # Postgres must stay a quiet green. Reading `not db` out of the string as if it were a
+        # global negation, or reading `db` out of it as if it were a request, both misfire here.
+        # Deciding on the selection cannot: the non-db tests are right there in it.
+        ("db or not db", _EVERYTHING, False),
+        ("(not db) or slow", _ONLY_OFFLINE, False),
+        # The offline matrix.
+        ("not db", _ONLY_OFFLINE, False),
+        ("", _EVERYTHING, False),
+        # A bare `pytest` collects the db tests too (they skip by fixture) — and must NOT be read as
+        # a request for a database, or every developer without Postgres gets a hard error.
+        ("", _ONLY_DB, False),
+        # An explicit selection that matched nothing is not a database run; it is caught by the
+        # zero-collection arm instead.
+        ("db", _NOTHING, False),
+        ("slow", _NOTHING, False),
     ],
 )
-def test_which_invocations_count_as_asking_for_the_database_suite(
-    markexpr: str, requested: bool
+def test_which_runs_target_the_database_suite(
+    markexpr: str, db_marked: list[bool], targets: bool
 ) -> None:
-    assert _root_conftest().db_suite_requested(markexpr) is requested
+    assert _root_conftest().targets_the_db_suite(markexpr, db_marked) is targets
 
 
 def test_pytest_m_db_without_a_database_exits_non_zero() -> None:
@@ -85,6 +101,39 @@ def test_pytest_m_db_without_a_database_exits_non_zero() -> None:
         "and CI would call that a pass."
     )
     assert "AETHERCAL_TEST_DATABASE_URL" in (result.stderr + result.stdout)
+
+
+@pytest.mark.parametrize("markexpr", ["db or not db", "(not db) or slow"])
+def test_an_expression_that_selects_everything_is_not_a_database_run(markexpr: str) -> None:
+    """==The two expressions a text-matching guard misreads, run for real, with no database.==
+
+    Both select tests that are not db-marked, so both are ordinary runs however they happen to be
+    spelled, and both must stay green without Postgres. A guard that pattern-matched the string
+    ``not db`` — or the string ``db`` — would fire on one of these and turn a legitimate invocation
+    into a hard error. Deciding on the SELECTION cannot make that mistake: the non-db tests are
+    simply sitting there in it.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-m",
+            markexpr,
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=REPO_ROOT,
+        env=_env_without_the_database_url(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_the_offline_matrix_is_left_alone() -> None:
