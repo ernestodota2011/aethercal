@@ -17,10 +17,12 @@ So the tests below check the OUTBOX, which is where a rule either becomes a mess
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -34,6 +36,7 @@ from aethercal.schemas.workflows import (
     TEMPLATE_VARIABLES,
     WORKFLOW_TRIGGER_NAMES,
     WorkflowCreate,
+    WorkflowRead,
     WorkflowStepIn,
     WorkflowTemplateCreate,
     WorkflowTemplateUpdate,
@@ -50,6 +53,7 @@ from aethercal.server.db.models import (
     WorkflowStep,
 )
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.services import workflow_rules
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
     OutboxEffect,
@@ -71,6 +75,7 @@ from aethercal.server.services.workflow_rules import (
     list_templates,
     list_workflows,
     phone_channel_scope,
+    rule_to_read,
     set_workflow_active,
     update_template,
     update_workflow,
@@ -1132,3 +1137,70 @@ async def test_another_tenants_phone_rule_never_makes_us_ask(
 
     scope = await phone_channel_scope(sqlite_session, tenant_id=tenant.id)
     assert scope.covers(ours.id) is False
+
+
+# --------------------------------------------------------------------------------------
+# The projection (``Rule`` → ``WorkflowRead``): ONE of them, and it carries every field.
+# --------------------------------------------------------------------------------------
+#
+# It used to be two — hand-maintained in ``api/workflows.py`` and again in ``admin/service.py``,
+# field for field. Both were type-checked, so a REQUIRED new field broke both at once and the
+# duplication looked survivable. It was not: an OPTIONAL new field (anything with a default) breaks
+# neither, and one surface simply stops carrying it while the other still does. Nothing raises, and
+# the two disagree about what a rule IS.
+
+_WORKFLOW_READ_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "trigger",
+        "offset_minutes",
+        "event_type_id",
+        "active",
+        "steps",
+        "created_at",
+        "updated_at",
+    }
+)
+"""Pinned on purpose: a field added to :class:`WorkflowRead` must FAIL here, rather than be omitted
+from the projection and read as its default on every surface at once."""
+
+
+async def test_rule_to_read_carries_every_field_the_schema_declares(
+    sqlite_session: AsyncSession, tenant: Tenant, reminder: WorkflowCreate
+) -> None:
+    """The read model, asserted field by field against the ROW it claims to project."""
+    rule = await create_workflow(sqlite_session, tenant_id=tenant.id, data=reminder, now=_NOW)
+
+    assert set(WorkflowRead.model_fields) == _WORKFLOW_READ_FIELDS
+
+    read = rule_to_read(rule)
+    workflow = rule.workflow
+    assert read.id == workflow.id
+    assert read.name == workflow.name
+    assert read.trigger == workflow.trigger
+    assert read.offset_minutes == workflow.offset_minutes
+    assert read.event_type_id == workflow.event_type_id
+    assert read.active == workflow.active
+    assert read.created_at == workflow.created_at
+    assert read.updated_at == workflow.updated_at
+    assert [(step.id, step.channel, step.kind, step.position) for step in read.steps] == [
+        (step.id, step.channel, step.kind, step.position) for step in rule.steps
+    ]
+
+
+def test_no_read_surface_re_projects_a_rule_by_hand() -> None:
+    """==The lock on the duplication, not on its symptom.==
+
+    Deleting the two copies buys nothing if the next endpoint writes a third. So the fact is
+    asserted about the TREE: outside this service, ``WorkflowRead`` is a type — never a constructor.
+    """
+    home = Path(workflow_rules.__file__).resolve()
+    server_root = home.parent.parent
+    offenders = sorted(
+        str(path.relative_to(server_root))
+        for path in server_root.rglob("*.py")
+        if path.resolve() != home
+        and re.search(r"\bWorkflowRead\(", path.read_text(encoding="utf-8"))
+    )
+    assert offenders == []

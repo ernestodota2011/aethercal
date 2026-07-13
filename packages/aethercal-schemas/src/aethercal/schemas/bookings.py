@@ -54,8 +54,14 @@ def normalize_phone(value: str) -> str | None:
     return candidate if _E164.match(candidate) else None
 
 
-def _require_iana_zone(value: str) -> str:
-    """Reject a guest timezone that is not a real IANA zone (so email/ICS rendering never fails)."""
+def require_iana_zone(value: str) -> str:
+    """Reject a timezone that is not a real IANA zone (so email/ICS rendering never fails).
+
+    ==Public, and deliberately not "the guest's".== The HOST's timezone is the same string, rendered
+    into the same messages, and ``server/services/users.py`` holds it to this very function. A
+    second copy of "what a real zone is" is precisely how two write surfaces come to disagree about
+    it — which is what happened to the host CRUD before it had a service.
+    """
     try:
         ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -63,11 +69,17 @@ def _require_iana_zone(value: str) -> str:
     return value
 
 
-def _require_emailish(value: str) -> str:
-    """A light structural check (a single ``@`` with non-empty local/domain, no spaces).
+def require_emailish(value: str) -> str:
+    """A light structural check (a single ``@`` with non-empty local/domain, no spaces), trimmed.
 
     Deliberately not full RFC 5322 validation (no extra dependency): the transactional email either
-    reaches the guest or does not — a stricter gate belongs to the sending layer, not this contract.
+    reaches its recipient or does not — a stricter gate belongs to the sending layer, not this
+    contract.
+
+    Public for the same reason as :func:`require_iana_zone`: the host's address — the one every
+    confirmation is copied to — is now held to the rule the guest's has been held to all along. The
+    ``ValueError`` names the guest's field because that is this module's own contract; the host
+    service catches it and words its own refusal.
     """
     candidate = value.strip()
     local, _, domain = candidate.partition("@")
@@ -102,12 +114,12 @@ class BookingCreate(BaseModel):
     @field_validator("guest_timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
-        return _require_iana_zone(value)
+        return require_iana_zone(value)
 
     @field_validator("guest_email")
     @classmethod
     def _validate_email(cls, value: str) -> str:
-        return _require_emailish(value)
+        return require_emailish(value)
 
     @field_validator("guest_phone")
     @classmethod
@@ -165,4 +177,11 @@ class BookingRead(BaseModel):
     created_at: datetime
 
 
-__all__ = ["BookingCreate", "BookingRead", "BookingReschedule", "normalize_phone"]
+__all__ = [
+    "BookingCreate",
+    "BookingRead",
+    "BookingReschedule",
+    "normalize_phone",
+    "require_emailish",
+    "require_iana_zone",
+]
