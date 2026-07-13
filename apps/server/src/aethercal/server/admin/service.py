@@ -1,10 +1,23 @@
-"""The admin's in-process service layer (F1-11, RF-18).
+"""The admin's in-process service layer (F1-11, RF-18, B-01).
 
 This is the seam the Reflex state handlers call. It deliberately does NOT go through the HTTP API or
-the SDK — it opens a session from the same-process ``async_sessionmaker`` and calls the real
+the SDK — it opens a session on the same-process DB layer and calls the real
 ``aethercal.server.services`` functions directly, owning one transaction per action exactly like the
 CLI's ``run_*`` coroutines. That keeps the admin fast, avoids a second network hop and a second auth
 surface, and lets the whole layer be unit-tested offline against an aiosqlite sessionmaker.
+
+.. rubric:: It takes an ACCESSOR, not a session factory (B-01)
+
+Every function here used to take the raw ``async_sessionmaker``, open its own transaction, and only
+then resolve the business inside it. Under RLS that is the silent-failure shape: the transaction is
+open before the business is known, so it carries an empty ``aethercal.tenant_id``, the policies
+compare against ``NULL``, and the panel reads **zero rows** — no error, no log line, just an admin
+that tells the operator their business is empty. And the cure could not be "all 28 of these remember
+to bind the business", because the 29th is the one that ships.
+
+So they take :class:`AdminSessions` — an accessor that resolves the business, BINDS it, and hands
+back a session already belted (:meth:`~aethercal.server.admin.runtime.AdminRuntime.admin_session`).
+There is no factory left in these signatures to forget to bind.
 
 Two error families cross the boundary:
 
@@ -13,20 +26,23 @@ Two error families cross the boundary:
 * :class:`AdminActionError` — a requested action was refused by the underlying service (unknown
   booking, slot taken, duplicate slug/name, invalid input, ...). Its ``message`` is operator-facing.
 
-Every read/write is scoped to the resolved tenant, so administering tenant A can never see or mutate
-tenant B's rows — the service layer's ``tenant_id`` filters do the enforcing; this layer just
-resolves the single tenant to pass down.
+Every read/write is scoped to the resolved tenant, so administering tenant A never sees or mutates
+tenant B's rows: the service layer's ``tenant_id`` filters do the enforcing, and (B-01) the DATABASE
+now refuses another business's rows even where a filter is forgotten. This layer resolves the
+tenant, binds it, and passes it down.
 """
 
 from __future__ import annotations
 
 import uuid
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from typing import Protocol
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.bookings import BookingRead
@@ -58,7 +74,38 @@ from aethercal.server.services import schedules as schedules_service
 from aethercal.server.services import users as users_service
 from aethercal.server.services import workflow_rules as workflow_rules_service
 
-Sessionmaker = async_sessionmaker[AsyncSession]
+# --------------------------------------------------------------------------------------
+# The session accessor (B-01).
+# --------------------------------------------------------------------------------------
+
+
+class AdminSessions(Protocol):
+    """The way this layer reaches the database: a session that is ALREADY bound to a business.
+
+    A protocol rather than the concrete :class:`~aethercal.server.admin.runtime.AdminRuntime` for
+    two reasons, and the second is the load-bearing one:
+
+    * it keeps the dependency pointing one way (``runtime`` → ``service``), so the accessor can
+      import the resolver it needs without a cycle; and
+    * ==it names, in a type, the only thing this layer is allowed to be handed.== The parameter used
+      to be an ``async_sessionmaker``, and an ``async_sessionmaker`` will happily open a transaction
+      with no business bound — which under RLS reads nothing at all, silently. That object is not in
+      these signatures any more, so the mistake is not expressible here.
+
+    It takes the SLUG, not a resolved context, and that ordering is not an accident: the business is
+    resolved by a query, the query needs a session, and the session is what the accessor is opening.
+    An accessor that demanded a resolved context would be asking its caller to have already done the
+    thing it exists to do.
+    """
+
+    def admin_session(
+        self, tenant_slug: str | None
+    ) -> AbstractAsyncContextManager[tuple[AsyncSession, AdminContext]]:
+        """Open a transaction bound to the business ``tenant_slug`` names (``None`` → the only one).
+
+        Raises :class:`AdminSetupError` when it names none — never yields an unbound session.
+        """
+        ...  # pragma: no cover - a protocol declaration; the runtime implements it
 
 
 # --------------------------------------------------------------------------------------
@@ -279,7 +326,7 @@ def _booking_action_error(exc: bookings_service.BookingError) -> AdminActionErro
 
 
 async def list_bookings_view(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     status: BookingStatus | None = None,
@@ -287,8 +334,7 @@ async def list_bookings_view(
     date_to: date | None = None,
 ) -> list[BookingRead]:
     """List the tenant's bookings (optionally filtered), as read models for the agenda view."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rows = await bookings_service.list_bookings(
             session,
             tenant_id=ctx.tenant_id,
@@ -300,15 +346,14 @@ async def list_bookings_view(
 
 
 async def cancel_booking_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
     now: datetime | None = None,
 ) -> BookingRead:
     """Cancel a booking (idempotent), returning the updated read model."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             booking = await bookings_service.cancel_booking(
                 session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
@@ -320,7 +365,7 @@ async def cancel_booking_action(
 
 
 async def reschedule_booking_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
@@ -328,8 +373,7 @@ async def reschedule_booking_action(
     now: datetime | None = None,
 ) -> BookingRead:
     """Reschedule a booking to ``new_start``, returning the new confirmed booking's read model."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             booking = await bookings_service.reschedule_booking(
                 session,
@@ -345,7 +389,7 @@ async def reschedule_booking_action(
 
 
 async def mark_no_show_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
@@ -362,8 +406,7 @@ async def mark_no_show_action(
     service's own words (see :data:`_BOOKING_ERROR_MESSAGES`): a no-show allowed before the end
     would be a cancellation by another name that does not give the time back.
     """
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             booking = await bookings_service.mark_no_show(
                 session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
@@ -375,7 +418,7 @@ async def mark_no_show_action(
 
 
 async def create_booking_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     form: BookingForm,
@@ -388,8 +431,7 @@ async def create_booking_action(
     (an off-hours or taken slot maps to a safe :class:`AdminActionError`), and ``end`` is derived
     from the event type's duration inside the service.
     """
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             booking = await bookings_service.create_booking(
                 session,
@@ -422,21 +464,19 @@ def _validation_message(exc: ValidationError) -> str:
 
 
 async def list_event_types_view(
-    maker: Sessionmaker, *, tenant_slug: str | None
+    admin: AdminSessions, *, tenant_slug: str | None
 ) -> list[EventTypeRead]:
     """List all of the tenant's event types (active and inactive)."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rows = await event_types_service.list_event_types(session, tenant_id=ctx.tenant_id)
         return [EventTypeRead.model_validate(row) for row in rows]
 
 
 async def create_event_type_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, form: EventTypeForm
+    admin: AdminSessions, *, tenant_slug: str | None, form: EventTypeForm
 ) -> EventTypeRead:
     """Create an event type from ``form``, injecting the host user from the resolved context."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             data = EventTypeCreate(
                 host_id=form.host_id,
@@ -467,15 +507,14 @@ async def create_event_type_action(
 
 
 async def update_event_type_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     event_type_id: uuid.UUID,
     data: EventTypeUpdate,
 ) -> EventTypeRead:
     """Apply a partial update to an event type; raise if it does not exist for the tenant."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await event_types_service.update_event_type(
                 session, tenant_id=ctx.tenant_id, event_type_id=event_type_id, data=data
@@ -489,11 +528,10 @@ async def update_event_type_action(
 
 
 async def deactivate_event_type_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, event_type_id: uuid.UUID
+    admin: AdminSessions, *, tenant_slug: str | None, event_type_id: uuid.UUID
 ) -> bool:
     """Soft-delete an event type (set ``active = False``); return whether it existed."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         return await event_types_service.deactivate_event_type(
             session, tenant_id=ctx.tenant_id, event_type_id=event_type_id
         )
@@ -505,21 +543,19 @@ async def deactivate_event_type_action(
 
 
 async def list_schedules_view(
-    maker: Sessionmaker, *, tenant_slug: str | None
+    admin: AdminSessions, *, tenant_slug: str | None
 ) -> list[ScheduleRead]:
     """List the tenant's weekly schedules, as read models."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rows = await schedules_service.list_schedules(session, tenant_id=ctx.tenant_id)
         return [schedules_service.schedule_to_read(row) for row in rows]
 
 
 async def create_schedule_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, data: ScheduleCreate
+    admin: AdminSessions, *, tenant_slug: str | None, data: ScheduleCreate
 ) -> ScheduleRead:
     """Create a weekly schedule; map name/validation failures to :class:`AdminActionError`."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await schedules_service.create_schedule(
                 session, tenant_id=ctx.tenant_id, data=data
@@ -530,15 +566,14 @@ async def create_schedule_action(
 
 
 async def update_schedule_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     schedule_id: uuid.UUID,
     data: ScheduleUpdate,
 ) -> ScheduleRead:
     """Patch a weekly schedule; raise if it does not exist or the new shape is invalid."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await schedules_service.update_schedule(
                 session, tenant_id=ctx.tenant_id, schedule_id=schedule_id, data=data
@@ -549,11 +584,10 @@ async def update_schedule_action(
 
 
 async def delete_schedule_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, schedule_id: uuid.UUID
+    admin: AdminSessions, *, tenant_slug: str | None, schedule_id: uuid.UUID
 ) -> None:
     """Delete a weekly schedule (its date overrides cascade); raise if it does not exist."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             await schedules_service.delete_schedule(
                 session, tenant_id=ctx.tenant_id, schedule_id=schedule_id
@@ -648,7 +682,7 @@ def _age_seconds(moment: datetime | None, *, now: datetime) -> float:
 
 
 async def metrics_view(
-    maker: Sessionmaker, *, tenant_slug: str | None, now: datetime | None = None
+    admin: AdminSessions, *, tenant_slug: str | None, now: datetime | None = None
 ) -> AdminMetrics:
     """Read this business's operational state: the outbox backlog and the no-show rate (RF-25/R9).
 
@@ -657,9 +691,7 @@ async def metrics_view(
     guest ever hears from the system again — in silence.
     """
     moment = _now(now)
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
-
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         by_status = {status.value: 0 for status in OutboxStatus}
         for status, count in await session.execute(
             select(Outbox.status, func.count())
@@ -759,20 +791,18 @@ def _host_form_data(form: HostForm) -> users_service.UserData:
     return users_service.UserData(name=form.name, email=form.email, timezone=form.timezone)
 
 
-async def list_hosts_view(maker: Sessionmaker, *, tenant_slug: str | None) -> list[HostRead]:
+async def list_hosts_view(admin: AdminSessions, *, tenant_slug: str | None) -> list[HostRead]:
     """The tenant's hosts, oldest first — the choices the host selector offers."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rows = await users_service.list_users(session, tenant_id=ctx.tenant_id)
         return [_host_read(row) for row in rows]
 
 
 async def create_host_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, form: HostForm
+    admin: AdminSessions, *, tenant_slug: str | None, form: HostForm
 ) -> HostRead:
     """Add a host to the business (name, a real address, a real timezone — the service decides)."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await users_service.create_user(
                 session, tenant_id=ctx.tenant_id, data=_host_form_data(form)
@@ -783,11 +813,10 @@ async def create_host_action(
 
 
 async def update_host_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
+    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
 ) -> HostRead:
     """Edit a host's name / email / timezone (all three are sent; the create rules apply again)."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await users_service.update_user(
                 session, tenant_id=ctx.tenant_id, user_id=host_id, data=_host_form_data(form)
@@ -798,7 +827,7 @@ async def update_host_action(
 
 
 async def delete_host_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID
 ) -> None:
     """Remove a host — refused, by the service, while an event type or a schedule still holds them.
 
@@ -807,8 +836,7 @@ async def delete_host_action(
     them); let it ORPHAN and the page keeps offering slots for a host who no longer exists. The
     refusal names what is holding them, and the operator decides.
     """
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             await users_service.delete_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
         except users_service.UserServiceError as exc:
@@ -816,7 +844,7 @@ async def delete_host_action(
 
 
 async def list_connections_view(
-    maker: Sessionmaker, *, tenant_slug: str | None, host_id: uuid.UUID
+    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID
 ) -> list[ConnectionRead]:
     """A host's connected calendar accounts, and the calendar each writes bookings into.
 
@@ -825,8 +853,7 @@ async def list_connections_view(
     ignored — and an ignored calendar is an ignored busy set, which is a double-booking waiting to
     happen. The operator cannot designate a calendar on a connection the panel never shows them.
     """
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             host = await users_service.get_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
         except users_service.UserServiceError as exc:
@@ -857,7 +884,7 @@ async def list_connections_view(
 
 
 async def designate_calendar_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     connection_id: uuid.UUID,
@@ -875,8 +902,7 @@ async def designate_calendar_action(
     choice on the host's row, and invalidates the busy cache only when the calendars actually read
     have changed.
     """
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         # Tenant-scoped BEFORE it is handed to the service: the id came off a form, and the service
         # takes the connection row itself, so an unscoped load here would let one business re-point
         # another's calendar and write its meetings into theirs.
@@ -919,25 +945,23 @@ async def designate_calendar_action(
 
 
 async def list_workflows_view(
-    maker: Sessionmaker, *, tenant_slug: str | None
+    admin: AdminSessions, *, tenant_slug: str | None
 ) -> list[WorkflowRead]:
     """Every rule of the tenant (active and inactive), each with its steps."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rules = await workflow_rules_service.list_workflows(session, tenant_id=ctx.tenant_id)
         return [workflow_rules_service.rule_to_read(rule) for rule in rules]
 
 
 async def create_workflow_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     data: WorkflowCreate,
     now: datetime | None = None,
 ) -> WorkflowRead:
     """Author a rule and ARM it against the bookings that already exist."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             rule = await workflow_rules_service.create_workflow(
                 session, tenant_id=ctx.tenant_id, data=data, now=_now(now)
@@ -948,7 +972,7 @@ async def create_workflow_action(
 
 
 async def update_workflow_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     workflow_id: uuid.UUID,
@@ -956,8 +980,7 @@ async def update_workflow_action(
     now: datetime | None = None,
 ) -> WorkflowRead:
     """Edit a rule and MAKE THE EDIT TRUE for every booking it already governs."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             rule = await workflow_rules_service.update_workflow(
                 session,
@@ -976,7 +999,7 @@ async def update_workflow_action(
 
 
 async def set_workflow_active_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     workflow_id: uuid.UUID,
@@ -984,8 +1007,7 @@ async def set_workflow_active_action(
     now: datetime | None = None,
 ) -> WorkflowRead:
     """Switch a rule on or off. Off PAUSES its queued messages; on re-arms and re-times them."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             rule = await workflow_rules_service.set_workflow_active(
                 session,
@@ -1002,21 +1024,19 @@ async def set_workflow_active_action(
 
 
 async def list_templates_view(
-    maker: Sessionmaker, *, tenant_slug: str | None
+    admin: AdminSessions, *, tenant_slug: str | None
 ) -> list[WorkflowTemplateRead]:
     """Every message body the tenant has authored."""
-    async with maker() as session:
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         rows = await workflow_rules_service.list_templates(session, tenant_id=ctx.tenant_id)
         return [WorkflowTemplateRead.model_validate(row) for row in rows]
 
 
 async def create_template_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, data: WorkflowTemplateCreate
+    admin: AdminSessions, *, tenant_slug: str | None, data: WorkflowTemplateCreate
 ) -> WorkflowTemplateRead:
     """Store the body for one ``(channel, kind, locale)``."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await workflow_rules_service.create_template(
                 session, tenant_id=ctx.tenant_id, data=data
@@ -1027,15 +1047,14 @@ async def create_template_action(
 
 
 async def update_template_action(
-    maker: Sessionmaker,
+    admin: AdminSessions,
     *,
     tenant_slug: str | None,
     template_id: uuid.UUID,
     data: WorkflowTemplateUpdate,
 ) -> WorkflowTemplateRead:
     """Edit a template's TEXT (its ``(channel, kind, locale)`` identity is immutable by design)."""
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             row = await workflow_rules_service.update_template(
                 session, tenant_id=ctx.tenant_id, template_id=template_id, data=data
@@ -1048,7 +1067,7 @@ async def update_template_action(
 
 
 async def delete_template_action(
-    maker: Sessionmaker, *, tenant_slug: str | None, template_id: uuid.UUID
+    admin: AdminSessions, *, tenant_slug: str | None, template_id: uuid.UUID
 ) -> None:
     """Delete a template; refused while it is the last body a live step can render.
 
@@ -1056,8 +1075,7 @@ async def delete_template_action(
     and a handler that reports that as "deleted" tells the operator it removed something that was
     never there (the same no-op ``deactivate_event_type`` already guards against).
     """
-    async with maker() as session, session.begin():
-        ctx = await resolve_admin_context(session, tenant_slug=tenant_slug)
+    async with admin.admin_session(tenant_slug) as (session, ctx):
         try:
             deleted = await workflow_rules_service.delete_template(
                 session, tenant_id=ctx.tenant_id, template_id=template_id
@@ -1073,6 +1091,7 @@ __all__ = [
     "AdminContext",
     "AdminError",
     "AdminMetrics",
+    "AdminSessions",
     "AdminSetupError",
     "BookingForm",
     "ConnectionRead",

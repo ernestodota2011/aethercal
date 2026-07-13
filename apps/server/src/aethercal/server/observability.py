@@ -23,10 +23,12 @@ true no matter which process answers the scrape.
 * **DB-derived gauges** (the backlog, the due backlog, the oldest-due age, the expired leases, the
   booking counts) are read from the table on every scrape. Correct from ANY process.
 * **Drain counters** (``lost``, ``voided_midflight``, delivered/failed/dead/…) are PROCESS-local:
-  the drain accumulates them as it runs, and the container starts the scheduler in exactly one
-  process. Scrape a different one and they read zero — which looks exactly like "nothing was ever
-  lost". Rather than pretend otherwise, the exposition publishes ``aethercal_scheduler_enabled`` so
-  an operator can tell a healthy zero from a meaningless one.
+  the drain accumulates them as it runs. They used to be published by the WEB process, where they
+  could only ever read zero — a zero indistinguishable from "nothing was ever lost", which is why
+  the exposition once carried an ``aethercal_scheduler_enabled`` gauge to warn you that you were
+  reading the wrong process. ``GET /metrics`` now lives in the ``aethercal-worker`` process, which
+  IS the drain, so the counters are finally true where they are published and that warning gauge is
+  gone with the problem it described.
 
   ``lost`` is the one to alert on: it means a provider call outran its lease, the row was recovered
   under the worker, and the effect may have been executed **twice** — a duplicate message to a real
@@ -56,6 +58,7 @@ from aethercal.core.model import BookingStatus
 from aethercal.server.db.models import Booking, Outbox, OutboxStatus, WebhookDelivery
 from aethercal.server.db.models.booking import held_filter
 from aethercal.server.db.models.outbox import due_filter
+from aethercal.server.db.pools import require_bypass
 from aethercal.server.webhooks.delivery import DELIVERY_FAILURE_REASONS
 
 if TYPE_CHECKING:  # pragma: no cover - the drain imports THIS module, so the type is deferred
@@ -181,7 +184,29 @@ class MetricsSnapshot:
 
 
 async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSnapshot:
-    """Read the instance's operational state. Read-only, instance-wide, no tenant dimension."""
+    """Read the instance's operational state. Read-only, instance-wide, no tenant dimension.
+
+    ==It REFUSES a session that is not on the bypass pool. It fails; it does not degrade.==
+
+    Count the ``WHERE tenant_id`` clauses in the queries below: there are none, and there are not
+    supposed to be — this is the OPERATOR's view of every business at once. But that also means
+    every one of them is a cross-business query, and under row-level security a cross-business query
+    on the app role does not raise. It returns nothing. And this function is written to FILL WITH
+    ZEROS wherever it finds nothing (``dict.fromkeys(..., 0)``, ``or 0``, ``if expected else 0.0``),
+    because for a dashboard an absent series is worse than a zero one.
+
+    Put those two facts together and the result is the worst outcome available: ``outbox.due = 0``,
+    ``oldest_due_age_seconds = 0.0``, ``status: "ready"`` — **for ever, with the outbox on fire.**
+    The one component whose entire job is to make a dead drain visible would have become the deadest
+    thing in the system, and it would have been the isolation batch that killed it.
+
+    So the belt goes at the ROOT rather than on each caller: a session with no bypass marker is a
+    hard error here. That is what stops the next ``/health/ready`` — an unauthenticated,
+    cross-business, zero-filling endpoint that nobody thought of as a metrics consumer — from ever
+    being born.
+    """
+    require_bypass(session, caller="collect_metrics")
+
     by_status = {status.value: 0 for status in OutboxStatus}
     for status, count in await session.execute(
         sa.select(Outbox.status, sa.func.count()).group_by(Outbox.status)
@@ -319,10 +344,17 @@ def _series(
     lines.extend(f"{name}{labels} {_num(value)}" for labels, value in samples)
 
 
-def render_prometheus(
-    snapshot: MetricsSnapshot, *, counters: DrainCounters, scheduler_enabled: bool
-) -> str:
-    """Render the exposition. ==Instance-wide only: no tenant, no guest, no event title.=="""
+def render_prometheus(snapshot: MetricsSnapshot, *, counters: DrainCounters) -> str:
+    """Render the exposition. ==Instance-wide only: no tenant, no guest, no event title.==
+
+    ``scheduler_enabled`` is gone, and with it the question it answered. It existed because
+    ``/metrics`` was served by the WEB process, where the drain counters below are process-local and
+    therefore read zero — a zero that looked exactly like "nothing was ever lost". The endpoint now
+    lives in the ``aethercal-worker`` process, which IS the drain: the counters are true where they
+    are published, and there is no longer any such thing as a scrape of a process that does not
+    drain. A gauge whose only purpose was to warn you that you were reading the wrong process is a
+    gauge that should disappear when the wrong process does.
+    """
     lines: list[str] = []
 
     _series(
@@ -395,15 +427,6 @@ def render_prometheus(
         "Drain passes run by THIS process.",
         "counter",
         [("", counters.passes)],
-    )
-    _series(
-        lines,
-        "aethercal_scheduler_enabled",
-        "1 if this process runs the drain. The drain counters above are process-local, so on a "
-        "process reporting 0 they are meaningless rather than reassuring; the backlog gauges are "
-        "read from the database and are correct anywhere.",
-        "gauge",
-        [("", int(scheduler_enabled))],
     )
     _series(
         lines,

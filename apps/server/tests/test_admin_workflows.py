@@ -43,11 +43,29 @@ from aethercal.server.admin.service import (
     update_template_action,
     update_workflow_action,
 )
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import Outbox, Tenant, User, Workflow, WorkflowTemplate
 from aethercal.server.services.bookings import BookingParams, create_booking
 
 Sessionmaker = async_sessionmaker[AsyncSession]
+
+
+def _admin(maker: Sessionmaker) -> AdminRuntime:
+    """The session accessor the admin service layer takes, over the offline sessionmaker (B-01).
+
+    The service functions no longer accept a raw ``async_sessionmaker``. Under RLS a session opened
+    without a business bound reads ZERO rows — silently — so the factory is private to the runtime
+    and the only way in is ``admin_session``, which resolves the business and BINDS it before it
+    yields. The suite goes through the same door the panel does: a harness that kept the old
+    shortcut would be exercising a seam nobody ships.
+    """
+    return AdminRuntime(
+        sessionmaker=maker,
+        config=AdminConfig(username="admin", password_hash="x", tenant_slug=None),
+    )
+
 
 _WEEKLY_9_TO_5 = {day: [TimeRangeSchema(start="09:00", end="17:00")] for day in range(5)}
 _NOW = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)  # Monday 00:00 UTC
@@ -89,12 +107,12 @@ async def _seed(maker: Sessionmaker, *, slug: str = "acme") -> tuple[uuid.UUID, 
         tenant_id, host_id = tenant.id, host.id
 
     schedule = await create_schedule_action(
-        maker,
+        _admin(maker),
         tenant_slug=slug,
         data=ScheduleCreate(name="Weekly", timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
     event_type = await create_event_type_action(
-        maker,
+        _admin(maker),
         tenant_slug=slug,
         form=EventTypeForm(
             host_id=host_id,  # RF-30: the host is an explicit choice, never the tenant's first user
@@ -190,7 +208,9 @@ async def test_a_rule_authored_in_the_admin_arms_the_bookings_that_already_exist
     tenant_id, event_type_id = await _seed(sessionmaker)
     booking_id = await _book(sessionmaker, tenant_id=tenant_id, event_type_id=event_type_id)
 
-    await create_workflow_action(sessionmaker, tenant_slug="acme", data=_reminder_email(), now=_NOW)
+    await create_workflow_action(
+        _admin(sessionmaker), tenant_slug="acme", data=_reminder_email(), now=_NOW
+    )
 
     rows = await _notify_rows(sessionmaker, booking_id)
     assert len(rows) == 1
@@ -212,13 +232,13 @@ async def test_editing_the_offset_in_the_admin_moves_the_reminder_already_queued
     tenant_id, event_type_id = await _seed(sessionmaker)
     booking_id = await _book(sessionmaker, tenant_id=tenant_id, event_type_id=event_type_id)
     rule = await create_workflow_action(
-        sessionmaker, tenant_slug="acme", data=_reminder_email(), now=_NOW
+        _admin(sessionmaker), tenant_slug="acme", data=_reminder_email(), now=_NOW
     )
     before = await _notify_rows(sessionmaker, booking_id)
     assert _as_utc(before[0].next_retry_at) == _SEND_AT_24H_BEFORE
 
     await update_workflow_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         workflow_id=rule.id,
         data=WorkflowUpdate(offset_minutes=-60),
@@ -237,11 +257,11 @@ async def test_switching_a_rule_off_from_the_admin_is_visible_in_the_database(
     """The toggle writes the ROW, not just the screen."""
     await _seed(sessionmaker)
     rule = await create_workflow_action(
-        sessionmaker, tenant_slug="acme", data=_reminder_email(), now=_NOW
+        _admin(sessionmaker), tenant_slug="acme", data=_reminder_email(), now=_NOW
     )
 
     await set_workflow_active_action(
-        sessionmaker, tenant_slug="acme", workflow_id=rule.id, active=False, now=_NOW
+        _admin(sessionmaker), tenant_slug="acme", workflow_id=rule.id, active=False, now=_NOW
     )
 
     async with sessionmaker() as session:
@@ -265,20 +285,22 @@ async def test_a_step_with_no_template_is_refused_and_no_rule_is_written(
 
     with pytest.raises(AdminActionError) as refusal:
         await create_workflow_action(
-            sessionmaker, tenant_slug="acme", data=_whatsapp_rule(), now=_NOW
+            _admin(sessionmaker), tenant_slug="acme", data=_whatsapp_rule(), now=_NOW
         )
     assert "template" in refusal.value.message
 
-    assert await list_workflows_view(sessionmaker, tenant_slug="acme") == []
+    assert await list_workflows_view(_admin(sessionmaker), tenant_slug="acme") == []
 
 
 async def test_a_duplicate_rule_name_is_refused(sessionmaker: Sessionmaker) -> None:
     await _seed(sessionmaker)
-    await create_workflow_action(sessionmaker, tenant_slug="acme", data=_reminder_email(), now=_NOW)
+    await create_workflow_action(
+        _admin(sessionmaker), tenant_slug="acme", data=_reminder_email(), now=_NOW
+    )
 
     with pytest.raises(AdminActionError):
         await create_workflow_action(
-            sessionmaker, tenant_slug="acme", data=_reminder_email(), now=_NOW
+            _admin(sessionmaker), tenant_slug="acme", data=_reminder_email(), now=_NOW
         )
 
 
@@ -291,7 +313,7 @@ async def test_editing_an_unknown_rule_is_an_error_not_a_silent_success(
 
     with pytest.raises(AdminActionError):
         await update_workflow_action(
-            sessionmaker,
+            _admin(sessionmaker),
             tenant_slug="acme",
             workflow_id=uuid.uuid4(),
             data=WorkflowUpdate(active=False),
@@ -308,13 +330,13 @@ async def test_a_template_round_trips_through_the_admin(sessionmaker: Sessionmak
     await _seed(sessionmaker)
 
     created = await create_template_action(
-        sessionmaker, tenant_slug="acme", data=_whatsapp_template()
+        _admin(sessionmaker), tenant_slug="acme", data=_whatsapp_template()
     )
-    listed = await list_templates_view(sessionmaker, tenant_slug="acme")
+    listed = await list_templates_view(_admin(sessionmaker), tenant_slug="acme")
     assert [row.id for row in listed] == [created.id]
 
     await update_template_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         template_id=created.id,
         data=WorkflowTemplateUpdate(body="Hola {{guest_name}}."),
@@ -340,12 +362,16 @@ async def test_deleting_the_last_body_a_live_step_renders_is_refused(
     refuses, and the template is STILL THERE afterwards (the effective state)."""
     await _seed(sessionmaker)
     template = await create_template_action(
-        sessionmaker, tenant_slug="acme", data=_whatsapp_template()
+        _admin(sessionmaker), tenant_slug="acme", data=_whatsapp_template()
     )
-    await create_workflow_action(sessionmaker, tenant_slug="acme", data=_whatsapp_rule(), now=_NOW)
+    await create_workflow_action(
+        _admin(sessionmaker), tenant_slug="acme", data=_whatsapp_rule(), now=_NOW
+    )
 
     with pytest.raises(AdminActionError):
-        await delete_template_action(sessionmaker, tenant_slug="acme", template_id=template.id)
+        await delete_template_action(
+            _admin(sessionmaker), tenant_slug="acme", template_id=template.id
+        )
 
     async with sessionmaker() as session:
         assert await session.get(WorkflowTemplate, template.id) is not None
@@ -359,7 +385,9 @@ async def test_deleting_an_unknown_template_is_an_error_not_a_silent_success(
     await _seed(sessionmaker)
 
     with pytest.raises(AdminActionError):
-        await delete_template_action(sessionmaker, tenant_slug="acme", template_id=uuid.uuid4())
+        await delete_template_action(
+            _admin(sessionmaker), tenant_slug="acme", template_id=uuid.uuid4()
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -370,7 +398,9 @@ async def test_deleting_an_unknown_template_is_an_error_not_a_silent_success(
 async def test_a_tenant_never_sees_another_tenants_rules(sessionmaker: Sessionmaker) -> None:
     await _seed(sessionmaker, slug="alpha")
     await _seed(sessionmaker, slug="beta")
-    await create_workflow_action(sessionmaker, tenant_slug="beta", data=_reminder_email(), now=_NOW)
+    await create_workflow_action(
+        _admin(sessionmaker), tenant_slug="beta", data=_reminder_email(), now=_NOW
+    )
 
-    assert await list_workflows_view(sessionmaker, tenant_slug="alpha") == []
-    assert len(await list_workflows_view(sessionmaker, tenant_slug="beta")) == 1
+    assert await list_workflows_view(_admin(sessionmaker), tenant_slug="alpha") == []
+    assert len(await list_workflows_view(_admin(sessionmaker), tenant_slug="beta")) == 1

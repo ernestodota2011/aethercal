@@ -37,11 +37,29 @@ from aethercal.server.admin.service import (
     list_hosts_view,
     update_host_action,
 )
+from aethercal.server.admin.config import AdminConfig
+from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db import Base
 from aethercal.server.db.models import EventType, ExternalCalendarLink, ExternalConnection, Tenant
 from aethercal.server.services.calendars import resolve_calendar_target
 
 Sessionmaker = async_sessionmaker[AsyncSession]
+
+
+def _admin(maker: Sessionmaker) -> AdminRuntime:
+    """The session accessor the admin service layer takes, over the offline sessionmaker (B-01).
+
+    The service functions no longer accept a raw ``async_sessionmaker``. Under RLS a session opened
+    without a business bound reads ZERO rows — silently — so the factory is private to the runtime
+    and the only way in is ``admin_session``, which resolves the business and BINDS it before it
+    yields. The suite goes through the same door the panel does: a harness that kept the old
+    shortcut would be exercising a seam nobody ships.
+    """
+    return AdminRuntime(
+        sessionmaker=maker,
+        config=AdminConfig(username="admin", password_hash="x", tenant_slug=None),
+    )
+
 
 _WEEKLY_9_TO_5 = {day: [TimeRangeSchema(start="09:00", end="17:00")] for day in range(5)}
 _MAX_ADVANCE = 60 * 60 * 24 * 30
@@ -94,7 +112,7 @@ async def _connection(
 
 async def _weekly(maker: Sessionmaker, *, slug: str = "acme", name: str = "Weekly") -> uuid.UUID:
     created = await create_schedule_action(
-        maker,
+        _admin(maker),
         tenant_slug=slug,
         data=ScheduleCreate(name=name, timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
@@ -118,16 +136,16 @@ async def test_an_event_type_lands_on_the_host_the_operator_chose(
     """
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     bruno = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Bruno", "bruno@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Bruno", "bruno@example.com")
     )
     assert ana.id != bruno.id
     schedule_id = await _weekly(sessionmaker)
 
     created = await create_event_type_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         form=EventTypeForm(
             host_id=bruno.id,  # the SECOND host — the one the old code could never reach
@@ -153,16 +171,16 @@ async def test_an_event_type_cannot_be_assigned_to_another_tenants_host(
     await _tenant(sessionmaker, slug="alpha")
     await _tenant(sessionmaker, slug="beta")
     await create_host_action(
-        sessionmaker, tenant_slug="alpha", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="alpha", form=_host("Ana", "ana@example.com")
     )
     intruder = await create_host_action(
-        sessionmaker, tenant_slug="beta", form=_host("Beto", "beto@example.com")
+        _admin(sessionmaker), tenant_slug="beta", form=_host("Beto", "beto@example.com")
     )
     schedule_id = await _weekly(sessionmaker, slug="alpha")
 
     with pytest.raises(AdminActionError):
         await create_event_type_action(
-            sessionmaker,
+            _admin(sessionmaker),
             tenant_slug="alpha",
             form=EventTypeForm(
                 host_id=intruder.id,  # beta's host, submitted into alpha's form
@@ -174,7 +192,7 @@ async def test_an_event_type_cannot_be_assigned_to_another_tenants_host(
             ),
         )
 
-    assert await list_hosts_view(sessionmaker, tenant_slug="alpha") != []
+    assert await list_hosts_view(_admin(sessionmaker), tenant_slug="alpha") != []
 
 
 async def test_a_host_may_not_be_given_another_hosts_private_schedule(
@@ -185,13 +203,13 @@ async def test_a_host_may_not_be_given_another_hosts_private_schedule(
     hours."""
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     bruno = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Bruno", "bruno@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Bruno", "bruno@example.com")
     )
     brunos_own = await create_schedule_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         data=ScheduleCreate(
             name="Bruno's hours", timezone="UTC", rules=_WEEKLY_9_TO_5, user_id=bruno.id
@@ -200,7 +218,7 @@ async def test_a_host_may_not_be_given_another_hosts_private_schedule(
 
     with pytest.raises(AdminActionError):
         await create_event_type_action(
-            sessionmaker,
+            _admin(sessionmaker),
             tenant_slug="acme",
             form=EventTypeForm(
                 host_id=ana.id,
@@ -217,17 +235,17 @@ async def test_a_shared_schedule_is_usable_by_every_host(sessionmaker: Sessionma
     """``user_id IS NULL`` is the business's own pattern — the zero-config path stays open."""
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     shared = await create_schedule_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         data=ScheduleCreate(name="Business hours", timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
     assert shared.user_id is None
 
     created = await create_event_type_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         form=EventTypeForm(
             host_id=ana.id,
@@ -249,28 +267,30 @@ async def test_a_shared_schedule_is_usable_by_every_host(sessionmaker: Sessionma
 async def test_hosts_round_trip_through_the_admin(sessionmaker: Sessionmaker) -> None:
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
 
     await update_host_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         host_id=ana.id,
         form=HostForm(name="Ana Ruiz", email="ana@example.com", timezone="Europe/Madrid"),
     )
 
-    hosts = await list_hosts_view(sessionmaker, tenant_slug="acme")
+    hosts = await list_hosts_view(_admin(sessionmaker), tenant_slug="acme")
     assert [(row.name, row.timezone) for row in hosts] == [("Ana Ruiz", "Europe/Madrid")]
 
 
 async def test_a_duplicate_host_email_is_refused(sessionmaker: Sessionmaker) -> None:
     """``(tenant_id, email)`` is unique — two hosts on one address is one host with a typo."""
     await _tenant(sessionmaker)
-    await create_host_action(sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com"))
+    await create_host_action(
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
+    )
 
     with pytest.raises(AdminActionError):
         await create_host_action(
-            sessionmaker, tenant_slug="acme", form=_host("Ana again", "ana@example.com")
+            _admin(sessionmaker), tenant_slug="acme", form=_host("Ana again", "ana@example.com")
         )
 
 
@@ -285,11 +305,11 @@ async def test_deleting_a_host_who_still_hosts_an_event_type_is_refused(
     """
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     schedule_id = await _weekly(sessionmaker)
     await create_event_type_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         form=EventTypeForm(
             host_id=ana.id,
@@ -302,21 +322,23 @@ async def test_deleting_a_host_who_still_hosts_an_event_type_is_refused(
     )
 
     with pytest.raises(AdminActionError) as refusal:
-        await delete_host_action(sessionmaker, tenant_slug="acme", host_id=ana.id)
+        await delete_host_action(_admin(sessionmaker), tenant_slug="acme", host_id=ana.id)
     assert "event type" in refusal.value.message
 
-    assert [row.id for row in await list_hosts_view(sessionmaker, tenant_slug="acme")] == [ana.id]
+    assert [row.id for row in await list_hosts_view(_admin(sessionmaker), tenant_slug="acme")] == [
+        ana.id
+    ]
 
 
 async def test_a_free_host_can_be_deleted(sessionmaker: Sessionmaker) -> None:
     await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
 
-    await delete_host_action(sessionmaker, tenant_slug="acme", host_id=ana.id)
+    await delete_host_action(_admin(sessionmaker), tenant_slug="acme", host_id=ana.id)
 
-    assert await list_hosts_view(sessionmaker, tenant_slug="acme") == []
+    assert await list_hosts_view(_admin(sessionmaker), tenant_slug="acme") == []
 
 
 async def test_deleting_an_unknown_host_is_an_error_not_a_silent_success(
@@ -324,27 +346,29 @@ async def test_deleting_an_unknown_host_is_an_error_not_a_silent_success(
 ) -> None:
     await _tenant(sessionmaker)
     with pytest.raises(AdminActionError):
-        await delete_host_action(sessionmaker, tenant_slug="acme", host_id=uuid.uuid4())
+        await delete_host_action(_admin(sessionmaker), tenant_slug="acme", host_id=uuid.uuid4())
 
 
 async def test_a_tenant_never_sees_another_tenants_hosts(sessionmaker: Sessionmaker) -> None:
     await _tenant(sessionmaker, slug="alpha")
     await _tenant(sessionmaker, slug="beta")
-    await create_host_action(sessionmaker, tenant_slug="beta", form=_host("Beto", "b@example.com"))
+    await create_host_action(
+        _admin(sessionmaker), tenant_slug="beta", form=_host("Beto", "b@example.com")
+    )
 
-    assert await list_hosts_view(sessionmaker, tenant_slug="alpha") == []
+    assert await list_hosts_view(_admin(sessionmaker), tenant_slug="alpha") == []
 
 
 async def test_a_host_of_another_tenant_cannot_be_edited(sessionmaker: Sessionmaker) -> None:
     await _tenant(sessionmaker, slug="alpha")
     await _tenant(sessionmaker, slug="beta")
     beto = await create_host_action(
-        sessionmaker, tenant_slug="beta", form=_host("Beto", "b@example.com")
+        _admin(sessionmaker), tenant_slug="beta", form=_host("Beto", "b@example.com")
     )
 
     with pytest.raises(AdminActionError):
         await update_host_action(
-            sessionmaker,
+            _admin(sessionmaker),
             tenant_slug="alpha",
             host_id=beto.id,
             form=HostForm(name="Hijacked", email="b@example.com", timezone="UTC"),
@@ -367,14 +391,14 @@ async def test_designating_a_calendar_makes_it_the_bookings_write_target(
     """
     tenant_id = await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     connection_id = await _connection(
         sessionmaker, tenant_id=tenant_id, user_id=ana.id, email="ana@gmail.com"
     )
 
     await designate_calendar_action(
-        sessionmaker,
+        _admin(sessionmaker),
         tenant_slug="acme",
         connection_id=connection_id,
         calendar_id="bookings@group.calendar.google.com",
@@ -395,7 +419,7 @@ async def test_a_connection_of_another_tenant_cannot_be_re_pointed(
     beta_id = await _tenant(sessionmaker, slug="beta")
     await _tenant(sessionmaker, slug="alpha")
     beto = await create_host_action(
-        sessionmaker, tenant_slug="beta", form=_host("Beto", "b@example.com")
+        _admin(sessionmaker), tenant_slug="beta", form=_host("Beto", "b@example.com")
     )
     beta_connection = await _connection(
         sessionmaker, tenant_id=beta_id, user_id=beto.id, email="beto@gmail.com"
@@ -403,7 +427,7 @@ async def test_a_connection_of_another_tenant_cannot_be_re_pointed(
 
     with pytest.raises(AdminActionError):
         await designate_calendar_action(
-            sessionmaker,
+            _admin(sessionmaker),
             tenant_slug="alpha",
             connection_id=beta_connection,
             calendar_id="hijack@group.calendar.google.com",
@@ -421,7 +445,7 @@ async def test_the_connections_of_a_host_are_listed_for_the_operator(
     layer down."""
     tenant_id = await _tenant(sessionmaker)
     ana = await create_host_action(
-        sessionmaker, tenant_slug="acme", form=_host("Ana", "ana@example.com")
+        _admin(sessionmaker), tenant_slug="acme", form=_host("Ana", "ana@example.com")
     )
     first = await _connection(
         sessionmaker, tenant_id=tenant_id, user_id=ana.id, email="ana@gmail.com"
@@ -430,6 +454,6 @@ async def test_the_connections_of_a_host_are_listed_for_the_operator(
         sessionmaker, tenant_id=tenant_id, user_id=ana.id, email="ana@work.com"
     )
 
-    listed = await list_connections_view(sessionmaker, tenant_slug="acme", host_id=ana.id)
+    listed = await list_connections_view(_admin(sessionmaker), tenant_slug="acme", host_id=ana.id)
 
     assert {row.id for row in listed} == {first, second}

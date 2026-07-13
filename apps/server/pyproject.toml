@@ -69,6 +69,12 @@ google = [
 [project.scripts]
 aethercal-admin = "aethercal.server.cli:app"
 aethercal-serve = "aethercal.server.app:serve"
+# The worker. A SEPARATE PROCESS, not a flag on the web one: `AETHERCAL_RUN_SCHEDULER=1` bound every
+# tick to the request path's sessionmaker, which under row-level security carries no business and
+# therefore selects zero rows — silently. It runs the drain + webhook delivery + busy-cache refresh
+# on two pools (a BYPASSRLS one to FIND work, the app one to EXECUTE it under RLS) and serves the
+# operator surface (/metrics, /health/ready with the backlog). Run EXACTLY ONE — see deploy/README.
+aethercal-worker = "aethercal.server.worker:run_worker"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]

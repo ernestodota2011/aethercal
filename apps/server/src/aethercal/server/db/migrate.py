@@ -11,7 +11,10 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Engine
+from alembic.script import ScriptDirectory
+from sqlalchemy import Engine, text
+from sqlalchemy.exc import DatabaseError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -59,3 +62,71 @@ def run_migrations(engine: Engine) -> None:
             lock_conn.exec_driver_sql(
                 "SELECT pg_advisory_unlock(%(key)s)", {"key": ADVISORY_LOCK_KEY}
             )
+
+
+# --------------------------------------------------------------------------------------
+# The head check — the web process refuses to serve on a schema it has outgrown.
+# --------------------------------------------------------------------------------------
+
+
+class SchemaOutOfDateError(RuntimeError):
+    """The database is not at the migration head. ==Refuse to serve; do not migrate.=="""
+
+
+def head_revision() -> str:
+    """The revision this build's migration tree ends at. Read from disk; no database needed."""
+    return ScriptDirectory.from_config(make_alembic_config("sqlite://")).get_current_head() or ""
+
+
+_CURRENT_REVISION = text("SELECT version_num FROM alembic_version")
+
+
+async def assert_schema_at_head(engine: AsyncEngine) -> None:
+    """Refuse to start unless the database is at head. ==The replacement for ``auto_migrate``.==
+
+    ``auto_migrate`` used to run the DDL inside the web process, on the same URL the request path
+    served from — which is precisely why the app role could never be anything but the table owner,
+    and therefore why RLS was a placebo. With the roles separated, the web holds ``aethercal_app``
+    and simply **cannot** migrate. Something else has to be true instead: *do not serve on a schema
+    you have outgrown*.
+
+    Fail-closed, and deliberately so. A process that boots against a stale schema does not crash: it
+    serves, and it 500s (or worse, half-works) on whichever endpoint touches the column that is not
+    there yet. Refusing at boot turns that into one legible message, before any traffic arrives.
+
+    ``alembic_version`` is created by Alembic, not by ``Base.metadata``, so it cannot be derived —
+    its ``GRANT SELECT`` to the app role is part of the provisioning runbook. If the grant is
+    missing this raises loudly, which is an acceptable failure: loud is the whole objective.
+    """
+    if engine.dialect.name != "postgresql":
+        # Roles, RLS and Alembic version tracking are PostgreSQL facts. The only non-PostgreSQL
+        # consumer of this code path is the offline in-memory harness, which builds its schema
+        # straight from Base.metadata and has no migration history to be behind.
+        return
+
+    head = head_revision()
+    async with engine.connect() as connection:
+        try:
+            current = (await connection.execute(_CURRENT_REVISION)).scalar_one_or_none()
+        except DatabaseError as exc:  # the table does not exist: never migrated at all
+            raise SchemaOutOfDateError(
+                "This database has no alembic_version table: it has never been migrated.\n"
+                "\n"
+                f"Bring it up to head ({head}) as the OWNER, before starting the web process:\n"
+                "\n"
+                "    aethercal-admin db upgrade\n"
+            ) from exc
+
+    if current != head:
+        raise SchemaOutOfDateError(
+            f"The database is at migration {current!r}, but this build's head is {head!r}. "
+            "Refusing to serve.\n"
+            "\n"
+            "The web process no longer migrates on boot (it runs as `aethercal_app` and does not "
+            "own the tables). Run the migration as the OWNER first:\n"
+            "\n"
+            "    aethercal-admin db upgrade\n"
+            "\n"
+            "Serving on a stale schema is not a state this process will enter: it does not crash, "
+            "it half-works — 500s on whichever endpoint reaches the column that is not there yet."
+        )

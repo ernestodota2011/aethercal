@@ -198,17 +198,13 @@ async def _host_of_event_type(runtime: AdminRuntime) -> dict[uuid.UUID, str]:
     a host. It carries an event type, and the event type carries the host. Which is exactly why
     dragging a booking to another host's row has no meaning to give it.
     """
-    rows = await service.list_event_types_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_event_types_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return {row.id: str(row.host_id) for row in rows}
 
 
 async def _fetch_resources(runtime: AdminRuntime) -> list[CalendarResource]:
     """The timeline's rows: the tenant's hosts (RF-28)."""
-    rows = await service.list_hosts_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_hosts_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [host_resource(row) for row in rows]
 
 
@@ -230,15 +226,13 @@ async def _fetch_booking_views(
     single query feeds both; a navigated window adds one scoped query for the events.
     """
     tenant_slug = runtime.config.tenant_slug
-    reads: list[BookingRead] = await service.list_bookings_view(
-        runtime.sessionmaker, tenant_slug=tenant_slug
-    )
+    reads: list[BookingRead] = await service.list_bookings_view(runtime, tenant_slug=tenant_slug)
     rows = [booking_row(read) for read in reads]
     if date_from is None and date_to is None:
         event_reads = reads
     else:
         event_reads = await service.list_bookings_view(
-            runtime.sessionmaker, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
+            runtime, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
         )
     hosts = await _host_of_event_type(runtime)
     events = [
@@ -262,7 +256,7 @@ async def _fetch_calendar_events(
     in place, refreshed only on initial load and after mutations that actually change the rows.
     """
     reads = await service.list_bookings_view(
-        runtime.sessionmaker,
+        runtime,
         tenant_slug=runtime.config.tenant_slug,
         date_from=date_from,
         date_to=date_to,
@@ -503,7 +497,7 @@ async def _optimistic_reschedule(
     try:
         new_start = _parse_admin_start(new_start_raw)
         await service.reschedule_booking_action(
-            runtime.sessionmaker,
+            runtime,
             tenant_slug=runtime.config.tenant_slug,
             booking_id=uuid.UUID(booking_id),
             new_start=new_start,
@@ -523,22 +517,18 @@ async def _optimistic_reschedule(
 
 
 async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_event_types_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_event_types_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [event_type_row(row) for row in rows]
 
 
 async def _fetch_hosts(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_hosts_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_hosts_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [host_row(row) for row in rows]
 
 
 async def _fetch_connections(runtime: AdminRuntime, host_id: uuid.UUID) -> list[dict[str, str]]:
     rows = await service.list_connections_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, host_id=host_id
+        runtime, tenant_slug=runtime.config.tenant_slug, host_id=host_id
     )
     return [connection_row(row) for row in rows]
 
@@ -577,16 +567,12 @@ def _owner_update(form_data: dict[str, str]) -> dict[str, uuid.UUID | None]:
 
 
 async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_workflows_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_workflows_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [workflow_row(row) for row in rows]
 
 
 async def _fetch_templates(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_templates_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_templates_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [template_row(row) for row in rows]
 
 
@@ -652,9 +638,7 @@ def _steps_update(form_data: dict[str, str]) -> dict[str, list[WorkflowStepIn]]:
 
 
 async def _fetch_schedules(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_schedules_view(
-        runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-    )
+    rows = await service.list_schedules_view(runtime, tenant_slug=runtime.config.tenant_slug)
     return [schedule_row(row) for row in rows]
 
 
@@ -822,7 +806,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.cancel_booking_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=uuid.UUID(booking_id),
             )
@@ -851,7 +835,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.mark_no_show_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=uuid.UUID(booking_id),
             )
@@ -876,7 +860,7 @@ class AdminState(rx.State):
             booking_id = uuid.UUID(_clean(form_data, "booking_id"))
             new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=booking_id,
                 new_start=new_start,
@@ -988,7 +972,7 @@ class AdminState(rx.State):
         try:
             new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 booking_id=uuid.UUID(self.selected_booking_id),
                 new_start=new_start,
@@ -1027,7 +1011,7 @@ class AdminState(rx.State):
                 guest_timezone=_clean(form_data, "guest_timezone") or "UTC",
             )
             await service.create_booking_action(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
+                runtime, tenant_slug=runtime.config.tenant_slug, form=form
             )
         except (ValueError, service.AdminError, SQLAlchemyError) as exc:
             self.error = _error_text(exc)
@@ -1079,7 +1063,7 @@ class AdminState(rx.State):
                 description_translations=_en_translation(form_data, "description_en"),
             )
             await service.create_event_type_action(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, form=form
+                runtime, tenant_slug=runtime.config.tenant_slug, form=form
             )
             self.event_types = await _fetch_event_types(runtime)
             self.error = ""
@@ -1125,7 +1109,7 @@ class AdminState(rx.State):
                 update_fields["description_translations"] = description_tr
             data = EventTypeUpdate.model_validate(update_fields)
             await service.update_event_type_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 event_type_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
@@ -1143,7 +1127,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             existed = await service.deactivate_event_type_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 event_type_id=uuid.UUID(event_type_id),
             )
@@ -1190,7 +1174,7 @@ class AdminState(rx.State):
                 ),
             )
             await service.create_schedule_action(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, tenant_slug=runtime.config.tenant_slug, data=data
             )
             self.schedules = await _fetch_schedules(runtime)
             self.error = ""
@@ -1225,7 +1209,7 @@ class AdminState(rx.State):
             # this schedule back to the whole business" rather than "leave the owner alone".
             data = ScheduleUpdate.model_validate(fields)
             await service.update_schedule_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 schedule_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
@@ -1243,7 +1227,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.delete_schedule_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 schedule_id=uuid.UUID(schedule_id),
             )
@@ -1267,9 +1251,7 @@ class AdminState(rx.State):
         self.error = ""
         try:
             runtime = current_runtime()
-            snapshot = await service.metrics_view(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug
-            )
+            snapshot = await service.metrics_view(runtime, tenant_slug=runtime.config.tenant_slug)
             self.metrics = metrics_rows(snapshot)
         except service.AdminError as exc:
             self.error = _error_text(exc)
@@ -1295,7 +1277,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.create_host_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 form=service.HostForm(
                     name=_clean(form_data, "name"),
@@ -1316,7 +1298,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.update_host_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 host_id=uuid.UUID(_clean(form_data, "id")),
                 form=service.HostForm(
@@ -1338,7 +1320,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.delete_host_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 host_id=uuid.UUID(host_id),
             )
@@ -1376,7 +1358,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.designate_calendar_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 connection_id=uuid.UUID(_clean(form_data, "connection_id")),
                 calendar_id=_clean(form_data, "calendar_id"),
@@ -1425,7 +1407,7 @@ class AdminState(rx.State):
                 steps=_parse_steps(form_data),
             )
             await service.create_workflow_action(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, tenant_slug=runtime.config.tenant_slug, data=data
             )
             self.workflows = await _fetch_workflows(runtime)
             self.error = ""
@@ -1459,7 +1441,7 @@ class AdminState(rx.State):
             fields.update(_steps_update(form_data))
             data = WorkflowUpdate.model_validate(fields)
             await service.update_workflow_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 workflow_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
@@ -1492,7 +1474,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.set_workflow_active_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 workflow_id=uuid.UUID(workflow_id),
                 active=active,
@@ -1520,7 +1502,7 @@ class AdminState(rx.State):
                 body=_clean(form_data, "body"),
             )
             await service.create_template_action(
-                runtime.sessionmaker, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, tenant_slug=runtime.config.tenant_slug, data=data
             )
             self.templates = await _fetch_templates(runtime)
             self.error = ""
@@ -1549,7 +1531,7 @@ class AdminState(rx.State):
                 fields["body"] = body
             data = WorkflowTemplateUpdate.model_validate(fields)
             await service.update_template_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 template_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
@@ -1568,7 +1550,7 @@ class AdminState(rx.State):
         runtime = current_runtime()
         try:
             await service.delete_template_action(
-                runtime.sessionmaker,
+                runtime,
                 tenant_slug=runtime.config.tenant_slug,
                 template_id=uuid.UUID(template_id),
             )

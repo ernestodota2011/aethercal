@@ -12,7 +12,13 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aethercal.server.crypto import derive_fernet_key
-from aethercal.server.db.config import DatabaseConfig, normalize_database_url
+from aethercal.server.db.config import (
+    OWNER_DATABASE_URL_ENV,
+    WORKER_DATABASE_URL_ENV,
+    DatabaseConfig,
+    normalize_database_url,
+    require_database_url,
+)
 from aethercal.server.scheduler import (
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
     DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
@@ -38,17 +44,47 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AETHERCAL_", extra="ignore")
 
-    # Required.
+    # Required. This one is the APP role (aethercal_app): the request path and the admin, under RLS.
     database_url: str
     app_secret: str
 
+    # The OWNER role (aethercal_owner): Alembic + the CLI. Owns the tables, carries BYPASSRLS.
+    #
+    # ==No default, and no fallback to database_url.== A CLI that fell back to the app role would
+    # run `guest purge --tenant X` over zero rows and exit GREEN: erasure of personal data,
+    # reporting success, having erased nothing. See db.config.require_database_url.
+    owner_database_url: str | None = None
+
+    # The WORKER role (aethercal_worker): the worker's SCAN pool only (BYPASSRLS). The worker's
+    # EXECUTION pool is the app role, under RLS, with the GUC of each item's own row.
+    #
+    # ==No default, and no fallback either.== On the app role `select_due` returns zero rows, so the
+    # drain would run for ever, deliver nothing, and log nothing.
+    worker_database_url: str | None = None
+
     # Operational toggles.
-    auto_migrate: bool = True
     echo_sql: bool = False
-    # Run the in-process background scheduler (reminder firing + webhook delivery + busy-cache
-    # refresh) in THIS process. Off by default so the offline test/API path starts no loop; the
-    # container sets AETHERCAL_RUN_SCHEDULER=1 in exactly ONE process (see deploy/README).
+
+    # ------------------------------------------------------------------------------------
+    # RETIRED — and both fields SURVIVE, as tripwires. Deleting them would be the silent no-op.
+    # ------------------------------------------------------------------------------------
+    #
+    # `model_config` sets extra="ignore", so an AETHERCAL_* variable with no field behind it is
+    # simply DROPPED. Remove these two and the shipped image's own defaults
+    # (AETHERCAL_RUN_SCHEDULER=1, AETHERCAL_AUTO_MIGRATE=1 — deploy/Dockerfile) would go on being
+    # set, be silently ignored, and leave the operator believing the drain runs and the schema
+    # migrates. So the fields stay, and a truthy value is a LOUD boot failure that names its
+    # replacement.
+    auto_migrate: bool = False
+    """RETIRED. Migrations run as the OWNER, via ``aethercal-admin db upgrade`` — never inside the
+    web process, which holds only the app role and cannot execute DDL."""
     run_scheduler: bool = False
+    """RETIRED. The drain/scheduler runs in the ``aethercal-worker`` process, on its own two pools.
+
+    A flag could never have separated them: ``run_scheduler=1`` still mounted the whole API and the
+    admin, and bound every tick to the APP sessionmaker — which, in a background tick with no
+    request and therefore no ``ContextVar``, reads an EMPTY GUC and so selects **zero rows**,
+    silently."""
 
     # How often the in-process scheduler ticks, in seconds. The defaults ARE the production values
     # (``scheduler.DEFAULT_*``, imported so the two can never drift apart); they are exposed to the
@@ -149,9 +185,81 @@ class Settings(BaseSettings):
         """The private networks outbound webhooks may reach. Empty (fail-closed) unless declared."""
         return PrivateTargetAllowlist.parse(self.webhook_private_target_cidrs)
 
+    @field_validator("run_scheduler", mode="after")
+    @classmethod
+    def _refuse_the_retired_scheduler_flag(cls, value: bool) -> bool:
+        """``AETHERCAL_RUN_SCHEDULER=1`` must FAIL THE BOOT, not be quietly honoured or ignored.
+
+        The flag never separated anything: the process it produced was a full API **with the admin
+        mounted**, whose three ticks ran on the request path's own sessionmaker. Under RLS a tick
+        has no request, therefore no ``ContextVar``, therefore an empty GUC — and an empty GUC
+        selects zero rows. ``select_due`` → 0. ``deliver_due`` → 0. ``refresh_all_busy_caches`` → 0.
+        **No errors.** Every outbound effect stops, and ``/metrics`` — which has moved to the worker
+        — is no longer in that process to say so.
+
+        Honouring it would therefore be worse than ignoring it, and ignoring it would be worse than
+        refusing: the shipped image still sets it, so an operator upgrading would run a web process
+        that they believe is draining. It is not. Refuse, and say where the drain went.
+        """
+        if not value:
+            return value
+        raise ValueError(
+            "AETHERCAL_RUN_SCHEDULER is retired and the web process refuses to start with it set.\n"
+            "\n"
+            "The drain, the webhook delivery and the busy-cache refresh now run in their own "
+            "process: `aethercal-worker`. It holds the two pools they need (a BYPASSRLS scan pool "
+            "to find work across every business, and an app-role pool to EXECUTE each item under "
+            "row-level security with its own business bound), and it is the process that now "
+            "serves /metrics.\n"
+            "\n"
+            "Run exactly ONE `aethercal-worker` for the whole deployment (deploy/README.md) and "
+            "unset AETHERCAL_RUN_SCHEDULER."
+        )
+
+    @field_validator("auto_migrate", mode="after")
+    @classmethod
+    def _refuse_the_retired_migrate_flag(cls, value: bool) -> bool:
+        """``AETHERCAL_AUTO_MIGRATE=1`` must FAIL THE BOOT: the web process cannot run DDL any more.
+
+        It holds ``aethercal_app``, which does not own the tables. Booting the migrator there would
+        fail — or, worse, half-succeed on an instance whose roles were never separated properly.
+        Migrations are the OWNER's job and now have a supported command of their own.
+        """
+        if not value:
+            return value
+        raise ValueError(
+            "AETHERCAL_AUTO_MIGRATE is retired and the web process refuses to start with it set.\n"
+            "\n"
+            "The web process runs as `aethercal_app`, which does not own the tables and cannot "
+            "execute DDL. Migrate as the OWNER instead, as a one-shot step before the app starts:\n"
+            "\n"
+            "    aethercal-admin db upgrade\n"
+            "\n"
+            "(it uses AETHERCAL_OWNER_DATABASE_URL). The web process then REFUSES to start if the "
+            "schema is behind head, so serving on a stale schema is not a state it can reach."
+        )
+
     def database_config(self) -> DatabaseConfig:
-        """Build a :class:`DatabaseConfig` (URL normalized to the psycopg driver)."""
+        """The APP role's config (``aethercal_app``) — the request path and the admin, under RLS."""
         return DatabaseConfig(url=normalize_database_url(self.database_url), echo=self.echo_sql)
+
+    def owner_database_config(self) -> DatabaseConfig:
+        """The OWNER role's config (Alembic + the CLI). ==Refuses when unset; never falls back.=="""
+        return require_database_url(
+            self.owner_database_url,
+            env_var=OWNER_DATABASE_URL_ENV,
+            used_by="the CLI (and Alembic)",
+            echo=self.echo_sql,
+        )
+
+    def worker_database_config(self) -> DatabaseConfig:
+        """The WORKER role's SCAN config. ==Refuses when unset; never falls back.=="""
+        return require_database_url(
+            self.worker_database_url,
+            env_var=WORKER_DATABASE_URL_ENV,
+            used_by="the worker",
+            echo=self.echo_sql,
+        )
 
     def fernet_key(self) -> bytes:
         """The Fernet key used to encrypt stored provider credentials, derived from the secret."""

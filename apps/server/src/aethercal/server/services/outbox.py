@@ -74,9 +74,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel
+from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import Booking, ExternalConnection, Outbox, Workflow
 from aethercal.server.db.models.outbox import OutboxStatus, due_filter
 from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.db.pools import BypassReason, WorkerPools
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.integrations.messaging.guard import (
     ChannelUnavailable,
@@ -931,7 +933,7 @@ class _Outcome(StrEnum):
 
 
 async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well-defined pass
-    sessionmaker: Sessionmaker,
+    pools: WorkerPools,
     *,
     now: datetime,
     execute: OutboxExecutor,
@@ -944,16 +946,42 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
 ) -> OutboxReport:
     """One drain pass: recover → plan → (claim → execute → settle) per item. Returns the report.
 
-    Takes a ``sessionmaker``, not a session, because the whole design turns on owning the
-    transaction
-    BOUNDARIES: the claim commits before any network call and the settle opens a fresh transaction
-    after it. A caller that handed us one long-lived session would reintroduce the very bug this
-    replaces.
+    Takes the worker's :class:`~aethercal.server.db.pools.WorkerPools`, never a session, because the
+    whole design turns on owning the transaction BOUNDARIES: the claim commits before any network
+    call and the settle opens a fresh transaction after it. A caller that handed this one long-lived
+    session would reintroduce the very bug it replaces.
 
-    The batch is PLANNED up front but CLAIMED item by item, each at the moment it begins — see
-    :func:`claim_one`. Claiming the whole batch at once stamps every row with the same lease
-    deadline, and the rows at the back of a slow batch have their leases expire while still waiting
-    their turn. That is a duplicate send, and not a theoretical one.
+    .. rubric:: ==Which pool — and why the first three queries are not like the fourth==
+
+    The drain is a **loop over a batch spanning several businesses**, and it cannot know whose work
+    is due until it has looked. Its first three queries therefore cannot run under RLS — not because
+    that would be inconvenient, but because each would silently match nothing:
+
+    * ``recover_expired_leases`` — a dead worker's rows belong to businesses nobody has named;
+    * ``select_due`` — *whose* intents are due is the answer, not the question;
+    * ==``claim_one`` — and this is the one that was nearly missed.== It is an ``UPDATE ... WHERE
+      id = :id AND status = 'pending'`` over a row whose ``tenant_id`` can only be learned by
+      READING
+      it. On the RLS pool, with no GUC bound yet, that UPDATE matches **zero rows** → ``work is
+      None`` → ``unclaimed`` → ``continue`` → ==the drainer reclaims NOTHING, ever, without one
+      exception being raised.==
+
+    Each goes through :meth:`~aethercal.server.db.pools.WorkerPools.scan_session`, naming its
+    reason.
+    Everything AFTER the claim knows the business — it came off the row — so it runs on the **exec**
+    pool, under RLS, inside a :func:`~aethercal.server.db.guc.tenant_scope` for that item and no
+    other.
+
+    .. rubric:: The scope is ONE ITEM, and both alternatives are silent disasters
+
+    Hold one binding for the whole loop and the batch's second business RAISES (the binding is
+    immutable inside a scope), so everything not belonging to the first business dies in the
+    dead-letter. Relax the immutability so the loop compiles, and an item of B executes under the
+    GUC
+    of A: its ``session.get(...)`` calls return ``None``, the handlers read that as
+    "cascade-deleted,
+    be defensive" and return quietly, and ==the intent settles ``delivered`` having sent nothing at
+    all.== Hence ``tenant_scope``, opened and closed around each item.
 
     ``clock`` reads the wall clock. It defaults to ``now`` advanced by the REAL time elapsed since
     the pass began, because a lease is a wall-clock deadline — a frozen clock would put the deadline
@@ -967,16 +995,16 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
     worker = worker_id or new_worker_id()
     report = OutboxReport()
 
-    async with sessionmaker() as session, session.begin():
+    async with pools.scan_session(BypassReason.RECOVER_LEASES) as session, session.begin():
         report.recovered.extend(await recover_expired_leases(session, now=tick(), limit=batch_size))
 
-    async with sessionmaker() as session:
+    async with pools.scan_session(BypassReason.PLAN_OUTBOX) as session:
         planned = await select_due(session, now=tick(), limit=batch_size)
 
     for intent_id in planned:
         # The lease starts HERE, for THIS item — not back when the batch was planned.
         item_now = tick()
-        async with sessionmaker() as session, session.begin():
+        async with pools.scan_session(BypassReason.CLAIM_OUTBOX) as session, session.begin():
             work = await claim_one(
                 session, intent_id=intent_id, now=item_now, worker_id=worker, lease=lease
             )
@@ -986,74 +1014,21 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
             report.unclaimed.append(intent_id)
             continue
 
-        # THE NETWORK I/O. No session, no transaction and no row lock is open across this line —
-        # that is the entire point of R8. Each handler opens its own short transactions around it.
-        #
-        # And it is BOUNDED. `PROVIDER_TIMEOUT_CEILING` is not a constant, a comment and a hopeful
-        # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
-        # something actually stops the send. This is that something.
-        defer_for: timedelta | None = None
-        try:
-            async with asyncio.timeout(provider_timeout.total_seconds()):
-                await execute(work, item_now)
-        except TimeoutError:
-            # Retryable — and neither of the two things it could be mistaken for. NOT a success (we
-            # have no idea whether the provider acted). NOT a death (this worker is alive and still
-            # holds its lease, precisely because the timeout fired strictly INSIDE it). It goes back
-            # on the queue with backoff, exactly like any other transient provider failure.
-            _logger.error(
-                "outbox intent %s (%s) for booking %s: the provider call exceeded "
-                "PROVIDER_TIMEOUT_CEILING (%ss) and was ABORTED. It retries with backoff. This is "
-                "the guard that stops a send outliving its own lease — without it the row would be "
-                "recovered under us and delivered twice",
-                work.id,
-                work.effect,
-                work.booking_id,
-                provider_timeout.total_seconds(),
+        # The business is known from here on — it came off the row we just claimed — so the rest of
+        # this item runs under RLS, bound to that business and to no other. The scope closes on the
+        # way out, including when the effect raises: a failed item must not leave its business bound
+        # for the next one in the batch.
+        with tenant_scope(work.tenant_id):
+            await _run_one_item(
+                pools.exec_maker,
+                work,
+                execute=execute,
+                tick=tick,
+                item_now=item_now,
+                report=report,
+                max_attempts=max_attempts,
+                provider_timeout=provider_timeout,
             )
-            outcome = _Outcome.FAILED
-        except OutboxDeferred as deferred:
-            _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
-            outcome = _Outcome.DEFERRED
-            defer_for = deferred.retry_after
-        except OutboxUnknownOutcome as unknown:
-            # NOT a failure (a retry could duplicate) and NOT a skip (the guest may never have got
-            # it). It is the third thing, and it is the one a human has to resolve.
-            _logger.error(
-                "outbox intent %s (%s) for booking %s: OUTCOME UNKNOWN - %s",
-                work.id,
-                work.effect,
-                work.booking_id,
-                unknown,
-            )
-            outcome = _Outcome.UNKNOWN
-        except OutboxSkipped as skipped:
-            # NOT a failure: this effect can never run, so retrying it would only burn the backoff
-            # budget and dead-letter. Loud, terminal, and out of the queue.
-            _logger.warning(
-                "outbox intent %s (%s) for booking %s SKIPPED: %s",
-                work.id,
-                work.effect,
-                work.booking_id,
-                skipped,
-            )
-            outcome = _Outcome.SKIPPED
-        except Exception:
-            _logger.exception(
-                "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
-            )
-            outcome = _Outcome.FAILED
-        else:
-            outcome = _Outcome.DELIVERED
-        await _settle(
-            sessionmaker,
-            work,
-            now=tick(),
-            outcome=outcome,
-            report=report,
-            max_attempts=max_attempts,
-            defer_for=defer_for,
-        )
 
     # R9. Recorded HERE, not by the scheduler tick: a counter that only moves when the caller
     # remembers to report it reads zero for whichever path somebody forgot — and a zero meaning
@@ -1062,6 +1037,96 @@ async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well
     # nothing if it can silently fail to be counted.
     observe_drain(report)
     return report
+
+
+async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both clocks and the knobs
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    *,
+    execute: OutboxExecutor,
+    tick: Clock,
+    item_now: datetime,
+    report: OutboxReport,
+    max_attempts: int,
+    provider_timeout: timedelta,
+) -> None:
+    """Execute ONE claimed intent and settle it. ==Always called inside that item's
+    ``tenant_scope``.
+
+    Lifted out of :func:`drain_outbox`'s body so the per-item binding has a function-shaped boundary
+    rather than an indented block. Everything in here — the executor's own short transactions
+    included, because they come from this same ``exec_maker`` and the GUC listener stamps whatever
+    the ContextVar holds — runs on the app role, under RLS, with this item's business bound.
+    """
+
+    # THE NETWORK I/O. No session, no transaction and no row lock is open across this line —
+    # that is the entire point of R8. Each handler opens its own short transactions around it.
+    #
+    # And it is BOUNDED. `PROVIDER_TIMEOUT_CEILING` is not a constant, a comment and a hopeful
+    # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
+    # something actually stops the send. This is that something.
+    defer_for: timedelta | None = None
+    try:
+        async with asyncio.timeout(provider_timeout.total_seconds()):
+            await execute(work, item_now)
+    except TimeoutError:
+        # Retryable — and neither of the two things it could be mistaken for. NOT a success (we
+        # have no idea whether the provider acted). NOT a death (this worker is alive and still
+        # holds its lease, precisely because the timeout fired strictly INSIDE it). It goes back
+        # on the queue with backoff, exactly like any other transient provider failure.
+        _logger.error(
+            "outbox intent %s (%s) for booking %s: the provider call exceeded "
+            "PROVIDER_TIMEOUT_CEILING (%ss) and was ABORTED. It retries with backoff. This is "
+            "the guard that stops a send outliving its own lease — without it the row would be "
+            "recovered under us and delivered twice",
+            work.id,
+            work.effect,
+            work.booking_id,
+            provider_timeout.total_seconds(),
+        )
+        outcome = _Outcome.FAILED
+    except OutboxDeferred as deferred:
+        _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
+        outcome = _Outcome.DEFERRED
+        defer_for = deferred.retry_after
+    except OutboxUnknownOutcome as unknown:
+        # NOT a failure (a retry could duplicate) and NOT a skip (the guest may never have got
+        # it). It is the third thing, and it is the one a human has to resolve.
+        _logger.error(
+            "outbox intent %s (%s) for booking %s: OUTCOME UNKNOWN - %s",
+            work.id,
+            work.effect,
+            work.booking_id,
+            unknown,
+        )
+        outcome = _Outcome.UNKNOWN
+    except OutboxSkipped as skipped:
+        # NOT a failure: this effect can never run, so retrying it would only burn the backoff
+        # budget and dead-letter. Loud, terminal, and out of the queue.
+        _logger.warning(
+            "outbox intent %s (%s) for booking %s SKIPPED: %s",
+            work.id,
+            work.effect,
+            work.booking_id,
+            skipped,
+        )
+        outcome = _Outcome.SKIPPED
+    except Exception:
+        _logger.exception(
+            "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
+        )
+        outcome = _Outcome.FAILED
+    else:
+        outcome = _Outcome.DELIVERED
+    await _settle(
+        sessionmaker,
+        work,
+        now=tick(),
+        outcome=outcome,
+        report=report,
+        max_attempts=max_attempts,
+        defer_for=defer_for,
+    )
 
 
 async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the outcome, the report

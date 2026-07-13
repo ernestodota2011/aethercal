@@ -108,6 +108,12 @@ async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
     ``mount_admin``, so the sessionmaker is present when the admin mounts. We stub only the Reflex
     ASGI build (which needs a compiled frontend); the real ``AdminRuntime`` + the real
     ``app.state.sessionmaker`` access run, exercising the previously-uncovered live mount path.
+
+    The factory is asserted through its PRIVATE name, deliberately: it became private in B-01 so that
+    no admin module could open a session with no business bound (``test_admin_session_belt`` locks
+    that). What is asserted here is the WIRING — the admin shares the server's ONE engine/pool rather
+    than opening a second, separately-managed one — and the wiring is exactly what a private field
+    hides. The rule this looks like it is bending is a rule about the PRODUCT, not about the harness.
     """
     for key, value in _ENABLED_ENV.items():
         monkeypatch.setenv(key, value)
@@ -129,7 +135,7 @@ async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
     try:
         runtime = captured["runtime"]
         assert isinstance(runtime, AdminRuntime)
-        assert runtime.sessionmaker is app.state.sessionmaker
+        assert runtime._sessionmaker is app.state.sessionmaker  # noqa: SLF001 - see the docstring
         mounted = [r for r in app.routes if getattr(r, "path", "") == ADMIN_MOUNT_PATH]
         assert mounted, "the admin should be mounted at /admin when enabled"
     finally:

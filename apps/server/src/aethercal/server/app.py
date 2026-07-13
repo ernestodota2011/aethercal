@@ -1,21 +1,24 @@
-"""The FastAPI application factory (F1 foundation) + the self-host runtime wiring (F1-12).
+"""The FastAPI **web** application factory — the process that serves the API and the admin.
+
+It holds exactly ONE database identity: ``aethercal_app``, subject to row-level security. It builds
+no engine with ``BYPASSRLS``, runs no background tick, and executes no DDL. The two things it used
+to also be — the migrator and the scheduler — have moved out, because neither could survive the
+isolation belt where it was:
+
+* **the migrator** ran Alembic on the app's own URL, which is exactly why the app had to be the
+  table owner, which is exactly why RLS would have been a placebo. It is now
+  ``aethercal-admin db upgrade``, run as the OWNER, and this process REFUSES to serve a schema it
+  has outgrown (``assert_schema_at_head``);
+* **the scheduler** ran its ticks on the request path's sessionmaker. A tick has no request, so it
+  has no ``ContextVar``, so its GUC is empty, so every query it makes returns **zero rows** —
+  silently. It is now the ``aethercal-worker`` process (:mod:`aethercal.server.worker`), which owns
+  the two pools that work actually requires, and ``AETHERCAL_RUN_SCHEDULER=1`` now fails the boot.
 
 ``create_app`` builds the async engine and ``async_sessionmaker`` **eagerly** and stores them on
 ``app.state`` so requests work under an ASGITransport test client, which never runs the lifespan.
-
-The lifespan does the things that must happen against a live process:
-
-* run the boot migrator (when ``auto_migrate`` is set) on startup;
-* attach the runtime **effects** the booking flow reads best-effort: an ``httpx.AsyncClient``,
-  the derived ``fernet_key``, and (when SMTP is set via env) an ``SmtpEmailSender``. A missing
-  SMTP/Google config leaves the effect ``None`` and never hard-fails boot (the path degrades);
-* when ``run_scheduler`` is set (the container turns it on in exactly ONE process — see
-  ``deploy/README.md``), start the in-process scheduler: a single ``AsyncIOScheduler`` running the
-  recurring webhook-delivery + busy-cache-refresh + transactional-outbox-drain jobs (the outbox IS
-  the durable scheduler, so there is no second, persistent reminder scheduler any more);
-* on shutdown -- or on a failure part-way through startup -- unwind every resource that was
-  acquired (via an ``AsyncExitStack``): stop the scheduler, close the HTTP client, and dispose
-  the async engine, so a partial boot never leaks a started scheduler/client/engine.
+The lifespan is where the live-process checks live: the boot assertion (``SELECT current_user`` —
+the only detector that can exist for a mis-pointed URL, because RLS makes that failure silent), the
+schema head check, and the best-effort runtime effects (HTTP client, Fernet key, SMTP, channels).
 
 ``create_app_from_env`` is the uvicorn ``--factory`` entrypoint: it builds ``Settings`` from the
 environment (RF-19, no secrets in source) and returns ``create_app(settings)``.
@@ -26,7 +29,6 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, TypedDict
 
 import httpx
 import uvicorn
@@ -39,8 +41,10 @@ from aethercal.server.admin.mount import mount_admin
 from aethercal.server.api import api_router
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.channels import Channel
-from aethercal.server.db.engine import build_async_engine, build_sessionmaker, build_sync_engine
-from aethercal.server.db.migrate import run_migrations
+from aethercal.server.db.config import DATABASE_URL_ENV
+from aethercal.server.db.engine import build_async_engine, build_sessionmaker
+from aethercal.server.db.migrate import assert_schema_at_head
+from aethercal.server.db.roles import DbRole, assert_engine_role
 from aethercal.server.integrations.messaging.guard import PhoneChannelSender
 from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
@@ -48,15 +52,7 @@ from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
-from aethercal.server.scheduler import (
-    WEBHOOK_HTTP_TIMEOUT_SECONDS,
-    build_interval_scheduler,
-    make_busy_refresh_tick,
-    make_outbox_drain_tick,
-    make_webhook_delivery_tick,
-    start_scheduler,
-    stop_scheduler,
-)
+from aethercal.server.scheduler import WEBHOOK_HTTP_TIMEOUT_SECONDS
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -82,29 +78,6 @@ def build_email_sender(environ: Mapping[str, str] | None = None) -> EmailSender 
     except RuntimeError:
         return None
     return SmtpEmailSender(config)
-
-
-class SchedulerIntervals(TypedDict):
-    """The tick intervals :func:`start_scheduler` takes, as keyword arguments."""
-
-    webhook_interval_seconds: int
-    busy_refresh_interval_seconds: int
-    outbox_drain_interval_seconds: int
-
-
-def scheduler_intervals(settings: Settings) -> SchedulerIntervals:
-    """The scheduler's tick intervals, sourced from the environment (RF-19).
-
-    A ``TypedDict`` unpacked into :func:`start_scheduler`, rather than three loose arguments, so the
-    keys are type-checked against that function's keywords: a knob the scheduler does not accept
-    fails to type-check, instead of being read from the environment, documented, and then silently
-    dropped while the scheduler keeps ticking at its default.
-    """
-    return SchedulerIntervals(
-        webhook_interval_seconds=settings.webhook_interval_seconds,
-        busy_refresh_interval_seconds=settings.busy_refresh_interval_seconds,
-        outbox_drain_interval_seconds=settings.outbox_drain_interval_seconds,
-    )
 
 
 def build_channel_senders(
@@ -142,32 +115,41 @@ def build_channel_senders(
 def create_app(settings: Settings) -> FastAPI:
     """Build the AetherCal API application from ``settings``."""
     engine = build_async_engine(settings.database_config())
+    # `build_sessionmaker` produces GUC-aware sessions: the `after_begin` listener stamps
+    # `aethercal.tenant_id` on EVERY transaction this factory opens while a business is bound. That
+    # is what makes the belt survive a mid-request commit, a SAVEPOINT and a post-commit lazy load
+    # (`expire_on_commit=False` opens a NEW transaction, and it gets the GUC too) — and, because the
+    # admin shares this one sessionmaker, it covers the request path AND the admin's 28 call sites
+    # through a single seam instead of 29 of them.
     sessionmaker = build_sessionmaker(engine)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # An AsyncExitStack registers each resource's teardown the instant it is acquired, so a
         # failure at ANY later startup step unwinds everything already started (in reverse order)
-        # instead of leaking it — a partial boot no longer skips cleanup. On the normal path the
-        # stack unwinds at shutdown in the same order the old try/finally did: interval scheduler →
-        # HTTP client → engine.
+        # instead of leaking it — a partial boot no longer skips cleanup.
         async with AsyncExitStack() as stack:
             # The async engine is built eagerly in create_app (above), so its teardown is registered
-            # FIRST — ahead of the boot migration, the earliest startup step that can fail. Register
-            # it after the migration and a bad or blocked Alembic upgrade (the startup path most
-            # likely to blow up in production) strands the engine's connection pool.
+            # FIRST — ahead of the earliest startup step that can fail. Register it later and a
+            # refused boot strands the engine's connection pool.
             stack.push_async_callback(engine.dispose)
 
-            if settings.auto_migrate:
-                # The boot migrator is synchronous (Alembic); run it on a throwaway sync engine.
-                sync_engine = build_sync_engine(settings.database_config())
-                try:
-                    run_migrations(sync_engine)
-                finally:
-                    sync_engine.dispose()
+            # ==THE BOOT ASSERTION — the only detector that can exist for the failure beneath it.==
+            #
+            # Under RLS a connection on the wrong role does not raise: it reads zero rows. An
+            # AETHERCAL_DATABASE_URL still pointing at the old table OWNER would therefore produce a
+            # web process that works perfectly and enforces NOTHING — every policy bypassed, every
+            # business's rows readable through any API key, and not one error anywhere to show it.
+            # So the process asks the connection who it is, and refuses to serve on a wrong answer.
+            await assert_engine_role(engine, DbRole.APP, url_env=DATABASE_URL_ENV)
 
-            # Shared runtime effects the booking flow (and the webhook job) read best-effort. Absent
-            # SMTP/Google config → the effect is None and the request path degrades gracefully.
+            # And it refuses to serve a schema it has outgrown. `auto_migrate` is retired: the web
+            # holds the app role, does not own the tables, and cannot run DDL (Settings refuses to
+            # even build with it set). Migrating is `aethercal-admin db upgrade`, run as the owner.
+            await assert_schema_at_head(engine)
+
+            # Shared runtime effects the booking flow reads best-effort. Absent SMTP/Google config →
+            # the effect is None and the request path degrades gracefully.
             http_client = httpx.AsyncClient(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
             stack.push_async_callback(http_client.aclose)
             app.state.http_client = http_client
@@ -177,25 +159,12 @@ def create_app(settings: Settings) -> FastAPI:
             # build_channel_senders. "Sending, but uncapped" must never be a state this reaches.
             app.state.channel_senders = build_channel_senders(http_client)
 
-            interval_scheduler: Any = None
-            if settings.run_scheduler:  # pragma: no cover - live: starts a real APScheduler loop
-                # ONE scheduler now. The per-booking reminder used to run on a SECOND, persistent
-                # APScheduler (a Postgres jobstore) carrying its own idempotency barrier; it is
-                # gone. A reminder is a workflow rule materialised into the transactional outbox,
-                # whose `next_retry_at` IS its send time — so the outbox is the durable scheduler
-                # and a booking has exactly one thing that can decide to remind its guest. Two
-                # schedulers with two barriers meant a tenant with a "24 h before" rule mailed the
-                # guest twice.
-                interval_scheduler = build_interval_scheduler()
-                start_scheduler(
-                    interval_scheduler,
-                    webhook_tick=make_webhook_delivery_tick(app),
-                    busy_refresh_tick=make_busy_refresh_tick(app),
-                    outbox_tick=make_outbox_drain_tick(app),
-                    **scheduler_intervals(settings),
-                )
-                stack.callback(stop_scheduler, interval_scheduler)
-            app.state.scheduler = interval_scheduler
+            # ==NO SCHEDULER LIVES HERE ANY MORE.== `AETHERCAL_RUN_SCHEDULER=1` does not start one:
+            # it fails the boot inside Settings, naming `aethercal-worker`. The flag never separated
+            # anything — it left the API and the admin mounted and bound all three ticks to the
+            # REQUEST PATH's sessionmaker. A background tick carries no request, therefore no
+            # ContextVar, therefore an empty GUC: `select_due` = 0 rows, `deliver_due` = 0,
+            # `refresh_all_busy_caches` = 0. Every outbound effect stops, and nothing says a word.
 
             yield
 
