@@ -160,22 +160,41 @@ def _now(now: datetime | None) -> datetime:
 # Bookings.
 # --------------------------------------------------------------------------------------
 
-_BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str] = {
+_BOOKING_ERROR_MESSAGES: dict[type[bookings_service.BookingError], str | None] = {
     bookings_service.EventTypeNotFoundError: "Event type not found",
     bookings_service.BookingNotFoundError: "Booking not found",
     bookings_service.AvailabilityUnavailableError: (
         "Host availability is temporarily unavailable; please try again"
     ),
-    bookings_service.BookingNotActiveError: "Booking cannot be rescheduled",
     bookings_service.SlotUnavailableError: "That time is no longer available",
+    # ``None`` = the SERVICE's own message IS the operator-facing one. These two are refusals of the
+    # booking STATE MACHINE, and the same type is raised by SEVERAL operations: ``mark_no_show``
+    # raises ``BookingNotActiveError`` exactly as ``reschedule_booking`` does. One hard-coded
+    # sentence therefore has to be wrong for every caller but one — this map used to answer "Booking
+    # cannot be rescheduled" to an operator who had clicked NO-SHOW and never asked to reschedule.
+    # Only the service knows WHICH operation it refused, and it already words its refusal for a
+    # human ("only a confirmed booking can be marked a no-show"), so that message is passed through
+    # instead of being replaced by a guess. ``BookingNotEndedError`` was mapped nowhere at all and
+    # fell through to the catch-all below, which names no cause whatsoever.
+    bookings_service.BookingNotActiveError: None,
+    bookings_service.BookingNotEndedError: None,
 }
+"""Every :class:`~aethercal.server.services.bookings.BookingError`, mapped to what the operator is
+told. ``test_every_booking_error_has_an_operator_message`` asserts this map stays EXHAUSTIVE over the
+service's error tree, so a new subclass fails a test instead of silently inheriting a vague catch-all
+that names no cause."""
 
 
 def _booking_action_error(exc: bookings_service.BookingError) -> AdminActionError:
-    """Map a booking-service domain error to a safe, operator-facing :class:`AdminActionError`."""
-    for error_type, message in _BOOKING_ERROR_MESSAGES.items():
-        if isinstance(exc, error_type):
-            return AdminActionError(message)
+    """Map a booking-service domain error to a safe, operator-facing :class:`AdminActionError`.
+
+    Resolved along the exception's MRO rather than by dict iteration order, so a future subclass of
+    a mapped error deterministically inherits its parent's wording instead of depending on where it
+    happened to be inserted.
+    """
+    for error_type in type(exc).__mro__:
+        if error_type in _BOOKING_ERROR_MESSAGES:
+            return AdminActionError(_BOOKING_ERROR_MESSAGES[error_type] or str(exc))
     return AdminActionError("The booking could not be updated")  # pragma: no cover - defensive
 
 

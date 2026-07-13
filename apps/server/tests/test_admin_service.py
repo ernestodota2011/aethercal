@@ -47,8 +47,10 @@ from aethercal.server.admin.service import (
     update_event_type_action,
     update_schedule_action,
 )
+from aethercal.server.admin import service
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant, User
+from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services.bookings import BookingParams, create_booking
 
 Sessionmaker = async_sessionmaker[AsyncSession]
@@ -486,3 +488,66 @@ async def test_admin_cannot_cancel_another_tenants_booking(sessionmaker: Session
         row = await session.get(Booking, beta_booking)
         assert row is not None
         assert row.status is BookingStatus.CONFIRMED
+
+
+# --------------------------------------------------------------------------------------
+# The operator-facing message must name the refusal that ACTUALLY happened.
+# --------------------------------------------------------------------------------------
+
+
+def _booking_error_subclasses() -> list[type[bookings_service.BookingError]]:
+    """Every concrete ``BookingError`` in the service, found by walking the class tree."""
+
+    def _walk(cls: type[bookings_service.BookingError]) -> list[type[bookings_service.BookingError]]:
+        found: list[type[bookings_service.BookingError]] = []
+        for sub in cls.__subclasses__():
+            found.append(sub)
+            found.extend(_walk(sub))
+        return found
+
+    return _walk(bookings_service.BookingError)
+
+
+def test_every_booking_error_has_an_operator_message() -> None:
+    """The map is EXHAUSTIVE over the service's error tree, or the drift is silent.
+
+    ``BookingNotEndedError`` was raised by ``mark_no_show`` and mapped nowhere: it fell through to
+    a vague "The booking could not be updated" that named no cause. A new subclass must FAIL THIS
+    TEST, not quietly inherit that catch-all.
+    """
+    unmapped = [
+        exc.__name__
+        for exc in _booking_error_subclasses()
+        if exc not in service._BOOKING_ERROR_MESSAGES
+    ]
+    assert unmapped == [], f"booking errors with no operator message: {unmapped}"
+
+
+def test_a_refused_no_show_does_not_claim_the_reschedule_was_refused() -> None:
+    """``BookingNotActiveError`` is raised by reschedule AND by no-show. A single hard-coded
+    sentence ("Booking cannot be rescheduled") is therefore a LIE for one of them: the operator who
+    clicked "no-show" is told about a reschedule they never asked for."""
+    refusal = service._booking_action_error(
+        bookings_service.BookingNotActiveError("only a confirmed booking can be marked a no-show")
+    )
+    assert "no-show" in refusal.message
+    assert "reschedul" not in refusal.message.lower()
+
+
+def test_a_reschedule_refusal_still_says_reschedule() -> None:
+    """The same error type, from the other operation, must still say what IT refused."""
+    refusal = service._booking_action_error(
+        bookings_service.BookingNotActiveError("only a confirmed booking can be rescheduled")
+    )
+    assert "rescheduled" in refusal.message
+
+
+def test_a_booking_that_has_not_ended_is_told_exactly_that() -> None:
+    """The refusal names the cause instead of the catch-all's "could not be updated"."""
+    refusal = service._booking_action_error(
+        bookings_service.BookingNotEndedError(
+            "a booking can only be marked a no-show after it has ended"
+        )
+    )
+    assert "ended" in refusal.message
+    assert "could not be updated" not in refusal.message
