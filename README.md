@@ -23,6 +23,9 @@ exactly that. This section is checked against the code, not against the roadmap.
 | Booking — book, cancel, reschedule; a double-booked slot is rejected with `409` | Working |
 | Public booking page (FastHTML + HTMX), bilingual ES/EN, embeddable widget | Working — see [docs/embedding.md](docs/embedding.md) |
 | Transactional email with an `.ics` invitation | Working (SMTP; absent SMTP degrades gracefully) |
+| Guest self-service — the cancel / reschedule links in the confirmation email | Working |
+| The 24-hour reminder, seeded per tenant as a workflow rule | Working, over email |
+| No-show — mark a booking `no_show` (it keeps its slot; the time has passed) | Working |
 | Signed outgoing webhooks | Working — **at-least-once**, see [docs/webhooks.md](docs/webhooks.md) |
 | Calendar component — month, week, day, list **and resource timeline** views | Working: drag/resize with optimistic reconciliation, 4 theme presets + token overrides, ES/EN i18n, keyboard parity |
 | Google Calendar **busy-check** — a real busy block removes the slot | Working; degrades safely when the calendar is unreachable |
@@ -35,10 +38,12 @@ exactly that. This section is checked against the code, not against the roadmap.
   host's calendar, but the write-back leg is not connected (see `_build_effects` in
   `apps/server/src/aethercal/server/api/bookings.py`). Cancelling and rescheduling likewise do not
   touch Google.
-- **Notification workflows are half-landed.** The engine, its migration, and the seeded 24-hour
-  reminder rule exist, but only the **email** channel has an adapter. WhatsApp and SMS are declared
-  in the `Channel` enum with no integration behind them, and there is no workflow CRUD API or admin
-  screen yet.
+- **Notification workflows run, but only over email.** The engine, its migration and the seeded
+  24-hour reminder are live — and the reminder does reach the guest. But **WhatsApp and SMS are
+  declared in the `Channel` enum with no adapter behind them**, and there is no workflow CRUD API or
+  admin screen yet: the rules are seeded, not editable.
+- **No-show has no webhook.** You can mark a booking `no_show`, but the outgoing events are still
+  only `booking.created`, `booking.cancelled` and `booking.rescheduled`.
 - **No payments, no multi-business isolation, no round-robin or collective bookings.**
 
 See [ROADMAP.md](ROADMAP.md) for what comes next.

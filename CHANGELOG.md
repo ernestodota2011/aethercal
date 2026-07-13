@@ -38,6 +38,15 @@ contract may still change before 1.0.
   delivery, exponential backoff, and a dead-letter state.
 - Transactional email with an `.ics` invitation. Missing SMTP or Google configuration degrades
   gracefully instead of failing the boot.
+- Guest self-service: the cancel and reschedule links in the confirmation email carry a signed guest
+  token, so a guest can act on their own booking without an API key — and cannot touch anyone
+  else's.
+- Notification workflows: a durable step lifecycle on the transactional outbox, with the 24-hour
+  reminder seeded per tenant as a rule and delivered over email. A step is materialised, voided or
+  skipped by an exhaustive transition table, so a rescheduled booking cannot still fire its
+  predecessor's follow-up.
+- No-show: a booking can be marked `no_show`. It keeps occupying its slot — the time has passed, and
+  releasing it would permit a retroactive booking over it.
 - Google Calendar **busy-check**: a real busy block on a host's calendar removes the slot, and an
   unreachable calendar withholds that host's slots rather than risk a double-booking.
 - A public bilingual (ES/EN) booking page, an embeddable widget, and a minimal Reflex admin.
@@ -74,9 +83,11 @@ contract may still change before 1.0.
   either. See [docs/webhooks.md](docs/webhooks.md).
 - **A booking does not create an event in the host's Google Calendar.** The busy-check reads the
   calendar; the write-back leg is not connected yet.
-- **Notification workflows are only partially landed.** The engine, its migration and the seeded
-  24-hour reminder rule exist, but only the email channel has an adapter — WhatsApp and SMS are
-  declared with no integration behind them, and there is no workflow CRUD API yet.
+- **Notification workflows run over email only.** The engine, its migration and the seeded 24-hour
+  reminder are live, but WhatsApp and SMS are declared in the `Channel` enum with no adapter behind
+  them, and there is no workflow CRUD API yet — the rules are seeded, not editable.
+- **No-show emits no webhook.** A booking can be marked `no_show`, but the outgoing events remain
+  `booking.created`, `booking.cancelled` and `booking.rescheduled`.
 
 [Unreleased]: https://github.com/ernestodota2011/aethercal/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/ernestodota2011/aethercal/releases/tag/v0.1.0

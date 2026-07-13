@@ -26,9 +26,12 @@ Lo que **aún no está conectado** — no planifiques con ello:
 
 - **Una reserva no crea el evento en el Google Calendar del anfitrión.** La verificación de
   ocupación *lee* su calendario, pero la escritura de vuelta no está conectada.
-- **Los flujos de notificación están a medio camino.** El motor, su migración y la regla del
-  recordatorio de 24 horas existen, pero solo el canal de **email** tiene adaptador: WhatsApp y SMS
-  están declarados sin ninguna integración detrás.
+- **Los flujos de notificación funcionan, pero solo por email.** El motor, su migración y el
+  recordatorio de 24 horas están vivos (y el recordatorio sí le llega al invitado), pero **WhatsApp
+  y SMS están declarados sin ningún adaptador detrás**, y todavía no hay API ni pantalla para editar
+  las reglas: se siembran, no se editan.
+- **El no-show no emite webhook.** Puedes marcar una reserva como `no_show`, pero los eventos
+  salientes siguen siendo `booking.created`, `booking.cancelled` y `booking.rescheduled`.
 - **No hay pagos, ni aislamiento multi-negocio, ni reservas round-robin o colectivas.**
 
 El detalle completo, verificado contra el código, está en el [README](../../README.md).
