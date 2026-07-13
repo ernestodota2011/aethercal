@@ -17,6 +17,7 @@ silently:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -49,6 +50,7 @@ from aethercal.server.services.calendars import (
     AmbiguousCalendarTargetError,
     CalendarTargetMissingError,
     GoogleCredential,
+    link_booking_calendar,
     store_google_connection,
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
@@ -338,6 +340,118 @@ async def test_rescheduling_moves_the_event(
 # --------------------------------------------------------------------------------------
 # The two silent-failure modes the wiring could have introduced.
 # --------------------------------------------------------------------------------------
+
+
+async def test_cancelling_after_the_write_target_moved_deletes_from_the_original_calendar(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+) -> None:
+    """The whole reason the booking records WHERE its event lives.
+
+    The operator re-designates the connection's booking calendar between the confirmation and the
+    cancellation. Deleting from the calendar configured NOW would hit a calendar the event was never
+    written to; Google would answer 404, ``_is_already_gone`` would (correctly) count that as a
+    success — and the real event would sit in the host's original calendar forever while the system
+    reported it deleted. The persisted target is what makes that impossible.
+    """
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="old@cal")
+    google = FakeGoogle()
+    execute = make_booking_effect_executor(
+        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+    )
+
+    booking = await _book(sqlite_session, tenant, event_type)
+    await _drain(sqlite_session, sqlite_maker, execute)
+    await sqlite_session.refresh(booking)
+    assert google.created == [("old@cal", "evt-1")]
+    assert booking.external_calendar_id == "old@cal"  # persisted with the event, in one flush
+
+    # The operator moves the booking target to a brand-new calendar.
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="new@cal")
+
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=NOW, effects=_effects()
+    )
+    await _drain(sqlite_session, sqlite_maker, execute)
+
+    # The delete follows the EVENT, not the configuration: nothing is orphaned in old@cal.
+    assert google.deleted == [("old@cal", "evt-1")]
+    assert ("new@cal", "evt-1") not in google.deleted
+
+
+async def test_rescheduling_after_the_write_target_moved_deletes_old_and_creates_new(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+) -> None:
+    """Same rule for the move: the old event is removed from the calendar it LIVES in, and the new
+    one is created in the calendar the host is configured for NOW."""
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="old@cal")
+    google = FakeGoogle()
+    execute = make_booking_effect_executor(
+        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+    )
+
+    first = await _book(sqlite_session, tenant, event_type)
+    await _drain(sqlite_session, sqlite_maker, execute)
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="new@cal")
+
+    moved = await reschedule_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=first.id,
+        new_start=SLOT_11,
+        now=NOW,
+        effects=_effects(),
+    )
+    await _drain(sqlite_session, sqlite_maker, execute)
+    await sqlite_session.refresh(moved)
+
+    assert google.deleted == [("old@cal", "evt-1")]
+    assert google.created == [("old@cal", "evt-1"), ("new@cal", "evt-2")]
+    assert moved.external_calendar_id == "new@cal"  # and the new home is recorded in its turn
+
+
+async def test_a_booking_from_before_the_columns_existed_falls_back_and_says_so(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A booking predating this migration can hold an event id and NO recorded calendar. There is
+    no other information to act on, so the delete falls back to the host's currently configured
+    target — but it is an EXPLICIT, logged fallback, never a silent guess."""
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="current@cal")
+    google = FakeGoogle()
+    execute = make_booking_effect_executor(
+        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+    )
+
+    booking = await _book(sqlite_session, tenant, event_type)
+    # The legacy row: an event exists, its calendar was never recorded (the columns did not exist).
+    booking.external_event_id = "legacy-evt"
+    booking.external_connection_id = None
+    booking.external_calendar_id = None
+    await sqlite_session.flush()
+
+    await cancel_booking(
+        sqlite_session, tenant_id=tenant.id, booking_id=booking.id, now=NOW, effects=_effects()
+    )
+    with caplog.at_level(logging.WARNING):
+        await _drain(sqlite_session, sqlite_maker, execute)
+
+    assert google.deleted == [("current@cal", "legacy-evt")]
+    assert any("no recorded calendar" in record.message for record in caplog.records)
 
 
 async def test_a_host_without_a_calendar_enqueues_no_google_intent(
