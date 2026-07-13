@@ -667,3 +667,58 @@ async def test_designating_a_target_retires_the_one_on_the_hosts_other_connectio
     # The old target was retired rather than left to collide: the work calendar still contributes
     # busy (nothing was un-linked), it simply no longer receives the bookings.
     assert await busy_calendar_ids(sqlite_session, connection=work) == ["work@cal"]
+
+
+async def test_relinking_the_same_calendar_keeps_the_availability_cache(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """Invalidation is right when the calendars being read CHANGE — and a bug when nothing changed.
+
+    Re-saving an identical configuration (an operator clicking "save" twice, a re-run of the connect
+    command, a token refresh) must not blank the busy cache: the host would stop being offered any
+    slots until the next refresh cycle, for no reason at all. Switching yourself off by pressing the
+    same button twice is not a safe default; it is an outage.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _host(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="dedicated@cal")
+    await _cover(sqlite_session, connection)  # the refresher catches up
+
+    fresh = await read_busy(
+        sqlite_session, tenant_id=tenant.id, host_user_id=host.id, query=_query()
+    )
+    assert fresh.status is BusyStatus.FRESH
+
+    # The SAME calendar, designated again. Nothing about what is read has changed.
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="dedicated@cal")
+
+    assert connection.busy_synced_at is not None  # the coverage stamp survives
+    after = await read_busy(
+        sqlite_session, tenant_id=tenant.id, host_user_id=host.id, query=_query()
+    )
+    assert after.status is BusyStatus.FRESH  # and the host keeps offering slots
+
+
+async def test_moving_the_target_between_already_linked_calendars_keeps_the_cache(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """Both calendars were already being read for busy, so moving which one RECEIVES the bookings
+    changes nothing about the occupancy — the cache stays valid and the host keeps its slots."""
+    tenant = await tenant_factory(sqlite_session)
+    host = await _host(sqlite_session, tenant)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    await _link(sqlite_session, connection, calendar_id="a@cal", is_booking_target=True)
+    await _link(sqlite_session, connection, calendar_id="b@cal")
+    await _cover(sqlite_session, connection)
+
+    await link_booking_calendar(sqlite_session, connection=connection, calendar_id="b@cal")
+
+    assert connection.busy_synced_at is not None
+    result = await read_busy(
+        sqlite_session, tenant_id=tenant.id, host_user_id=host.id, query=_query()
+    )
+    assert result.status is BusyStatus.FRESH
+    target = await resolve_calendar_target(sqlite_session, tenant_id=tenant.id, user_id=host.id)
+    assert target is not None and target.calendar_id == "b@cal"

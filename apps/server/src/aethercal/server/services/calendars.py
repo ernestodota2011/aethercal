@@ -69,7 +69,12 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import TimeInterval
-from aethercal.server.db.models import BusyCache, ExternalCalendarLink, ExternalConnection
+from aethercal.server.db.models import (
+    BusyCache,
+    ExternalCalendarLink,
+    ExternalConnection,
+    User,
+)
 from aethercal.server.integrations.google.calendar import (
     build_service,
     delete_event,
@@ -248,12 +253,26 @@ async def link_booking_calendar(
     down: every other target of this host, on ANY of their connections, is retired in the same
     transaction.
 
-    IT ALSO INVALIDATES THE BUSY CACHE. The cache is keyed by connection, not by calendar, so
-    changing WHICH calendars are read leaves it holding the previous calendar's occupancy while
-    still stamped fresh and covering the window. Slots would then be offered against an occupancy
-    that is no longer the host's — a double-booking, which is the one invariant this product exists
-    to protect (RF-04).
+    IT INVALIDATES THE BUSY CACHE — but ONLY when the set of calendars actually being read changes.
+    The cache is keyed by connection, not by calendar, so switching which calendars are read leaves
+    it holding the previous calendar's occupancy while still stamped fresh and covering the window;
+    slots would then be offered against an occupancy that is no longer the host's — a double-book,
+    the one invariant this product exists to protect (RF-04). But invalidating when NOTHING changed
+    is its own bug: re-saving an identical configuration would blank the cache and stop the host
+    being offered any slots until the next refresh cycle. An operator who clicks "save" twice must
+    not switch themselves off.
+
+    CONCURRENCY: the choice is serialised on the HOST (:func:`_serialize_host_calendars`). Two
+    designations that interleave — two admin tabs, two API calls — would otherwise each read "nobody
+    holds the target", each promote their own, and leave the host with TWO write targets on two
+    different connections, which the per-connection unique index cannot catch. Every booking of that
+    host would then dead-letter on an ambiguity nobody chose.
     """
+    await _serialize_host_calendars(
+        session, tenant_id=connection.tenant_id, user_id=connection.user_id
+    )
+    before = await busy_calendar_ids(session, connection=connection)
+
     await _retire_other_targets(session, connection=connection, calendar_id=calendar_id)
 
     links = await _links(session, connection=connection)
@@ -267,10 +286,36 @@ async def link_booking_calendar(
         session.add(existing)
     existing.is_booking_target = True
     existing.busy = True
-
-    await invalidate_busy_cache(session, connection=connection)
     await session.flush()
+
+    after = await busy_calendar_ids(session, connection=connection)
+    if after != before:
+        await invalidate_busy_cache(session, connection=connection)
     return existing
+
+
+async def _serialize_host_calendars(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    """Serialise the host's calendar-configuration writes on their ``users`` row (PostgreSQL only).
+
+    ``SELECT … FOR UPDATE`` on the host makes the read-then-promote of a designation atomic against
+    another one: the second transaction blocks until the first commits, then re-reads the committed
+    state and retires what the winner just wrote — so exactly one target survives. The lock is
+    transaction-scoped and released on commit.
+
+    Locking the HOST row rather than the connection is the whole point: the invariant being defended
+    ("one booking target per host") spans every connection that host owns, and a per-connection lock
+    would let two designations on two different connections run side by side — which IS the race.
+
+    A no-op on SQLite (the offline backend serialises writers anyway), so the offline suite is
+    unaffected and the guarantee is proven where it lives: against a real PostgreSQL.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    await session.execute(
+        select(User.id).where(User.id == user_id, User.tenant_id == tenant_id).with_for_update()
+    )
 
 
 async def _retire_other_targets(
