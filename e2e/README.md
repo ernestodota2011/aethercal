@@ -63,21 +63,15 @@ So:
 | `specs/no-show.spec.ts` | RF-25 — **pending**, waiting on a surface that marks a no-show |
 | `specs/a11y.spec.ts` | axe-core over every step of the flow, in both locales |
 
-## Product defects this suite exposes
+## Product defects this suite exposed
 
-### 1. The mailed guest links are unusable (P1, `guest-links.spec.ts`)
+### 1. The mailed guest links were unusable — FIXED in `main` 7a8d336 (P1, RF-09)
 
-The server mints `{base}/cancel?token=…` (`services/bookings.py::_guest_link`); the booking page
-requires `booking=<uuid>` on `/cancel`, and `booking` + `event_type` on `/reschedule`
-(`apps/booking/.../app.py::cancel_form`, `reschedule_form`), and renders its "missing context" error
-otherwise. **A guest who clicks the link in their confirmation email cannot cancel or reschedule** —
-which is the whole of RF-09. Both halves are internally consistent and unit-tested, which is exactly
-why only an end-to-end test sees it.
-
-Root fix: mint the complete URL in `_guest_link` (it holds the booking and its event type), and
-update the unit test that pins the broken shape (`apps/server/tests/test_bookings_service.py:680`).
-The golden flow supplies the missing parameters so the rest of the journey stays covered; delete
-`completeGuestLink()` when the fix lands.
+The server minted `{base}/cancel?token=…` while the booking page reads `booking=<uuid>` (and
+`event_type` to reschedule), so **no guest could cancel or reschedule from their confirmation
+email**. Both halves were internally consistent and unit-tested; the defect lived in the seam, which
+is precisely what this suite exists to walk. `_guest_link` now mints the full context, and
+`guest-links.spec.ts` — which opens the mailed link **verbatim** — stays as the regression guard.
 
 ### 2. A webhook can never reach a private address
 

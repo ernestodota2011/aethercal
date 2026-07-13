@@ -51,20 +51,15 @@ function tokenOf(url: string): string {
 }
 
 /**
- * Rebuild a mailed guest link so the booking page will actually accept it.
+ * The mailed link, pinned to UTC and English.
  *
- * ⚠️ DEFECT — pinned by `guest-links.spec.ts`: the link the product mails carries ONLY the token
- * (`services/bookings.py::_guest_link` builds `{base}/{action}?token=…`), while the page requires
- * `booking=<uuid>` — and `event_type=<uuid>` to reschedule — or it renders its "missing context"
- * error. The guest's *credential* (the signed token) is genuine and is what this journey exercises;
- * the missing query parameters are supplied here so the rest of the flow stays covered.
- * DELETE THIS FUNCTION once `_guest_link` mints complete URLs.
+ * It adds a display timezone and a locale — nothing else. The link already carries everything the
+ * page needs (`services/bookings.py::_guest_link`), and `guest-links.spec.ts` opens it verbatim to
+ * keep it that way. This journey only pins tz/lang so the offered instants are unambiguous and the
+ * copy assertions read against stable English.
  */
-function completeGuestLink(mailed: string, params: Record<string, string>): string {
+function inUtcEnglish(mailed: string): string {
   const url = new URL(mailed);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
   url.searchParams.set("tz", "UTC");
   url.searchParams.set("lang", LANG);
   return url.toString();
@@ -159,12 +154,13 @@ test.describe("the golden flow", () => {
     const oldStart = journey.firstStart!;
     const links = journey.confirmationLinks!;
 
-    await page.goto(
-      completeGuestLink(links.reschedule, {
-        booking: oldBookingId,
-        event_type: run.eventTypeId,
-      }),
-    );
+    // The link as the guest received it — it carries the signed token AND the booking + event type
+    // the page needs (RF-09). We only pin the timezone and the locale.
+    const mailedReschedule = new URL(links.reschedule);
+    expect(mailedReschedule.searchParams.get("booking")).toBe(oldBookingId);
+    expect(mailedReschedule.searchParams.get("event_type")).toBe(run.eventTypeId);
+
+    await page.goto(inUtcEnglish(links.reschedule));
     await expect(page.getByRole("heading", { name: "Reschedule booking" })).toBeVisible();
 
     // Each offered time is a POST form carrying a hidden `new_start` (views.reschedule_section).
@@ -243,7 +239,10 @@ test.describe("the golden flow", () => {
     const bookingId = journey.secondBookingId!;
     const start = journey.secondStart!;
 
-    await page.goto(completeGuestLink(journey.rescheduleLinks!.cancel, { booking: bookingId }));
+    const mailedCancel = journey.rescheduleLinks!.cancel;
+    expect(new URL(mailedCancel).searchParams.get("booking")).toBe(bookingId);
+
+    await page.goto(inUtcEnglish(mailedCancel));
     await expect(page.getByRole("heading", { name: "Cancel booking" })).toBeVisible();
     await page.getByRole("button", { name: "Yes, cancel" }).click();
     await expect(page.getByText("Your booking has been cancelled.")).toBeVisible();

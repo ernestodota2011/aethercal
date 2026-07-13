@@ -1,23 +1,16 @@
 /**
  * The links the product mails the guest — used exactly as a guest uses them: clicked, verbatim.
  *
- * ⚠️ THIS SPEC IS RED ON PURPOSE (`test.fail`). It documents a live P1 defect that no unit test can
- * see, because the defect lives in the seam BETWEEN two internally-consistent halves:
+ * These two were RED on purpose (`test.fail`) until `main` 7a8d336. The server minted
+ * `{base}/cancel?token=…` while the booking page reads `booking=<uuid>` — and `event_type=<uuid>` to
+ * reschedule — and otherwise renders its "missing context" error, so **no guest could ever cancel or
+ * reschedule from their confirmation email**: the whole of RF-09. Each half was internally
+ * consistent and unit-tested; the defect lived in the seam between them, where only a test that
+ * crosses it can look. `_guest_link` now mints the full context, and these tests are green.
  *
- *   * the server mints `{base}/cancel?token=…` and `{base}/reschedule?token=…`
- *     (`apps/server/.../services/bookings.py::_guest_link`), and its unit test pins exactly that
- *     shape (`apps/server/tests/test_bookings_service.py:680`);
- *   * the booking page REQUIRES `booking=<uuid>` on `/cancel`, and `booking=<uuid>` +
- *     `event_type=<uuid>` on `/reschedule` (`apps/booking/.../app.py::cancel_form` /
- *     `reschedule_form`), and renders its "missing context" error page otherwise — and its own unit
- *     tests always pass those parameters.
- *
- * Result: **an account-less guest who clicks the link in their confirmation email cannot cancel or
- * reschedule.** RF-09's whole point, broken, with every test green. Root fix: mint the complete URL
- * in `_guest_link` (it has the booking and its event type in hand) and update the pinning unit test.
- *
- * When that lands, these two tests start PASSING — and `test.fail` turns the run RED, forcing the
- * annotation off. The defect cannot be fixed silently, and it cannot be forgotten.
+ * They stay as the regression guard. Nothing else in the suite opens a mailed link **verbatim**, and
+ * that verbatim click is exactly the act that was broken. Never "repair" the URL here: the moment
+ * this spec adds a query parameter of its own, it stops testing the thing it exists to test.
  */
 
 import { expect, test } from "@playwright/test";
@@ -62,21 +55,11 @@ test.beforeAll(async () => {
 });
 
 test("the mailed CANCEL link opens a page the guest can actually cancel from", async ({ page }) => {
-  test.fail(
-    true,
-    "P1: _guest_link mints /cancel?token=… but the page needs booking=<uuid> too — see the header",
-  );
-
   await page.goto(mailed.cancel); // verbatim: nothing added, nothing repaired
   await expect(page.getByRole("button", { name: /Yes, cancel|Sí, cancelar/ })).toBeVisible();
 });
 
 test("the mailed RESCHEDULE link opens a page offering new times", async ({ page }) => {
-  test.fail(
-    true,
-    "P1: _guest_link mints /reschedule?token=… but the page needs booking + event_type too",
-  );
-
   await page.goto(mailed.reschedule); // verbatim
   await expect(page.locator('#slots input[name="new_start"]').first()).toBeAttached();
 });

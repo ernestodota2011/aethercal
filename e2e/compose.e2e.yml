@@ -31,6 +31,12 @@ services:
       # so they carry the published address of the booking page, not its container name.
       AETHERCAL_BOOKING_BASE_URL: http://localhost:5001
       AETHERCAL_ENVIRONMENT: e2e
+      # A 60-second tick is right for production and absurd for a test: every asserted effect (the
+      # confirmation email, each outbound webhook) would cost a real minute of waiting, and this
+      # journey asserts six of them. The production DEFAULT is untouched — this is the same knob an
+      # operator has (RF-19), turned down for a throwaway stack.
+      AETHERCAL_OUTBOX_DRAIN_INTERVAL_SECONDS: "5"
+      AETHERCAL_WEBHOOK_INTERVAL_SECONDS: "5"
     networks:
       # Declaring networks here REPLACES the implicit `default`, so it must be listed again — or the
       # app loses Postgres.
