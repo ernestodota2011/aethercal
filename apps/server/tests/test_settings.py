@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.config import DatabaseConfig
+from aethercal.server.scheduler import (
+    DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
+    DEFAULT_WEBHOOK_INTERVAL_SECONDS,
+)
 from aethercal.server.settings import Settings
 
 
@@ -75,3 +81,33 @@ def test_settings_read_from_the_environment_with_prefix(monkeypatch: pytest.Monk
     assert settings.app_secret == "from-env"
     assert settings.auto_migrate is False
     assert settings.database_config().url == "postgresql+psycopg://u:p@h/db"
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick intervals (RF-19): production defaults, overridable from the environment.
+# --------------------------------------------------------------------------------------
+def test_scheduler_intervals_default_to_the_production_values() -> None:
+    settings = _settings()
+    assert settings.webhook_interval_seconds == DEFAULT_WEBHOOK_INTERVAL_SECONDS
+    assert settings.busy_refresh_interval_seconds == DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS
+    assert settings.outbox_drain_interval_seconds == DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS
+
+
+def test_scheduler_intervals_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AETHERCAL_DATABASE_URL", "postgres://u:p@h/db")
+    monkeypatch.setenv("AETHERCAL_APP_SECRET", "from-env")
+    monkeypatch.setenv("AETHERCAL_WEBHOOK_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("AETHERCAL_OUTBOX_DRAIN_INTERVAL_SECONDS", "5")
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.webhook_interval_seconds == 5
+    assert settings.outbox_drain_interval_seconds == 5
+    # Untouched knobs keep their production value — an override is not a reset.
+    assert settings.busy_refresh_interval_seconds == DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_interval_is_refused(value: int) -> None:
+    # An interval of 0 would make APScheduler spin (or refuse the job) — fail at the edge, loudly,
+    # rather than boot a scheduler that ticks wrong or not at all.
+    with pytest.raises(ValidationError):
+        _settings(outbox_drain_interval_seconds=value)

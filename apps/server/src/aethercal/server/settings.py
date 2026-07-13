@@ -8,10 +8,16 @@ depending on process environment.
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.config import DatabaseConfig, normalize_database_url
+from aethercal.server.scheduler import (
+    DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
+    DEFAULT_WEBHOOK_INTERVAL_SECONDS,
+)
 
 
 class Settings(BaseSettings):
@@ -34,6 +40,17 @@ class Settings(BaseSettings):
     # refresh) in THIS process. Off by default so the offline test/API path starts no loop; the
     # container sets AETHERCAL_RUN_SCHEDULER=1 in exactly ONE process (see deploy/README).
     run_scheduler: bool = False
+
+    # How often the in-process scheduler ticks, in seconds. The defaults ARE the production values
+    # (``scheduler.DEFAULT_*``, imported so the two can never drift apart); they are exposed to the
+    # environment because a minute-long tick is right for production and wrong for a test stack,
+    # where every asserted effect — the confirmation email, the outbound webhook — would otherwise
+    # cost a real 60 seconds of waiting. Strictly positive: a 0 would leave APScheduler either
+    # spinning or refusing the job, so it fails at the edge instead of booting a scheduler that
+    # ticks wrong.
+    webhook_interval_seconds: int = Field(default=DEFAULT_WEBHOOK_INTERVAL_SECONDS, gt=0)
+    busy_refresh_interval_seconds: int = Field(default=DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS, gt=0)
+    outbox_drain_interval_seconds: int = Field(default=DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS, gt=0)
 
     # Public base URL of the booking page, used to mint guest cancel/reschedule links. When unset,
     # the request path falls back to the incoming request's base URL.

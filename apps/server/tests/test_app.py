@@ -6,6 +6,7 @@ proving the eagerly-built engine/sessionmaker on ``app.state`` are what serve re
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -17,8 +18,14 @@ from httpx import ASGITransport, AsyncClient
 
 from aethercal.server import app as app_module
 from aethercal.server.api.auth import AuthContext, require_api_key
-from aethercal.server.app import build_email_sender, create_app, create_app_from_env
+from aethercal.server.app import (
+    build_email_sender,
+    create_app,
+    create_app_from_env,
+    scheduler_intervals,
+)
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
+from aethercal.server.scheduler import start_scheduler
 from aethercal.server.settings import Settings
 
 
@@ -255,3 +262,69 @@ async def test_lifespan_disposes_the_async_engine_when_the_boot_migration_fails(
     # pool must be released too — that is the leak this guards against.
     assert fake_sync_engine.disposed is True
     assert fake_engine.disposed is True
+
+
+# --------------------------------------------------------------------------------------
+# Scheduler tick intervals: the environment must actually REACH the scheduler.
+# --------------------------------------------------------------------------------------
+def test_scheduler_intervals_are_exactly_the_kwargs_start_scheduler_accepts() -> None:
+    settings = Settings(
+        database_url="sqlite+aiosqlite://",
+        app_secret="test-secret",
+        auto_migrate=False,
+        webhook_interval_seconds=7,
+        busy_refresh_interval_seconds=11,
+        outbox_drain_interval_seconds=5,
+    )
+    intervals = scheduler_intervals(settings)
+    assert intervals == {
+        "webhook_interval_seconds": 7,
+        "busy_refresh_interval_seconds": 11,
+        "outbox_drain_interval_seconds": 5,
+    }
+    # A key that is not a keyword of start_scheduler would be a knob that DOES NOTHING: the variable
+    # would be read from the environment, documented, and silently dropped on the floor.
+    accepted = set(inspect.signature(start_scheduler).parameters)
+    assert set(intervals) <= accepted
+
+
+async def test_the_lifespan_starts_the_scheduler_with_the_configured_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live branch, exercised: an interval set in the environment reaches start_scheduler.
+
+    Without this, `AETHERCAL_OUTBOX_DRAIN_INTERVAL_SECONDS` could be a setting nobody passes on —
+    read, validated, and never used. The scheduler would keep ticking at 60 s while the operator
+    believed otherwise, and no test would notice.
+    """
+    settings = Settings(
+        database_url="sqlite+aiosqlite://",
+        app_secret="test-secret",
+        auto_migrate=False,
+        run_scheduler=True,
+        webhook_interval_seconds=3,
+        busy_refresh_interval_seconds=9,
+        outbox_drain_interval_seconds=4,
+    )
+    captured: dict[str, Any] = {}
+
+    def _fake_start(scheduler: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    def _fake_build() -> object:
+        return object()
+
+    def _fake_stop(_scheduler: Any) -> None:
+        return None
+
+    monkeypatch.setattr(app_module, "build_interval_scheduler", _fake_build)
+    monkeypatch.setattr(app_module, "start_scheduler", _fake_start)
+    monkeypatch.setattr(app_module, "stop_scheduler", _fake_stop)
+
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        pass
+
+    assert captured["webhook_interval_seconds"] == 3
+    assert captured["busy_refresh_interval_seconds"] == 9
+    assert captured["outbox_drain_interval_seconds"] == 4

@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 import uvicorn
@@ -75,6 +75,29 @@ def build_email_sender(environ: Mapping[str, str] | None = None) -> EmailSender 
     except RuntimeError:
         return None
     return SmtpEmailSender(config)
+
+
+class SchedulerIntervals(TypedDict):
+    """The tick intervals :func:`start_scheduler` takes, as keyword arguments."""
+
+    webhook_interval_seconds: int
+    busy_refresh_interval_seconds: int
+    outbox_drain_interval_seconds: int
+
+
+def scheduler_intervals(settings: Settings) -> SchedulerIntervals:
+    """The scheduler's tick intervals, sourced from the environment (RF-19).
+
+    A ``TypedDict`` unpacked into :func:`start_scheduler`, rather than three loose arguments, so the
+    keys are type-checked against that function's keywords: a knob the scheduler does not accept
+    fails to type-check, instead of being read from the environment, documented, and then silently
+    dropped while the scheduler keeps ticking at its default.
+    """
+    return SchedulerIntervals(
+        webhook_interval_seconds=settings.webhook_interval_seconds,
+        busy_refresh_interval_seconds=settings.busy_refresh_interval_seconds,
+        outbox_drain_interval_seconds=settings.outbox_drain_interval_seconds,
+    )
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -127,6 +150,7 @@ def create_app(settings: Settings) -> FastAPI:
                     webhook_tick=make_webhook_delivery_tick(app),
                     busy_refresh_tick=make_busy_refresh_tick(app),
                     outbox_tick=make_outbox_drain_tick(app),
+                    **scheduler_intervals(settings),
                 )
                 stack.callback(stop_scheduler, interval_scheduler)
             app.state.scheduler = interval_scheduler
