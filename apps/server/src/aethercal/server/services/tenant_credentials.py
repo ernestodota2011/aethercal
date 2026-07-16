@@ -128,6 +128,28 @@ class MissingCredentialError(CredentialError):
     """
 
 
+class AmbiguousMoneyProviderError(CredentialError):
+    """==A business has TWO payment credentials, and nothing says which one to charge with.==
+
+    Raised, never resolved by picking one. There is no per-tenant preference field, so with both
+    Stripe and Mercado Pago configured there is **no fact in the system** that answers "which
+    account does this business want its guests' money in?" — and the failure mode of guessing is not
+    a visible error. It is money landing in the wrong account while every status code says success.
+
+    Deliberately NOT a subclass of :class:`MissingCredentialError`. The two are different facts —
+    "you have configured none" is a setup step the business has not done; "you have configured two"
+    is a misconfiguration a human must resolve — and a subclass relationship would let a caller
+    catch the one and silently absorb the other.
+
+    ==The debt, stated with its real price.== If this refusal proves a nuisance in practice, the fix
+    is a **per-tenant payment-provider preference** — a column, a migration and an admin control, so
+    the business STATES its choice and the system reads it. That is a product decision with a
+    migration attached. It is emphatically NOT a default (``prefer stripe``) added quietly to make
+    this exception go away: a default here is indistinguishable from the guess this exists to
+    prevent, and it would be discovered by whoever's money went to the wrong place.
+    """
+
+
 class WrongCredentialClassError(CredentialError):
     """A provider was routed through the door meant for the other class.
 
@@ -372,6 +394,57 @@ def _decrypt(
     )
 
 
+async def resolve_tenant_money_provider(
+    session: AsyncSession, *, tenant_id: uuid.UUID
+) -> CredentialProvider:
+    """Which provider this business charges with. ==DERIVED from its credential, never defaulted.==
+
+    The rule is the whole of the routing decision, and it is three branches long because the
+    alternative to each is worse:
+
+    * **none** → :class:`MissingCredentialError`. The pre-existing refusal, unchanged and re-raised
+      with the same type so :func:`resolve_money_credential`'s callers (and the public API's 402)
+      keep behaving exactly as they did;
+    * **exactly one** → that one. The real case. ==The credential IS the decision==, which is why
+      this needs no flag, no column and no default: a business that configured Mercado Pago has
+      already said what it wants, and asking it to say so twice is how the two answers drift apart;
+    * **two** → :class:`AmbiguousMoneyProviderError`. ==Never a silent pick.== See that class for
+      why, and for the real fix if the ambiguity ever bites.
+
+    ==Takes no ``fernet_key``, so it can leak no secret.== "Which provider?" is answerable without
+    decrypting anything, so it is answered without decrypting anything — the absent parameter is the
+    guarantee, exactly as in :func:`list_credential_providers`, which does the reading.
+    """
+    configured = await list_credential_providers(session, tenant_id=tenant_id)
+    money = [
+        provider for provider in configured if credential_class(provider) is CredentialClass.MONEY
+    ]
+    if not money:
+        raise MissingCredentialError(
+            f"business {tenant_id} has no payment credential of its own, so it cannot charge.\n"
+            "\n"
+            "==This does NOT fall back to the instance's account.== Configure the business's own "
+            "credential (`aethercal-admin credentials set --provider stripe|mercado_pago`), or "
+            "leave the event type free of charge."
+        )
+    if len(money) > 1:
+        names = ", ".join(sorted(provider.value for provider in money))
+        raise AmbiguousMoneyProviderError(
+            f"business {tenant_id} has more than one payment credential ({names}), and nothing "
+            "says which account its guests should pay into.\n"
+            "\n"
+            "==This is refused rather than guessed.== Picking one would put a guest's money in an "
+            "account the business may not have meant, and it would not look like a failure — every "
+            "status code would say success.\n"
+            "\n"
+            "Remove the credential this business does not charge with "
+            "(`aethercal-admin credentials delete --provider <name>`). If a business genuinely "
+            "needs both configured at once, that needs a per-tenant preference field — a product "
+            "decision with a migration, not a default."
+        )
+    return money[0]
+
+
 async def resolve_money_credential(
     session: AsyncSession,
     *,
@@ -456,6 +529,7 @@ async def resolve_infra_credential(
 
 
 __all__ = [
+    "AmbiguousMoneyProviderError",
     "CredentialClass",
     "CredentialError",
     "CredentialProvider",
@@ -471,5 +545,6 @@ __all__ = [
     "required_fields",
     "resolve_infra_credential",
     "resolve_money_credential",
+    "resolve_tenant_money_provider",
     "store_credential",
 ]

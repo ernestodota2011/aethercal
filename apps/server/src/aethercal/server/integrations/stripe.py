@@ -31,11 +31,15 @@ import hmac
 import json
 import logging
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 
-from aethercal.server.services.payment_webhooks import ParsedWebhookEvent, WebhookEventKind
+from aethercal.server.services.payment_webhooks import (
+    InboundWebhook,
+    ParsedWebhookEvent,
+    WebhookEventKind,
+)
 from aethercal.server.services.payments import CheckoutSession
 
 _logger = logging.getLogger(__name__)
@@ -43,6 +47,9 @@ _logger = logging.getLogger(__name__)
 _STRIPE_SIGNATURE_HEADER = "Stripe-Signature"
 _STRIPE_API_BASE = "https://api.stripe.com/v1"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
+
+_CHECKOUT_SESSION_FLOOR = timedelta(minutes=30)
+"""Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes in the future."""
 
 
 def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
@@ -59,9 +66,17 @@ def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
 
 
 class StripeWebhookAdapter:
-    """Stripe's signature + event layout. ==Pure crypto and JSON; unit-tested, no network.=="""
+    """Stripe's signature + event layout. ==Pure crypto and JSON; unit-tested, no network.==
 
-    def verify_signature(self, *, raw_body: bytes, secret: str, headers: Mapping[str, str]) -> bool:
+    ==Stripe signs the BODY==, so a verified body IS the evidence and nothing needs fetching — which
+    is why ``parse`` here performs no I/O and ignores the ``secrets`` the protocol hands it. That is
+    a fact about Stripe, not about payment providers: Mercado Pago signs a manifest that does not
+    cover the body, and sends no money in the notification at all, so its adapter must call the
+    API. The seam carries both; see :mod:`aethercal.server.services.payment_webhooks`.
+    """
+
+    def verify_signature(self, request: InboundWebhook, *, secret: str) -> bool:
+        headers = request.headers
         header = headers.get(_STRIPE_SIGNATURE_HEADER) or headers.get(
             _STRIPE_SIGNATURE_HEADER.lower()
         )
@@ -70,15 +85,18 @@ class StripeWebhookAdapter:
         timestamp, signatures = _parse_stripe_signature(header)
         if timestamp is None or not signatures:
             return False
-        signed_payload = f"{timestamp}.".encode() + raw_body
+        signed_payload = f"{timestamp}.".encode() + request.raw_body
         expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
         # Constant-time against EVERY presented v1 (Stripe may send more than one during a secret
         # rotation). Any match authorises.
         return any(hmac.compare_digest(expected, presented) for presented in signatures)
 
-    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:  # noqa: PLR0911 - one return per Stripe event type + the guards
+    async def parse(  # noqa: PLR0911 - one return per Stripe event type + the guards
+        self, request: InboundWebhook, *, secrets: Mapping[str, str]
+    ) -> ParsedWebhookEvent | None:
+        del secrets  # Stripe's signed body is self-describing; no lookup is needed or wanted
         try:
-            event = json.loads(raw_body)
+            event = json.loads(request.raw_body)
         except (json.JSONDecodeError, ValueError):
             return None
         if not isinstance(event, dict):
@@ -161,6 +179,17 @@ class StripeGateway:
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        """==Stripe's 30-minute MINIMUM ``expires_at``, declared where it belongs (B-06).==
+
+        Stripe rejects a Checkout Session set to expire under 30 minutes out. This number used to
+        live in ``services/payments`` as a constant documented as "Stripe's floor" — inside the
+        provider-AGNOSTIC arbiter, where it silently charged Mercado Pago for a rule Mercado Pago
+        does not have. The provider that has the rule is the one that states it.
+        """
+        return _CHECKOUT_SESSION_FLOOR
+
     def _client(self, secret_key: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=_STRIPE_API_BASE,
@@ -210,15 +239,14 @@ class StripeGateway:
         return CheckoutSession(checkout_url=str(body["url"]), checkout_session_id=str(body["id"]))
 
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
-        del provider, amount_cents  # a full refund keys on the PaymentIntent alone
+        """Refund the PaymentIntent ``provider_ref`` in full, on the business's own key.
+
+        ==No ``provider`` and no ``amount_cents``.== Both used to be taken and immediately
+        ``del``'d; see :meth:`PaymentGateway.refund` for why an ignored parameter was not harmless
+        here. A full refund keys on the PaymentIntent alone.
+        """
         secret_key = secrets["secret_key"]
         async with self._client(secret_key) as client:
             response = await client.post(

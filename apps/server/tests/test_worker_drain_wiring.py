@@ -35,14 +35,12 @@ class _GatewaySpy:
     def __init__(self) -> None:
         self.refunds: list[str] = []
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        return timedelta(minutes=30)
+
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
         assert secrets.get("secret_key", "").startswith("sk_test_")
         self.refunds.append(idempotency_key)
@@ -60,7 +58,7 @@ def _fake_worker_app(sqlite_maker: async_sessionmaker[AsyncSession], gateway: ob
         state=SimpleNamespace(
             pools=WorkerPools.for_offline_tests(sqlite_maker),
             fernet_keys=[_KEY],
-            payment_gateway=gateway,
+            payment_gateways={"stripe": gateway},
             email_sender=None,
             channel_senders={},
         )

@@ -16,10 +16,31 @@ router's order is strict and this module is only reached after it:
 A provider's raw event is translated into a :class:`ParsedWebhookEvent` — a normalised, PII-free
 shape (kind, event id, ``provider_ref``, amount, currency) that is all the arbiter and the parked
 tick need. The signature scheme and the raw JSON layout are the ADAPTER's concern, so the router and
-the arbiter stay provider-agnostic. :class:`GenericHmacAdapter` is the default (HMAC-SHA256 over the
-raw body, header ``X-Webhook-Signature: sha256=<hex>``, a normalised JSON envelope) — the real
-Stripe test-mode adapter, with Stripe's own ``Stripe-Signature`` timestamped scheme, is a later cut
-and REPLACES the ``stripe`` entry in :data:`PAYMENT_WEBHOOK_ADAPTERS`.
+the arbiter stay provider-agnostic. :class:`GenericHmacAdapter` is the fake used by tests
+(HMAC-SHA256 over the raw body, header ``X-Webhook-Signature: sha256=<hex>``, a normalised JSON
+envelope); the real per-provider adapters live in :mod:`aethercal.server.integrations` and are
+selected by :func:`~aethercal.server.integrations.money.webhook_adapter_for`.
+
+.. rubric:: ==Why the adapter is handed the WHOLE request, and why ``parse`` is async (B-06)==
+
+Both facts are Mercado Pago's doing, and neither is a generalisation invented in advance.
+
+* **The whole request, not just the body.** Stripe signs the raw body, so ``(raw_body, headers)``
+  was all a verifier could need. Mercado Pago signs a *manifest* built from the ``data.id`` QUERY
+  PARAMETER, the ``x-request-id`` header and a timestamp — the query string is load-bearing
+  material that a body-and-headers signature simply cannot reach. :class:`InboundWebhook` carries
+  all three so the protocol can express both schemes instead of one.
+* **``parse`` is async.** Mercado Pago's notification body carries ``{"data": {"id": "…"}}`` and
+  **no amount, no currency, no status** — and its signature does not cover the body anyway, so the
+  body is not evidence of anything. The provider's documented instruction is to fetch the resource:
+  ``GET /v1/payments/{id}``. That call needs the business's own ``access_token``, which is why
+  ``parse`` receives the resolved ``secrets`` and not merely the signing secret. A synchronous,
+  body-only ``parse`` could only ever return ``amount_cents=None`` for Mercado Pago — and
+  :func:`dispatch_payment_event` marks such an event APPLIED and drops it, so a guest would pay,
+  the booking would never confirm, and nothing would alarm. The protocol's shape was the bug.
+
+``verify_signature`` deliberately still takes ONLY the signing ``secret``, not the whole credential:
+the half that authorises an event has no business holding the key that can move money.
 """
 
 from __future__ import annotations
@@ -94,31 +115,71 @@ class ParsedWebhookEvent:
         return body
 
 
+@dataclass(frozen=True, slots=True)
+class InboundWebhook:
+    """One inbound webhook request, in the three parts a provider may sign or read.
+
+    ==The QUERY is here because Mercado Pago signs it (B-06).== Stripe's HMAC covers the raw body,
+    so a body-and-headers verifier was sufficient while Stripe was the only provider; Mercado Pago
+    signs ``id:<data.id>;request-id:<x-request-id>;ts:<ts>;``, where ``data.id`` is a QUERY
+    parameter. A protocol that cannot see the query cannot verify Mercado Pago at all — which is
+    not a shortcoming of the provider, but of a seam shaped around a sample of one.
+    """
+
+    raw_body: bytes
+    headers: Mapping[str, str]
+    query: Mapping[str, str]
+
+
 class PaymentWebhookAdapter(Protocol):
     """One payment provider's signature scheme and event layout. Injected, so the router is
     provider-agnostic and a test passes a fake."""
 
-    def verify_signature(self, *, raw_body: bytes, secret: str, headers: Mapping[str, str]) -> bool:
-        """Whether ``headers`` carry a valid signature for ``raw_body`` under ``secret``."""
+    def verify_signature(self, request: InboundWebhook, *, secret: str) -> bool:
+        """Whether ``request`` carries a valid signature under ``secret``.
+
+        ==Takes the signing secret ALONE, never the whole credential.== The half that decides
+        whether an event is authentic has no need of the key that moves money, so it is not given
+        one — a Mercado Pago ``access_token`` cannot leak through a verifier that never receives it.
+        """
         ...
 
-    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:
-        """The raw body as a normalised event, or ``None`` if it is not one we act on."""
+    async def parse(
+        self, request: InboundWebhook, *, secrets: Mapping[str, str]
+    ) -> ParsedWebhookEvent | None:
+        """The request as a normalised event, or ``None`` if it is not one we act on.
+
+        ==Called only AFTER :meth:`verify_signature` has passed.== ``secrets`` is the business's own
+        resolved credential: an adapter whose provider does not put the money in the notification
+        (Mercado Pago sends an id and nothing else) must fetch the payment from that provider's API
+        on the business's own key. An adapter whose provider signs a complete body (Stripe) ignores
+        it and performs no I/O.
+        """
         ...
 
 
 class GenericHmacAdapter:
-    """HMAC-SHA256 over the raw body + a normalised JSON envelope. The default until a provider
-    ships its own scheme (Stripe's timestamped ``Stripe-Signature`` lands with its test-mode
-    adapter)."""
+    """HMAC-SHA256 over the raw body + a normalised JSON envelope — ==the FAKE, for tests.==
 
-    def verify_signature(self, *, raw_body: bytes, secret: str, headers: Mapping[str, str]) -> bool:
+    Not a provider. It is the shape a well-behaved webhook would have if we designed one, and it
+    exists so tests can drive :func:`dispatch_payment_event` without Stripe's or Mercado Pago's
+    ceremony. ==Real providers are selected by
+    :func:`~aethercal.server.integrations.money.webhook_adapter_for`, which is exhaustive over the
+    MONEY credential providers== — so this can never silently stand in for one that is missing.
+    """
+
+    def verify_signature(self, request: InboundWebhook, *, secret: str) -> bool:
+        headers = request.headers
         signature = headers.get(_SIGNATURE_HEADER) or headers.get(_SIGNATURE_HEADER.lower())
         if not signature:
             return False
-        return verify_signature(raw_body, secret.encode("utf-8"), signature)
+        return verify_signature(request.raw_body, secret.encode("utf-8"), signature)
 
-    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:
+    async def parse(
+        self, request: InboundWebhook, *, secrets: Mapping[str, str]
+    ) -> ParsedWebhookEvent | None:
+        del secrets  # a self-describing envelope needs no lookup
+        raw_body = request.raw_body
         try:
             data = json.loads(raw_body)
         except (json.JSONDecodeError, ValueError):
@@ -145,13 +206,6 @@ class GenericHmacAdapter:
             currency=str(currency) if isinstance(currency, str) else None,
             checkout_session_id=str(session_id) if isinstance(session_id, str) else None,
         )
-
-
-PAYMENT_WEBHOOK_ADAPTERS: dict[str, PaymentWebhookAdapter] = {
-    # The real Stripe test-mode adapter (Stripe-Signature) REPLACES this entry in its own cut.
-    "stripe": GenericHmacAdapter(),
-    "mercado_pago": GenericHmacAdapter(),
-}
 
 
 async def record_payment_event(
@@ -267,8 +321,8 @@ async def dispatch_payment_event(  # noqa: PLR0913 - the event's identity + the 
 
 
 __all__ = [
-    "PAYMENT_WEBHOOK_ADAPTERS",
     "GenericHmacAdapter",
+    "InboundWebhook",
     "ParsedWebhookEvent",
     "PaymentWebhookAdapter",
     "WebhookEventKind",

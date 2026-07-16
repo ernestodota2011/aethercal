@@ -56,6 +56,20 @@ _CHECKOUT_URL = "https://checkout.test/cs_test_NOT_A_REAL_KEY"
 # PaymentIntent — the intent does not exist yet when the session is opened.
 _SESSION_ID = "cs_test_NOT_A_REAL_KEY_x"
 
+# The BYOK secret shapes differ per provider, and that difference is load-bearing: a Mercado Pago
+# credential has no ``secret_key`` at all, which is exactly what used to blow up when one
+# instance-wide StripeGateway was handed every business's credential.
+_CREDENTIAL_SECRETS: dict[CredentialProvider, dict[str, str]] = {
+    CredentialProvider.STRIPE: {
+        "secret_key": "sk_test_NOT_A_REAL_KEY_x",
+        "webhook_secret": "whsec_x",
+    },
+    CredentialProvider.MERCADO_PAGO: {
+        "access_token": "TEST-NOT-A-REAL-TOKEN",
+        "webhook_secret": "mp_whsec_x",
+    },
+}
+
 
 class _StubTurnstile:
     VALID = "a-human-solved-this"
@@ -73,6 +87,12 @@ class _FakeGateway:
     def __init__(self) -> None:
         self.sessions: list[dict[str, Any]] = []
         self.fail = False
+
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        """Stripe's floor — this fake stands in for Stripe, so it must carry Stripe's constraint or
+        the resume tests would silently exercise a window Stripe would never allow."""
+        return timedelta(minutes=30)
 
     async def create_checkout_session(  # noqa: PLR0913 - mirrors the gateway contract
         self,
@@ -102,15 +122,7 @@ class _FakeGateway:
         )
         return CheckoutSession(checkout_url=_CHECKOUT_URL, checkout_session_id=_SESSION_ID)
 
-    async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Any,
-    ) -> None:
+    async def refund(self, *, provider_ref: str, idempotency_key: str, secrets: Any) -> None:
         raise AssertionError("refund is not part of the checkout flow")
 
 
@@ -131,7 +143,7 @@ async def paid_app(
     application = create_app(settings)
     application.state.turnstile = _StubTurnstile()
     gateway = _FakeGateway()
-    application.state.payment_gateway = gateway
+    application.state.payment_gateways = {"stripe": gateway}
     try:
         yield application, gateway
     finally:
@@ -150,6 +162,7 @@ async def _seed(
     *,
     price_cents: int | None = _PRICE,
     with_credential: bool = True,
+    provider: CredentialProvider = CredentialProvider.STRIPE,
 ) -> dict[str, Any]:
     slug = f"biz-{uuid.uuid4().hex[:8]}"
     async with owner_maker() as session, session.begin():
@@ -177,8 +190,8 @@ async def _seed(
             await store_credential(
                 session,
                 tenant_id=tenant.id,
-                provider=CredentialProvider.STRIPE,
-                secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": "whsec_x"},
+                provider=provider,
+                secrets=_CREDENTIAL_SECRETS[provider],
                 fernet_key=_KEY,
             )
         now = datetime.now(UTC)
@@ -623,3 +636,85 @@ async def test_resume_without_a_valid_token_is_forbidden(
     )
     assert ok.status_code == 200, ok.text
     assert len(await _payments_for(owner_maker, booking_id)) == 1
+
+
+# --------------------------------------------------------------------------------------
+# ==A Mercado Pago business charges with Mercado Pago== (B-06).
+# --------------------------------------------------------------------------------------
+
+
+class _FakeMercadoPagoGateway:
+    """A Mercado Pago gateway. ==No ``secret_key`` reaches it, and it declares no floor.=="""
+
+    def __init__(self) -> None:
+        self.sessions: list[dict[str, Any]] = []
+
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        return timedelta(0)
+
+    async def create_checkout_session(  # noqa: PLR0913 - mirrors the gateway contract
+        self,
+        *,
+        idempotency_key: str,
+        amount_cents: int,
+        currency: str,
+        expires_at: datetime,
+        return_url: str,
+        secrets: Any,
+    ) -> CheckoutSession:
+        # ==The BYOK secret is the business's own MERCADO PAGO credential.== If the routing were
+        # still hardcoded to Stripe this would be a Stripe key — or there would be none at all.
+        assert "secret_key" not in secrets, "a Mercado Pago business has no Stripe key"
+        assert secrets["access_token"].startswith("TEST-")
+        del amount_cents, currency, expires_at, return_url
+        self.sessions.append({"idempotency_key": idempotency_key})
+        # Mercado Pago's anchor IS the external_reference we chose — the payment never names the
+        # preference, so the adapter hands back the key it was given.
+        return CheckoutSession(
+            checkout_url="https://mercadopago.test/checkout", checkout_session_id=idempotency_key
+        )
+
+    async def refund(self, *, provider_ref: str, idempotency_key: str, secrets: Any) -> None:
+        raise AssertionError("refund is not part of the checkout flow")
+
+
+async def test_a_mercado_pago_business_opens_a_mercado_pago_checkout(
+    paid_app: tuple[FastAPI, _FakeGateway],
+    paid_client: AsyncClient,
+    owner_maker: Sessionmaker,
+) -> None:
+    """==The routing, end to end — auditing the READER, not just the resolver.==
+
+    ``resolve_tenant_money_provider`` returning MERCADO_PAGO proves nothing on its own: the public
+    checkout path had ``CredentialProvider.STRIPE`` hardcoded in TWO places (the secret lookup and
+    the payment row), and one instance-wide ``StripeGateway``. This drives the real endpoint and
+    asserts the two things that were wrong: the Mercado Pago gateway is the one called (with the
+    business's ``access_token``, never a Stripe key), and the payment row records
+    ``provider="mercado_pago"`` — the string the inbound webhook route matches on and the refund
+    intent carries to pick its gateway. Write "stripe" there and a real Mercado Pago payment is
+    unresolvable and its refund unroutable.
+    """
+    application, stripe_gateway = paid_app
+    mp_gateway = _FakeMercadoPagoGateway()
+    application.state.payment_gateways = {
+        "stripe": stripe_gateway,
+        "mercado_pago": mp_gateway,
+    }
+    seeded = await _seed(owner_maker, provider=CredentialProvider.MERCADO_PAGO)
+
+    response = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["checkout_url"] == "https://mercadopago.test/checkout"
+    assert len(mp_gateway.sessions) == 1, "the Mercado Pago business went to Mercado Pago"
+    assert stripe_gateway.sessions == [], "Stripe was never asked to charge for this business"
+
+    payment = await _one_payment(owner_maker, uuid.UUID(body["id"]))
+    assert payment.provider == "mercado_pago"
+    # ==The anchor is the external_reference the gateway echoed back== — the booking-id idempotency
+    # key — never a preference id the payment would not carry.
+    assert payment.checkout_session_id == str(payment.booking_id)

@@ -34,7 +34,8 @@ from aethercal.server.services.bookings import (
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.payment_webhooks import (
-    PAYMENT_WEBHOOK_ADAPTERS,
+    InboundWebhook,
+    PaymentWebhookAdapter,
     dispatch_payment_event,
     record_payment_event,
 )
@@ -158,7 +159,19 @@ async def receive_payment_webhook(
     # is a memory-exhaustion DoS. An over-cap body is a 413 here, before any verification or write.
     raw_body = await _read_body_within_limit(request)
 
-    adapters = getattr(request.app.state, "webhook_adapters", PAYMENT_WEBHOOK_ADAPTERS)
+    # ==No fallback registry.== This used to default to a hand-written dict whose Mercado Pago entry
+    # was a generic HMAC adapter that could never have verified a real Mercado Pago
+    # notification. The
+    # map is now built exhaustively from the MONEY credential providers
+    # (``integrations.money.build_webhook_adapters``) and wired onto app state at startup; if it is
+    # absent, payments are not configured and this refuses rather than reaching for a stand-in.
+    adapters: dict[str, PaymentWebhookAdapter] | None = getattr(
+        request.app.state, "webhook_adapters", None
+    )
+    if not adapters:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="payments are not configured"
+        )
     adapter = adapters.get(provider)
     if adapter is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown provider")
@@ -192,10 +205,17 @@ async def receive_payment_webhook(
     if not webhook_secret:  # pragma: no cover - required_fields guarantees it, but fail closed
         raise _unauthorized()
 
-    # (4) ==verify the HMAC over the RAW body. Invalid → 401, and NOTHING has been written.==
-    if not adapter.verify_signature(
-        raw_body=raw_body, secret=webhook_secret, headers=request.headers
-    ):
+    # (4) ==verify the provider's signature. Invalid → 401, and NOTHING has been written.==
+    # The whole request goes to the adapter — body, headers AND query — because what a provider
+    # signs is the provider's business: Stripe HMACs the raw body, Mercado Pago HMACs a manifest
+    # built from the ``data.id`` QUERY parameter and the ``x-request-id`` header. The adapter is
+    # handed the signing secret ALONE, never the credential that can move money.
+    inbound = InboundWebhook(
+        raw_body=raw_body,
+        headers=request.headers,
+        query=request.query_params,
+    )
+    if not adapter.verify_signature(inbound, secret=webhook_secret):
         raise _unauthorized()
 
     # (5) only now: parse, record (idempotent / anti-replay), dispatch.
@@ -204,7 +224,12 @@ async def receive_payment_webhook(
     # rejected: any non-2xx makes the provider retry it for ever. 401 (bad signature) is the only
     # rejection; there is no 400 here, because a verified body we choose not to act on is not an
     # error, it is an event we are simply not interested in.
-    event = adapter.parse(raw_body)
+    # ==``parse`` may perform provider I/O, and is given the business's own credential to do it.==
+    # Mercado Pago's notification carries an id and nothing else — no amount, no currency, no
+    # status — and its signature does not cover the body anyway, so the adapter must fetch the
+    # payment (``GET /v1/payments/{id}``) on the business's ``access_token`` to learn what happened.
+    # Stripe's adapter ignores ``secrets`` and does no I/O: its signed body is self-describing.
+    event = await adapter.parse(inbound, secrets=credential.secrets)
     if event is None:
         return {"status": "ignored"}
 

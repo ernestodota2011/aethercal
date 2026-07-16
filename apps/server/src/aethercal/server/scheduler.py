@@ -438,15 +438,15 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
     # rotation, so the drain never fails to decrypt a row the rotation has not reached.
     fernet = _decryption_fernet(app)
     service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-    # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateway + rotation keys
+    # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateways + rotation keys
     # DEFENSIVELY off app state (a missing one must not AttributeError), and let
     # ``build_money_runners`` decide: the REFUND runner needs BOTH, EXPIRE_HOLD needs neither. With
     # either missing the refund runner is None and a REFUND intent raises loudly, not silently
     # stranding a guest's money.
     fernet_keys = getattr(app.state, "fernet_keys", None)
-    gateway = getattr(app.state, "payment_gateway", None)
+    gateways = getattr(app.state, "payment_gateways", None)
     refund_runner, expire_hold_runner = build_money_runners(
-        exec_maker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
+        exec_maker=pools.exec_maker, gateways=gateways, fernet_keys=fernet_keys
     )
     return make_booking_effect_executor(
         sessionmaker=pools.exec_maker,

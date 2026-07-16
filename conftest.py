@@ -31,6 +31,12 @@ from collections.abc import Sequence
 
 import pytest
 
+# ==The network guard travels as a NAMED plugin, not as more of this file.== Fixtures must live in
+# a conftest or a registered plugin, and every `conftest.py` in this tree imports under the same
+# top-level name — so a test could never import the guard's exception unambiguously. Registering it
+# here gives it one importable name (`pytest_network_guard`) and keeps this file about the db gate.
+pytest_plugins = ["pytest_network_guard"]
+
 DB_URL_ENV = "AETHERCAL_TEST_DATABASE_URL"
 DB_MARKER = "db"
 

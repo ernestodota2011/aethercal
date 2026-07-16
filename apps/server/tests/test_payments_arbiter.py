@@ -154,6 +154,30 @@ async def _apply(  # noqa: PLR0913 - a test helper mirroring the arbiter call
     )
 
 
+async def _apply_with_session(  # noqa: PLR0913 - the arbiter call, plus the creation-time anchor
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    provider_ref: str,
+    spy: _Spy,
+    *,
+    session_id: str,
+    amount_cents: int = _PRICE,
+    currency: str = _CUR,
+):
+    """:func:`_apply`, but carrying the ``checkout_session_id`` the confirming event brings."""
+    return await apply_paid_event(
+        session,
+        tenant_id=tenant_id,
+        provider=_PROVIDER,
+        provider_ref=provider_ref,
+        amount_cents=amount_cents,
+        currency=currency,
+        now=NOW,
+        confirm_effects=spy,
+        checkout_session_id=session_id,
+    )
+
+
 # --------------------------------------------------------------------------------------
 
 
@@ -399,3 +423,127 @@ async def test_the_echo_of_a_mismatch_refund_is_not_read_as_an_out_of_band_refun
         "our own mismatch refund was read as an operator's out-of-band refund"
     )
     assert cancelled == [], "the arbiter cancelled a booking over the echo of its own refund"
+# --------------------------------------------------------------------------------------
+# ==Two charges under ONE checkout reference== — the shape Mercado Pago can produce and
+# Stripe cannot (B-06).
+# --------------------------------------------------------------------------------------
+
+
+async def _pay_by_session(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    booking: Booking,
+    *,
+    checkout_session_id: str,
+) -> Payment:
+    """The row as the checkout writes it: anchored on the checkout reference, intent still NULL."""
+    payment = Payment(
+        tenant_id=tenant_id,
+        booking_id=booking.id,
+        provider=_PROVIDER,
+        provider_ref=None,
+        checkout_session_id=checkout_session_id,
+        status=PaymentStatus.INTENT,
+        amount_cents=_PRICE,
+        currency=_CUR,
+    )
+    session.add(payment)
+    await session.flush()
+    return payment
+
+
+async def test_a_second_charge_on_one_checkout_reference_is_refunded_not_swallowed(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The B-06 finding, closed.== Two DISTINCT charges can share one checkout reference.
+
+    Stripe cannot produce this — one Checkout Session mints one PaymentIntent, so two charges mean
+    two session ids and two rows, and the ordinary double-payment branch refunds the loser. Mercado
+    Pago can: its payment carries no preference id, so the anchor is an ``external_reference`` we
+    choose, and if a guest pays two preferences minted for one booking BOTH payments echo it.
+
+    Before the fix the second charge resolved to the SAME row, found the booking already confirmed
+    by that row's own payment id, and was read as a REPLAY — ==so we kept a guest's money and said
+    nothing.== It must be refunded, exactly like any other double payment.
+    """
+    tenant_id, booking, _ = await _seed(sqlite_session)
+    await _pay_by_session(sqlite_session, tenant_id, booking, checkout_session_id="booking:abc")
+    spy = _Spy()
+
+    # The first charge confirms, resolving by the checkout reference and backfilling the intent.
+    first = await _apply_with_session(
+        sqlite_session, tenant_id, "mp_1", spy, session_id="booking:abc"
+    )
+    assert first.outcome is ArbiterOutcome.CONFIRMED
+    await sqlite_session.refresh(booking)
+    assert booking.status is BookingStatus.CONFIRMED
+
+    # A SECOND, different charge arrives carrying the SAME external_reference.
+    second = await _apply_with_session(
+        sqlite_session, tenant_id, "mp_2", spy, session_id="booking:abc"
+    )
+
+    assert second.outcome is ArbiterOutcome.REFUNDED_DOUBLE, "the second charge must not be kept"
+    # The booking stays confirmed on the FIRST charge: the guest keeps what they paid for.
+    await sqlite_session.refresh(booking)
+    assert booking.status is BookingStatus.CONFIRMED
+    assert spy.calls == [booking.id], "the confirmation chain fires once, not twice"
+
+    # ==The refund is enqueued against the SECOND charge==, not the first.
+    refunds = await _refund_rows(sqlite_session, booking.id)
+    assert len(refunds) == 1
+    assert refunds[0].payload["provider_ref"] == "mp_2"
+
+
+async def test_the_second_charge_gets_its_own_payment_row_so_the_refund_can_find_it(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Auditing the READER, not just the writer.==
+
+    Enqueuing a refund is not refunding. ``make_refund_runner`` resolves the payment by
+    ``provider_ref`` and, finding none, logs "nothing to refund" and RETURNS — so a refund queued
+    for a charge with no row of its own is a silent no-op, and the guest's second charge would stay
+    with us just as surely as before. The second charge therefore gets its own PAID row (with a NULL
+    checkout reference, which the UNIQUE permits) so the runner can find it, refund it, and record
+    that it did.
+    """
+    tenant_id, booking, _ = await _seed(sqlite_session)
+    await _pay_by_session(sqlite_session, tenant_id, booking, checkout_session_id="booking:abc")
+    spy = _Spy()
+    await _apply_with_session(sqlite_session, tenant_id, "mp_1", spy, session_id="booking:abc")
+    await _apply_with_session(sqlite_session, tenant_id, "mp_2", spy, session_id="booking:abc")
+
+    rows = list(
+        (
+            await sqlite_session.scalars(
+                select(Payment)
+                .where(Payment.booking_id == booking.id)
+                .order_by(Payment.provider_ref)
+            )
+        ).all()
+    )
+    assert [r.provider_ref for r in rows] == ["mp_1", "mp_2"], "the second charge is on the ledger"
+    second = rows[1]
+    assert second.status is PaymentStatus.PAID, "the money did move; the ledger must say so"
+    assert second.checkout_session_id is None, "the anchor belongs to the row that claimed it"
+    assert second.amount_cents == _PRICE
+
+
+async def test_a_replay_of_the_second_charge_is_still_a_replay(
+    sqlite_session: AsyncSession,
+) -> None:
+    """The double-charge branch must not re-refund on every redelivery: once the second charge has
+    its own row, it resolves by ``provider_ref`` like any other and is an ordinary replay."""
+    tenant_id, booking, _ = await _seed(sqlite_session)
+    await _pay_by_session(sqlite_session, tenant_id, booking, checkout_session_id="booking:abc")
+    spy = _Spy()
+    await _apply_with_session(sqlite_session, tenant_id, "mp_1", spy, session_id="booking:abc")
+    await _apply_with_session(sqlite_session, tenant_id, "mp_2", spy, session_id="booking:abc")
+
+    again = await _apply_with_session(
+        sqlite_session, tenant_id, "mp_2", spy, session_id="booking:abc"
+    )
+
+    assert again.outcome is ArbiterOutcome.REFUNDED_DOUBLE
+    refunds = await _refund_rows(sqlite_session, booking.id)
+    assert len(refunds) == 1, "the outbox dedupe collapses it to ONE refund of the second charge"
