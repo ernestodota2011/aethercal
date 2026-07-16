@@ -197,6 +197,22 @@ def _clients(client: object) -> SenderClients:
     return SenderClients(operator=client, tenant=client)  # type: ignore[arg-type]
 
 
+def _refusal_for(senders: object, provider: CredentialProvider) -> Exception:
+    """The error recorded for ``provider``'s channel. ==Asserts it is THERE, not that it escaped.==
+
+    A refused credential used to blow the whole resolve up, which is what took a business's EMAIL
+    down along with its bad WhatsApp. It is now scoped to its own channel — so the assertion moves
+    from "the function raised" to "this channel, and only this channel, carries the reason".
+    """
+    channel = channel_for(provider)
+    errors = senders.channel_errors  # type: ignore[attr-defined]
+    assert channel in errors, (
+        f"the {channel.value} channel was refused and recorded no reason. Silently absent is "
+        "indistinguishable from never configured — that is the no-op, not a fix for it."
+    )
+    return errors[channel]
+
+
 async def _public_dns(host: str) -> list[str]:
     """A resolver that answers with one ordinary public address.
 
@@ -523,10 +539,10 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
         )
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError) as caught:
-                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
 
-        message = str(caught.value)
+        assert channel_for(provider) not in senders.channels
+        message = str(_refusal_for(senders, provider))
         assert "base_url" in message, "the error must name the field a human has to go and fix"
         assert target not in message, "the stored value is never echoed — not even a URL"
 
@@ -555,15 +571,15 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             return ["127.0.0.1"]
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError):
-                await resolve_tenant_senders(
-                    sqlite_session,
-                    tenant_id=business.id,
-                    fernet_key=KEY,
-                    defaults=_defaults(),
-                    clients=_clients(client),
-                    resolver=_resolves_inward,
-                )
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_resolves_inward,
+            )
+        _refusal_for(senders, provider)
 
     @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
     async def test_one_poisoned_record_in_a_mixed_answer_refuses_the_whole_target(
@@ -590,15 +606,15 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             return ["93.184.216.34", "10.0.0.1"]
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError):
-                await resolve_tenant_senders(
-                    sqlite_session,
-                    tenant_id=business.id,
-                    fernet_key=KEY,
-                    defaults=_defaults(),
-                    clients=_clients(client),
-                    resolver=_mixed,
-                )
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_mixed,
+            )
+        _refusal_for(senders, provider)
 
     @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
     async def test_plaintext_http_is_refused_for_a_tenant_supplied_target(
@@ -626,15 +642,15 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             return ["93.184.216.34"]
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError, match="https"):
-                await resolve_tenant_senders(
-                    sqlite_session,
-                    tenant_id=business.id,
-                    fernet_key=KEY,
-                    defaults=_defaults(),
-                    clients=_clients(client),
-                    resolver=_public,
-                )
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_public,
+            )
+        assert "https" in str(_refusal_for(senders, provider))
 
     async def test_a_public_https_target_is_allowed(
         self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
@@ -725,10 +741,10 @@ class TestATenantsSmtpRelayCannotBeInternalEither:
         )
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError) as caught:
-                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
 
-        message = str(caught.value)
+        assert senders.email is None
+        message = str(_refusal_for(senders, CredentialProvider.SMTP))
         assert "host" in message
         assert host not in message, "the stored value is never echoed"
 
@@ -749,10 +765,11 @@ class TestATenantsSmtpRelayCannotBeInternalEither:
             return ["127.0.0.1"]
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError):
-                await _senders(
-                    sqlite_session, business, defaults=_defaults(), client=client, resolver=_inward
-                )
+            senders = await _senders(
+                sqlite_session, business, defaults=_defaults(), client=client, resolver=_inward
+            )
+        assert senders.email is None
+        _refusal_for(senders, CredentialProvider.SMTP)
 
     async def test_a_public_relay_is_allowed(
         self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
@@ -1058,6 +1075,157 @@ class TestTheGuardedTransportClosesRebinding:
         )
 
 
+class TestOneBrokenChannelDoesNotSilenceTheOthers:
+    """==A fail-closed applied per BUSINESS when the whole design says per CHANNEL.==
+
+    A refused credential escaped ``resolve_tenant_senders`` entirely, so a business whose WhatsApp
+    ``base_url`` pointed at the metadata service ==stopped receiving its EMAIL==. That is this
+    module's own rule broken by this module: the channel configured correctly cannot pay for the one
+    that is not.
+
+    The opposite extreme is the trap: a broken channel must not go quiet either. It stays a failure,
+    with its own reason — just its own.
+    """
+
+    async def test_a_refused_whatsapp_does_not_take_the_email_channel_with_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "one-bad-channel")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets={"base_url": "https://169.254.169.254/", "instance": "i", "api_key": "k"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is not None, (
+            "the business lost its EMAIL because its WHATSAPP credential was bad. The channel that "
+            "is configured correctly does not pay for the one that is not."
+        )
+        assert Channel.WHATSAPP not in senders.channels
+        assert Channel.WHATSAPP in senders.channel_errors, (
+            "the broken channel went SILENT — no sender and no reason. That is the no-op this "
+            "codebase exists to refuse; it must stay a failure, just its own."
+        )
+
+    async def test_a_refused_smtp_does_not_take_the_phone_channels_with_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The mirror. Isolation that only runs one way is half a fix."""
+        business = await _business(sqlite_session, tenant_factory, "bad-smtp")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "127.0.0.1", "from_addr": "a@b.example"},
+            fernet_key=KEY,
+        )
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is None
+        assert Channel.EMAIL in senders.channel_errors
+        assert Channel.WHATSAPP in senders.channels, (
+            "the business lost its WhatsApp because its SMTP relay host was bad"
+        )
+
+    async def test_a_refused_channels_step_still_FAILS_with_its_own_reason(self) -> None:
+        """==Not silent, and not somebody else's problem.==
+
+        The step whose channel was refused must still fail — retryably, carrying the reason — so the
+        misconfiguration is visible and the message survives long enough for the fix to land.
+        """
+
+        async def _resolver(tenant_id: uuid.UUID) -> TenantSenders:
+            return TenantSenders(
+                tenant_id=tenant_id,
+                email=None,
+                channels={},
+                channel_errors={Channel.EMAIL: UnusableCredentialError("the relay host is inward")},
+            )
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # the refusal precedes any use
+            resolve_senders=_resolver,
+            service_factory=None,
+        )
+        with pytest.raises(UnusableCredentialError, match="inward"):
+            await execute(_email_work(uuid.uuid4()), _NOW)
+
+
+class TestTheTenantClientCannotShareAConnectionBetweenBusinesses:
+    """==The price of pinning, and it landed on the leak this batch exists to close.==
+
+    Pinning rewrites the request's host to the validated IP — and a connection pool is keyed by
+    ORIGIN. So two businesses whose different hostnames resolve to the SAME address collapse onto
+    one pool key, and the second's request can ride a TLS connection handshaked with the FIRST's SNI
+    and certificate: that business's API key delivered to the other's server.
+    """
+
+    async def test_two_hostnames_on_one_ip_collapse_to_one_origin(self) -> None:
+        """==The mechanism, demonstrated.== This is WHY reuse must be off — not a hypothetical."""
+        seen: list[tuple[str, str | None, int | None]] = []
+
+        class _Spy(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                seen.append((request.url.scheme, request.url.host, request.url.port))
+                return httpx.Response(200)
+
+        async def _same_ip(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        transport = EgressGuardedTransport(_Spy(), resolver=_same_ip)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post("https://tenant-a.example/send")
+            await client.post("https://tenant-b.example/send")
+
+        assert seen[0] == seen[1], (
+            "the premise of this test no longer holds — the pin no longer collapses the origin, so "
+            "the keep-alive ban below may be guarding nothing. Re-derive it before deleting it."
+        )
+
+    def test_the_tenant_client_keeps_no_connection_to_reuse(self) -> None:
+        """==With no idle connection there is none to share.==
+
+        Asserted on the pool the real ``SenderClients.build`` produces, not on a value a test chose.
+        """
+        clients = SenderClients.build(timeout=10.0)
+        pool = clients.tenant._transport._inner._pool  # type: ignore[attr-defined]
+        assert pool._max_keepalive_connections == 0, (
+            "the tenant client keeps idle connections. After the pin their pool key is the IP, so "
+            "two businesses on one address can share a TLS connection established with the other's "
+            "certificate — one business's API key sent to the other's server."
+        )
+        assert clients.operator is not clients.tenant
+
+    def test_http2_stays_off_or_the_ban_buys_nothing(self) -> None:
+        """==The hole the keep-alive ban does not cover.==
+
+        HTTP/2 multiplexes CONCURRENT requests onto one connection. Turn it on and two businesses
+        drained at the same moment share a connection again, on the same collapsed origin, with no
+        idle connection ever involved. It is off by default in httpx — which is exactly why it gets
+        an assertion rather than a hope.
+        """
+        clients = SenderClients.build(timeout=10.0)
+        pool = clients.tenant._transport._inner._pool  # type: ignore[attr-defined]
+        assert pool._http2 is False, (
+            "HTTP/2 is on for tenant egress: concurrent sends would be multiplexed onto one "
+            "connection, putting the cross-tenant sharing back."
+        )
+
+
 class TestAStoredCredentialWhoseValueCannotBeUsed:
     """==A credential can be complete and still be unusable, and that difference decides the
     outcome.==
@@ -1138,8 +1306,10 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
         )
 
         async with httpx.AsyncClient() as client:
-            with pytest.raises(UnusableCredentialError):
-                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is None
+        _refusal_for(senders, CredentialProvider.SMTP)
 
         # ...and the drain turns exactly that into a RETRYABLE failure, never a terminal skip:
         # `_run_one_item` names OutboxSkipped / OutboxDeferred / OutboxUnknownOutcome explicitly,

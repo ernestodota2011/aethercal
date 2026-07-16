@@ -1994,13 +1994,14 @@ async def _clear_provider_call_marker(sessionmaker: Sessionmaker, work: OutboxWo
         }
 
 
-async def run_notify_effect(
+async def run_notify_effect(  # noqa: PLR0913 - one keyword per injected sending seam
     sessionmaker: Sessionmaker,
     work: OutboxWork,
     now: datetime,
     *,
     sender: EmailSender | None,
     channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
 ) -> None:
     """Execute one workflow step: send its message on its channel (RF-24).
 
@@ -2024,7 +2025,9 @@ async def run_notify_effect(
     have accepted a minute later.
     """
     async with sessionmaker() as session:
-        plan = await _prepare_notify(session, work, now, sender=sender, channels=channels)
+        plan = await _prepare_notify(
+            session, work, now, sender=sender, channels=channels, channel_errors=channel_errors
+        )
         await session.rollback()  # a pure read: release the connection before any network call
     if plan is None:
         return
@@ -2249,13 +2252,14 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
         )
 
 
-async def _prepare_notify(
+async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending seam
     session: AsyncSession,
     work: OutboxWork,
     now: datetime,
     *,
     sender: EmailSender | None,
     channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
 ) -> _NotifyPlan | None:
     """The step's READ phase: decide, then compose/render. ``None`` = nothing to send.
 
@@ -2330,6 +2334,15 @@ async def _prepare_notify(
 
     phone_sender = channels.get(channel)
     if phone_sender is None:
+        # ==Absent and REFUSED are not the same state, and collapsing them loses a real fault.==
+        # No credential at all is a disabled feature: terminal, nothing to fix, retrying is noise.
+        # A credential that IS configured and was refused (an endpoint pointing inside our network,
+        # a field that cannot be parsed) is a misconfiguration a human undoes with one
+        # `credentials set` — so it FAILS and retries, carrying its own reason, and its message
+        # survives long enough for the fix to land.
+        refused = channel_errors.get(channel)
+        if refused is not None:
+            raise refused
         raise OutboxSkipped(
             f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this instance "
             "(a channel without credentials is a disabled feature, not an error)"
@@ -2494,6 +2507,13 @@ def make_booking_effect_executor(
         effect = work.effect
         if effect is OutboxEffect.EMAIL:
             senders = await resolve_senders(work.tenant_id)
+            # Configured and REFUSED is not the same as never configured. A relay whose host points
+            # inside our network is a fault a human fixes with one `credentials set`, so it fails
+            # and retries carrying its own reason — and, crucially, it took no other channel down
+            # with it on the way here.
+            refused = senders.channel_errors.get(Channel.EMAIL)
+            if refused is not None:
+                raise refused
             if senders.email is None:  # pragma: no cover - live misconfiguration guard
                 # RETRYABLE, and deliberately NOT an OutboxSkipped. Email is the one channel with a
                 # legitimate instance-wide default (a relay is a lent transport, not an identity —
@@ -2509,7 +2529,12 @@ def make_booking_effect_executor(
         elif effect is OutboxEffect.NOTIFY:
             senders = await resolve_senders(work.tenant_id)
             await run_notify_effect(
-                sessionmaker, work, now, sender=senders.email, channels=senders.channels
+                sessionmaker,
+                work,
+                now,
+                sender=senders.email,
+                channels=senders.channels,
+                channel_errors=senders.channel_errors,
             )
         else:
             assert_never(effect)

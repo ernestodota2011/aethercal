@@ -50,6 +50,17 @@ credentials; nothing sent with them.
   tenant's sender is now built on a client whose transport re-validates and pins the address at
   connect (reusing the webhook path's `pinned_ip_for`), with `Host` and TLS certificate
   verification still bound to the real hostname.
+- **Tenant egress keeps no idle connection.** Pinning rewrites the request's host to the validated
+  IP, and a connection pool is keyed by origin — so two businesses whose hostnames resolve to the
+  same address would collapse onto one pool key and could share a TLS connection established with
+  the other's certificate. Keep-alive is off for tenant egress (HTTP/2 stays off too, and is now
+  asserted): every send stands up its own connection, handshaked for its own hostname. The cost is
+  a TLS handshake per send.
+- **One broken channel no longer silences the others.** A refused credential escaped the resolver
+  entirely, so a business with a bad WhatsApp `base_url` stopped receiving its *email*. The failure
+  is now scoped to the channel that owns it — and it stays a failure, with its reason: a channel
+  that is configured and refused FAILS and retries (fixable with `credentials set`), while a channel
+  that was never configured is still skipped.
 - **A tenant's SMTP relay host is guarded too, and pinned at connect.** `host: 127.0.0.1, port: 25`
   relayed a business's mail through the operator's own local MTA — an open relay on the operator's
   IP reputation. It is the same trust-boundary bug without the HTTP, and scoping it out was

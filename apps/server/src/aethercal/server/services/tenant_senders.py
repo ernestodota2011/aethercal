@@ -98,7 +98,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import assert_never
 from urllib.parse import urlsplit
@@ -513,6 +513,28 @@ class TenantSenders:
     email: EmailSender | None
     channels: Mapping[Channel, PhoneChannelSender]
 
+    channel_errors: Mapping[Channel, CredentialError] = field(default_factory=dict)
+    """Why a channel that IS configured could not be built. ==One channel's fault stays its own.==
+
+    A refused credential used to escape :func:`resolve_tenant_senders` entirely, which meant a
+    business with a bad WhatsApp ``base_url`` ==stopped receiving its EMAIL==. That is this module's
+    own rule broken by this module: the channel that is configured correctly cannot pay for the one
+    that is not.
+
+    So the failure is scoped to the channel that owns it, and carried here rather than raised. It is
+    deliberately NOT collapsed into "the channel is absent":
+
+    * **absent** (no entry here) means *the business never configured it* → the step is
+      :class:`~aethercal.server.services.outbox.OutboxSkipped`: terminal, and rightly so, because
+      nothing is broken;
+    * **an entry here** means *it is configured and was refused* → the step FAILS and retries. A
+      broken credential is undone by one ``credentials set``, and terminal "may only carry a
+      condition that cannot be undone" — retiring it would destroy the very message the fix would
+      deliver.
+
+    Collapsing the two would silence a real misconfiguration, which is the no-op this codebase is
+    built to refuse."""
+
     @classmethod
     def for_offline_tests(
         cls,
@@ -810,7 +832,30 @@ class SenderClients:
         return cls(
             operator=httpx.AsyncClient(timeout=timeout),
             tenant=httpx.AsyncClient(
-                transport=EgressGuardedTransport(httpx.AsyncHTTPTransport(), resolver=resolver),
+                transport=EgressGuardedTransport(
+                    # ==NO KEEP-ALIVE, and this is a correctness requirement, not a tuning knob.==
+                    #
+                    # `EgressGuardedTransport` rewrites the request's host to the pinned IP, and a
+                    # connection pool is keyed by ORIGIN — (scheme, host, port). So after the pin,
+                    # two businesses whose different hostnames resolve to the SAME address collapse
+                    # onto the SAME pool key, and the second one's request can go down a TLS
+                    # connection established with the FIRST one's SNI and certificate. That ships
+                    # one business's API key to whatever server answered for the other: ==the
+                    # cross-tenant leak this whole batch exists to close, reintroduced by the fix
+                    # for rebinding.==
+                    #
+                    # The identity is restored by removing the sharing. With no idle connection
+                    # kept there is none to reuse, so every send stands up its own — resolved,
+                    # pinned, and handshaked for its own hostname. (HTTP/2 is off by default in
+                    # httpx and must stay off: it multiplexes concurrent requests onto ONE
+                    # connection, which would put the sharing back on the same collapsed origin.)
+                    #
+                    # The cost is a TLS handshake per send. The alternative was a pool per hostname
+                    # — more machinery, unbounded state, same result — for a saving nobody can
+                    # measure on a queue that sends a handful of reminders a minute.
+                    httpx.AsyncHTTPTransport(limits=httpx.Limits(max_keepalive_connections=0)),
+                    resolver=resolver,
+                ),
                 timeout=timeout,
             ),
         )
@@ -1149,6 +1194,8 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
     (:class:`~aethercal.server.services.outbox.OutboxSkipped`); it is never a failure, and never a
     silent success.
     """
+    channel_errors: dict[Channel, CredentialError] = {}
+
     email: EmailSender | None = None
     smtp_credential = await _resolve_one(
         session,
@@ -1158,13 +1205,25 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
         defaults=defaults,
     )
     if smtp_credential is not None:
-        smtp_target = await _assert_smtp_host_reachable(
-            smtp_credential.secrets, source=smtp_credential.source, resolver=resolver
-        )
-        email = SmtpEmailSender(
-            _smtp_from_secrets(smtp_credential.secrets, target=smtp_target),
-            connect=smtp_target.connect,
-        )
+        # ==Scoped to EMAIL, and the symmetry with the loop below is the point.== A refused SMTP
+        # credential used to escape this whole function, so a business with a bad relay host lost
+        # its WhatsApp too. One channel's fault stays its own — in both directions.
+        try:
+            smtp_target = await _assert_smtp_host_reachable(
+                smtp_credential.secrets, source=smtp_credential.source, resolver=resolver
+            )
+            email = SmtpEmailSender(
+                _smtp_from_secrets(smtp_credential.secrets, target=smtp_target),
+                connect=smtp_target.connect,
+            )
+        except CredentialError as exc:
+            _logger.warning(
+                "business %s: its email channel is configured and unusable, so THAT channel is off "
+                "and no other — %s",
+                tenant_id,
+                exc,
+            )
+            channel_errors[Channel.EMAIL] = exc
 
     channels: dict[Channel, PhoneChannelSender] = {}
     for provider in (CredentialProvider.WHATSAPP, CredentialProvider.SMS):
@@ -1199,14 +1258,30 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
         # fabricated, and `_build_phone_sender` requires one — so a tenant's URL is never dialed
         # without having been through it. See `_assert_target_reachable`: this is the bill B-03bis
         # incurred by turning `base_url` from operator config into third-party input.
-        target = await _assert_target_reachable(
-            provider,
-            credential.secrets,
-            source=credential.source,
-            default_url=_DEFAULT_BASE_URLS[provider],
-            resolver=resolver,
-            clients=clients,
-        )
+        #
+        # ==And its refusal stays on THIS channel.== It used to escape the whole function, so a
+        # business whose WhatsApp base_url pointed inward stopped receiving its EMAIL — a
+        # fail-closed applied per BUSINESS when the design says per CHANNEL. The channel that is
+        # configured correctly does not pay for the one that is not.
+        try:
+            target = await _assert_target_reachable(
+                provider,
+                credential.secrets,
+                source=credential.source,
+                default_url=_DEFAULT_BASE_URLS[provider],
+                resolver=resolver,
+                clients=clients,
+            )
+        except CredentialError as exc:
+            _logger.warning(
+                "business %s: its %s channel is configured and unusable, so THAT channel "
+                "is off and no other — %s",
+                tenant_id,
+                provider.value,
+                exc,
+            )
+            channel_errors[channel_for(provider)] = exc
+            continue
         if credential.source is CredentialSource.INSTANCE:
             _logger.warning(
                 "business %s has no %s credential of its own and is sending from the OPERATOR's "
@@ -1220,7 +1295,9 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
             provider, credential.secrets, target=target, caps=caps
         )
 
-    return TenantSenders(tenant_id=tenant_id, email=email, channels=channels)
+    return TenantSenders(
+        tenant_id=tenant_id, email=email, channels=channels, channel_errors=channel_errors
+    )
 
 
 __all__ = [
