@@ -21,9 +21,11 @@ notice the one somebody adds tomorrow.
 
 from __future__ import annotations
 
+import ast
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -866,5 +868,244 @@ async def test_a_retained_row_written_before_the_guard_is_still_redacted(
         await sqlite_session.scalars(sa.select(Outbox).where(Outbox.dedupe_key == "refund:legacy"))
     ).one()
     assert row.payload["provider_ref"] == "pi_legacy", "the money must still move"
-    assert row.payload["guest_email"] == ERASED_EMAIL, "the person must be gone"
+    # DROPPED, not tombstoned: a retained payload is rebuilt from what it may KEEP, so a key that
+    # names the guest simply is not carried over. A tombstone would still be a key nobody declared.
+    assert "guest_email" not in row.payload, "the person must be gone"
+    assert row.payload == {"provider": "stripe", "provider_ref": "pi_legacy"}
     assert report.outbox_payloads_redacted == 1
+
+
+# --- B-05c re-Crisol: a retained payload is redacted by ALLOWLIST, not by denylist ---------------
+
+
+async def _legacy_retained_row(
+    session: AsyncSession, booking: Booking, *, effect: str, payload: dict[str, object]
+) -> None:
+    """A row written straight to the table, as one committed before the funnel guard existed."""
+    session.add(
+        Outbox(
+            tenant_id=booking.tenant_id,
+            booking_id=booking.id,
+            effect=effect,
+            dedupe_key=f"legacy:{effect}:{uuid.uuid4().hex[:6]}",
+            payload=payload,
+            status=OutboxStatus.PENDING.value,
+            attempts=0,
+        )
+    )
+    await session.flush()
+
+
+async def test_a_retained_payload_loses_a_pii_key_the_redactor_never_heard_of(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==A denylist is a photograph, exactly like a list of instances.==
+
+    ``JSON_PII_KEYS`` knows ``guest_email``. It does not know ``receipt_email``, ``billing_name``,
+    or whatever the next person calls the address they put in a refund payload — and a redactor
+    built on "the keys I know how to erase" leaves behind every key it has not met. On a row the
+    purge DELETES that costs nothing (the row goes anyway). On a row the purge KEEPS it is a guest
+    erasure that quietly kept the guest.
+
+    So a retained payload is rebuilt from what it is ALLOWED to keep (``RETAINED_PAYLOAD_KEYS``,
+    which is exactly what the runner reads) rather than stripped of what we know to remove. An
+    unrecognised key is dropped for the same reason an unclassified effect fails the build: nobody
+    vouched for it.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect=OutboxEffect.REFUND.value,
+        # `receipt_email` is NOT in JSON_PII_KEYS — the denylist has never heard of it.
+        payload={
+            "provider": "stripe",
+            "provider_ref": "pi_legacy",
+            "receipt_email": _EMAIL,
+            "billing_name": _NAME,
+        },
+    )
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    row = (
+        await sqlite_session.scalars(
+            sa.select(Outbox).where(
+                Outbox.booking_id == booking.id, Outbox.effect == OutboxEffect.REFUND.value
+            )
+        )
+    ).one()
+    # What the runner needs survives, whole.
+    assert row.payload == {"provider": "stripe", "provider_ref": "pi_legacy"}, (
+        "the retained payload must be exactly what the refund runner reads — no more"
+    )
+    assert report.outbox_payloads_redacted == 1
+
+
+async def test_a_retained_row_of_an_unrecognised_effect_loses_its_payload_wholesale(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Fail CLOSED on an effect nothing can vouch for.==
+
+    An effect string the enum no longer knows (somebody removed a member; a hand-written row) is not
+    deleted — the purge does not destroy what it cannot classify — but nothing can say which of its
+    keys name a person either. So there is no allowlist to keep, and the payload goes wholesale, the
+    same way ``payment_events`` does with a provider schema that is not ours.
+
+    It loses nothing operational: an effect with no enum member has no handler, so the row was never
+    going to run.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect="carrier_pigeon",  # never an OutboxEffect
+        payload={"address": _EMAIL, "note": _NOTES},
+    )
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    row = (
+        await sqlite_session.scalars(sa.select(Outbox).where(Outbox.effect == "carrier_pigeon"))
+    ).one()
+    assert row.payload == {"redacted": True}
+    assert _EMAIL not in str(row.payload)
+    assert _NOTES not in str(row.payload)
+
+
+async def test_an_ordinary_purge_reports_no_anomaly_and_says_nothing_about_one(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The other half of an alarm: it must be SILENT when nothing is wrong.==
+
+    A refund whose payload is exactly what it should be is not an anomaly, and a purge that
+    announced one every time would train the reader to skip the line — which is how the real one
+    gets missed. The count is 0 and there is nothing to tell the operator.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _owe_them_a_refund(sqlite_session, booking)
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    assert report.outbox_retained == 1, "the refund is kept"
+    assert report.outbox_payloads_redacted == 0, "and it is not an anomaly"
+    assert report.purge_anomalies == [], "so there is nothing to tell the operator"
+
+
+async def test_an_anomalous_retained_payload_is_reported_to_the_operator_by_name(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==An anomaly nobody is told about is the silent no-op wearing a hat.==
+
+    The purge stripping an undeclared key means a row got past the funnel guard — because it
+    predates it, or because something wrote to the table directly. Either way it is a fact about
+    the erasure that a human has to be able to act on: the count alone ("1 payload redacted") does
+    not say WHICH effect or WHICH key, and an operator who must PROVE what they erased cannot work
+    from that.
+
+    Reported as data on the report (not only as a log line), so the CLI can surface it and a test
+    can assert it.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect=OutboxEffect.REFUND.value,
+        payload={"provider": "stripe", "provider_ref": "pi_legacy", "receipt_email": _EMAIL},
+    )
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    assert report.purge_anomalies, "an anomaly that reaches nobody may as well not be detected"
+    anomaly = report.purge_anomalies[0]
+    assert OutboxEffect.REFUND.value in anomaly
+    assert "receipt_email" in anomaly, "the operator needs to know WHICH key was found"
+    # The anomaly line is evidence, and evidence naming the erased person is the one thing an
+    # erasure must not write down.
+    assert _EMAIL not in anomaly
+    assert _NAME not in anomaly
+
+
+# --- The inference that "gone means purged" rests on exactly one fact ---------------------------
+
+
+_SRC = Path(__file__).resolve().parents[1] / "src" / "aethercal" / "server"
+_PRIVACY = _SRC / "services" / "privacy.py"
+
+
+def _shipped_modules() -> list[Path]:
+    """Every module of the shipped server source. The Alembic versions are generated: excluded."""
+    return [
+        path
+        for path in sorted(_SRC.rglob("*.py"))
+        if "migrations" not in path.parts and "__pycache__" not in path.parts
+    ]
+
+
+def _deletes(tree: ast.Module, model: str) -> list[int]:
+    """Line numbers of any ``delete(<model>)`` / ``sa.delete(<model>)`` in this module."""
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name != "delete":
+            continue
+        hits += [node.lineno for arg in node.args if isinstance(arg, ast.Name) and arg.id == model]
+    return hits
+
+
+def test_the_guest_purge_is_the_only_thing_that_deletes_an_outbox_row() -> None:
+    """==The lock under ``_why_it_vanished``, and the reason it is an AST walk.==
+
+    A deleted row leaves nothing to read, so "the settle found no row" cannot be OBSERVED to mean
+    "a guest erasure took it" — it is inferred. The inference is sound today for one reason only:
+    ``services/privacy.py`` holds the sole ``DELETE`` against ``outbox`` in the entire source tree.
+
+    That is exactly the shape of fact that rots. Add a second deleter — a retention sweep, an admin
+    "clear the queue" button — and ``_why_it_vanished`` keeps answering ``PURGED``, in silence, for
+    rows no erasure ever touched: routine-looking, unalarmed, and wrong. So the inference is not
+    left to a comment somebody has to remember to keep true. It is asserted.
+    """
+    offenders = {
+        path.relative_to(_SRC).as_posix(): lines
+        for path in _shipped_modules()
+        if path != _PRIVACY
+        and (lines := _deletes(ast.parse(path.read_text(encoding="utf-8")), "Outbox"))
+    }
+
+    assert offenders == {}, (
+        "something other than the guest purge deletes outbox rows: "
+        f"{offenders}. `_why_it_vanished` (services/outbox.py) reads a missing row as PURGED — "
+        "routine, unalarmed — because the purge was the only thing that could have removed it. A "
+        "second deleter makes that classification lie: its vanished rows would be filed as "
+        "ordinary erasures instead of reaching anybody. Either delete through the purge, or give "
+        "`Vanished` a fourth cause and classify it."
+    )
+
+
+def test_nothing_deletes_a_booking_out_from_under_its_intents() -> None:
+    """The back door: ``outbox.booking_id`` is ``ON DELETE CASCADE``.
+
+    A ``DELETE`` on ``bookings`` removes that booking's intents with no ``delete(Outbox)`` for the
+    lock above to catch — and the erasure deliberately REDACTS bookings rather than deleting them
+    (the appointment happened; the slot was genuinely taken). So nothing should be deleting one at
+    all, and if that ever changes, the cascade becomes a second, invisible deleter — of the REFUND
+    a guest is owed, among other things.
+    """
+    offenders = {
+        path.relative_to(_SRC).as_posix(): lines
+        for path in _shipped_modules()
+        if (lines := _deletes(ast.parse(path.read_text(encoding="utf-8")), "Booking"))
+    }
+
+    assert offenders == {}, (
+        f"something deletes bookings: {offenders}. `outbox.booking_id` is ON DELETE CASCADE, so "
+        "that silently deletes their queued intents — including a REFUND the guest is owed — "
+        "through a door neither `purge_policy` nor the lock above can see."
+    )

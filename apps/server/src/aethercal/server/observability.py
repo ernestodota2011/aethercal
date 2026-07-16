@@ -107,6 +107,12 @@ class DrainCounters:
 
     Kept out of :attr:`lost` deliberately — that separation is the whole reason ``lost`` stays worth
     alerting on."""
+    purged_midflight: int = 0
+    """Intents a GUEST ERASURE deleted WHILE they were being sent. Routine, expected, NOT lost.
+
+    The third cause of a vanished row, kept out of :attr:`lost` for exactly the reason
+    :attr:`voided_midflight` is: an alarm that also fires on every erasure that happens to land
+    during a drain is an alarm nobody reads."""
     lost: int = 0
     """==Sends whose LEASE EXPIRED mid-flight, so the result was discarded: the effect may have run
     TWICE.==
@@ -126,6 +132,7 @@ class DrainCounters:
         self.recovered += len(report.recovered)
         self.unclaimed += len(report.unclaimed)
         self.voided_midflight += len(report.voided_midflight)
+        self.purged_midflight += len(report.purged_midflight)
         self.lost += len(report.lost)
         if report.lost:
             _logger.error(
@@ -441,6 +448,14 @@ def render_prometheus(snapshot: MetricsSnapshot, *, counters: DrainCounters) -> 
         "apart from 'lost' so that alarm is not drowned by every ordinary cancellation.",
         "counter",
         [("", counters.voided_midflight)],
+    )
+    _series(
+        lines,
+        "aethercal_outbox_drain_purged_midflight_total",
+        "Intents deleted by a guest erasure while in flight. Routine and expected; counted apart "
+        "from 'lost' so that alarm is not drowned by every ordinary right-to-be-forgotten request.",
+        "counter",
+        [("", counters.purged_midflight)],
     )
     _series(
         lines,

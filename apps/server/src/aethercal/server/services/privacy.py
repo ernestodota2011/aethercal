@@ -88,7 +88,11 @@ from aethercal.server.db.models import (
     SentNotification,
     WebhookDelivery,
 )
-from aethercal.server.services.outbox import PURGEABLE_EFFECTS
+from aethercal.server.services.outbox import (
+    PURGEABLE_EFFECTS,
+    RETAINED_PAYLOAD_KEYS,
+    OutboxEffect,
+)
 
 # ==A payment event is redactable ONLY once it is TERMINAL (r6 finding 2).== ``received``/``parked``
 # events are still ACTIONABLE — the parked tick re-runs the arbiter from their payload — so
@@ -247,11 +251,19 @@ class PurgeReport:
     performed, and "we kept two rows about this person" is exactly the sort of fact they must be
     able to explain. The answer is that those rows name nobody (see :func:`purge_policy`)."""
     outbox_payloads_redacted: int = 0
-    """RETAINED intents whose payload nonetheless carried a guest key, now erased.
+    """RETAINED intents whose payload carried an undeclared key, now rebuilt from its allowlist.
 
     Normally ``0``, and that is the point: :data:`RETAINED_PAYLOAD_KEYS` plus the funnel guard mean
-    a retained payload should never hold PII in the first place. This counts rows written BEFORE
-    that guard existed, so a non-zero here is worth an operator's attention rather than a shrug."""
+    a retained payload should never hold anything undeclared. This counts rows written BEFORE that
+    guard existed, so a non-zero here is worth an operator's attention rather than a shrug."""
+    purge_anomalies: list[str] = field(default_factory=list)
+    """One line per anomaly, for a HUMAN — naming the effect and the keys, never the values.
+
+    ==A detected anomaly nobody is told about is the silent no-op wearing a hat.== The count alone
+    ("1 payload redacted") cannot be acted on: an operator who must PROVE what they erased needs to
+    know WHICH effect and WHICH key. Carried as data rather than only as a log line, so the CLI can
+    surface it and the suite can assert it. Empty on an ordinary purge, and the CLI then says
+    nothing at all — an alarm that fires every time is an alarm nobody reads."""
     deleted_by_table: Mapping[str, int] = field(default_factory=dict)
     """Rows deleted, per table — keyed by :data:`_PURGED_BY_BOOKING`, so a table added there is
     counted here without anybody having to remember to add a field for it."""
@@ -357,7 +369,7 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
         for name, table in _PURGED_BY_BOOKING.items()
     }
     # What the outbox KEPT (a refund owed, a hold to expire) loses the guest but not its job.
-    retained, redacted_payloads = await _redact_retained_outbox(session, booking_ids)
+    retained, redacted_payloads, anomalies = await _redact_retained_outbox(session, booking_ids)
     await session.flush()
 
     report = PurgeReport(
@@ -366,6 +378,7 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
         payment_events=payment_events,
         outbox_retained=retained,
         outbox_payloads_redacted=redacted_payloads,
+        purge_anomalies=anomalies,
         deleted_by_table=deleted,
     )
     # Loud, and with the counts: an erasure is a thing an operator may one day have to PROVE they
@@ -406,27 +419,64 @@ async def _delete_by_booking(
     return result.rowcount or 0
 
 
+REDACTED_OUTBOX_PAYLOAD: dict[str, Any] = {"redacted": True}
+"""What a retained payload becomes when nothing can vouch for a single one of its keys."""
+
+
+def _retained_payload(effect: str, payload: Any) -> tuple[Any, bool]:
+    """Rebuild a retained payload from what it may KEEP. Returns ``(payload, changed)``.
+
+    ==An ALLOWLIST, and the distinction is the whole finding.== :func:`_redact_json` erases the keys
+    it KNOWS (``guest_email``, ``guest_name``, ...), which is right for a row that is about to be
+    deleted anyway and wrong for one the erasure KEEPS: it leaves behind every key it has not met.
+    ``receipt_email``, ``billing_name``, ``customer`` — a denylist has the same defect as a list of
+    instances. It is a photograph, and the key somebody adds tomorrow is not in it.
+
+    So the retained payload is rebuilt from :data:`RETAINED_PAYLOAD_KEYS`, and everything else is
+    dropped. Nothing operational is lost by construction: those keys are exactly what the runners
+    read (``work.payload["provider"]`` / ``["provider_ref"]`` in ``make_refund_runner``,
+    ``["booking_id"]`` in ``make_expire_hold_runner``), so an undeclared key was, by definition,
+    read by nobody.
+
+    An effect no enum member recognises (one removed from ``OutboxEffect`` later; a hand-written
+    row) has no allowlist at all, so it FAILS CLOSED: the payload goes wholesale, the way
+    :func:`_purge_payment_events` treats a provider schema that is not ours. That costs nothing
+    either — an effect with no member has no handler, so the row was never going to run.
+    """
+    try:
+        allowed = RETAINED_PAYLOAD_KEYS[OutboxEffect(effect)]
+    except (ValueError, KeyError):
+        # No member, or a RETAINED member that declared nothing: we cannot vouch for any key here.
+        kept: Any = dict(REDACTED_OUTBOX_PAYLOAD)
+        return kept, payload != REDACTED_OUTBOX_PAYLOAD
+    if not isinstance(payload, dict):
+        return dict(REDACTED_OUTBOX_PAYLOAD), True
+    source: dict[str, Any] = payload
+    kept = {key: value for key, value in source.items() if key in allowed}
+    return kept, kept != source
+
+
 async def _redact_retained_outbox(
     session: AsyncSession, booking_ids: set[uuid.UUID]
-) -> tuple[int, int]:
-    """Strip the guest out of the intents the purge KEEPS. Returns ``(retained, redacted)``.
+) -> tuple[int, int, list[str]]:
+    """Strip the guest out of the intents the purge KEEPS. ``(retained, redacted, anomalies)``.
 
     ==The purge does not merely trust the classification.== A ``REFUND`` is retained because its
     payload is ``{provider, provider_ref}`` and names nobody; :data:`RETAINED_PAYLOAD_KEYS` and the
     guard in ``enqueue_effect`` are what keep that true going forward. But neither binds a row
     committed a year ago, before either existed — and an erasure cannot be conditional on the
-    history of the codebase. So what survives is redacted, the same way ``webhook_deliveries`` and
-    ``payment_events`` are: ==keep the row, remove the person==.
+    history of the codebase. So what survives is rebuilt from its allowlist, the same spirit as
+    ``webhook_deliveries`` and ``payment_events``: ==keep the row, remove the person==.
 
-    Ordinarily this changes nothing and reports ``0``. It is the belt, not the mechanism.
+    Ordinarily this changes nothing and reports ``0``, and it says nothing — an anomaly line printed
+    on every ordinary purge is one nobody reads, which is how the real one gets missed.
 
     Selected by the COMPLEMENT of :data:`PURGEABLE_EFFECTS` rather than by naming the retained
-    effects: a row whose effect nothing recognises (legacy data, a hand-written row) is then
-    retained and redacted rather than deleted — the purge does not destroy what it cannot classify,
-    but it does take the person out of it.
+    effects: a row whose effect nothing recognises is then retained and redacted rather than
+    deleted — the purge does not destroy what it cannot classify, but it does take the person out.
     """
     if not booking_ids:
-        return 0, 0
+        return 0, 0, []
     rows = (
         await session.scalars(
             sa.select(Outbox).where(
@@ -436,22 +486,35 @@ async def _redact_retained_outbox(
         )
     ).all()
     redacted_count = 0
+    anomalies: list[str] = []
     for row in rows:
-        redacted, changed = _redact_json(row.payload)
+        rebuilt, changed = _retained_payload(row.effect, row.payload)
         if not changed:
             continue
+        dropped = sorted(set(row.payload) - set(rebuilt))
         # REASSIGNED, never mutated in place: SQLAlchemy does not track mutation inside a plain JSON
         # column, so an in-place edit would leave the object looking clean and would never be
         # written — a purge that runs, reports success, and changes nothing at all.
-        row.payload = redacted
+        row.payload = rebuilt
         redacted_count += 1
-        _logger.warning(
-            "purge: a RETAINED outbox intent (%s) carried a guest key; redacted. It predates the "
-            "payload guard in enqueue_effect — the intent still runs, the person is gone",
-            row.effect,
+        # The KEYS, never the values. An anomaly line is evidence an operator may have to show, and
+        # evidence naming the person who asked to be forgotten is the one thing an erasure must not
+        # write down — the same reason the address itself never reaches the log.
+        anomalies.append(
+            f"outbox intent ({row.effect}) carried undeclared payload key(s) {dropped}; dropped"
+        )
+    if anomalies:
+        # ERROR, not warning: a row got past the funnel guard. It predates it, or something wrote to
+        # the table directly — and either way somebody should find out which.
+        _logger.error(
+            "purge: %d RETAINED outbox intent(s) carried undeclared payload key(s). The intents "
+            "still run and the person is gone, but a row reached the table without passing "
+            "enqueue_effect's guard: %s",
+            redacted_count,
+            "; ".join(anomalies),
         )
     await session.flush()
-    return len(rows), redacted_count
+    return len(rows), redacted_count, anomalies
 
 
 async def _purge_webhook_deliveries(

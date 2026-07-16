@@ -641,6 +641,18 @@ class OutboxReport:
     Kept out of :attr:`lost` deliberately: that counter exists to alert on a broken timing
     assumption, and an alarm that also fires on every ordinary cancellation is one nobody reads.
     """
+    purged_midflight: list[uuid.UUID] = field(default_factory=list)
+    """DELETED by a guest erasure WHILE we were sending them. Routine, expected, and NOT lost.
+
+    ==The third cause of a vanished row, and it earns its own bucket for the same reason
+    :attr:`voided_midflight` did.== ``purge_guest`` filters on effect, never on status, so a message
+    intent a worker is mid-send on is as deletable as an idle one — and at settle time that looks
+    EXACTLY like a lost lease: the row is not ours any more. Filed as :attr:`lost` it would fire the
+    duplicate-send alarm on every erasure that happened to land during a drain, and send an operator
+    off to re-tune lease timings that are working perfectly.
+
+    Nothing was sent twice and nothing timed out: somebody exercised their right to be forgotten.
+    """
     lost: list[uuid.UUID] = field(default_factory=list)
     """Rows whose LEASE EXPIRED mid-send, so this worker's result was DISCARDED at settle time.
 
@@ -1482,12 +1494,17 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         if row is None:
             # WHY we lost it decides which bucket it lands in, and that matters: `lost` is the
             # metric that proves in production whether the timeout assumption holds. Fill it with
-            # routine cancellations and a real duplicate-send signal drowns in noise — and an alarm
-            # that always fires is an alarm nobody reads.
-            if await _lost_because_voided(session, work):
-                report.voided_midflight.append(work.id)
-            else:
-                report.lost.append(work.id)
+            # routine cancellations — or with routine ERASURES — and a real duplicate-send signal
+            # drowns in noise, and an alarm that always fires is an alarm nobody reads.
+            match await _why_it_vanished(session, work):
+                case Vanished.VOIDED:
+                    report.voided_midflight.append(work.id)
+                case Vanished.PURGED:
+                    report.purged_midflight.append(work.id)
+                case Vanished.LEASE_LOST:
+                    report.lost.append(work.id)
+                case _ as unreachable:
+                    assert_never(unreachable)
             return
         row.claimed_by = None
         row.lease_expires_at = None
@@ -1545,21 +1562,54 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         assert_never(outcome)
 
 
-async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
-    """Log why our result is being discarded; return whether it was a VOID rather than a lost lease.
+class Vanished(StrEnum):
+    """Why a row we held is no longer ours at settle time. Three causes, three buckets."""
 
-    Both end in "we do not write", but they are different facts. One is the system working as
-    designed: a cancellation retired the step under us — routine, expected, harmless. The other is a
-    real failure of our own timing assumption: our send outran its lease, the row was recovered, and
-    somebody else owns it now — which means the effect may have been executed TWICE.
+    VOIDED = "voided"
+    """A booking transition retired the step under us. Routine."""
+    PURGED = "purged"
+    """A guest erasure DELETED it under us. Routine."""
+    LEASE_LOST = "lease_lost"
+    """Our send outran its lease and somebody else owns the row. ==The one to alarm on.=="""
 
-    Collapsing them into one bucket would file routine cancellations into the very counter that is
-    supposed to alert on duplicate sends.
+
+async def _why_it_vanished(session: AsyncSession, work: OutboxWork) -> Vanished:
+    """Log why our result is being discarded, and say which of the three causes it was.
+
+    All three end in "we do not write", and they are three different facts. Two are the system
+    working as designed — a cancellation retired the step; a guest exercised their right to be
+    forgotten — and are routine, expected and harmless. The third is a real failure of our own
+    timing assumption: our send outran its lease, the row was recovered, and somebody else owns it
+    now — which means the effect may have been executed TWICE.
+
+    Collapsing any of them together files a routine event into the very counter that is supposed to
+    alert on duplicate sends. ``voided`` was split out for exactly that reason; ==``purged`` is the
+    third cause, and it was landing in the alarm bucket== — with an error line telling an operator
+    to re-tune lease timings that were working perfectly.
+
+    .. rubric:: ==Why "gone" means PURGED, and what keeps that true==
+
+    A deleted row leaves no marker to read — it is gone — so the cause has to be INFERRED, and the
+    inference is only sound because ``services/privacy.py`` holds the only ``DELETE`` against this
+    table in the whole source tree (nothing deletes ``bookings`` either, so the ``ON DELETE
+    CASCADE`` never fires). That is not a comment anybody has to keep true by remembering:
+    ``test_purge_drain_concurrency_pg`` walks the AST of every shipped module and fails the day a
+    second deleter appears — which is the day this classification would start lying.
     """
     current = await session.get(Outbox, work.id)
-    status = current.status if current is not None else "gone"
 
-    if status == _VOIDED:
+    if current is None:
+        _logger.info(
+            "outbox intent %s (%s) for booking %s: PURGED mid-flight by a guest erasure (RNF-8). "
+            "Our result is discarded and the intent is gone for good — which is the point: it was "
+            "a message to somebody who asked to be forgotten. Routine, and NOT a lost lease",
+            work.id,
+            work.effect,
+            work.booking_id,
+        )
+        return Vanished.PURGED
+
+    if current.status == _VOIDED:
         _logger.warning(
             "outbox intent %s (%s) for booking %s: VOIDED mid-flight by a booking transition "
             "(cancel / reschedule / no-show). Our result is discarded and the step will not be "
@@ -1568,7 +1618,7 @@ async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
             work.effect,
             work.booking_id,
         )
-        return True
+        return Vanished.VOIDED
 
     _logger.error(
         "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (we held it as %s; it is now "
@@ -1579,9 +1629,9 @@ async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
         work.effect,
         work.booking_id,
         work.claimed_by,
-        status,
+        current.status,
     )
-    return False
+    return Vanished.LEASE_LOST
 
 
 async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
@@ -2736,6 +2786,7 @@ __all__ = [
     "Staleness",
     "StepSchedule",
     "Suppressed",
+    "Vanished",
     "Voidability",
     "as_utc",
     "backoff_delay",
