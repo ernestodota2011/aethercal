@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 from aethercal.schemas import ErrorResponse
 from aethercal.server.admin.mount import mount_admin
-from aethercal.server.api import API_V1_PREFIX, api_router, public
+from aethercal.server.api import API_V1_PREFIX, api_router, public, webhooks_inbound
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.api.ratelimit import PublicRateLimitMiddleware, SlidingWindowLimiter
 from aethercal.server.channels import Channel
@@ -197,6 +197,16 @@ def create_app(settings: Settings) -> FastAPI:
     # lifespan — every test client — must still resolve addresses exactly as production does. A
     # malformed CIDR has already failed the boot, inside Settings.
     app.state.trusted_proxies = settings.trusted_proxy_networks()
+
+    # ==The inbound payment webhook (B-05b), and the keys it decrypts BYOK credentials with.==
+    # Built EAGERLY (like the sessionmaker and the proxies), not in the lifespan, because the
+    # router reads ``fernet_keys`` off ``app.state`` on every request and a test client never runs
+    # the lifespan. It is the (current, retiring) reader so a credential the key rotation has not
+    # reached yet still verifies. The router is UNAUTHENTICATED-BUT-SIGNED — the HMAC over the
+    # raw body is its whole authority — so it is always mounted: the provider must be able to reach
+    # it whenever payments are in use, and an unsigned or wrongly-signed request is a 401.
+    app.state.fernet_keys = settings.decryption_fernet_keys()
+    app.include_router(webhooks_inbound.router)
 
     # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
     #

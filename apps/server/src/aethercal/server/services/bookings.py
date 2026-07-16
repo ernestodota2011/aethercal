@@ -615,8 +615,8 @@ async def cancel_booking(
     await apply_booking_transition(
         session, booking=booking, transition=BookingTransition.CANCEL, now=now
     )
-    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking cancelled
-    # within the event type's refund window queues a REFUND per paid charge — the SECOND enqueue path,
+    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking
+    # cancelled within the refund window queues a REFUND per paid charge — the SECOND enqueue path,
     # which the arbiter's late-webhook branch collapses with by the shared provider_ref dedupe key
     # (criterion 30). Not gated on ``effects``: a refund is domain-required money movement, like the
     # cancellation webhook and the ``on_cancel`` workflow above, never contingent on a live sender.
@@ -1104,6 +1104,50 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
     )
 
 
+async def confirm_paid_booking_effects(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    effects: BookingEffects | None,
+    now: datetime,
+    locale: str = "es",
+) -> None:
+    """Fire the confirmation chain for a hold the arbiter just CONFIRMED (B-05b).
+
+    ==The SAME chain :func:`create_booking` runs on a free booking== — the ``booking.created``
+    webhook, the ``CONFIRM`` workflow transition, and (with an ``effects`` bundle) the guest tokens,
+    the Google sync and the confirmation email — so a paid hold's confirmation is indistinguishable
+    from a free one downstream. It runs only AFTER the arbiter has stamped ``confirmed_at`` (the
+    B-05a silence gate kept every one of these effects suppressed while the booking was still
+    an unpaid ``PENDING`` hold), so nothing here can announce an appointment nobody paid for.
+
+    Injected into the arbiter as its ``confirm_effects`` by the webhook layer — the one place
+    that may import both this module and ``services.payments`` — the arbiter itself never does.
+    """
+    event_type = await get_event_type(
+        session, tenant_id=booking.tenant_id, event_type_id=booking.event_type_id
+    )
+    await enqueue_event(
+        session,
+        booking=booking,
+        event="booking.created",
+        data=_serialize_booking(booking),
+        now=now,
+    )
+    await apply_booking_transition(
+        session, booking=booking, transition=BookingTransition.CONFIRM, now=now, locale=locale
+    )
+    if effects is not None and event_type is not None:
+        await _apply_create_effects(
+            session,
+            booking=booking,
+            event_type=event_type,
+            effects=effects,
+            now=now,
+            locale=locale,
+        )
+
+
 async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is part of the contract
     session: AsyncSession,
     *,
@@ -1270,6 +1314,7 @@ __all__ = [
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",
+    "confirm_paid_booking_effects",
     "count_bookings",
     "create_booking",
     "get_booking",

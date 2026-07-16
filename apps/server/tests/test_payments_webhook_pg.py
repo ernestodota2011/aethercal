@@ -1,0 +1,196 @@
+"""The inbound payment webhook router, end-to-end on real PostgreSQL (B-05b, criterion 33).
+
+``db``-marked: the router's whole point is the order slug → bind → read-secret → verify → write, and
+that only means anything under row-level security with a real ``tenant_credentials`` row. It drives
+the real FastAPI app over Postgres, seeding on the OWNER engine and POSTing over HTTP so the request
+path binds the business exactly as production does.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from aethercal.core.model import BookingStatus
+from aethercal.server.crypto import derive_fernet_key
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    Payment,
+    PaymentEvent,
+    PaymentStatus,
+    Schedule,
+    Tenant,
+    User,
+)
+from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
+from aethercal.server.webhooks.signing import signature_header
+
+pytestmark = pytest.mark.db
+
+_KEY = derive_fernet_key("test-app-secret")  # the app fixture's app_secret
+_SECRET = "whsec_test_NOT_A_REAL_KEY_x"
+_PRICE = 5000
+_CUR = "usd"
+_REF = "pi_test_NOT_A_REAL_KEY_A"
+
+
+async def _seed(owner_maker: async_sessionmaker[AsyncSession]) -> tuple[str, uuid.UUID]:
+    """A business with a Stripe webhook secret + a PENDING hold and its INTENT payment. OWNER
+    engine."""
+    slug = f"biz-{uuid.uuid4().hex[:8]}"
+    async with owner_maker() as session, session.begin():
+        tenant = Tenant(slug=slug, name="Biz")
+        session.add(tenant)
+        await session.flush()
+        host = User(tenant_id=tenant.id, email="h@example.com", name="H", timezone="UTC")
+        schedule = Schedule(tenant_id=tenant.id, name="W", timezone="UTC", rules={})
+        session.add_all([host, schedule])
+        await session.flush()
+        event_type = EventType(
+            tenant_id=tenant.id,
+            host_id=host.id,
+            schedule_id=schedule.id,
+            slug="paid",
+            title="Paid",
+            duration_seconds=1800,
+            max_advance_seconds=60 * 60 * 24 * 60,
+            price_cents=_PRICE,
+            currency=_CUR,
+        )
+        session.add(event_type)
+        await session.flush()
+        now = datetime.now(UTC)
+        booking = Booking(
+            tenant_id=tenant.id,
+            event_type_id=event_type.id,
+            start_at=now + timedelta(days=2),
+            end_at=now + timedelta(days=2, minutes=30),
+            status=BookingStatus.PENDING,
+            confirmed_at=None,
+            hold_expires_at=now + timedelta(minutes=30),
+            guest_name="Ada",
+            guest_email="ada@example.com",
+            guest_timezone="UTC",
+        )
+        session.add(booking)
+        await session.flush()
+        session.add(
+            Payment(
+                tenant_id=tenant.id,
+                booking_id=booking.id,
+                provider="stripe",
+                provider_ref=_REF,
+                status=PaymentStatus.INTENT,
+                amount_cents=_PRICE,
+                currency=_CUR,
+            )
+        )
+        await store_credential(
+            session,
+            tenant_id=tenant.id,
+            provider=CredentialProvider.STRIPE,
+            secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": _SECRET},
+            fernet_key=_KEY,
+        )
+        return slug, booking.id
+
+
+def _paid_body(event_id: str = "evt_1") -> bytes:
+    return json.dumps(
+        {
+            "kind": "paid",
+            "event_id": event_id,
+            "provider_ref": _REF,
+            "amount_cents": _PRICE,
+            "currency": _CUR,
+        }
+    ).encode("utf-8")
+
+
+async def _payment_event_count(owner_maker: async_sessionmaker[AsyncSession]) -> int:
+    async with owner_maker() as session:
+        return (await session.scalar(select(func.count()).select_from(PaymentEvent))) or 0
+
+
+async def test_an_invalid_signature_is_401_with_zero_writes(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """==Criterion 33.== A bad signature is refused BEFORE anything is written — the payment_events
+    table is untouched."""
+    slug, _booking_id = await _seed(owner_maker)
+
+    response = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=_paid_body(),
+        headers={"X-Webhook-Signature": "sha256=deadbeef", "content-type": "application/json"},
+    )
+
+    assert response.status_code == 401
+    assert await _payment_event_count(owner_maker) == 0, "an unverified event must write NOTHING"
+
+
+async def test_a_valid_signature_records_the_event_and_confirms_the_hold(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """A correctly-signed paid event is recorded and the arbiter confirms the hold."""
+    slug, booking_id = await _seed(owner_maker)
+    body = _paid_body()
+    sig = signature_header(body, _SECRET.encode("utf-8"))
+
+    response = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=body,
+        headers={"X-Webhook-Signature": sig, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert await _payment_event_count(owner_maker) == 1
+    async with owner_maker() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert booking.confirmed_by_payment_id is not None
+
+
+async def test_a_replayed_event_id_writes_only_one_row(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """The same ``event_id`` delivered twice (Stripe retries) records ONE row — the anti-replay
+    UNIQUE."""
+    slug, _booking_id = await _seed(owner_maker)
+    body = _paid_body(event_id="evt_dup")
+    sig = signature_header(body, _SECRET.encode("utf-8"))
+    headers = {"X-Webhook-Signature": sig, "content-type": "application/json"}
+
+    first = await client.post(f"/webhooks/stripe/{slug}", content=body, headers=headers)
+    second = await client.post(f"/webhooks/stripe/{slug}", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert first.json() == {"status": "ok"}
+    assert second.status_code == 200
+    assert second.json() == {"status": "duplicate"}
+    assert await _payment_event_count(owner_maker) == 1
+
+
+async def test_an_unknown_business_is_401(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """An unknown slug is a 401, indistinguishable from a bad signature (no enumeration)."""
+    body = _paid_body()
+    sig = signature_header(body, _SECRET.encode("utf-8"))
+
+    response = await client.post(
+        f"/webhooks/stripe/does-not-exist-{uuid.uuid4().hex[:6]}",
+        content=body,
+        headers={"X-Webhook-Signature": sig, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 401
