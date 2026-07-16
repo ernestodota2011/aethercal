@@ -39,7 +39,7 @@ Since 0007 a batch on ``users``/``bookings`` reflects the schema, and SQLite can
 expression index — this project escalates that ``SAWarning`` to an error. Both backends support
 ``ALTER TABLE ... DROP COLUMN`` natively, so the plain ``op.drop_column`` reflects nothing.
 
-Revision ID: 0013_payments_and_holds
+Revision ID: 0015_payments_and_holds
 Revises: 0014_tenant_branding
 Create Date: 2026-07-16 00:00:00.000000
 """
@@ -55,8 +55,10 @@ from aethercal.server.db.rls import disable_rls, enable_rls, grant_table
 
 # 23 characters — well within `alembic_version.version_num`'s VARCHAR(32). `test_alembic_config.py`
 # guards this offline (an over-long id passes the whole SQLite suite and dies on PostgreSQL at boot).
-revision: str = "0013_payments_and_holds"
-# The batch head is 0014_tenant_branding (B-07 landed before this cut); this chains onto it.
+revision: str = "0015_payments_and_holds"
+# Numbered 0015, AFTER its parent 0014_tenant_branding (B-07 landed before this cut) — the file was
+# renamed from 0013 (re-Crisol r4 finding 2) so the number no longer reads as before its own parent.
+# The down_revision is what Alembic actually chains on; the number is only a human-readable label.
 down_revision: str | None = "0014_tenant_branding"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

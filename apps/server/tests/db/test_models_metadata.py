@@ -53,7 +53,7 @@ EXPECTED_TABLES = {
     "memberships",
     # 0010 — BYOK: each business's own provider credentials, encrypted at rest (RF-27).
     "tenant_credentials",
-    # 0013 — payments (B-05b, RF-26). ``payments`` is the money ledger the arbiter reasons over
+    # 0015 — payments (B-05b, RF-26). ``payments`` is the money ledger the arbiter reasons over
     # (idempotency anchored on ``provider_ref``, NEVER ``event.id``); ``payment_events`` is the
     # "parking lot" — every inbound webhook event lands here first, so an event whose booking does
     # not exist yet is retried rather than lost, and the same ``event.id`` can never be replayed.
