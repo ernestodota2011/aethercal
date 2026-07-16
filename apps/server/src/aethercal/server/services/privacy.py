@@ -59,6 +59,8 @@ from aethercal.server.db.models import (
     Booking,
     GuestToken,
     Outbox,
+    Payment,
+    PaymentEvent,
     SentNotification,
     WebhookDelivery,
 )
@@ -141,6 +143,28 @@ Derived from :data:`_PURGED_BY_BOOKING`, so satisfying it means WIRING the table
 ``webhook_deliveries`` is absent on purpose — it carries no ``booking_id``, so it is found by its
 payload instead, which is exactly why a foreign-key-walking purge misses it."""
 
+TABLES_RETAINED_OFF_BOOKING: dict[str, str] = {
+    "payments": (
+        "A FINANCIAL RECORD, kept — not deleted, and with no guest-PII column to redact. It is the "
+        "'proven otherwise' the lock's default (a booking_id table holds guest data → delete it) "
+        "leaves room for, spelled out so the exemption is a DECISION rather than an omission that "
+        "looks like one. Three reasons it must survive an erasure: it is the ledger a refund is "
+        "audited against; its UNIQUE (tenant_id, provider, provider_ref) is the money's "
+        "idempotency, and a deleted row lets the same charge be re-processed; and it names no "
+        "person — only a booking, a provider, an opaque provider_ref and an amount. The guest is "
+        "erased from the "
+        "BOOKING it points at; the money record it keeps identifies nobody."
+    ),
+}
+"""The SECOND category the tables lock needs: tables that hang off a booking but are RETAINED.
+
+The mirror of :data:`BOOKING_RETAINED_GUEST_COLUMNS` (which does this for columns). Without it the
+only way to satisfy the ``booking_id`` lock would be to DELETE ``payments`` — destroying the refund
+audit trail and the money's idempotency. Each entry carries, in prose, WHY the row is kept and why
+keeping it leaks no PII. ``payment_events`` is NOT here — it has no ``booking_id``, so the lock
+reaches it; its payload is redacted by :func:`_purge_payment_events`, the same way
+``webhook_deliveries`` is."""
+
 # The keys that carry the guest INSIDE a JSON payload, and what they become. Applied recursively, at
 # any depth: the outbox keeps `guest_email` at the top level, while a webhook delivery buries the
 # whole serialised booking under `data`, with `answers` a level below that again.
@@ -159,6 +183,8 @@ class PurgeReport:
 
     bookings: int = 0
     webhook_deliveries: int = 0
+    payment_events: int = 0
+    """Payment-event rows whose raw provider payload was redacted (the row itself stands)."""
     deleted_by_table: Mapping[str, int] = field(default_factory=dict)
     """Rows deleted, per table — keyed by :data:`_PURGED_BY_BOOKING`, so a table added there is
     counted here without anybody having to remember to add a field for it."""
@@ -233,6 +259,13 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
     deliveries = await _purge_webhook_deliveries(
         session, tenant_id=tenant_id, booking_ids=booking_ids, email=target
     )
+    # The guest's PAYMENT EVENTS, found by the provider_refs of their payments — that table has no
+    # booking_id either, so the booking is reached through the payment. The rows STAND (the columns
+    # carry the anti-replay key); only the raw provider payload, which can hold a customer email, is
+    # cleared. Gathered before any booking is redacted, like the deliveries above.
+    payment_events = await _purge_payment_events(
+        session, tenant_id=tenant_id, booking_ids=booking_ids
+    )
 
     if not bookings:
         # Nothing of this guest's here. Worth saying out loud: an operator who ran the purge against
@@ -243,7 +276,7 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
             tenant_id,
             deliveries,
         )
-        return PurgeReport(webhook_deliveries=deliveries)
+        return PurgeReport(webhook_deliveries=deliveries, payment_events=payment_events)
 
     for booking in bookings:
         for column, erased in BOOKING_PII_COLUMNS.items():
@@ -261,6 +294,7 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
     report = PurgeReport(
         bookings=len(bookings),
         webhook_deliveries=deliveries,
+        payment_events=payment_events,
         deleted_by_table=deleted,
     )
     # Loud, and with the counts: an erasure is a thing an operator may one day have to PROVE they
@@ -342,12 +376,74 @@ async def _purge_webhook_deliveries(
     return touched
 
 
+async def _purge_payment_events(
+    session: AsyncSession, *, tenant_id: uuid.UUID, booking_ids: set[uuid.UUID]
+) -> int:
+    """Redact the raw provider payload out of this guest's payment events. Returns how many changed.
+
+    ==The row STANDS; only its ``payload`` is cleared.== Deleting the row would destroy the
+    ``UNIQUE (tenant_id, provider, event_id)`` that IS the anti-replay guard — and then the same
+    provider event could be applied again, refunding or confirming against a booking that has
+    already been dealt with. So the anti-replay key (which lives in COLUMNS, not the payload) is
+    kept, and the payload — a raw provider event that can carry a customer's email — is replaced
+    wholesale.
+
+    Replaced wholesale, not key-by-key like the booking-shaped blobs: a provider's event schema
+    is not ours and puts PII under keys we do not control (Stripe's ``customer_details.email``,
+    ``receipt_email``, a billing name). A key allow-list would leak the first field a provider
+    renamed. What the arbiter needs from an APPLIED event is already in the ``payments`` ledger and
+    in the booking; the payload is evidence, and evidence naming an erased person is exactly what
+    an erasure removes.
+
+    The events are reached through the guest's PAYMENTS (``payment_events`` has no ``booking_id``
+    — it links to a payment by ``provider_ref``), so a purge that walked foreign keys from the
+    booking would miss it, which is the whole reason it is handled here by name.
+    """
+    if not booking_ids:
+        return 0
+    provider_refs = set(
+        (
+            await session.scalars(
+                sa.select(Payment.provider_ref).where(
+                    Payment.tenant_id == tenant_id, Payment.booking_id.in_(booking_ids)
+                )
+            )
+        ).all()
+    )
+    if not provider_refs:
+        return 0
+    rows = (
+        await session.scalars(
+            sa.select(PaymentEvent).where(
+                PaymentEvent.tenant_id == tenant_id,
+                PaymentEvent.provider_ref.in_(provider_refs),
+            )
+        )
+    ).all()
+    touched = 0
+    for row in rows:
+        if row.payload == _REDACTED_PAYMENT_PAYLOAD:
+            continue
+        # REASSIGNED, never mutated in place — SQLAlchemy does not track mutation in a plain JSON
+        # column, so an in-place edit would look clean and never be written (a purge that reports
+        # success and changes nothing).
+        row.payload = dict(_REDACTED_PAYMENT_PAYLOAD)
+        touched += 1
+    await session.flush()
+    return touched
+
+
+_REDACTED_PAYMENT_PAYLOAD: dict[str, Any] = {"redacted": True}
+"""What a purged payment-event payload becomes: a marker, carrying no PII and no provider schema."""
+
+
 __all__ = [
     "BOOKING_PII_COLUMNS",
     "BOOKING_RETAINED_GUEST_COLUMNS",
     "ERASED_EMAIL",
     "ERASED_NAME",
     "TABLES_PURGED_BY_BOOKING",
+    "TABLES_RETAINED_OFF_BOOKING",
     "PurgeReport",
     "purge_guest",
 ]

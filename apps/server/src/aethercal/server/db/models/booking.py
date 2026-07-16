@@ -112,6 +112,31 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     # reschedule successor INHERITS its predecessor's stamp (the same appointment, moved), which is
     # also the chain B-05b hangs the payment on.
     confirmed_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # WHEN an unpaid hold self-cancels if nobody pays (B-05b). NULL for every booking that is not a
+    # hold — the free ones, the admin's and the API key's direct confirmations. Deliberately NOT a
+    # new ``BookingStatus``: a ``PENDING`` hold already occupies its slot through the
+    # ``status <> 'cancelled'`` partial index, and when the hold lapses the booking simply moves to
+    # ``CANCELLED`` and the same index frees the slot. No status the enum does not already have.
+    hold_expires_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # ==THE DISCRIMINATOR OF THE WINNER.== Which payment confirmed this booking — so the arbiter can
+    # tell "I am the payment that confirmed it" (a replay → NO-OP) from "I confirmed it, but some
+    # OTHER payment did" (a double payment → refund me). Without it the two are indistinguishable
+    # a paying guest's second card is either kept or their first is refunded. NULL until a payment
+    # wins the conditional UPDATE (or forever, for a free/admin/API-key booking nobody paid for).
+    #
+    # ``use_alter`` breaks the create-order cycle (``payments.booking_id`` → ``bookings`` and this
+    # one → ``payments``): SQLAlchemy emits the constraint after both tables exist, and skips it on
+    # SQLite, where the offline suite only compares columns. SET NULL, never CASCADE: deleting a
+    # payment row must never delete the appointment a guest is holding.
+    confirmed_by_payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey(
+            "payments.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_bookings_confirmed_by_payment_id_payments",
+        ),
+    )
     cancelled_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     # When the host marked the guest a no-show (RF-25). Only ever set from ``confirmed``, and only
     # after the appointment has ENDED. The booking keeps occupying its slot (see BookingStatus).
