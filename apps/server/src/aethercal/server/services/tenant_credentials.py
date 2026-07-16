@@ -81,6 +81,7 @@ from enum import StrEnum
 from typing import assert_never
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.crypto import decrypt_secret, encrypt_secret
@@ -270,10 +271,29 @@ async def store_credential(
         await session.flush()
         return existing
 
+    # The read above and this INSERT are not one act. A concurrent store_credential for the same
+    # (tenant, provider) — two admin tabs, a retried request — can slip a row in between them, and
+    # then the UNIQUE(tenant_id, provider) constraint refuses this one. On a payment credential "it
+    # looked like it saved and then threw IntegrityError" is a failure the caller must never see. So
+    # the INSERT runs inside a SAVEPOINT (the guarded pattern services/event_types.py uses for a
+    # duplicate slug): the violation rolls back only this INSERT — not the caller's transaction —
+    # and we re-read the row the racer just committed and UPDATE it, so the last writer wins and the
+    # caller sees a clean re-save. Anything the re-read does NOT explain (the FOREIGN KEY refusing
+    # an orphan tenant, say) is not ours to translate — it travels intact.
     credential = TenantCredential(
         tenant_id=tenant_id, provider=provider.value, encrypted_payload=ciphertext
     )
-    session.add(credential)
+    try:
+        async with session.begin_nested():
+            session.add(credential)
+            await session.flush()
+    except IntegrityError:
+        conflicting = await _row_for(session, tenant_id=tenant_id, provider=provider)
+        if conflicting is None:
+            raise
+        conflicting.encrypted_payload = ciphertext
+        await session.flush()
+        return conflicting
     return credential
 
 
