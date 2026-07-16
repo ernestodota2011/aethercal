@@ -240,6 +240,34 @@ JSON_PII_KEYS: dict[str, Any] = {
     "answers": {},
 }
 
+SAFE_TO_NAME_KEYS: frozenset[str] = frozenset(JSON_PII_KEYS) | frozenset(
+    key for keys in RETAINED_PAYLOAD_KEYS.values() for key in keys
+)
+"""The payload keys an anomaly line may QUOTE. ==Because a key can BE the datum.==
+
+The anomaly reporter exists so a strange erasure cannot pass unseen, and it was itself a leak.
+"Names keys, never values" sounds like the safe rule and is not: a dict keyed by address —
+``{"ada@example.com": {...}}``, a group-by that got serialised, an old per-recipient map — puts the
+guest's email in the KEY position. Quoting it writes the address to an ERROR log and an operator's
+terminal moments after the erasure removed it from the table, and a log is replicated and outlives
+the row. That is the erasure undone in the one artefact nobody audits as a database.
+
+So this is an ALLOWLIST, the same lesson a third time: ==a key may be quoted only if it is OUR OWN
+word.== ``guest_email`` is not somebody's email — it is a name chosen in this module, a constant in
+the source tree, and printing it discloses nothing while telling the operator the most useful thing
+there is. A key nobody declared is DATA until proven otherwise: it gets counted, never quoted.
+
+DERIVED from the two declarations that already exist — the guest-bearing key names, and everything
+the retained effects declare — so a new declared key is quotable for free and no separate list of
+"safe words" can rot alongside them.
+
+==No hash, and that is a decision.== Hashing an unrecognised key would let an operator confirm a
+guess, and that is exactly the problem: an email is low-entropy, so a hash of one is re-identifiable
+by dictionary attack, and a pseudonymised identifier of an erased person is still their personal
+data. It would be the same leak, one step slower. The effect, the intent id and a count are what
+make the anomaly actionable; the row itself is RETAINED, so an operator can go and read its
+``created_at``/``dedupe_key`` and find the write path that produced it."""
+
 
 @dataclass(frozen=True, slots=True)
 class PurgeReport:
@@ -262,7 +290,7 @@ class PurgeReport:
     a retained payload should never hold anything undeclared. This counts rows written BEFORE that
     guard existed, so a non-zero here is worth an operator's attention rather than a shrug."""
     purge_anomalies: list[str] = field(default_factory=list)
-    """One line per anomaly, for a HUMAN — naming the effect and the keys, never the values.
+    """One line per anomaly, for a HUMAN — naming the effect and the ROW, never the person.
 
     ==A detected anomaly nobody is told about is the silent no-op wearing a hat.== The count alone
     ("1 payload redacted") cannot be acted on: an operator who must PROVE what they erased needs to
@@ -532,12 +560,27 @@ def _retained_payload(effect: str, payload: Any) -> _Rebuilt:
     kept = {key: value for key, value in source.items() if key in allowed}
     if kept == source:
         return _Rebuilt(source, changed=False)
-    dropped = sorted(set(source) - set(kept))
-    return _Rebuilt(
-        kept,
-        changed=True,
-        reason=f"carried undeclared payload key(s) {dropped}; dropped",
-    )
+    dropped = set(source) - set(kept)
+    return _Rebuilt(kept, changed=True, reason=_describe_dropped(dropped))
+
+
+def _describe_dropped(dropped: set[str]) -> str:
+    """Say what was dropped, quoting only OUR OWN words. See :data:`SAFE_TO_NAME_KEYS`.
+
+    The split is the whole point: a key we declared is a constant in the source tree and safe to
+    print; a key we have never seen may BE the person we just erased, so it is counted instead.
+    Useless as a rule of thumb, exact as a rule — and the operator still gets a number, an effect
+    and (from the caller) the row, which is what makes the line worth acting on.
+    """
+    ours = sorted(dropped & SAFE_TO_NAME_KEYS)
+    unrecognised = len(dropped) - len(ours)
+    parts: list[str] = []
+    if ours:
+        parts.append(f"declared-elsewhere key(s) {ours}")
+    if unrecognised:
+        # NOT named: it could be an address, a phone, anything. The count is the whole message.
+        parts.append(f"{unrecognised} unrecognised key(s) (not quoted — a key can BE the data)")
+    return f"carried undeclared payload {' + '.join(parts)}; dropped"
 
 
 async def _redact_retained_outbox(
@@ -585,7 +628,11 @@ async def _redact_retained_outbox(
         # of characters for a string. It carries keys and shapes, never VALUES — an anomaly line is
         # evidence an operator may have to show, and evidence naming the person who asked to be
         # forgotten is the one thing an erasure must not write down.
-        anomalies.append(f"outbox intent ({row.effect}) {rebuilt.reason}")
+        # The intent's ID is what makes the line actionable without quoting anything of the guest's:
+        # it is a UUID we generated, and the row is RETAINED — so an operator can go and read its
+        # created_at / dedupe_key / tenant and find the write path that got past the funnel guard.
+        # That is the action here. Recovering the dropped key is not: it was the person.
+        anomalies.append(f"outbox intent {row.id} ({row.effect}) {rebuilt.reason}")
     if anomalies:
         # ERROR, not warning: a row got past the funnel guard. It predates it, or something wrote to
         # the table directly — and either way somebody should find out which.
@@ -741,6 +788,7 @@ __all__ = [
     "ERASED_EMAIL",
     "ERASED_NAME",
     "JSON_PII_KEYS",
+    "SAFE_TO_NAME_KEYS",
     "TABLES_PURGED_BY_BOOKING",
     "TABLES_RETAINED_OFF_BOOKING",
     "PurgeReport",

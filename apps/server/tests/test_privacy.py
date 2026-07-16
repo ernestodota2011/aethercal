@@ -995,19 +995,23 @@ async def test_an_ordinary_purge_reports_no_anomaly_and_says_nothing_about_one(
     assert report.purge_anomalies == [], "so there is nothing to tell the operator"
 
 
-async def test_an_anomalous_retained_payload_is_reported_to_the_operator_by_name(
+async def test_an_anomaly_reaches_the_operator_and_says_WHICH_ROW(
     sqlite_session: AsyncSession,
 ) -> None:
     """==An anomaly nobody is told about is the silent no-op wearing a hat.==
 
     The purge stripping an undeclared key means a row got past the funnel guard — because it
-    predates it, or because something wrote to the table directly. Either way it is a fact about
-    the erasure that a human has to be able to act on: the count alone ("1 payload redacted") does
-    not say WHICH effect or WHICH key, and an operator who must PROVE what they erased cannot work
-    from that.
+    predates it, or because something wrote to the table directly. Either way it is a fact about the
+    erasure that a human has to be able to act on, and the count alone ("1 payload redacted") cannot
+    be acted on at all.
 
-    Reported as data on the report (not only as a log line), so the CLI can surface it and a test
-    can assert it.
+    ==What makes it actionable is the ROW, not the key.== This test used to demand the key by name
+    ("the operator needs to know WHICH key was found") — and that demand was itself the defect a
+    later review caught: an unrecognised key can BE the guest's address, so quoting it re-publishes
+    what the purge just erased. The intent's id is a UUID we generated, it names nobody, and the row
+    is RETAINED — so it is the thread an operator actually pulls: read its ``created_at`` and
+    ``dedupe_key``, and find the write path that produced it. Which key it was is not recoverable,
+    and must not be: it was the person.
     """
     tenant, event_type = await _tenant(sqlite_session, "acme")
     booking = await _guest_booking(sqlite_session, tenant, event_type)
@@ -1017,15 +1021,24 @@ async def test_an_anomalous_retained_payload_is_reported_to_the_operator_by_name
         effect=OutboxEffect.REFUND.value,
         payload={"provider": "stripe", "provider_ref": "pi_legacy", "receipt_email": _EMAIL},
     )
+    row_id = (
+        await sqlite_session.scalars(
+            sa.select(Outbox.id).where(
+                Outbox.booking_id == booking.id, Outbox.effect == OutboxEffect.REFUND.value
+            )
+        )
+    ).one()
 
     report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
 
     assert report.purge_anomalies, "an anomaly that reaches nobody may as well not be detected"
     anomaly = report.purge_anomalies[0]
     assert OutboxEffect.REFUND.value in anomaly
-    assert "receipt_email" in anomaly, "the operator needs to know WHICH key was found"
+    assert str(row_id) in anomaly, (
+        "without the row there is nothing for the operator to go and read"
+    )
     # The anomaly line is evidence, and evidence naming the erased person is the one thing an
-    # erasure must not write down.
+    # erasure must not write down — whether that person is in a value OR in a key.
     assert _EMAIL not in anomaly
     assert _NAME not in anomaly
 
@@ -1216,3 +1229,123 @@ async def test_the_purge_deletes_a_message_intent_a_worker_is_mid_send_on(
         "command is one-shot and no timer runs it), so 'the next pass will get it' means never — "
         "and this row carries the guest's address"
     )
+
+
+# --- B-05c re-Crisol r3: the anomaly reporter must not itself leak the person -------------------
+
+
+async def test_an_anomaly_never_names_a_key_that_could_BE_the_person(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The reporter built to make a strange erasure visible must not be the leak.==
+
+    Naming keys and never values sounds safe, and it is not: ==a key can BE the datum.== A dict
+    keyed by address (``{"ada@example.com": {...}}`` — a group-by that got serialised, an old
+    per-recipient map) puts the guest's email in the key position, and the anomaly line writes it
+    to an ERROR log and to the operator's terminal, moments after the erasure removed it from the
+    table. A log is usually replicated and outlives the database row, so that is the erasure
+    undone, in the one artefact nobody thinks of as a database.
+
+    The rule is the one this cut keeps re-learning: ==name only what is in OUR OWN vocabulary.== A
+    key we declared somewhere is a constant in the source tree — printing it discloses nothing. A
+    key we have never seen is data until proven otherwise, and it is counted, not quoted.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect=OutboxEffect.REFUND.value,
+        # The guest's address IN THE KEY POSITION, and their phone too.
+        payload={"provider": "stripe", "provider_ref": "pi_legacy", _EMAIL: True, _PHONE: 1},
+    )
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    anomaly = report.purge_anomalies[0]
+    assert _EMAIL not in anomaly, (
+        "the anomaly line names the address the purge just erased — and it goes to an ERROR log, "
+        "which is replicated and outlives the row"
+    )
+    assert _PHONE not in anomaly
+    # Still ACTIONABLE: the operator learns the effect, the row, and that two keys were dropped.
+    assert OutboxEffect.REFUND.value in anomaly
+    assert "2 unrecognised" in anomaly
+    # And the erasure itself still did its job on the payload.
+    row = (
+        await sqlite_session.scalars(sa.select(Outbox).where(Outbox.booking_id == booking.id))
+    ).one()
+    assert row.payload == {"provider": "stripe", "provider_ref": "pi_legacy"}
+
+
+async def test_an_anomaly_names_the_keys_that_are_our_own_vocabulary(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==And it must still be worth reading.== A count alone is an alarm nobody can act on.
+
+    ``guest_email`` is not the guest's email — it is a column name we chose, sitting in
+    ``JSON_PII_KEYS`` in this very module. Printing it tells the operator the most useful thing
+    there is (a legacy refund payload was carrying the guest's address) and discloses nothing that
+    is not already in the source tree.
+
+    Both halves are DERIVED from declarations that already exist: our vocabulary is
+    ``JSON_PII_KEYS`` plus everything ``RETAINED_PAYLOAD_KEYS`` declares. No new hand-written list
+    of "safe words" — those rot exactly like the denylist did.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect=OutboxEffect.REFUND.value,
+        payload={
+            "provider": "stripe",
+            "provider_ref": "pi_legacy",
+            "guest_email": _EMAIL,  # our word, in the key position; its VALUE is the address
+            "booking_id": str(booking.id),  # our word, declared for EXPIRE_HOLD
+            "receipt_email": _EMAIL,  # NOT our word — could be anything
+        },
+    )
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    anomaly = report.purge_anomalies[0]
+    assert "guest_email" in anomaly, "our own schema words are safe to print, and the useful part"
+    assert "booking_id" in anomaly
+    assert "1 unrecognised" in anomaly, "and the one we cannot vouch for is counted, not quoted"
+    assert _EMAIL not in anomaly, "the VALUE never appears, whatever the key is called"
+    assert "receipt_email" not in anomaly
+
+
+async def test_the_anomaly_lines_carry_no_trace_of_the_guest_at_all(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The catch-all, pointed at the report instead of the database.==
+
+    ``test_after_the_purge_the_guest_appears_nowhere_in_the_database`` proves the tables are clean.
+    It says nothing about what the purge SAID while cleaning them — and the report goes to a log and
+    a terminal, which is where a leak is least likely to be looked for and most likely to be kept.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session,
+        booking,
+        effect=OutboxEffect.REFUND.value,
+        payload={
+            "provider": "stripe",
+            "provider_ref": "pi_legacy",
+            _EMAIL: True,
+            _NAME: True,
+            _PHONE: True,
+            _NOTES: True,
+            "answers": {"contact": _EMAIL},
+        },
+    )
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    said = " ".join(report.purge_anomalies)
+    assert report.purge_anomalies, "the haystack must contain something, or this proves nothing"
+    for needle in (_EMAIL, _NAME, _PHONE, _NOTES, _ANSWER):
+        assert needle not in said, f"the purge said {needle!r} out loud while erasing it"

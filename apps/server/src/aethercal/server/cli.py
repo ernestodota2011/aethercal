@@ -1136,10 +1136,15 @@ def guest_purge_command(
         # A retained row carrying an undeclared key means something reached the table without
         # passing enqueue_effect's guard: the erasure is complete (the key was dropped), but the
         # write path that produced it is still out there, and a human has to go and look.
+        #
+        # Each line names the ROW, and quotes a key only when it is one of our own declared words —
+        # an unrecognised key can BE the address just erased, and this terminal's scrollback is not
+        # the place to put it back. The row is retained: that is what the operator goes and reads.
         typer.echo(
             f"  ANOMALY: {len(report.purge_anomalies)} retained intent(s) carried undeclared "
             "payload key(s). The keys were dropped, so the erasure IS complete — but a row got "
-            "past the enqueue guard, which is worth finding:",
+            "past the enqueue guard. Read each intent's created_at/dedupe_key to find the write "
+            "path that produced it:",
             err=True,
         )
         for anomaly in report.purge_anomalies:
