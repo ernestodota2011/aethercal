@@ -36,7 +36,7 @@ from aethercal.server.db.models import (
 )
 from aethercal.server.db.roles import DbRole
 from aethercal.server.services.outbox import OutboxEffect
-from aethercal.server.services.payments import CheckoutSession
+from aethercal.server.services.payments import CHECKOUT_SESSION_TTL, CheckoutSession
 from aethercal.server.services.slots import compute_slots
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 from aethercal.server.settings import Settings
@@ -433,6 +433,75 @@ async def test_resume_is_refused_for_a_non_live_hold(
     assert unknown.status_code == 404
 
     assert len(gateway.sessions) == opened_before, "a refused resume opens no checkout"
+
+
+async def test_a_resumed_checkout_expiry_is_capped_to_the_hold(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==r6 finding 1.== Resuming a hold near its deadline: the Stripe ``expires_at`` is CAPPED to
+    the hold's real deadline, never ``now + CHECKOUT_SESSION_TTL`` — so the session cannot outlive
+    the hold and let the guest pay for a slot ``EXPIRE_HOLD`` already freed."""
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+    gateway.fail = True
+    failed = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    detail = failed.json()["detail"]
+    booking_id = uuid.UUID(detail["booking_id"])
+    token = detail["checkout_token"]
+
+    # Move the hold's deadline close, but still above Stripe's 30-min floor (so it stays resumable).
+    deadline = datetime.now(UTC) + timedelta(minutes=30, seconds=30)
+    async with owner_maker() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.hold_expires_at = deadline
+
+    gateway.fail = False
+    before = datetime.now(UTC)
+    resumed = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params={"token": token}
+    )
+    assert resumed.status_code == 200, resumed.text
+
+    sent_expires_at = gateway.sessions[-1]["expires_at"]
+    # Never outlives the hold — the whole point of the fix.
+    assert sent_expires_at <= deadline, "the checkout must not outlive the hold"
+    # And the cap actually BOUND: below the standard now+CHECKOUT_SESSION_TTL it would have used.
+    assert sent_expires_at < before + CHECKOUT_SESSION_TTL, "the expiry was capped to the hold"
+
+
+async def test_resume_is_refused_when_the_hold_has_no_room_for_a_checkout(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==r6 finding 1.== If the hold no longer has room for a Stripe-valid checkout (≥ 30 min out),
+    resume is a clear 409 — never a doomed session that would be rejected or outlive the hold."""
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+    gateway.fail = True
+    failed = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    detail = failed.json()["detail"]
+    booking_id = uuid.UUID(detail["booking_id"])
+    token = detail["checkout_token"]
+
+    # Under Stripe's 30-min floor: still PENDING and not yet expired, but no room for a checkout.
+    deadline = datetime.now(UTC) + timedelta(minutes=20)
+    async with owner_maker() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.hold_expires_at = deadline
+
+    gateway.fail = False
+    opened_before = len(gateway.sessions)
+    resp = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params={"token": token}
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "hold_not_resumable"
+    assert len(gateway.sessions) == opened_before, "a doomed resume opens no checkout"
 
 
 async def test_resume_without_a_valid_token_is_forbidden(

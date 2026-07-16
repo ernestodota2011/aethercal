@@ -107,6 +107,13 @@ TokenQuery = Annotated[str | None, Query(description="Signed guest token authori
 # gates a resume — an expired hold is a clean 409, never a confusing token failure (r5).
 _CHECKOUT_TOKEN_TTL = HOLD_TTL + timedelta(minutes=5)
 
+# ==Stripe's documented floor for a Checkout Session ``expires_at`` (r6 finding 1).== A session must
+# expire at least 30 minutes in the future. On CREATE the hold (``HOLD_TTL``) always has room; on a
+# late RESUME the hold has already spent part of its life, so if less than this remains there is no
+# way to open a session that BOTH clears Stripe's floor AND expires within the hold — refuse (409)
+# rather than open one that outlives the hold (paying for a slot ``EXPIRE_HOLD`` already freed).
+_STRIPE_MIN_CHECKOUT_TTL = timedelta(minutes=30)
+
 _NOT_FOUND = "not_found"
 _CAPTCHA_REQUIRED = "captcha_required"
 
@@ -625,15 +632,16 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     delegated to :func:`record_checkout_intent`, which is TOCTOU-safe (r4 finding 1): two concurrent
     resumes of one hold both open the SAME session and both try to record it, and the loser absorbs
     the UNIQUE conflict instead of handing the caller an ``IntegrityError``."""
+    expires_at = _checkout_expires_at(booking, now=now)
     try:
         checkout: CheckoutSession = await gateway.create_checkout_session(
             idempotency_key=str(booking.id),
             amount_cents=price_cents,
             currency=currency,
-            # ==Finding 2.== The Stripe session expires at ``now + CHECKOUT_SESSION_TTL`` (30-min
-            # minimum + a latency buffer), NOT the hold's TTL. The hold (``HOLD_TTL``, longer)
-            # outlives the session, so ``EXPIRE_HOLD`` never frees the slot while it is payable.
-            expires_at=now + CHECKOUT_SESSION_TTL,
+            # ==The session NEVER outlives the hold (r6 finding 1).== ``_checkout_expires_at`` caps
+            # the expiry to the hold's real deadline (still ≥ Stripe's 30-min floor + a buffer, or a
+            # 409), so ``EXPIRE_HOLD`` can never free the slot while the checkout is still payable.
+            expires_at=expires_at,
             # ==Finding 3.== The guest returns to the REAL booking page, never a dead placeholder.
             return_url=_booking_base_url(request, _settings(request)),
             secrets=secrets,
@@ -656,6 +664,27 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
         currency=currency,
     )
     return checkout.checkout_url
+
+
+def _checkout_expires_at(booking: Booking, *, now: datetime) -> datetime:
+    """The Stripe Checkout Session ``expires_at`` — ==capped to the hold's deadline (r6 finding 1).
+
+    The session must never OUTLIVE the hold: if it did, ``EXPIRE_HOLD`` could free the slot while
+    the session was still payable, and the guest would pay for a slot already given away (a charge
+    to capture and immediately refund). On CREATE this is a non-issue — a fresh hold has
+    ``HOLD_TTL``, longer than ``CHECKOUT_SESSION_TTL``. On a late RESUME the hold has spent part of
+    its life, so the expiry is the EARLIER of our standard TTL and the hold's deadline. But Stripe
+    rejects a session under 30 minutes out, so if the hold no longer has room for one, there is no
+    valid session to open — refuse with a 409 rather than open one doomed to be rejected or to
+    outlive the hold.
+    """
+    hold_deadline = booking.hold_expires_at
+    assert hold_deadline is not None  # a paid hold always has one (create_booking with hold_ttl)
+    hold_deadline = as_utc(hold_deadline)
+    now = as_utc(now)
+    if hold_deadline - now < _STRIPE_MIN_CHECKOUT_TTL:
+        raise _conflict("This hold is about to expire; please book again")
+    return min(now + CHECKOUT_SESSION_TTL, hold_deadline)
 
 
 def _require_resumable_hold(booking: Booking, *, now: datetime) -> None:
