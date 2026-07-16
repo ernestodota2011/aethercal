@@ -307,6 +307,29 @@ def test_index_lists_events_in_spanish_by_default() -> None:
     assert "/e/intro" in response.text
 
 
+def test_index_event_links_stay_in_the_tenant_route_space() -> None:
+    # A guest on business ``/t/bravo`` who clicks an event must land on THAT business's event —
+    # ``/t/bravo/e/intro`` — never the default business's ``/e/intro``. The index used to hardcode
+    # the ``/e`` prefix, dropping the route tenant and bouncing the guest onto the wrong business:
+    # the same "links follow the route" bug already fixed for the event page, another instance.
+    client, _ = _make_client()
+    response = client.get("/t/bravo")
+    assert response.status_code == 200
+    assert "Intro Call" in response.text
+    assert "/t/bravo/e/intro" in response.text
+    assert 'href="/e/intro' not in response.text
+
+
+def test_index_event_links_carry_no_tenant_prefix_for_the_self_hoster() -> None:
+    # The single-business self-hoster arrives on the unprefixed ``/`` — its event links must stay
+    # unprefixed (``/e/intro``) and never gain a ``/t/...`` space their URLs never had.
+    client, _ = _make_client()
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'href="/e/intro' in response.text
+    assert "/t/" not in response.text
+
+
 def test_index_respects_accept_language_english() -> None:
     client, _ = _make_client()
     response = client.get("/", headers={"Accept-Language": "en-US,en;q=0.9"})

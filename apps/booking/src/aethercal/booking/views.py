@@ -369,8 +369,17 @@ def index_page(
     event_types: Sequence[PublicEventTypeRead],
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    event_base: str = "/e",
 ) -> Any:
-    """Landing page: the tenant's bookable meeting types, each linking into the booking flow."""
+    """Landing page: the tenant's bookable meeting types, each linking into the booking flow.
+
+    ``event_base`` is the route-scoped booking prefix the handler derives (``_booking_prefix``):
+    ``/e`` for the single-business self-hoster, ``/t/{slug}/e`` when the request arrived on a
+    business-scoped route. Every event link is built on it so the guest STAYS inside the business
+    whose page they are on. Hardcoding ``/e`` here dropped the route tenant and bounced a guest on
+    ``/t/{slug}`` onto the DEFAULT business's event — the same "links follow the route" rule the
+    event page already keeps via ``event_path``, applied to the index's links too.
+    """
     if not event_types:
         body: Any = P(t(locale, "index_empty"), cls="lead")
     else:
@@ -378,7 +387,7 @@ def index_page(
             Li(
                 A(
                     resolve_title(event, locale),
-                    href=_with_lang(f"/e/{event.slug}", locale),
+                    href=_with_lang(f"{event_base}/{event.slug}", locale),
                     cls="brand",
                 ),
                 Div(_duration_label(locale, event), cls="meta"),

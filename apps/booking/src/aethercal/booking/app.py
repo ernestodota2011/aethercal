@@ -882,11 +882,18 @@ class _BookingApp:
             )
         # No `active` filter here any more: the PUBLIC listing only ever contains what is on sale.
         # Filtering in the client was never a defence — it was the server trusting its client.
+        #
+        # `event_base` is the SAME route-derived space `event()` keeps its links inside — passed so
+        # every event link the index emits stays on `/t/{tenant}/e/...` (or the self-hoster's plain
+        # `/e/...` when the route named no business). Letting `index_page` hardcode `/e` dropped the
+        # route tenant and bounced a guest on `/t/{tenant}` onto the DEFAULT business's event.
+        embed = _is_embed_request(request)
         return views.index_page(
             locale,
             event_types=events,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
+            event_base=_booking_prefix(embed, self._route_tenant(request)),
         )
 
     async def event(self, request: Request) -> object:
