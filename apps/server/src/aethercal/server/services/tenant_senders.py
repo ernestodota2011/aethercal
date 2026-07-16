@@ -91,6 +91,7 @@ table rather than to a cut about senders.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -121,7 +122,16 @@ from aethercal.server.services.tenant_credentials import (
     resolve_infra_credential,
 )
 from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS
-from aethercal.server.webhooks.ssrf import BlockedUrlError, Resolver, assert_target_allowed
+from aethercal.server.webhooks.pinning import pinned_ip_for
+from aethercal.server.webhooks.ssrf import (
+    BlockedUrlError,
+    BlockReason,
+    Resolver,
+    TargetUnresolvable,
+    assert_target_allowed,
+    default_resolver,
+    target_is_allowed,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -569,21 +579,256 @@ def _credential_bool(raw: str | None, *, field: str, default: bool) -> bool:
     )
 
 
-def _smtp_from_secrets(secrets: Mapping[str, str]) -> SmtpConfig:
+@dataclass(frozen=True, slots=True)
+class _SmtpTarget:
+    """==A WITNESS: this SMTP ``host`` has been through the egress guard.==
+
+    The same idiom as :class:`_EgressTarget`, for the relay that has no URL and no HTTP client.
+    Minted only by :func:`_assert_smtp_host_reachable`, and required by :func:`_smtp_from_secrets`,
+    so a tenant's relay host cannot become an :class:`SmtpConfig` unvalidated.
+    """
+
+    host: str
+    """The validated host. ==Read this, never ``secrets["host"]``.=="""
+
+
+def _as_literal_ip(host: str) -> str | None:
+    """The host as an IP literal, or ``None`` when it is a name that needs DNS.
+
+    A literal IS the declared destination — there is nothing for a rebind to change — so it is
+    checked directly and never resolved. The same rule ``webhooks.ssrf`` and ``webhooks.pinning``
+    each apply; each keeps its own three lines of it rather than importing the other's private one.
+    """
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
+async def _assert_host_public(host: str, *, resolver: Resolver | None) -> None:
+    """Refuse ``host`` unless every address it resolves to is on the public internet.
+
+    ==The same policy as the HTTP guard, minus the URL.== ``assert_target_allowed`` takes a url and
+    gates its scheme; an SMTP relay is a bare host and a port, and synthesising ``https://{host}``
+    to reuse it would mean **validating a different string than the one aiosmtplib dials** — the
+    exact theatre ``_build_phone_sender`` is locked against (a host like ``a.example/@127.0.0.1``
+    parses to one authority and resolves as another).
+
+    So the resolve-loop is repeated and the POLICY is not: ``target_is_allowed`` / ``ip_is_public``
+    remain the single definition of "public", decided in ``webhooks.ssrf``. Repeating four lines of
+    mechanism to avoid re-deciding a security question is the right way round.
+    """
+    literal = _as_literal_ip(host)
+    addresses = [literal] if literal is not None else None
+    if addresses is None:
+        resolve = resolver if resolver is not None else default_resolver
+        try:
+            addresses = await resolve(host)
+        except Exception as exc:
+            raise TargetUnresolvable(f"could not resolve host {host!r}: {exc}") from exc
+        if not addresses:
+            raise TargetUnresolvable(f"host {host!r} did not resolve to any address")
+    for address in addresses:
+        # EVERY record must pass: one internal answer poisons the target, exactly as it does for a
+        # webhook URL. No shopping for a routable IP in a mixed set.
+        if not target_is_allowed(address, allowlist=NO_PRIVATE_TARGETS):
+            raise BlockedUrlError(
+                BlockReason.PRIVATE_TARGET,
+                f"{BlockReason.PRIVATE_TARGET.value}: SMTP host {host!r} resolves to {address}, "
+                "which is not a public address",
+            )
+
+
+async def _assert_smtp_host_reachable(
+    secrets: Mapping[str, str], *, source: CredentialSource, resolver: Resolver | None
+) -> _SmtpTarget:
+    """Admit a tenant's SMTP relay host. ==The only constructor of :class:`_SmtpTarget`.==
+
+    .. rubric:: Why SMTP was not exempt, and classifying by protocol was the error
+
+    The first cut of this guard covered the HTTP providers because the finding named HTTP. That was
+    classifying by **protocol** when the rule is declared by **provenance** — the very lesson this
+    module spends its docstring on. A tenant's ``host: 127.0.0.1, port: 25`` is the same
+    trust-boundary bug with the H stripped off: this server connects to the operator's own local MTA
+    and relays on their behalf. ==That is an open relay wearing the operator's IP reputation==, and
+    reputation is the one thing a mail sender cannot buy back.
+
+    .. rubric:: And here the guard is genuinely the only defence
+
+    On the HTTP side an attacker who rebinds still has to satisfy TLS certificate verification for
+    the hostname they declared, which an internal service will not have. SMTP has no such backstop:
+    ``use_tls`` is the tenant's own field, STARTTLS is opportunistic, and port 25 on loopback will
+    talk plaintext happily. So this check is not one layer of several — it is the layer.
+
+    ``CredentialSource.INSTANCE`` is exempt for the reason it is exempt on the HTTP side: that host
+    is the operator's own relay, configured by the person running the process.
+    """
+    host = secrets["host"].strip()
+    if source is not CredentialSource.TENANT:
+        return _SmtpTarget(host=host)
+    try:
+        await _assert_host_public(host, resolver=resolver)
+    except BlockedUrlError as exc:
+        raise UnusableCredentialError(
+            _unusable_message(
+                CredentialProvider.SMTP,
+                field="host",
+                expected=(
+                    "a public internet address. It resolves somewhere inside this instance's own "
+                    "network — loopback, link-local, or a private range — and relaying a "
+                    "business's mail through this server's own network is an open relay on the "
+                    "operator's IP reputation"
+                ),
+            )
+        ) from exc
+    # TargetUnresolvable flies, as on the HTTP side: DNS down is a network failure, not a policy.
+    return _SmtpTarget(host=host)
+
+
+def _smtp_from_secrets(secrets: Mapping[str, str], *, target: _SmtpTarget) -> SmtpConfig:
     """An :class:`SmtpConfig` from the stored field shape.
 
     ``host`` / ``from_addr`` are guaranteed present by ``required_fields(SMTP)``, which
     ``store_credential`` enforces at the door. The OPTIONAL fields are not guaranteed anything, and
     that is exactly where :class:`UnusableCredentialError` lives.
+
+    ==The host comes off the witness, never back out of ``secrets``==, for the same reason the phone
+    builder takes its URL off :class:`_EgressTarget`: validating one string and dialing another is
+    not a guard, it is a comment.
     """
     return SmtpConfig(
-        host=secrets["host"],
+        host=target.host,
         from_addr=secrets["from_addr"],
         port=_credential_port(secrets.get("port")),
         username=secrets.get("username") or None,
         password=secrets.get("password") or None,
         use_tls=_credential_bool(secrets.get("use_tls"), field="use_tls", default=True),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SenderClients:
+    """The two HTTP clients a sending process holds, and ==which one you get is a policy.==
+
+    ``operator`` is the plain client: the operator's own configuration, dialed as the operator
+    always dialed it. ``tenant`` re-pins every request at connect through
+    :class:`EgressGuardedTransport`, so a business's endpoint cannot be rebound into this instance's
+    network between the guard and the socket.
+
+    Two clients rather than one wrapped per sender, deliberately. Wrapping per sender would allocate
+    a client per drain item, and a client that owns no pool of its own is a client whose ``aclose``
+    would tear down somebody else's — a fragility pointed straight at the egress path. Two, built
+    once at boot and closed by the lifespan, have honest ownership; the second pool is a rounding
+    error next to a socket leaked per item, and it isolates tenant egress from the operator's own
+    traffic besides.
+    """
+
+    operator: httpx.AsyncClient
+    tenant: httpx.AsyncClient
+
+    @classmethod
+    def build(
+        cls, *, timeout: float, resolver: Resolver | None = None
+    ) -> SenderClients:  # pragma: no cover - constructs real pools; the policy is tested via both
+        """Build both, each owning its own transport. The caller closes both."""
+        return cls(
+            operator=httpx.AsyncClient(timeout=timeout),
+            tenant=httpx.AsyncClient(
+                transport=EgressGuardedTransport(httpx.AsyncHTTPTransport(), resolver=resolver),
+                timeout=timeout,
+            ),
+        )
+
+    async def aclose(self) -> None:  # pragma: no cover - lifespan teardown
+        await self.operator.aclose()
+        await self.tenant.aclose()
+
+
+class EgressBlocked(httpx.ConnectError):
+    """==This server refused to open the connection.== A rebind, caught at connect time.
+
+    Subclassing :class:`httpx.ConnectError` is a decision, not a convenience. "We refused to dial
+    that address" **is** a failure to establish a connection, and typing it as one makes the rest of
+    the machinery correct for free, by its own rules:
+
+    * the senders already catch ``httpx.HTTPError``;
+    * ``messaging.status.is_definitely_undelivered`` answers **True** for a ``ConnectError`` — its
+      question is *"did the request leave this machine?"*, and here it provably did not;
+    * so the send becomes a
+      :class:`~aethercal.server.integrations.messaging.guard.ChannelUnavailable` — retryable, the
+      in-flight marker is cleared, and the guest cannot be messaged twice.
+
+    Getting that wrong is expensive in a way that is easy to miss: an exception the senders do NOT
+    recognise escapes their handlers with the provider-call marker still standing, and the next
+    drain
+    reads that marker and parks the step as ``unknown`` — *"we do not know whether the guest got the
+    message; a human must resolve it"*. About a message we never even dialed.
+    """
+
+
+class EgressGuardedTransport(httpx.AsyncBaseTransport):
+    """==Re-validate and PIN at connect time. This is what closes DNS rebinding.==
+
+    :func:`_assert_target_reachable` validates a tenant's ``base_url`` when the sender is built.
+    That
+    is a pre-flight check and, on its own, a **TOCTOU window**: httpx re-resolves the hostname when
+    it
+    opens the socket, so a resolver the tenant controls can answer with a public address for the
+    guard and ``127.0.0.1`` for the connect. The check passes, the socket lands inside our network,
+    and every test stays green. ==A guard that DNS can flip is not a guard.==
+
+    So it is applied where it cannot be flipped: here, at the connect, against the address actually
+    about to be dialed. The policy is not re-implemented —
+    :func:`~aethercal.server.webhooks.pinning.pinned_ip_for` is the same connect-time pin the
+    webhook
+    delivery path uses. This transport is only the plumbing that puts it in the socket's way.
+
+    .. rubric:: Why ``validated=frozenset()`` is right, and not a shortcut
+
+    ``pinned_ip_for``'s identity check — *a private address may be dialed only if the pre-flight
+    guard validated THAT address for THIS url* — exists because the operator's allowlist can make a
+    private address legal. ==A tenant is never given that allowlist== (see
+    :func:`_assert_target_reachable`), so here "allowed" collapses to "public", the identity branch
+    is unreachable, and an empty set is not a gap: it is the honest encoding of *there are no
+    private
+    addresses to identify*.
+
+    ``Host`` and TLS survive the pin. The header is already materialised from the original authority
+    by the time a request reaches a transport, and ``sni_hostname`` keeps SNI + certificate
+    verification bound to the real hostname rather than to the dialed IP.
+    """
+
+    def __init__(
+        self, inner: httpx.AsyncBaseTransport, *, resolver: Resolver | None = None
+    ) -> None:
+        self._inner = inner
+        self._resolver = resolver
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raw_host = request.url.raw_host.decode("ascii")
+        try:
+            pinned = await pinned_ip_for(
+                raw_host,
+                resolver=self._resolver,
+                allowlist=NO_PRIVATE_TARGETS,
+                validated=frozenset(),
+            )
+        except (BlockedUrlError, TargetUnresolvable) as exc:
+            # Typed as a ConnectError so the send path classifies it correctly — see EgressBlocked.
+            # The cause carries the host and the address it resolved to; this message does not.
+            raise EgressBlocked(
+                "refused to connect: the address this request would dial is not on the public "
+                "internet. A business's endpoint may not point inside this instance's network."
+            ) from exc
+        request.url = request.url.copy_with(host=pinned)
+        # httpcore reads this extension as BYTES and decodes it into the TLS server_hostname, which
+        # drives SNI *and* certificate-hostname verification — so the certificate is still checked
+        # against the real name, never against the IP we pinned.
+        request.extensions["sni_hostname"] = raw_host.encode("ascii")
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,14 +854,30 @@ class _EgressTarget:
     Taking it off the witness rather than back out of the credential is what stops the guard being
     decorative: validate one string and dial another, and the check was theatre."""
 
+    client: httpx.AsyncClient
+    """==The client permitted to dial it — and the reason this witness is not a lie.==
 
-async def _assert_target_reachable(
+    The first version of this type attested *"this URL passed the guard at build time"*. That can be
+    true while the socket goes somewhere else entirely: DNS re-resolves at connect, and a tenant
+    that
+    controls its own resolver flips the answer in between. The witness was honest about a check and
+    silent about the connection, which is the only thing that matters.
+
+    So it now carries the client too, and the two are paired by the ONE function that validated them
+    together: a ``TENANT`` url is paired with the :class:`EgressGuardedTransport` client, which
+    re-pins every request at connect; an ``INSTANCE`` url is paired with the plain one, because the
+    operator's own configuration is not a threat to the operator. ==A pairing nobody can assemble by
+    hand is worth more than a check nobody can forget to call.=="""
+
+
+async def _assert_target_reachable(  # noqa: PLR0913 - the target, its provenance and both seams
     provider: CredentialProvider,
     secrets: Mapping[str, str],
     *,
     source: CredentialSource,
     default_url: str,
     resolver: Resolver | None,
+    clients: SenderClients,
 ) -> _EgressTarget:
     """Admit this provider's ``base_url``. ==The only constructor of :class:`_EgressTarget`.==
 
@@ -661,7 +922,9 @@ async def _assert_target_reachable(
     """
     raw = secrets.get("base_url") or default_url
     if source is not CredentialSource.TENANT:
-        return _EgressTarget(url=raw.rstrip("/"))
+        # The operator's own configuration, dialed on the plain client: they are not their own
+        # threat model, and their LAN Evolution must stay reachable.
+        return _EgressTarget(url=raw.rstrip("/"), client=clients.operator)
 
     if urlsplit(raw).scheme != _REQUIRED_TENANT_SCHEME:
         raise UnusableCredentialError(
@@ -692,7 +955,11 @@ async def _assert_target_reachable(
         ) from exc
     # TargetUnresolvable deliberately flies: DNS being down is a NETWORK failure, not a policy one,
     # and the drain must retry it rather than write the credential off as broken.
-    return _EgressTarget(url=raw.rstrip("/"))
+    #
+    # ==Paired with the GUARDED client, and that pairing is the point.== Everything above is a
+    # pre-flight check, and a pre-flight check is exactly what DNS rebinding defeats. The guarded
+    # client re-pins at connect, so the witness attests the CONNECTION and not merely the string.
+    return _EgressTarget(url=raw.rstrip("/"), client=clients.tenant)
 
 
 def _build_phone_sender(
@@ -701,7 +968,6 @@ def _build_phone_sender(
     *,
     target: _EgressTarget,
     caps: DailyCaps,
-    http_client: httpx.AsyncClient,
 ) -> PhoneChannelSender:
     """The live phone sender for ``provider``. ==Both its guarantees are TYPES, not checks.==
 
@@ -710,8 +976,10 @@ def _build_phone_sender(
     come from :func:`_assert_target_reachable`, so there is no shape of this program in which a
     tenant's URL is dialed without having been through the egress guard.
 
-    ==The URL comes off the witness, never back out of ``secrets``.== Validating one string and then
-    dialing another is how a guard becomes decoration.
+    ==BOTH the URL and the CLIENT come off the witness== — there is no ``http_client`` parameter to
+    pass. Validating one string and dialing another is how a guard becomes decoration; validating a
+    URL and then handing it to an unguarded client is the same mistake one layer down, and it was
+    the one this signature used to allow.
     """
     match provider:
         case CredentialProvider.WHATSAPP:
@@ -722,7 +990,7 @@ def _build_phone_sender(
                     api_key=secrets["api_key"],
                     caps=caps,
                 ),
-                http_client,
+                target.client,
             )
         case CredentialProvider.SMS:
             return TwilioSmsSender(
@@ -733,7 +1001,7 @@ def _build_phone_sender(
                     caps=caps,
                     base_url=target.url,
                 ),
-                http_client,
+                target.client,
             )
         case _:  # pragma: no cover - only the phone providers reach here
             raise WrongCredentialClassError(f"{provider.value} is not a phone channel")
@@ -778,7 +1046,7 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
     tenant_id: uuid.UUID,
     fernet_key: bytes | Sequence[bytes],
     defaults: InstanceSenderDefaults,
-    http_client: httpx.AsyncClient,
+    clients: SenderClients,
     resolver: Resolver | None = None,
 ) -> TenantSenders:
     """==The funnel.== The senders ONE business sends with. There is no way to ask for "a sender".
@@ -814,7 +1082,10 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
         defaults=defaults,
     )
     if smtp_credential is not None:
-        email = SmtpEmailSender(_smtp_from_secrets(smtp_credential.secrets))
+        smtp_target = await _assert_smtp_host_reachable(
+            smtp_credential.secrets, source=smtp_credential.source, resolver=resolver
+        )
+        email = SmtpEmailSender(_smtp_from_secrets(smtp_credential.secrets, target=smtp_target))
 
     channels: dict[Channel, PhoneChannelSender] = {}
     for provider in (CredentialProvider.WHATSAPP, CredentialProvider.SMS):
@@ -855,6 +1126,7 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
             source=credential.source,
             default_url=_DEFAULT_BASE_URLS[provider],
             resolver=resolver,
+            clients=clients,
         )
         if credential.source is CredentialSource.INSTANCE:
             _logger.warning(
@@ -866,7 +1138,7 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
                 LEND_OPERATOR_PHONE_IDENTITY_ENV,
             )
         channels[channel_for(provider)] = _build_phone_sender(
-            provider, credential.secrets, target=target, caps=caps, http_client=http_client
+            provider, credential.secrets, target=target, caps=caps
         )
 
     return TenantSenders(tenant_id=tenant_id, email=email, channels=channels)
@@ -874,8 +1146,11 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
 
 __all__ = [
     "LEND_OPERATOR_PHONE_IDENTITY_ENV",
+    "EgressBlocked",
+    "EgressGuardedTransport",
     "InstanceFallback",
     "InstanceSenderDefaults",
+    "SenderClients",
     "TenantSenders",
     "UnusableCredentialError",
     "channel_for",

@@ -49,6 +49,7 @@ from aethercal.server.db.models import Tenant, User
 from aethercal.server.db.roles import DbRole
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import build_drain_executor, resolve_senders_for
+from aethercal.server.services import tenant_senders
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 from aethercal.server.settings import Settings
@@ -99,7 +100,12 @@ def _deterministic_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _public(host: str) -> list[str]:
         return ["93.184.216.34"]
 
+    # BOTH bindings. `from ... import default_resolver` binds the name at import time, so
+    # `tenant_senders` holds its own reference and patching only `ssrf` would leave the SMTP guard
+    # talking to the real DNS. (`assert_target_allowed` resolves the name out of ssrf's own globals,
+    # so the phone path needs the first; `_assert_host_public` needs the second.)
     monkeypatch.setattr(ssrf, "default_resolver", _public)
+    monkeypatch.setattr(tenant_senders, "default_resolver", _public)
 
 
 @pytest_asyncio.fixture

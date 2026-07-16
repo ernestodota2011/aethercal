@@ -79,7 +79,10 @@ from aethercal.server.scheduler import (
     start_scheduler,
     stop_scheduler,
 )
-from aethercal.server.services.tenant_senders import warn_if_operator_identity_is_lent
+from aethercal.server.services.tenant_senders import (
+    SenderClients,
+    warn_if_operator_identity_is_lent,
+)
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -146,6 +149,17 @@ def create_worker_app(settings: Settings) -> FastAPI:
             http_client = httpx.AsyncClient(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
             stack.push_async_callback(http_client.aclose)
             app.state.http_client = http_client
+
+            # ==TWO clients, and which one a sender gets is a POLICY (B-03bis).==
+            #
+            # `sender_clients.tenant` re-pins every request at connect through
+            # `EgressGuardedTransport`, so a business's endpoint cannot be rebound into this
+            # instance's network between the egress guard and the socket. `.operator` is plain: the
+            # operator's own configuration, dialed as it always was. `_assert_target_reachable`
+            # pairs each resolved credential with the right one, and that pairing IS the witness.
+            sender_clients = SenderClients.build(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
+            stack.push_async_callback(sender_clients.aclose)
+            app.state.sender_clients = sender_clients
             app.state.fernet_key = settings.fernet_key()
             # The READ reader: the current key, plus the retiring one while a rotation is in flight.
             # The ticks decrypt with this so a row the rotation has not reached yet stays readable —

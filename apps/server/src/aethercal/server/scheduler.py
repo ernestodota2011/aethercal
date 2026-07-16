@@ -442,7 +442,7 @@ async def resolve_senders_for(app: FastAPI, tenant_id: uuid.UUID) -> TenantSende
             # rotation has not reached yet still sends throughout the window.
             fernet_key=app.state.fernet_keys,
             defaults=app.state.instance_sender_defaults,
-            http_client=app.state.http_client,
+            clients=app.state.sender_clients,
         )
 
 

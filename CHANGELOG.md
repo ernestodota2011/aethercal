@@ -44,6 +44,16 @@ credentials; nothing sent with them.
   `AETHERCAL_*_BASE_URL` is unaffected — provenance decides — and the operator's private-target
   allowlist is deliberately not honoured for a tenant: it exists so the operator can reach their own
   LAN, not so a business can.
+- **The egress guard is re-applied at connect, so DNS rebinding cannot move the socket.** A
+  build-time check is a TOCTOU window — httpx re-resolves when it opens the connection, so a tenant
+  controlling its own resolver could answer public for the guard and `127.0.0.1` for the socket. A
+  tenant's sender is now built on a client whose transport re-validates and pins the address at
+  connect (reusing the webhook path's `pinned_ip_for`), with `Host` and TLS certificate
+  verification still bound to the real hostname.
+- **A tenant's SMTP relay host is guarded too.** `host: 127.0.0.1, port: 25` relayed a business's
+  mail through the operator's own local MTA — an open relay on the operator's IP reputation. It is
+  the same trust-boundary bug without the HTTP, and scoping it out was classifying by protocol when
+  the rule is declared by provenance. The operator's own `AETHERCAL_SMTP_HOST` is unaffected.
 - Removed `app.build_email_sender` / `app.build_channel_senders`, replaced by
   `app.build_instance_sender_defaults` (configuration, not clients). The web process no longer
   builds senders at all — it never read the ones it was building. Its half-configured-phone-channel

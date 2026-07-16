@@ -35,6 +35,7 @@ from aethercal.server.services.tenant_credentials import CredentialProvider, sto
 from aethercal.server.services.tenant_senders import (
     LEND_OPERATOR_PHONE_IDENTITY_ENV,
     InstanceSenderDefaults,
+    SenderClients,
     resolve_tenant_senders,
 )
 
@@ -62,6 +63,11 @@ def _whatsapp_secrets(name: str) -> dict[str, str]:
         "instance": f"{name}-own-number",
         "api_key": f"NOT_A_REAL_KEY_{name}",
     }
+
+
+def _clients(client: object) -> SenderClients:
+    """Both clients as the same double — the pairing is what matters here, not the transport."""
+    return SenderClients(operator=client, tenant=client)  # type: ignore[arg-type]
 
 
 async def _public_dns(host: str) -> list[str]:
@@ -115,7 +121,7 @@ async def _resolve_as(
                 fernet_key=KEY,
                 defaults=defaults,
                 # type: ignore[arg-type] — only stored on the sender, never dialled here.
-                http_client=None,  # type: ignore[arg-type]
+                clients=_clients(None),  # type: ignore[arg-type]
                 resolver=_public_dns,
             )
 

@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.server.channels import Channel
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant
+from aethercal.server.integrations.messaging.status import is_definitely_undelivered
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
@@ -47,11 +48,15 @@ from aethercal.server.services.tenant_credentials import (
 from aethercal.server.services.tenant_senders import (
     _SPECS,
     LEND_OPERATOR_PHONE_IDENTITY_ENV,
+    EgressBlocked,
+    EgressGuardedTransport,
     InstanceFallback,
     InstanceSenderDefaults,
+    SenderClients,
     TenantSenders,
     UnusableCredentialError,
     _smtp_from_secrets,
+    _SmtpTarget,
     channel_for,
     instance_fallback,
     resolve_tenant_senders,
@@ -174,6 +179,18 @@ def _defaults(**overrides: str) -> InstanceSenderDefaults:
     return InstanceSenderDefaults.from_env({**_OPERATOR_ENV, **overrides})
 
 
+def _clients(client: object) -> SenderClients:
+    """Both clients pointing at the same test double.
+
+    ==The PAIRING is what these tests assert, not the transport.== Whether the guarded client really
+    re-pins at connect is `TestTheGuardedTransportClosesRebinding`'s job, against the real
+    `EgressGuardedTransport`. Here what matters is that `_assert_target_reachable` hands a TENANT
+    target the `.tenant` client and an INSTANCE target the `.operator` one — so the doubles are
+    distinguishable by identity, and nothing else.
+    """
+    return SenderClients(operator=client, tenant=client)  # type: ignore[arg-type]
+
+
 async def _public_dns(host: str) -> list[str]:
     """A resolver that answers with one ordinary public address.
 
@@ -198,7 +215,7 @@ async def _senders(
         tenant_id=tenant.id,
         fernet_key=KEY,
         defaults=defaults,
-        http_client=client,
+        clients=_clients(client),
         resolver=resolver,  # type: ignore[arg-type]
     )
 
@@ -538,7 +555,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
                     tenant_id=business.id,
                     fernet_key=KEY,
                     defaults=_defaults(),
-                    http_client=client,
+                    clients=_clients(client),
                     resolver=_resolves_inward,
                 )
 
@@ -573,7 +590,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
                     tenant_id=business.id,
                     fernet_key=KEY,
                     defaults=_defaults(),
-                    http_client=client,
+                    clients=_clients(client),
                     resolver=_mixed,
                 )
 
@@ -609,7 +626,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
                     tenant_id=business.id,
                     fernet_key=KEY,
                     defaults=_defaults(),
-                    http_client=client,
+                    clients=_clients(client),
                     resolver=_public,
                 )
 
@@ -640,7 +657,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
                 tenant_id=business.id,
                 fernet_key=KEY,
                 defaults=_defaults(),
-                http_client=client,
+                clients=_clients(client),
                 resolver=_public,
             )
 
@@ -671,6 +688,253 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
         assert senders.channels[Channel.WHATSAPP]._config.base_url == ("http://192.168.1.50:8080")
 
 
+class TestATenantsSmtpRelayCannotBeInternalEither:
+    """==The same trust-boundary bug with the H stripped off.==
+
+    The first cut of this guard covered the HTTP providers because the finding named HTTP. That was
+    classifying by **protocol** when the rule is declared by **provenance** — and a tenant's
+    ``host: 127.0.0.1, port: 25`` makes this server connect to the operator's own local MTA and
+    relay on their behalf. ==An open relay wearing the operator's IP reputation==, which is the one
+    thing a mail sender cannot buy back.
+
+    Here the guard is genuinely the only defence: there is no certificate check to fall back on,
+    because ``use_tls`` is the tenant's own field and port 25 on loopback talks plaintext happily.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1", "169.254.169.254", "192.168.1.25", "10.0.0.1", "::1"],
+        ids=["loopback", "metadata", "rfc1918", "rfc1918-10", "ipv6-loopback"],
+    )
+    async def test_an_internal_relay_host_is_refused(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory, host: str
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, f"mta-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": host, "from_addr": "a@x.example", "port": "25"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError) as caught:
+                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        message = str(caught.value)
+        assert "host" in message
+        assert host not in message, "the stored value is never echoed"
+
+    async def test_a_relay_hostname_that_RESOLVES_inward_is_refused(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The resolved address is the destination here too — a name is only a string."""
+        business = await _business(sqlite_session, tenant_factory, "mta-dns")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "relay.evil.example", "from_addr": "a@x.example"},
+            fernet_key=KEY,
+        )
+
+        async def _inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError):
+                await _senders(
+                    sqlite_session, business, defaults=_defaults(), client=client, resolver=_inward
+                )
+
+    async def test_a_public_relay_is_allowed(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Anti-vacuity.== Without this, a guard that refused every relay would pass the lot."""
+        business = await _business(sqlite_session, tenant_factory, "mta-ok")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets=_TENANT_SMTP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email._config.host == _TENANT_SMTP["host"]
+
+    async def test_the_OPERATORS_own_relay_is_not_guarded(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """A self-hoster's relay on their own LAN keeps working. Provenance, not protocol."""
+        business = await _business(sqlite_session, tenant_factory, "mta-lan")
+        lan = InstanceSenderDefaults.from_env(
+            {**_OPERATOR_ENV, "AETHERCAL_SMTP_HOST": "192.168.1.25"}
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=lan, client=client)
+
+        assert senders.email._config.host == "192.168.1.25"
+
+
+class TestTheWitnessPairsTheUrlWithTheClientThatMayDialIt:
+    """==The half a build-time guard cannot give you, and the half that matters.==
+
+    A witness saying *"this URL passed the guard"* can be TRUE while the socket goes somewhere else
+    entirely: DNS re-resolves at connect. So the witness pairs the URL with the client permitted to
+    dial it — a TENANT url with the re-pinning client, an INSTANCE url with the plain one — and
+    these tests assert that pairing with **distinguishable** clients.
+
+    ==Without them the whole rebinding fix is untested.== Pairing a tenant's target with the
+    operator's unguarded client compiles, reads as a tidy simplification, silently restores the
+    TOCTOU window — and every other test in this file passes, because they hand both slots the same
+    double. That is not hypothetical: it is what happened here, and it is why these exist.
+    """
+
+    async def test_a_tenants_sender_is_built_on_the_GUARDED_client(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "paired-tenant")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+        operator, tenant = httpx.AsyncClient(), httpx.AsyncClient()
+        try:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=SenderClients(operator=operator, tenant=tenant),
+                resolver=_public_dns,
+            )
+            assert senders.channels[Channel.WHATSAPP]._http is tenant, (
+                "a business's own endpoint was given the UNGUARDED client. The build-time guard "
+                "would still pass and DNS could then rebind the socket into our network — which is "
+                "the entire attack the guarded transport exists to stop."
+            )
+        finally:
+            await operator.aclose()
+            await tenant.aclose()
+
+    async def test_the_operators_own_sender_is_built_on_the_PLAIN_client(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The mirror, and it is not symmetry for its own sake.
+
+        The operator's LAN Evolution is a private address by design. Put it behind the public-only
+        pin and a self-hoster's WhatsApp stops working — the guard would be protecting the operator
+        from themselves, which is exactly the mistake the provenance rule exists to avoid.
+        """
+        business = await _business(sqlite_session, tenant_factory, "paired-operator")
+        lent = _defaults(**{LEND_OPERATOR_PHONE_IDENTITY_ENV: "true"})
+        operator, tenant = httpx.AsyncClient(), httpx.AsyncClient()
+        try:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=lent,
+                clients=SenderClients(operator=operator, tenant=tenant),
+                resolver=_public_dns,
+            )
+            assert senders.channels[Channel.WHATSAPP]._http is operator, (
+                "the operator's own account was put behind the tenant's public-only pin; a "
+                "self-hoster's LAN relay would stop working."
+            )
+        finally:
+            await operator.aclose()
+            await tenant.aclose()
+
+
+class TestTheGuardedTransportClosesRebinding:
+    """==The pre-flight guard is a TOCTOU window, and this is what shuts it.==
+
+    ``_assert_target_reachable`` resolves when the sender is BUILT. httpx resolves again when it
+    opens the SOCKET. A tenant that controls its own resolver answers public for the first and
+    ``127.0.0.1`` for the second: the guard passes, the socket lands inside our network, and every
+    other test in this file stays green. ==A guard DNS can flip is not a guard.==
+
+    So these drive the REAL :class:`EgressGuardedTransport` — the object the worker actually gives a
+    tenant's sender — with a resolver that rebinds.
+    """
+
+    async def test_a_rebind_to_loopback_is_refused_at_connect(self) -> None:
+        """==The attack, executed.== The guard already said yes; DNS then changes its mind."""
+        dialed: list[str] = []
+
+        class _Recording(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                dialed.append(str(request.url))
+                return httpx.Response(200)
+
+        async def _rebinds_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        transport = EgressGuardedTransport(_Recording(), resolver=_rebinds_inward)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(EgressBlocked):
+                await client.post("https://evolution.business.example/message/sendText/x")
+
+        assert dialed == [], "the request reached the socket despite resolving to loopback"
+
+    async def test_a_public_answer_is_pinned_and_dialed_with_TLS_bound_to_the_name(self) -> None:
+        """==Anti-vacuity, and the TLS half.==
+
+        The refusal above would pass against a transport that refused everything. This proves the
+        guarded client still WORKS — and that pinning does not silently downgrade TLS: the socket
+        goes to the IP while SNI and certificate verification stay bound to the hostname. Get that
+        wrong and the fix for rebinding becomes a break in certificate checking.
+        """
+        seen: list[httpx.Request] = []
+
+        class _Recording(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                seen.append(request)
+                return httpx.Response(200)
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        transport = EgressGuardedTransport(_Recording(), resolver=_public)
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await client.post("https://evolution.business.example/send")
+
+        assert response.status_code == 200
+        request = seen[0]
+        assert request.url.host == "93.184.216.34", "the socket was not pinned to the checked IP"
+        assert request.headers["Host"] == "evolution.business.example", (
+            "the Host header lost the original authority — the provider's vhost routing would break"
+        )
+        assert request.extensions["sni_hostname"] == b"evolution.business.example", (
+            "SNI/cert verification is not bound to the real hostname. Pinning to an IP without it "
+            "verifies the certificate against the IP, which fails for every honest provider — and "
+            "would push somebody to disable verification to make it work."
+        )
+
+    async def test_the_refusal_is_typed_so_the_send_path_classifies_it_correctly(self) -> None:
+        """==The subtle half, and the expensive one to get wrong.==
+
+        The senders catch ``httpx.HTTPError`` and ask ``is_definitely_undelivered``. An exception
+        they do NOT recognise escapes their handlers with the provider-call marker still standing,
+        and the next drain reads that marker and parks the step as ``unknown`` — *"a human must go
+        and check whether the guest was messaged"* — about a message we never dialed.
+        """
+        assert isinstance(EgressBlocked("x"), httpx.ConnectError)
+        assert is_definitely_undelivered(EgressBlocked("x")), (
+            "a refused connection must classify as definitely-undelivered: nothing left this "
+            "machine, so the retry is safe and the in-flight marker must be cleared."
+        )
+
+
 class TestAStoredCredentialWhoseValueCannotBeUsed:
     """==A credential can be complete and still be unusable, and that difference decides the
     outcome.==
@@ -687,7 +951,8 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
     def test_a_non_numeric_port_is_a_legible_domain_error_naming_the_field(self) -> None:
         with pytest.raises(UnusableCredentialError) as caught:
             _smtp_from_secrets(
-                {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"}
+                {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
+                target=_SmtpTarget(host="smtp.x.example"),
             )
 
         message = str(caught.value)
@@ -708,7 +973,8 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
         """
         with pytest.raises(UnusableCredentialError) as caught:
             _smtp_from_secrets(
-                {"host": "smtp.x.example", "from_addr": "a@x.example", "use_tls": "maybe"}
+                {"host": "smtp.x.example", "from_addr": "a@x.example", "use_tls": "maybe"},
+                target=_SmtpTarget(host="smtp.x.example"),
             )
 
         message = str(caught.value)

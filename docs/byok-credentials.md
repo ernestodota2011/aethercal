@@ -60,8 +60,9 @@ messages guests from a number none of them own.
 
 ### A business's endpoint must be on the public internet
 
-A WhatsApp or SMS credential carries a `base_url`, and this server makes requests to it. That makes
-it **your endpoint, our network** — so it is validated like any other URL a third party hands us:
+A WhatsApp or SMS credential carries a `base_url`, and an SMTP credential carries a relay `host`.
+This server connects to them. That makes it **your endpoint, our network** — so it is validated like
+anything else a third party hands us and we obey:
 
 | Rule | Why |
 |---|---|
@@ -69,6 +70,12 @@ it **your endpoint, our network** — so it is validated like any other URL a th
 | **a public address** | loopback, link-local (**including `169.254.169.254`**, the cloud metadata service), RFC1918, CGNAT and reserved ranges are all refused |
 | **checked by resolved IP** | a public hostname pointing at `127.0.0.1` is refused. The destination is the address, not the string |
 | **every record must pass** | one internal address in a mixed DNS answer refuses the whole target |
+| **re-checked at connect** | the address is validated again when the socket opens, and pinned. A DNS answer that changes between the check and the connect (rebinding) cannot move the socket |
+
+The same applies to a **tenant SMTP relay host** — `host: 127.0.0.1, port: 25` would relay your mail
+through the operator's own MTA, which is an open relay on their IP reputation. There is no `https`
+rule there (SMTP has no such scheme), and no certificate to fall back on: the address check is the
+whole defence.
 
 A credential that fails this is **not usable**: the channel stays off, and the worker logs which
 field is wrong (never its value). Fix it with `credentials set` and the next attempt goes through.
