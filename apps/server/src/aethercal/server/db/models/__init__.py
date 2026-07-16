@@ -11,7 +11,7 @@ from aethercal.server.db.models.integrations import (
 from aethercal.server.db.models.notifications import SentNotification
 from aethercal.server.db.models.outbox import Outbox, OutboxStatus
 from aethercal.server.db.models.scheduling import DateOverride, EventType, Schedule
-from aethercal.server.db.models.tenancy import ApiKey, Tenant, User
+from aethercal.server.db.models.tenancy import ApiKey, MemberRole, Membership, Tenant, User
 from aethercal.server.db.models.webhooks import Webhook, WebhookDelivery
 from aethercal.server.db.models.workflows import (
     Workflow,
@@ -29,6 +29,8 @@ __all__ = [
     "ExternalCalendarLink",
     "ExternalConnection",
     "GuestToken",
+    "MemberRole",
+    "Membership",
     "Outbox",
     "OutboxStatus",
     "Schedule",

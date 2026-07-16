@@ -44,7 +44,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aethercal.core.model import BookingStatus
+from aethercal.core.model import BookingStatus, MemberRole
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeCreate, EventTypeRead, EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleRead, ScheduleUpdate
@@ -58,8 +58,10 @@ from aethercal.schemas.workflows import (
 )
 from aethercal.server.db.models import (
     Booking,
+    EventType,
     ExternalCalendarLink,
     ExternalConnection,
+    Membership,
     Outbox,
     OutboxStatus,
     Tenant,
@@ -70,9 +72,13 @@ from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
+from aethercal.server.services import memberships as memberships_service
+from aethercal.server.services import rbac
 from aethercal.server.services import schedules as schedules_service
 from aethercal.server.services import users as users_service
 from aethercal.server.services import workflow_rules as workflow_rules_service
+from aethercal.server.services.memberships import MemberRead
+from aethercal.server.services.rbac import Capability, Principal
 
 # --------------------------------------------------------------------------------------
 # The session accessor (B-01).
@@ -129,6 +135,29 @@ class AdminActionError(AdminError):
         self.message = message
 
 
+class AdminPermissionError(AdminActionError):
+    """The person signed in may not do this (B-02) — ==raised, never rendered as an empty list.==
+
+    A refusal that comes back as "you have no members" instead of "you may not see the members" is a
+    silent no-op wearing a UI: it tells the person something FALSE about their own business, and it
+    tells nobody at all that a gate fired.
+
+    An ``AdminActionError`` on purpose, so every panel's existing ``except`` already surfaces it in
+    the operator's own words — and a subclass, so a test can assert the refusal came from the ROLE
+    GATE rather than from a service that happened to say no for its own reasons.
+    """
+
+
+class SessionRevokedError(AdminPermissionError):
+    """The person's ``memberships`` row is GONE — their access to this business was revoked (B-02).
+
+    Distinct from a plain permission refusal so the UI layer can tell "you may not do this" from
+    "you are no longer a member here, sign in again". It is still an :class:`AdminPermissionError`,
+    so every panel's existing ``except`` already fails closed on it — the distinct type is for the
+    session's benefit, not the gate's.
+    """
+
+
 # --------------------------------------------------------------------------------------
 # Inputs / context.
 # --------------------------------------------------------------------------------------
@@ -149,6 +178,24 @@ class AdminContext:
     """
 
     tenant_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class MemberForm:
+    """What an OWNER authors when they let one of the business's hosts into the panel (B-02).
+
+    ``host_id`` is EXPLICIT, and it is an existing host of this business — a member is not a new
+    kind of person, it is a person the business already has, given a role and (optionally) a way in.
+    The service resolves it WITHIN the business, which stops a membership row from being written
+    against another business's user (an id that, under RLS, is not even readable from here).
+
+    ``password=None`` grants the role WITHOUT a login: the person is listed, and an owner gives them
+    a password later. It is not "no password needed" — a NULL hash verifies against nothing.
+    """
+
+    host_id: uuid.UUID
+    role: MemberRole
+    password: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +303,146 @@ async def _resolve_tenant(session: AsyncSession, tenant_slug: str | None) -> Ten
     return tenants[0]
 
 
+async def _live_principal(
+    session: AsyncSession, principal: Principal, ctx: AdminContext
+) -> Principal:
+    """Re-read a member's CURRENT role from ``memberships`` on THIS action — not the login snapshot.
+
+    ==A role is not a fact you learn once at login.== The session carries the role the login wrote,
+    but authorising on that string is persistence of privilege: an owner who revokes a member, or
+    demotes an ``owner`` to ``member``, changes ``memberships`` — and the session goes on acting
+    with the old role until it happens to log out. In a multi-business SaaS that is escalation that
+    survives its own revocation. So every panel calls this the moment its session is bound, and
+    ``_authorize`` decides on the principal it returns, not the one the browser's session held.
+
+    * a **revoked** member — no ``memberships`` row — is :class:`SessionRevokedError` (their login
+      is gone; the UI can force a fresh sign-in);
+    * a **demoted/promoted** member gets a principal carrying their role AS IT IS NOW.
+
+    ==The cost is one extra ``SELECT`` per admin action, and it is the correct price.== The admin is
+    a low-frequency, one-operator surface; a stale ``owner`` capability is not a latency budget.
+
+    The bootstrap operator holds no ``memberships`` row at all — their authority is the environment
+    credential, re-resolved from the slug they selected on every action already — so their path does
+    not change. A member whose verified business is not the one being administered is left untouched
+    too: that is a cross-business request, and ``_authorize``'s tenant gate refuses it in precise
+    words. (Re-reading here, under a GUC bound to ``ctx.tenant_id``, would only find no row and
+    mislabel the refusal "revoked".)
+    """
+    if principal.is_operator or principal.user_id is None or principal.tenant_id != ctx.tenant_id:
+        return principal
+    membership = await memberships_service.get_membership_for_user(
+        session, tenant_id=ctx.tenant_id, user_id=principal.user_id
+    )
+    if membership is None:
+        raise SessionRevokedError(
+            "your access to this business has been revoked.\n"
+            "\n"
+            "The business you may administer is decided when you sign in, from your membership — "
+            "and yours no longer exists. Sign in again."
+        )
+    # ``principal.tenant_id == ctx.tenant_id`` here (the guard above returned otherwise), so the
+    # bound business IS the member's — use it, and pyright keeps a plain ``UUID`` rather than the
+    # ``UUID | None`` the snapshot field is typed as.
+    return Principal.member(
+        tenant_id=ctx.tenant_id, user_id=principal.user_id, role=membership.role
+    )
+
+
+def _authorize(principal: Principal, ctx: AdminContext, capability: Capability) -> None:
+    """The gate every panel passes through. ==Two questions, and the first one is not optional.==
+
+    ==Synchronous on purpose, and it is a security property, not a style.== It touches no database,
+    so it needs no ``await`` — and a gate that returned a coroutine could be *called without being
+    awaited*: the panel would sail straight past it, the check would never run, and Python would say
+    nothing louder than a warning at interpreter shutdown. That is this codebase's signature defect
+    (a control that looks applied and applies nothing) in its purest form, and it is exactly what
+    happened while this function was being written. A plain ``def`` cannot fail that way.
+
+    #. **Is this even their business?** ``tenant_slug`` arrives from the CLIENT; ``principal``'s
+       ``tenant_id`` was written by the login, from a server-side ``memberships`` lookup. When they
+       disagree, the SERVER's answer wins and the action is refused. Nothing about a role can save
+       this check: an ``owner`` of Acme holds every capability there is, and is still nobody in
+       Globex. ==The GUC is the authority; the client's slug is a request.==
+    #. **May they do this here?** ``services/rbac.py``, one total function from role to capability.
+
+    Why refuse rather than let row-level security handle it: it *would* handle it — the session
+    would bind Globex's GUC and the Acme owner would read Globex's rows, which is exactly what they
+    asked for. RLS stops nothing here: the request is coherent. It is the ROLE gate that has to
+    know the difference, and this is where it does.
+    """
+    if not principal.is_operator and principal.tenant_id != ctx.tenant_id:
+        raise AdminPermissionError(
+            "you are not a member of that business.\n"
+            "\n"
+            "The business you may administer is decided when you sign in, from your membership — "
+            "never from the address bar."
+        )
+    try:
+        rbac.require(principal, capability)
+    except rbac.PermissionDeniedError as exc:
+        raise AdminPermissionError(str(exc)) from exc
+
+
+async def _authorize_booking(
+    session: AsyncSession, principal: Principal, ctx: AdminContext, booking_id: uuid.UUID
+) -> None:
+    """Act on ONE booking: anybody's if you run the business, otherwise only the ones you host.
+
+    ==The half a capability cannot express.== ``MANAGE_OWN_BOOKINGS`` says *your own*; only a query
+    against the booking's HOST can say which ones those are. Without this, "your own" quietly comes
+    to mean "anybody's" — with no error, and no way to notice.
+
+    A booking that does not exist is refused the SAME way as one that belongs to another host: a
+    ``member`` who could tell the two apart would have an id oracle for their colleagues' agenda.
+    (For the roles that hold ``MANAGE_SCHEDULING`` nothing is queried at all, and the booking
+    service's own ``BookingNotFoundError`` still says what it always said.)
+    """
+    if rbac.has(principal, Capability.MANAGE_SCHEDULING):
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
+        return
+    _authorize(principal, ctx, Capability.MANAGE_OWN_BOOKINGS)
+
+    host_id = await session.scalar(
+        select(EventType.host_id)
+        .join(Booking, Booking.event_type_id == EventType.id)
+        .where(Booking.id == booking_id, Booking.tenant_id == ctx.tenant_id)
+    )
+    if host_id is None or host_id != principal.user_id:
+        raise AdminPermissionError(
+            "you may only act on the bookings you host.\n"
+            "\n"
+            "Ask an owner or an admin of this business to change it for you."
+        )
+
+
+async def _authorize_event_type(
+    session: AsyncSession, principal: Principal, ctx: AdminContext, event_type_id: uuid.UUID
+) -> None:
+    """Create a booking ON an event type: anybody's if you run the business, else only your own.
+
+    The same row-level question as :func:`_authorize_booking`, asked one step earlier — before the
+    booking exists, when the only thing that carries a host is the event type it is being made
+    against.
+    """
+    if rbac.has(principal, Capability.MANAGE_SCHEDULING):
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
+        return
+    _authorize(principal, ctx, Capability.MANAGE_OWN_BOOKINGS)
+
+    host_id = await session.scalar(
+        select(EventType.host_id).where(
+            EventType.id == event_type_id, EventType.tenant_id == ctx.tenant_id
+        )
+    )
+    if host_id is None or host_id != principal.user_id:
+        raise AdminPermissionError(
+            "you may only book the event types you host.\n"
+            "\n"
+            "Ask an owner or an admin of this business to book it for you."
+        )
+
+
 async def resolve_admin_context(session: AsyncSession, *, tenant_slug: str | None) -> AdminContext:
     """Resolve the tenant the admin is administering (RF-18).
 
@@ -325,9 +512,10 @@ def _booking_action_error(exc: bookings_service.BookingError) -> AdminActionErro
     return AdminActionError("The booking could not be updated")  # pragma: no cover - defensive
 
 
-async def list_bookings_view(
+async def list_bookings_view(  # noqa: PLR0913 - the principal is the AUTHORITY (never a default); the rest are the action's own inputs
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     status: BookingStatus | None = None,
     date_from: date | None = None,
@@ -335,6 +523,8 @@ async def list_bookings_view(
 ) -> list[BookingRead]:
     """List the tenant's bookings (optionally filtered), as read models for the agenda view."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rows = await bookings_service.list_bookings(
             session,
             tenant_id=ctx.tenant_id,
@@ -348,12 +538,15 @@ async def list_bookings_view(
 async def cancel_booking_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
     now: datetime | None = None,
 ) -> BookingRead:
     """Cancel a booking (idempotent), returning the updated read model."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        await _authorize_booking(session, principal, ctx, booking_id)
         try:
             booking = await bookings_service.cancel_booking(
                 session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
@@ -364,9 +557,10 @@ async def cancel_booking_action(
         return BookingRead.model_validate(booking)
 
 
-async def reschedule_booking_action(
+async def reschedule_booking_action(  # noqa: PLR0913 - the principal is the AUTHORITY (never a default); the rest are the action's own inputs
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
     new_start: datetime,
@@ -374,6 +568,8 @@ async def reschedule_booking_action(
 ) -> BookingRead:
     """Reschedule a booking to ``new_start``, returning the new confirmed booking's read model."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        await _authorize_booking(session, principal, ctx, booking_id)
         try:
             booking = await bookings_service.reschedule_booking(
                 session,
@@ -391,6 +587,7 @@ async def reschedule_booking_action(
 async def mark_no_show_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     booking_id: uuid.UUID,
     now: datetime | None = None,
@@ -407,6 +604,8 @@ async def mark_no_show_action(
     would be a cancellation by another name that does not give the time back.
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        await _authorize_booking(session, principal, ctx, booking_id)
         try:
             booking = await bookings_service.mark_no_show(
                 session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now(now)
@@ -420,6 +619,7 @@ async def mark_no_show_action(
 async def create_booking_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     form: BookingForm,
     now: datetime | None = None,
@@ -432,6 +632,8 @@ async def create_booking_action(
     from the event type's duration inside the service.
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        await _authorize_event_type(session, principal, ctx, form.event_type_id)
         try:
             booking = await bookings_service.create_booking(
                 session,
@@ -464,19 +666,23 @@ def _validation_message(exc: ValidationError) -> str:
 
 
 async def list_event_types_view(
-    admin: AdminSessions, *, tenant_slug: str | None
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
 ) -> list[EventTypeRead]:
     """List all of the tenant's event types (active and inactive)."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rows = await event_types_service.list_event_types(session, tenant_id=ctx.tenant_id)
         return [EventTypeRead.model_validate(row) for row in rows]
 
 
 async def create_event_type_action(
-    admin: AdminSessions, *, tenant_slug: str | None, form: EventTypeForm
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, form: EventTypeForm
 ) -> EventTypeRead:
     """Create an event type from ``form``, injecting the host user from the resolved context."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             data = EventTypeCreate(
                 host_id=form.host_id,
@@ -509,12 +715,15 @@ async def create_event_type_action(
 async def update_event_type_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     event_type_id: uuid.UUID,
     data: EventTypeUpdate,
 ) -> EventTypeRead:
     """Apply a partial update to an event type; raise if it does not exist for the tenant."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await event_types_service.update_event_type(
                 session, tenant_id=ctx.tenant_id, event_type_id=event_type_id, data=data
@@ -528,10 +737,12 @@ async def update_event_type_action(
 
 
 async def deactivate_event_type_action(
-    admin: AdminSessions, *, tenant_slug: str | None, event_type_id: uuid.UUID
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, event_type_id: uuid.UUID
 ) -> bool:
     """Soft-delete an event type (set ``active = False``); return whether it existed."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         return await event_types_service.deactivate_event_type(
             session, tenant_id=ctx.tenant_id, event_type_id=event_type_id
         )
@@ -543,19 +754,23 @@ async def deactivate_event_type_action(
 
 
 async def list_schedules_view(
-    admin: AdminSessions, *, tenant_slug: str | None
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
 ) -> list[ScheduleRead]:
     """List the tenant's weekly schedules, as read models."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rows = await schedules_service.list_schedules(session, tenant_id=ctx.tenant_id)
         return [schedules_service.schedule_to_read(row) for row in rows]
 
 
 async def create_schedule_action(
-    admin: AdminSessions, *, tenant_slug: str | None, data: ScheduleCreate
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, data: ScheduleCreate
 ) -> ScheduleRead:
     """Create a weekly schedule; map name/validation failures to :class:`AdminActionError`."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await schedules_service.create_schedule(
                 session, tenant_id=ctx.tenant_id, data=data
@@ -568,12 +783,15 @@ async def create_schedule_action(
 async def update_schedule_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     schedule_id: uuid.UUID,
     data: ScheduleUpdate,
 ) -> ScheduleRead:
     """Patch a weekly schedule; raise if it does not exist or the new shape is invalid."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await schedules_service.update_schedule(
                 session, tenant_id=ctx.tenant_id, schedule_id=schedule_id, data=data
@@ -584,10 +802,12 @@ async def update_schedule_action(
 
 
 async def delete_schedule_action(
-    admin: AdminSessions, *, tenant_slug: str | None, schedule_id: uuid.UUID
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, schedule_id: uuid.UUID
 ) -> None:
     """Delete a weekly schedule (its date overrides cascade); raise if it does not exist."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             await schedules_service.delete_schedule(
                 session, tenant_id=ctx.tenant_id, schedule_id=schedule_id
@@ -682,7 +902,11 @@ def _age_seconds(moment: datetime | None, *, now: datetime) -> float:
 
 
 async def metrics_view(
-    admin: AdminSessions, *, tenant_slug: str | None, now: datetime | None = None
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    now: datetime | None = None,
 ) -> AdminMetrics:
     """Read this business's operational state: the outbox backlog and the no-show rate (RF-25/R9).
 
@@ -692,6 +916,8 @@ async def metrics_view(
     """
     moment = _now(now)
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         by_status = {status.value: 0 for status in OutboxStatus}
         for status, count in await session.execute(
             select(Outbox.status, func.count())
@@ -791,18 +1017,24 @@ def _host_form_data(form: HostForm) -> users_service.UserData:
     return users_service.UserData(name=form.name, email=form.email, timezone=form.timezone)
 
 
-async def list_hosts_view(admin: AdminSessions, *, tenant_slug: str | None) -> list[HostRead]:
+async def list_hosts_view(
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
+) -> list[HostRead]:
     """The tenant's hosts, oldest first — the choices the host selector offers."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rows = await users_service.list_users(session, tenant_id=ctx.tenant_id)
         return [_host_read(row) for row in rows]
 
 
 async def create_host_action(
-    admin: AdminSessions, *, tenant_slug: str | None, form: HostForm
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, form: HostForm
 ) -> HostRead:
     """Add a host to the business (name, a real address, a real timezone — the service decides)."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await users_service.create_user(
                 session, tenant_id=ctx.tenant_id, data=_host_form_data(form)
@@ -813,10 +1045,17 @@ async def create_host_action(
 
 
 async def update_host_action(
-    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID, form: HostForm
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    host_id: uuid.UUID,
+    form: HostForm,
 ) -> HostRead:
     """Edit a host's name / email / timezone (all three are sent; the create rules apply again)."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await users_service.update_user(
                 session, tenant_id=ctx.tenant_id, user_id=host_id, data=_host_form_data(form)
@@ -827,7 +1066,7 @@ async def update_host_action(
 
 
 async def delete_host_action(
-    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, host_id: uuid.UUID
 ) -> None:
     """Remove a host — refused, by the service, while an event type or a schedule still holds them.
 
@@ -837,6 +1076,8 @@ async def delete_host_action(
     refusal names what is holding them, and the operator decides.
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             await users_service.delete_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
         except users_service.UserServiceError as exc:
@@ -844,7 +1085,7 @@ async def delete_host_action(
 
 
 async def list_connections_view(
-    admin: AdminSessions, *, tenant_slug: str | None, host_id: uuid.UUID
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, host_id: uuid.UUID
 ) -> list[ConnectionRead]:
     """A host's connected calendar accounts, and the calendar each writes bookings into.
 
@@ -854,6 +1095,8 @@ async def list_connections_view(
     happen. The operator cannot designate a calendar on a connection the panel never shows them.
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_CREDENTIALS)
         try:
             host = await users_service.get_user(session, tenant_id=ctx.tenant_id, user_id=host_id)
         except users_service.UserServiceError as exc:
@@ -886,6 +1129,7 @@ async def list_connections_view(
 async def designate_calendar_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     connection_id: uuid.UUID,
     calendar_id: str,
@@ -903,6 +1147,8 @@ async def designate_calendar_action(
     have changed.
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_CREDENTIALS)
         # Tenant-scoped BEFORE it is handed to the service: the id came off a form, and the service
         # takes the connection row itself, so an unscoped load here would let one business re-point
         # another's calendar and write its meetings into theirs.
@@ -945,10 +1191,12 @@ async def designate_calendar_action(
 
 
 async def list_workflows_view(
-    admin: AdminSessions, *, tenant_slug: str | None
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
 ) -> list[WorkflowRead]:
     """Every rule of the tenant (active and inactive), each with its steps."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rules = await workflow_rules_service.list_workflows(session, tenant_id=ctx.tenant_id)
         return [workflow_rules_service.rule_to_read(rule) for rule in rules]
 
@@ -956,12 +1204,15 @@ async def list_workflows_view(
 async def create_workflow_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     data: WorkflowCreate,
     now: datetime | None = None,
 ) -> WorkflowRead:
     """Author a rule and ARM it against the bookings that already exist."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             rule = await workflow_rules_service.create_workflow(
                 session, tenant_id=ctx.tenant_id, data=data, now=_now(now)
@@ -971,9 +1222,10 @@ async def create_workflow_action(
         return workflow_rules_service.rule_to_read(rule)
 
 
-async def update_workflow_action(
+async def update_workflow_action(  # noqa: PLR0913 - the principal is the AUTHORITY (never a default); the rest are the action's own inputs
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     workflow_id: uuid.UUID,
     data: WorkflowUpdate,
@@ -981,6 +1233,8 @@ async def update_workflow_action(
 ) -> WorkflowRead:
     """Edit a rule and MAKE THE EDIT TRUE for every booking it already governs."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             rule = await workflow_rules_service.update_workflow(
                 session,
@@ -998,9 +1252,10 @@ async def update_workflow_action(
         return workflow_rules_service.rule_to_read(rule)
 
 
-async def set_workflow_active_action(
+async def set_workflow_active_action(  # noqa: PLR0913 - the principal is the AUTHORITY (never a default); the rest are the action's own inputs
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     workflow_id: uuid.UUID,
     active: bool,
@@ -1008,6 +1263,8 @@ async def set_workflow_active_action(
 ) -> WorkflowRead:
     """Switch a rule on or off. Off PAUSES its queued messages; on re-arms and re-times them."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             rule = await workflow_rules_service.set_workflow_active(
                 session,
@@ -1024,19 +1281,27 @@ async def set_workflow_active_action(
 
 
 async def list_templates_view(
-    admin: AdminSessions, *, tenant_slug: str | None
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
 ) -> list[WorkflowTemplateRead]:
     """Every message body the tenant has authored."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
         rows = await workflow_rules_service.list_templates(session, tenant_id=ctx.tenant_id)
         return [WorkflowTemplateRead.model_validate(row) for row in rows]
 
 
 async def create_template_action(
-    admin: AdminSessions, *, tenant_slug: str | None, data: WorkflowTemplateCreate
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    data: WorkflowTemplateCreate,
 ) -> WorkflowTemplateRead:
     """Store the body for one ``(channel, kind, locale)``."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await workflow_rules_service.create_template(
                 session, tenant_id=ctx.tenant_id, data=data
@@ -1049,12 +1314,15 @@ async def create_template_action(
 async def update_template_action(
     admin: AdminSessions,
     *,
+    principal: Principal,
     tenant_slug: str | None,
     template_id: uuid.UUID,
     data: WorkflowTemplateUpdate,
 ) -> WorkflowTemplateRead:
     """Edit a template's TEXT (its ``(channel, kind, locale)`` identity is immutable by design)."""
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             row = await workflow_rules_service.update_template(
                 session, tenant_id=ctx.tenant_id, template_id=template_id, data=data
@@ -1067,7 +1335,7 @@ async def update_template_action(
 
 
 async def delete_template_action(
-    admin: AdminSessions, *, tenant_slug: str | None, template_id: uuid.UUID
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, template_id: uuid.UUID
 ) -> None:
     """Delete a template; refused while it is the last body a live step can render.
 
@@ -1076,6 +1344,8 @@ async def delete_template_action(
     never there (the same no-op ``deactivate_event_type`` already guards against).
     """
     async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
         try:
             deleted = await workflow_rules_service.delete_template(
                 session, tenant_id=ctx.tenant_id, template_id=template_id
@@ -1086,11 +1356,166 @@ async def delete_template_action(
             raise AdminActionError("Template not found")
 
 
+# --------------------------------------------------------------------------------------
+# Members (B-02) — ==the panel criterion 37 is about.==
+#
+# Every function here sits behind ``MANAGE_MEMBERS``: OWNER only. Not an over-reaction — whoever can
+# grant a role can grant ``owner``, and whoever can grant ``owner`` can hand the business away. That
+# is precisely why an ``admin``, who may do everything else in the business, may not do this.
+#
+# ==The READ is gated too, and that is deliberate.== "Who is in this business, on what address, and
+# which of them can sign in" is the reconnaissance half of taking it over, and a ``member`` has no
+# reason to hold it. Criterion 37 says *see or edit*, and it means both words.
+# --------------------------------------------------------------------------------------
+
+
+async def list_members_view(
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
+) -> list[MemberRead]:
+    """Who is in this business, what they may do, and which of them can actually sign in."""
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_MEMBERS)
+        return await memberships_service.list_members(session, tenant_id=ctx.tenant_id)
+
+
+async def create_member_action(
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, form: MemberForm
+) -> MemberRead:
+    """Give one of the business's hosts a role in it (and, optionally, an initial password).
+
+    ==Invitation by email is F5, and it is declared== — there is no mail round-trip here. The owner
+    sets an initial password and hands it over out of band; the member then changes it. Half an
+    invitation flow (a reset link that is guessable, replayable, or never expires) is a login for
+    whoever finds it, and that is not what this wave ships.
+    """
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_MEMBERS)
+        try:
+            await memberships_service.grant_membership(
+                session,
+                tenant_id=ctx.tenant_id,
+                user_id=form.host_id,
+                role=form.role,
+                password=form.password,
+            )
+        except (memberships_service.MembershipError, users_service.UserServiceError) as exc:
+            raise AdminActionError(str(exc)) from exc
+        return await _member_read(session, tenant_id=ctx.tenant_id, user_id=form.host_id)
+
+
+async def update_member_role_action(
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    membership_id: uuid.UUID,
+    role: MemberRole,
+) -> MemberRead:
+    """Change what a member may do. The service refuses to demote the LAST owner."""
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_MEMBERS)
+        try:
+            membership = await memberships_service.set_role(
+                session, tenant_id=ctx.tenant_id, membership_id=membership_id, role=role
+            )
+        except memberships_service.MembershipError as exc:
+            raise AdminActionError(str(exc)) from exc
+        return await _member_read(session, tenant_id=ctx.tenant_id, user_id=membership.user_id)
+
+
+async def set_member_password_action(
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    membership_id: uuid.UUID,
+    password: str,
+) -> None:
+    """An owner sets a member's password — the answer to "I lost mine" while recovery is F5.
+
+    It does NOT ask for the old one: the owner does not know it, and that is the point. What makes
+    this safe is not knowledge of the current password, it is the capability: only an owner is
+    here. A member changing their OWN password goes the other way and must produce the current one
+    (``memberships.change_own_password``), because an admin panel left open on a shared laptop must
+    not be a password reset.
+    """
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_MEMBERS)
+        membership = await _membership_or_refuse(
+            session, tenant_id=ctx.tenant_id, membership_id=membership_id
+        )
+        if len(password) < memberships_service.MIN_PASSWORD_LENGTH:
+            raise AdminActionError(
+                f"a password must be at least {memberships_service.MIN_PASSWORD_LENGTH} characters"
+            )
+        try:
+            await users_service.set_password(
+                session, tenant_id=ctx.tenant_id, user_id=membership.user_id, password=password
+            )
+        except users_service.UserServiceError as exc:
+            raise AdminActionError(str(exc)) from exc
+
+
+async def delete_member_action(
+    admin: AdminSessions,
+    *,
+    principal: Principal,
+    tenant_slug: str | None,
+    membership_id: uuid.UUID,
+) -> None:
+    """Remove a person from the business's panel. The service refuses to remove the LAST owner.
+
+    Their ``users`` row SURVIVES — they remain a host, with their event types, schedules and
+    bookings intact. What they lose is the panel. (Removing them altogether is
+    ``delete_host_action``,
+    which refuses while anything still points at them.)
+    """
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_MEMBERS)
+        try:
+            await memberships_service.revoke_membership(
+                session, tenant_id=ctx.tenant_id, membership_id=membership_id
+            )
+        except memberships_service.MembershipError as exc:
+            raise AdminActionError(str(exc)) from exc
+
+
+async def _membership_or_refuse(
+    session: AsyncSession, *, tenant_id: uuid.UUID, membership_id: uuid.UUID
+) -> Membership:
+    try:
+        return await memberships_service.get_membership(
+            session, tenant_id=tenant_id, membership_id=membership_id
+        )
+    except memberships_service.MembershipError as exc:
+        raise AdminActionError(str(exc)) from exc
+
+
+async def _member_read(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> MemberRead:
+    """Re-read the member the action just wrote, so the panel renders what the DATABASE now holds.
+
+    Assembling the row from the form would render what the operator TYPED — the same thing, right up
+    until it is not: a service that normalised a value, a race that changed one.
+    """
+    for row in await memberships_service.list_members(session, tenant_id=tenant_id):
+        if row.user_id == user_id:
+            return row
+    raise AdminActionError("that member is no longer in this business")  # pragma: no cover
+
+
 __all__ = [
     "AdminActionError",
     "AdminContext",
     "AdminError",
     "AdminMetrics",
+    "AdminPermissionError",
     "AdminSessions",
     "AdminSetupError",
     "BookingForm",
@@ -1098,15 +1523,18 @@ __all__ = [
     "EventTypeForm",
     "HostForm",
     "HostRead",
+    "MemberForm",
     "cancel_booking_action",
     "create_booking_action",
     "create_event_type_action",
     "create_host_action",
+    "create_member_action",
     "create_schedule_action",
     "create_template_action",
     "create_workflow_action",
     "deactivate_event_type_action",
     "delete_host_action",
+    "delete_member_action",
     "delete_schedule_action",
     "delete_template_action",
     "designate_calendar_action",
@@ -1114,6 +1542,7 @@ __all__ = [
     "list_connections_view",
     "list_event_types_view",
     "list_hosts_view",
+    "list_members_view",
     "list_schedules_view",
     "list_templates_view",
     "list_workflows_view",
@@ -1121,9 +1550,11 @@ __all__ = [
     "metrics_view",
     "reschedule_booking_action",
     "resolve_admin_context",
+    "set_member_password_action",
     "set_workflow_active_action",
     "update_event_type_action",
     "update_host_action",
+    "update_member_role_action",
     "update_schedule_action",
     "update_template_action",
     "update_workflow_action",

@@ -1,19 +1,27 @@
-"""Admin password hashing (F1-11, RF-18/RF-19): a salted, stretched, stdlib-only KDF.
+"""Password hashing (F1-11, RF-18/RF-19, B-02): a salted, stretched, stdlib-only KDF.
 
-The single admin operator's password is never in the source or the database — only its hash lives
-in ``AETHERCAL_ADMIN_PASSWORD_HASH`` (RF-19). A raw SHA-256 (as the API-key *secret* uses) is fine
-for a 40-char random key but wrong for a human-chosen password: it is unsalted and fast to brute
-force. So the admin password uses PBKDF2-HMAC-SHA256 with a per-hash random salt and a real work
-factor, encoded in a self-describing, Django-style string::
+A raw SHA-256 (as the API-key *secret* uses) is fine for a 40-char random key and wrong for a
+human-chosen password: it is unsalted and fast to brute force. So every human password in this
+product uses PBKDF2-HMAC-SHA256 with a per-hash random salt and a real work factor, encoded in a
+self-describing, Django-style string::
 
     pbkdf2_sha256$<iterations>$<salt_hex>$<derived_key_hex>
 
 Verification is constant-time (``hmac.compare_digest``) and every malformed/tampered/unknown-scheme
 input collapses to ``False`` — a verifier never raises on bad stored data or leaks *why* it failed.
 
-Mint a hash for an operator (the value goes into the env, never committed)::
+.. rubric:: Why this is no longer ``admin.passwords`` (B-02)
 
-    python -m aethercal.server.admin.passwords
+It hashed exactly one password — the instance operator's, which lives in the environment and never
+touches the database — so living inside the admin package was right. B-02 gives BUSINESS MEMBERS
+passwords (``users.hashed_password``, written by ``services.users``), and a service reaching *up*
+into the admin package for its KDF is an inverted dependency and, worse, the shape in which a second
+copy of "how we hash a password" gets written. There is ONE KDF, it is a server primitive, and it
+lives here.
+
+Mint a hash for the instance operator (the value goes into the env, never committed)::
+
+    python -m aethercal.server.passwords
 """
 
 from __future__ import annotations

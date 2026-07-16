@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     # component's ``rx.asset`` side effect, and ``admin.service`` would drag SQLAlchemy and the ORM
     # models into what is meant to be a leaf of pure functions.
     from aethercal.server.admin.service import AdminMetrics, ConnectionRead, HostRead
+    from aethercal.server.services.memberships import MemberRead
     from aethercal.ui import CalendarEvent, CalendarResource
 
 _MIN_WEEKDAY = 0
@@ -239,6 +240,25 @@ def host_row(host: HostRead) -> dict[str, str]:
     }
 
 
+def member_row(member: MemberRead) -> dict[str, str]:
+    """Flatten a member into the cells the members table renders (B-02).
+
+    ``can_sign_in`` is not decoration. ==Every host that existed before this wave has no password==
+    (``users.hashed_password`` was declared in migration 0001 and dead until now), so a members
+    panel
+    will legitimately list people who cannot get in yet. The owner has to SEE that — otherwise the
+    first they hear of it is a colleague telling them the password does not work.
+    """
+    return {
+        "id": str(member.id),
+        "host_id": str(member.user_id),
+        "name": member.name,
+        "email": member.email,
+        "role": member.role.value,
+        "can_sign_in": "yes" if member.has_password else "no",
+    }
+
+
 def connection_row(connection: ConnectionRead) -> dict[str, str]:
     """Flatten one of a host's connected calendar accounts.
 
@@ -335,6 +355,7 @@ __all__ = [
     "event_type_row",
     "host_resource",
     "host_row",
+    "member_row",
     "metrics_rows",
     "parse_weekdays",
     "schedule_row",

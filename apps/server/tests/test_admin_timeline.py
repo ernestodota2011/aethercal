@@ -25,12 +25,13 @@ from sqlalchemy.pool import StaticPool
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.passwords import hash_password
 from aethercal.server.admin.runtime import AdminRuntime, configure_runtime
 from aethercal.server.admin.state import AdminState
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant
+from aethercal.server.passwords import hash_password
 from aethercal.server.services.bookings import BookingParams, create_booking
+from aethercal.server.services.rbac import PrincipalKind
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -95,6 +96,7 @@ async def _authed(maker: Sessionmaker) -> AdminState:
     )
     state = AdminState(_reflex_internal_init=True)
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     return state
 
 
