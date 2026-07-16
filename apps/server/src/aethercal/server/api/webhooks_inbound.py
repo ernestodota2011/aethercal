@@ -50,6 +50,12 @@ TenantSlug = Annotated[str, Path(max_length=63, description="The business's glob
 
 _WEBHOOK_SECRET_FIELD = "webhook_secret"
 
+MAX_WEBHOOK_BODY_BYTES = 256 * 1024
+"""The hard cap on the inbound body (finding 3). Stripe events are a few KB; 256 KiB is generous
+headroom. ==This endpoint is UNAUTHENTICATED==, so an unbounded ``await request.body()`` would let a
+caller who cannot sign anything exhaust the process's memory with one giant POST — a denial of
+service that never reaches the signature check. The body is read with this cap instead."""
+
 _ConfirmEffects = Callable[[AsyncSession, Booking, datetime], Awaitable[None]]
 
 
@@ -62,6 +68,39 @@ def _unauthorized() -> HTTPException:
     signature. Deliberately indistinguishable: the endpoint tells a caller who could not sign
     nothing about which businesses exist or how they are set up."""
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="signature verification")
+
+
+def _payload_too_large() -> HTTPException:
+    """413 for a body over :data:`MAX_WEBHOOK_BODY_BYTES` — refused BEFORE any signature check or
+    database work, and without buffering the whole body (finding 3)."""
+    return HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="payload too large")
+
+
+async def _read_body_within_limit(request: Request) -> bytes:
+    """Read the raw body, but NEVER more than :data:`MAX_WEBHOOK_BODY_BYTES` (finding 3).
+
+    A declared ``Content-Length`` over the cap is rejected outright (the fast path); the STREAMED
+    read is also capped, byte for byte, so a missing or lying length cannot smuggle a large body
+    past the header check. Either way the body is never fully buffered before the limit is enforced,
+    so the memory this endpoint can be made to allocate is bounded by the cap."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="malformed Content-Length"
+            ) from None
+        if length > MAX_WEBHOOK_BODY_BYTES:
+            raise _payload_too_large()
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_WEBHOOK_BODY_BYTES:
+            raise _payload_too_large()
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _confirm_effects(request: Request, settings: Settings) -> _ConfirmEffects:
@@ -91,7 +130,9 @@ async def receive_payment_webhook(
     """Receive, verify, record and apply one inbound payment event. See the module docstring for the
     order — it is the design, not an implementation detail."""
     # (1) the RAW body, before FastAPI parses anything from it — the HMAC is over these exact bytes.
-    raw_body = await request.body()
+    # ==Finding 3.== Read it under a hard size cap: this endpoint has no auth, so an unbounded read
+    # is a memory-exhaustion DoS. An over-cap body is a 413 here, before any verification or write.
+    raw_body = await _read_body_within_limit(request)
 
     adapters = getattr(request.app.state, "webhook_adapters", PAYMENT_WEBHOOK_ADAPTERS)
     adapter = adapters.get(provider)

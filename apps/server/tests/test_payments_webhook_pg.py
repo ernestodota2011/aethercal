@@ -269,6 +269,49 @@ async def test_an_unknown_business_is_401(
     assert response.status_code == 401
 
 
+async def test_an_oversized_body_is_413_before_any_verification_or_write(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """==Re-Crisol r4 finding 3.== The webhook is UNAUTHENTICATED, so a body over the size cap is a
+    413 read under the cap — NOT buffered whole — before the signature is even checked or the
+    database is touched. A giant POST cannot exhaust the process's memory or write a row."""
+    slug, _booking_id = await _seed(owner_maker)
+    # Over the 256 KiB cap. A valid signature is irrelevant: the size gate runs first.
+    oversized = b'{"padding":"' + b"A" * (300 * 1024) + b'"}'
+
+    response = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=oversized,
+        headers={"Stripe-Signature": _stripe_sig(oversized), "content-type": "application/json"},
+    )
+
+    assert response.status_code == 413, response.text
+    assert await _payment_event_count(owner_maker) == 0, "an oversized body writes NOTHING"
+
+
+async def test_a_normal_sized_event_still_processes(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """The cap does not get in the way of a real event: an ordinary (KB-sized) payload is read and
+    applied exactly as before (finding 3 must not break the happy path)."""
+    slug, booking_id = await _seed(owner_maker)
+    body = _paid_body(event_id="evt_normal")
+    sig = _stripe_sig(body)
+
+    response = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=body,
+        headers={"Stripe-Signature": sig, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "ok"}
+    async with owner_maker() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+
+
 async def test_both_stripe_events_resolve_to_one_row_from_the_session_anchor(
     client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
 ) -> None:
