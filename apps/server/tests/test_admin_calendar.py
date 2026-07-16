@@ -617,8 +617,10 @@ async def test_reload_applies_only_the_latest_request_for_the_same_range(
 
     monkeypatch.setattr(state_mod, "_fetch_calendar_events", _fetch_reverse_order)
 
-    old = asyncio.create_task(state_mod._reload_calendar(state))
-    new = asyncio.create_task(state_mod._reload_calendar(state))
+    # ``_reload_calendar`` takes the caller as a parameter now (B-02): the identity is built by the
+    # in-class handler and passed down, so the module helper never reaches into ``state`` for it.
+    old = asyncio.create_task(state_mod._reload_calendar(state, state._caller))
+    new = asyncio.create_task(state_mod._reload_calendar(state, state._caller))
     await asyncio.gather(old, new)
 
     # The latest request wins; the stale same-range response is dropped.

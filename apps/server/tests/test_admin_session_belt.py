@@ -68,10 +68,15 @@ _ACCESSORS = frozenset({"admin_session", "bootstrap_session"})
 #: sentence rather than a hopeful one.
 _UNBOUND_ACCESSORS = frozenset({"bootstrap_session"})
 
-#: The admin modules that may CALL the unbound accessor, by module stem. Empty today, and that is
-#: the point: the operator's business selector (and B-02's member login) is the reason it exists,
-#: and it does not exist yet. A module added here is a decision somebody has to make in a diff.
-_BOOTSTRAP_CALLERS: frozenset[str] = frozenset()
+#: The admin modules that may CALL the unbound accessor, by module stem. ==One, and it is named.==
+#:
+#: It was empty in B-01 on purpose: the door existed, nothing had yet needed it. B-02 is the wave
+#: it was cut for — the operator's business SELECTOR (criterion 38) and a member's LOGIN (criterion
+#: 39), both of which run before there is a business to bind, because the business is the answer
+#: are looking for. Both live in ``admin/bootstrap.py`` and nowhere else, so this set stays at one
+#: entry: a module added here is a decision somebody has to defend in a diff, and a panel that "just
+#: needs one more table" from an unbound session is a panel that wanted ``admin_session``.
+_BOOTSTRAP_CALLERS: frozenset[str] = frozenset({"bootstrap"})
 
 #: The parameter a session-owning admin service function takes. The two context resolvers (which run
 #: INSIDE a session somebody else owns) take ``session`` instead.

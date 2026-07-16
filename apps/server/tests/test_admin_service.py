@@ -55,6 +55,14 @@ from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant, User
 from aethercal.server.services import bookings as bookings_service
 from aethercal.server.services.bookings import BookingParams, create_booking
+from aethercal.server.services.rbac import Principal
+
+# ==The instance's OPERATOR.== These tests drive the panels as the person whose credential is in the
+# environment — who drove them before B-02, when they were the only person who could sign in at
+# at all. WHO may do WHAT (and what a `member` is refused) is proven in `test_admin_rbac.py`; this
+# module is about the panels themselves, so it runs them as the principal that holds everything.
+_OPERATOR = Principal.bootstrap_operator()
+
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -117,6 +125,7 @@ async def _seed_tenant(
 async def _schedule_id(maker: Sessionmaker, *, tenant_slug: str, name: str = "Weekly") -> uuid.UUID:
     created = await create_schedule_action(
         _admin(maker),
+        principal=_OPERATOR,
         tenant_slug=tenant_slug,
         data=ScheduleCreate(name=name, timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
@@ -129,7 +138,7 @@ async def _only_host(maker: Sessionmaker, *, tenant_slug: str | None) -> uuid.UU
     RF-30 made the host an explicit field, so a helper may no longer leave it to the service to
     guess. It is stated here instead — and the multi-host behaviour it used to hide has its own
     suite (``test_admin_hosts.py``)."""
-    hosts = await list_hosts_view(_admin(maker), tenant_slug=tenant_slug)
+    hosts = await list_hosts_view(_admin(maker), principal=_OPERATOR, tenant_slug=tenant_slug)
     assert len(hosts) == 1, "this helper assumes a single-host tenant"
     return hosts[0].id
 
@@ -143,6 +152,7 @@ async def _make_event_type(
 ) -> uuid.UUID:
     created = await create_event_type_action(
         _admin(maker),
+        principal=_OPERATOR,
         tenant_slug=tenant_slug,
         form=EventTypeForm(
             host_id=await _only_host(maker, tenant_slug=tenant_slug),
@@ -238,7 +248,7 @@ async def test_list_bookings_returns_the_tenants_bookings(sessionmaker: Sessionm
         sessionmaker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT_9
     )
 
-    rows = await list_bookings_view(_admin(sessionmaker), tenant_slug=None)
+    rows = await list_bookings_view(_admin(sessionmaker), principal=_OPERATOR, tenant_slug=None)
     assert [r.id for r in rows] == [booking_id]
     assert rows[0].status is BookingStatus.CONFIRMED
 
@@ -254,7 +264,11 @@ async def test_cancel_booking_action_cancels(sessionmaker: Sessionmaker) -> None
     )
 
     cancelled = await cancel_booking_action(
-        _admin(sessionmaker), tenant_slug=None, booking_id=booking_id, now=_BEFORE
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug=None,
+        booking_id=booking_id,
+        now=_BEFORE,
     )
     assert cancelled.status is BookingStatus.CANCELLED
     assert cancelled.cancelled_at is not None
@@ -264,7 +278,11 @@ async def test_cancel_unknown_booking_is_an_action_error(sessionmaker: Sessionma
     await _seed_tenant(sessionmaker)
     with pytest.raises(AdminActionError):
         await cancel_booking_action(
-            _admin(sessionmaker), tenant_slug=None, booking_id=uuid.uuid4(), now=_BEFORE
+            _admin(sessionmaker),
+            principal=_OPERATOR,
+            tenant_slug=None,
+            booking_id=uuid.uuid4(),
+            now=_BEFORE,
         )
 
 
@@ -280,6 +298,7 @@ async def test_reschedule_booking_action_moves_to_a_new_slot(sessionmaker: Sessi
 
     moved = await reschedule_booking_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         booking_id=booking_id,
         new_start=_SLOT_11,
@@ -307,6 +326,7 @@ async def test_reschedule_to_an_off_hours_slot_is_an_action_error(
     with pytest.raises(AdminActionError):
         await reschedule_booking_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             booking_id=booking_id,
             new_start=off_hours,
@@ -329,6 +349,7 @@ async def test_event_type_create_list_update_deactivate(sessionmaker: Sessionmak
     schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
     created = await create_event_type_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         form=EventTypeForm(
             host_id=await _only_host(sessionmaker, tenant_slug=None),
@@ -341,11 +362,14 @@ async def test_event_type_create_list_update_deactivate(sessionmaker: Sessionmak
     )
     assert created.slug == "intro"
 
-    listed = await list_event_types_view(_admin(sessionmaker), tenant_slug=None)
+    listed = await list_event_types_view(
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug=None
+    )
     assert [e.id for e in listed] == [created.id]
 
     updated = await update_event_type_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         event_type_id=created.id,
         data=EventTypeUpdate(title="Renamed"),
@@ -353,9 +377,9 @@ async def test_event_type_create_list_update_deactivate(sessionmaker: Sessionmak
     assert updated.title == "Renamed"
 
     assert await deactivate_event_type_action(
-        _admin(sessionmaker), tenant_slug=None, event_type_id=created.id
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug=None, event_type_id=created.id
     )
-    after = await list_event_types_view(_admin(sessionmaker), tenant_slug=None)
+    after = await list_event_types_view(_admin(sessionmaker), principal=_OPERATOR, tenant_slug=None)
     assert after[0].active is False
 
 
@@ -366,6 +390,7 @@ async def test_duplicate_event_type_slug_is_an_action_error(sessionmaker: Sessio
     with pytest.raises(AdminActionError):
         await create_event_type_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             form=EventTypeForm(
                 host_id=await _only_host(sessionmaker, tenant_slug=None),
@@ -384,6 +409,7 @@ async def test_invalid_event_type_bounds_are_an_action_error(sessionmaker: Sessi
     with pytest.raises(AdminActionError):
         await create_event_type_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             form=EventTypeForm(
                 host_id=await _only_host(sessionmaker, tenant_slug=None),
@@ -401,6 +427,7 @@ async def test_update_unknown_event_type_is_an_action_error(sessionmaker: Sessio
     with pytest.raises(AdminActionError):
         await update_event_type_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             event_type_id=uuid.uuid4(),
             data=EventTypeUpdate(title="ghost"),
@@ -414,6 +441,7 @@ async def test_create_event_type_action_persists_the_en_translations(
     schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
     created = await create_event_type_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         form=EventTypeForm(
             host_id=await _only_host(sessionmaker, tenant_slug=None),
@@ -436,7 +464,9 @@ async def test_create_event_type_action_defaults_to_no_translations(
     await _seed_tenant(sessionmaker)
     schedule_id = await _schedule_id(sessionmaker, tenant_slug="acme")
     await _make_event_type(sessionmaker, tenant_slug=None, schedule_id=schedule_id)
-    listed = await list_event_types_view(_admin(sessionmaker), tenant_slug=None)
+    listed = await list_event_types_view(
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug=None
+    )
     assert listed[0].title_translations == {}
     assert listed[0].description_translations == {}
 
@@ -450,36 +480,44 @@ async def test_schedule_create_list_update_delete(sessionmaker: Sessionmaker) ->
     await _seed_tenant(sessionmaker)
     created = await create_schedule_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         data=ScheduleCreate(name="Weekdays", timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
     assert created.name == "Weekdays"
 
-    listed = await list_schedules_view(_admin(sessionmaker), tenant_slug=None)
+    listed = await list_schedules_view(_admin(sessionmaker), principal=_OPERATOR, tenant_slug=None)
     assert [s.id for s in listed] == [created.id]
 
     updated = await update_schedule_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         schedule_id=created.id,
         data=ScheduleUpdate(name="Renamed"),
     )
     assert updated.name == "Renamed"
 
-    await delete_schedule_action(_admin(sessionmaker), tenant_slug=None, schedule_id=created.id)
-    assert await list_schedules_view(_admin(sessionmaker), tenant_slug=None) == []
+    await delete_schedule_action(
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug=None, schedule_id=created.id
+    )
+    assert (
+        await list_schedules_view(_admin(sessionmaker), principal=_OPERATOR, tenant_slug=None) == []
+    )
 
 
 async def test_duplicate_schedule_name_is_an_action_error(sessionmaker: Sessionmaker) -> None:
     await _seed_tenant(sessionmaker)
     await create_schedule_action(
         _admin(sessionmaker),
+        principal=_OPERATOR,
         tenant_slug=None,
         data=ScheduleCreate(name="Weekly", timezone="UTC", rules={}),
     )
     with pytest.raises(AdminActionError):
         await create_schedule_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             data=ScheduleCreate(name="Weekly", timezone="UTC", rules={}),
         )
@@ -490,6 +528,7 @@ async def test_bad_timezone_schedule_is_an_action_error(sessionmaker: Sessionmak
     with pytest.raises(AdminActionError):
         await create_schedule_action(
             _admin(sessionmaker),
+            principal=_OPERATOR,
             tenant_slug=None,
             data=ScheduleCreate(name="Bad", timezone="Not/AZone", rules={}),
         )
@@ -499,7 +538,7 @@ async def test_delete_unknown_schedule_is_an_action_error(sessionmaker: Sessionm
     await _seed_tenant(sessionmaker)
     with pytest.raises(AdminActionError):
         await delete_schedule_action(
-            _admin(sessionmaker), tenant_slug=None, schedule_id=uuid.uuid4()
+            _admin(sessionmaker), principal=_OPERATOR, tenant_slug=None, schedule_id=uuid.uuid4()
         )
 
 
@@ -516,9 +555,13 @@ async def test_admin_scopes_every_read_to_its_tenant(sessionmaker: Sessionmaker)
     beta_event = await _make_event_type(sessionmaker, tenant_slug="beta", schedule_id=beta_schedule)
     await _book(sessionmaker, tenant_id=beta_id, event_type_id=beta_event, start=_SLOT_9)
 
-    alpha_bookings = await list_bookings_view(_admin(sessionmaker), tenant_slug="alpha")
+    alpha_bookings = await list_bookings_view(
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug="alpha"
+    )
     assert alpha_bookings == []
-    alpha_event_types = await list_event_types_view(_admin(sessionmaker), tenant_slug="alpha")
+    alpha_event_types = await list_event_types_view(
+        _admin(sessionmaker), principal=_OPERATOR, tenant_slug="alpha"
+    )
     assert alpha_event_types == []
 
 
@@ -534,7 +577,11 @@ async def test_admin_cannot_cancel_another_tenants_booking(sessionmaker: Session
     # Alpha's admin asks to cancel Beta's booking id → not found for Alpha (scoping).
     with pytest.raises(AdminActionError):
         await cancel_booking_action(
-            _admin(sessionmaker), tenant_slug="alpha", booking_id=beta_booking, now=_BEFORE
+            _admin(sessionmaker),
+            principal=_OPERATOR,
+            tenant_slug="alpha",
+            booking_id=beta_booking,
+            now=_BEFORE,
         )
     # Beta's booking is untouched.
     async with sessionmaker() as session:
@@ -634,7 +681,11 @@ async def test_marking_a_no_show_writes_the_status_and_the_timestamp(
     _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
 
     await service.mark_no_show_action(
-        _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=booking_id,
+        now=_AFTER_SLOT_9,
     )
 
     async with sessionmaker() as session:
@@ -653,7 +704,11 @@ async def test_a_no_show_does_not_free_the_slot(sessionmaker: Sessionmaker) -> N
     """
     tenant_id, event_type_id, booking_id = await _confirmed_booking(sessionmaker)
     await service.mark_no_show_action(
-        _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=booking_id,
+        now=_AFTER_SLOT_9,
     )
 
     # Book the very same slot again. It must be refused — the no-show still occupies it.
@@ -682,7 +737,11 @@ async def test_marking_a_no_show_before_the_appointment_ended_is_refused(
 
     with pytest.raises(AdminActionError) as refusal:
         await service.mark_no_show_action(
-            _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_BEFORE
+            _admin(sessionmaker),
+            principal=_OPERATOR,
+            tenant_slug="acme",
+            booking_id=booking_id,
+            now=_BEFORE,
         )
     assert "ended" in refusal.value.message
 
@@ -698,12 +757,20 @@ async def test_marking_a_cancelled_booking_a_no_show_says_no_show(
     """The refusal names the operation the operator actually asked for (the debt fixed earlier)."""
     _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
     await cancel_booking_action(
-        _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_BEFORE
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=booking_id,
+        now=_BEFORE,
     )
 
     with pytest.raises(AdminActionError) as refusal:
         await service.mark_no_show_action(
-            _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+            _admin(sessionmaker),
+            principal=_OPERATOR,
+            tenant_slug="acme",
+            booking_id=booking_id,
+            now=_AFTER_SLOT_9,
         )
     assert "no-show" in refusal.value.message
     assert "reschedul" not in refusal.value.message.lower()
@@ -712,10 +779,18 @@ async def test_marking_a_cancelled_booking_a_no_show_says_no_show(
 async def test_marking_a_no_show_twice_is_idempotent(sessionmaker: Sessionmaker) -> None:
     _tenant_id, _event_type_id, booking_id = await _confirmed_booking(sessionmaker)
     await service.mark_no_show_action(
-        _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=booking_id,
+        now=_AFTER_SLOT_9,
     )
     again = await service.mark_no_show_action(
-        _admin(sessionmaker), tenant_slug="acme", booking_id=booking_id, now=_AFTER_SLOT_9
+        _admin(sessionmaker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=booking_id,
+        now=_AFTER_SLOT_9,
     )
     assert again.status is BookingStatus.NO_SHOW
 
@@ -731,7 +806,11 @@ async def test_a_no_show_of_another_tenants_booking_is_refused(sessionmaker: Ses
 
     with pytest.raises(AdminActionError):
         await service.mark_no_show_action(
-            _admin(sessionmaker), tenant_slug="alpha", booking_id=beta_booking, now=_AFTER_SLOT_9
+            _admin(sessionmaker),
+            principal=_OPERATOR,
+            tenant_slug="alpha",
+            booking_id=beta_booking,
+            now=_AFTER_SLOT_9,
         )
     async with sessionmaker() as session:
         row = await session.get(Booking, beta_booking)

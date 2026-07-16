@@ -27,13 +27,14 @@ import asyncio
 import enum
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 import reflex as rx
 from reflex.event import EventSpec
 from sqlalchemy.exc import SQLAlchemyError
 
-from aethercal.core.model import BookingStatus
+from aethercal.core.model import BookingStatus, MemberRole
 from aethercal.schemas.bookings import BookingRead
 from aethercal.schemas.event_types import EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleUpdate
@@ -44,7 +45,7 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateUpdate,
     WorkflowUpdate,
 )
-from aethercal.server.admin import service
+from aethercal.server.admin import bootstrap, service
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.format import (
     ALL_EVENT_TYPES,
@@ -55,6 +56,7 @@ from aethercal.server.admin.format import (
     event_type_row,
     host_resource,
     host_row,
+    member_row,
     metrics_rows,
     parse_weekdays,
     schedule_row,
@@ -64,6 +66,8 @@ from aethercal.server.admin.format import (
 )
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER, LoginThrottledError
 from aethercal.server.admin.runtime import AdminRuntime, current_runtime
+from aethercal.server.services import rbac
+from aethercal.server.services.rbac import Principal, PrincipalKind
 from aethercal.ui import CalendarEvent, CalendarResource
 
 # Internal (prefix-free) routes; the mount prefix is applied by Reflex's ``frontend_path`` basename.
@@ -191,25 +195,50 @@ _RESYNC_MESSAGE = (
 )
 
 
-async def _host_of_event_type(runtime: AdminRuntime) -> dict[uuid.UUID, str]:
+async def _host_of_event_type(caller: _Caller) -> dict[uuid.UUID, str]:
     """``event_type_id → host_id``: the map that puts a booking's chip on a timeline row (RF-28).
 
     It has to be a lookup, and that is the whole point of this requirement: a booking does NOT carry
     a host. It carries an event type, and the event type carries the host. Which is exactly why
     dragging a booking to another host's row has no meaning to give it.
     """
-    rows = await service.list_event_types_view(runtime, tenant_slug=runtime.config.tenant_slug)
+    rows = await service.list_event_types_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return {row.id: str(row.host_id) for row in rows}
 
 
-async def _fetch_resources(runtime: AdminRuntime) -> list[CalendarResource]:
+@dataclass(frozen=True, slots=True)
+class _Caller:
+    """WHO is asking, in WHICH business, through which runtime — the three the service layer needs.
+
+    ==The fetch helpers used to take the runtime alone==, and derive the business from
+    ``runtime.config.tenant_slug`` — which was the only possible answer while the instance operator
+    was the only person who could sign in. It is now one of three (a member's own business, the one
+    the operator selected, or the single-business default), and WHO is asking is a question the
+    service layer refuses to guess.
+
+    Bundling them is not tidiness. A helper handed a bare ``AdminRuntime`` could still reach the
+    service — it would just have to invent a principal — and "invent a principal" is the one move
+    that must not be available anywhere. With this, a helper that wants data has to be handed an
+    identity first.
+    """
+
+    runtime: AdminRuntime
+    principal: Principal
+    business: str | None
+
+
+async def _fetch_resources(caller: _Caller) -> list[CalendarResource]:
     """The timeline's rows: the tenant's hosts (RF-28)."""
-    rows = await service.list_hosts_view(runtime, tenant_slug=runtime.config.tenant_slug)
+    rows = await service.list_hosts_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [host_resource(row) for row in rows]
 
 
 async def _fetch_booking_views(
-    runtime: AdminRuntime,
+    caller: _Caller,
     *,
     date_from: date | None = None,
     date_to: date | None = None,
@@ -225,16 +254,21 @@ async def _fetch_booking_views(
     would duplicate the moved chip); the row list keeps them. Before any navigation (no window) a
     single query feeds both; a navigated window adds one scoped query for the events.
     """
-    tenant_slug = runtime.config.tenant_slug
-    reads: list[BookingRead] = await service.list_bookings_view(runtime, tenant_slug=tenant_slug)
+    reads: list[BookingRead] = await service.list_bookings_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     rows = [booking_row(read) for read in reads]
     if date_from is None and date_to is None:
         event_reads = reads
     else:
         event_reads = await service.list_bookings_view(
-            runtime, tenant_slug=tenant_slug, date_from=date_from, date_to=date_to
+            caller.runtime,
+            principal=caller.principal,
+            tenant_slug=caller.business,
+            date_from=date_from,
+            date_to=date_to,
         )
-    hosts = await _host_of_event_type(runtime)
+    hosts = await _host_of_event_type(caller)
     events = [
         booking_event(read, resource_id=hosts.get(read.event_type_id))
         for read in event_reads
@@ -244,7 +278,7 @@ async def _fetch_booking_views(
 
 
 async def _fetch_calendar_events(
-    runtime: AdminRuntime,
+    caller: _Caller,
     *,
     date_from: date | None = None,
     date_to: date | None = None,
@@ -256,12 +290,13 @@ async def _fetch_calendar_events(
     in place, refreshed only on initial load and after mutations that actually change the rows.
     """
     reads = await service.list_bookings_view(
-        runtime,
-        tenant_slug=runtime.config.tenant_slug,
+        caller.runtime,
+        principal=caller.principal,
+        tenant_slug=caller.business,
         date_from=date_from,
         date_to=date_to,
     )
-    hosts = await _host_of_event_type(runtime)
+    hosts = await _host_of_event_type(caller)
     return [
         booking_event(read, resource_id=hosts.get(read.event_type_id))
         for read in reads
@@ -322,7 +357,7 @@ class _ReloadResult(enum.Enum):
 #: discipline as the F1 outbox / the client reconciliation ``revision``.
 
 
-async def _reload_calendar(state: AdminState) -> None:
+async def _reload_calendar(state: AdminState, caller: _Caller) -> None:
     """Navigation reload: refresh ONLY the visible-period calendar events, token-guarded.
 
     Leaves ``state.bookings`` (the full history) untouched — navigation never re-queries it (perf) —
@@ -333,7 +368,7 @@ async def _reload_calendar(state: AdminState) -> None:
     state.calendar_reload_seq += 1
     token = state.calendar_reload_seq
     try:
-        events = await _fetch_calendar_events(current_runtime(), **_window(state))
+        events = await _fetch_calendar_events(caller, **_window(state))
     except service.AdminError as exc:
         if token == state.calendar_reload_seq:
             state.error = _error_text(exc)
@@ -344,7 +379,7 @@ async def _reload_calendar(state: AdminState) -> None:
     state.error = ""
 
 
-async def _commit_calendar_view(state: AdminState) -> _ReloadResult:
+async def _commit_calendar_view(state: AdminState, caller: _Caller) -> _ReloadResult:
     """Refresh the FULL rows + the visible-period events after a mutation, token-guarded (F2-NAV).
 
     Shares the token with the navigation reload, so if a navigation moved the visible period while
@@ -363,7 +398,7 @@ async def _commit_calendar_view(state: AdminState) -> _ReloadResult:
     events_token = state.calendar_reload_seq
     rows_token = state.bookings_reload_seq
     try:
-        rows, events = await _fetch_booking_views(current_runtime(), **_window(state))
+        rows, events = await _fetch_booking_views(caller, **_window(state))
     except (service.AdminError, SQLAlchemyError):
         if events_token != state.calendar_reload_seq:
             return _ReloadResult.SUPERSEDED
@@ -455,7 +490,11 @@ def _same_instant(a: str, b: str) -> bool:
 
 
 async def _optimistic_reschedule(
-    state: AdminState, payload: dict[str, str], *, require_start_change: bool = False
+    state: AdminState,
+    caller: _Caller,
+    payload: dict[str, str],
+    *,
+    require_start_change: bool = False,
 ) -> AsyncIterator[None]:
     """Optimistic reschedule (RF-21) shared by drag and resize.
 
@@ -493,12 +532,12 @@ async def _optimistic_reschedule(
     )
     state.error = ""
     yield
-    runtime = current_runtime()
     try:
         new_start = _parse_admin_start(new_start_raw)
         await service.reschedule_booking_action(
-            runtime,
-            tenant_slug=runtime.config.tenant_slug,
+            caller.runtime,
+            principal=caller.principal,
+            tenant_slug=caller.business,
             booking_id=uuid.UUID(booking_id),
             new_start=new_start,
         )
@@ -513,22 +552,26 @@ async def _optimistic_reschedule(
     state.selected_booking_id = ""
     # Commit the authoritative state (token-guarded). On a FAILED refresh KEEP the optimistic move
     # (the DB really moved) + resync; on SUPERSEDED a newer navigation owns the view (leave it).
-    _settle_mutation(state, await _commit_calendar_view(state))
+    _settle_mutation(state, await _commit_calendar_view(state, caller))
 
 
-async def _fetch_event_types(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_event_types_view(runtime, tenant_slug=runtime.config.tenant_slug)
+async def _fetch_event_types(caller: _Caller) -> list[dict[str, str]]:
+    rows = await service.list_event_types_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [event_type_row(row) for row in rows]
 
 
-async def _fetch_hosts(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_hosts_view(runtime, tenant_slug=runtime.config.tenant_slug)
+async def _fetch_hosts(caller: _Caller) -> list[dict[str, str]]:
+    rows = await service.list_hosts_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [host_row(row) for row in rows]
 
 
-async def _fetch_connections(runtime: AdminRuntime, host_id: uuid.UUID) -> list[dict[str, str]]:
+async def _fetch_connections(caller: _Caller, host_id: uuid.UUID) -> list[dict[str, str]]:
     rows = await service.list_connections_view(
-        runtime, tenant_slug=runtime.config.tenant_slug, host_id=host_id
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business, host_id=host_id
     )
     return [connection_row(row) for row in rows]
 
@@ -566,13 +609,17 @@ def _owner_update(form_data: dict[str, str]) -> dict[str, uuid.UUID | None]:
     return {"user_id": None if raw == SHARED_SCHEDULE else uuid.UUID(raw)}
 
 
-async def _fetch_workflows(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_workflows_view(runtime, tenant_slug=runtime.config.tenant_slug)
+async def _fetch_workflows(caller: _Caller) -> list[dict[str, str]]:
+    rows = await service.list_workflows_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [workflow_row(row) for row in rows]
 
 
-async def _fetch_templates(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_templates_view(runtime, tenant_slug=runtime.config.tenant_slug)
+async def _fetch_templates(caller: _Caller) -> list[dict[str, str]]:
+    rows = await service.list_templates_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [template_row(row) for row in rows]
 
 
@@ -637,8 +684,10 @@ def _steps_update(form_data: dict[str, str]) -> dict[str, list[WorkflowStepIn]]:
     return {"steps": steps} if steps else {}
 
 
-async def _fetch_schedules(runtime: AdminRuntime) -> list[dict[str, str]]:
-    rows = await service.list_schedules_view(runtime, tenant_slug=runtime.config.tenant_slug)
+async def _fetch_schedules(caller: _Caller) -> list[dict[str, str]]:
+    rows = await service.list_schedules_view(
+        caller.runtime, principal=caller.principal, tenant_slug=caller.business
+    )
     return [schedule_row(row) for row in rows]
 
 
@@ -651,10 +700,44 @@ def _schedule_id(schedules: list[dict[str, str]], name: str) -> uuid.UUID:
 
 
 class AdminState(rx.State):
-    """The whole admin session: the login flag (backend-only) + the three data lists."""
+    """The whole admin session: WHO is signed in (backend-only), WHERE, and the data lists."""
 
     # Security-critical: backend-only var — never sent to the frontend, no client setter (RF-18).
     _authenticated: bool = False
+
+    # -- WHO (B-02) -----------------------------------------------------------------
+    # Backend-only, all three, and written by exactly one kind of place: a login handler that has
+    # just verified a password. ==A client cannot set them, and that IS the security property.== The
+    # business a panel acts on is derived from these — from a server-side membership check — and
+    # never from anything the browser sent.
+    #
+    # Three plain strings rather than one Principal, because a Reflex backend var has to be a plain
+    # serialisable value; :attr:`_principal` reassembles it. An empty ``_principal_kind`` means "no
+    # session", and every reader of it FAILS CLOSED.
+    _principal_kind: str = ""
+    _principal_role: str = ""
+    _principal_user_id: str = ""
+    # A MEMBER's business, as a uuid, exactly as the server resolved it at login. It is the
+    # AUTHORITY
+    # every panel compares the requested business against (``service._authorize``), and it is why a
+    # member naming another business's slug is refused rather than served. The operator has none:
+    # they belong to no business, and theirs is re-resolved from the slug they picked, every time.
+    _business_tenant_id: str = ""
+
+    # -- WHERE (B-02) ---------------------------------------------------------------
+    # The business being administered. It used to be ``runtime.config.tenant_slug``, full stop —
+    # the only possible answer while the instance operator was the only person who could sign in,
+    # and one that simply RAISED on an instance with more than one business and no configured slug.
+    #
+    # It is now one of three, and not one of them is "whatever the browser asked for":
+    #   * a MEMBER's — fixed at login from their membership, and never changed after (the
+    #     ``select_business`` handler refuses them);
+    #   * the OPERATOR's — whichever they picked in the selector (criterion 38), re-resolved
+    #     server-side against ``tenants`` on every action;
+    #   * blank — the single-business default (``AETHERCAL_ADMIN_TENANT_SLUG``, or the only business
+    #     there is). ==That is the mode every live instance runs in today, and it still works.==
+    _business_slug: str = ""
+
     error: str = ""
     bookings: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     event_types: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
@@ -704,6 +787,67 @@ class AdminState(rx.State):
     new_booking_start: str = ""
     show_new_booking: bool = False
 
+    # -- members + the business selector (B-02) --------------------------------------
+    # ``members`` is what criterion 37 is about: only an OWNER ever sees a row here (the service
+    # refuses everybody else — it does not quietly return an empty list). ``businesses`` is the
+    # operator's selector (criterion 38); a member's is always empty, because they are refused too.
+    members: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    businesses: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+
+    # -- who am I (B-02) -------------------------------------------------------------
+
+    @property
+    def _principal(self) -> Principal:
+        """Reassemble the signed-in principal from the backend vars a login handler wrote.
+
+        ==Fail-closed, and loudly.== An empty ``_principal_kind`` means no login ever ran, and there
+        is no sensible principal to invent: inventing one is precisely the hole (a "default" that
+        silently means full power). Every handler already returns early on ``_authenticated``, so
+        this raise is unreachable through the UI — which is exactly why it must stay a raise. The
+        day
+        a new handler forgets that guard, this is what stops it, instead of it acting as somebody.
+        """
+        if self._principal_kind == PrincipalKind.BOOTSTRAP_OPERATOR.value:
+            return Principal.bootstrap_operator()
+        if self._principal_kind == PrincipalKind.MEMBER.value:
+            return Principal.member(
+                tenant_id=uuid.UUID(self._business_tenant_id),
+                user_id=uuid.UUID(self._principal_user_id),
+                role=MemberRole(self._principal_role),
+            )
+        raise service.AdminPermissionError("you are not signed in")
+
+    @property
+    def _business(self) -> str | None:
+        """The slug of the business being administered — ``None`` for the single-business default.
+
+        ``None`` is the mode every LIVE instance runs in (``AETHERCAL_ADMIN_TENANT_SLUG`` is
+        optional, and ``admin_session(None)`` resolves the only business there is). Not honouring it
+        would leave the first live admin with no door at all.
+        """
+        return self._business_slug or self.__runtime_slug()
+
+    @property
+    def _caller(self) -> _Caller:
+        """WHO is asking + WHERE, bundled so no fetch helper can invent either of them.
+
+        ==A property, not a public method, on purpose.== Reflex wraps every PUBLIC method of an
+        ``rx.State`` into a client-callable event handler; a bundle of the operator's identity is
+        not something the websocket should be able to invoke. A property is never wrapped, and the
+        module-level calendar helpers that need it are handed it as a plain argument
+        (``_reload_calendar(state, caller)`` and friends) rather than reaching across into
+        ``state._caller`` — so the encapsulation holds AND nothing new is exposed.
+        """
+        return _Caller(
+            runtime=current_runtime(), principal=self._principal, business=self._business
+        )
+
+    def __runtime_slug(self) -> str | None:
+        try:
+            return current_runtime().config.tenant_slug
+        except RuntimeError:  # pragma: no cover - the admin is always built before it is used
+            return None
+
     # -- auth -----------------------------------------------------------------------
 
     @rx.event
@@ -738,6 +882,13 @@ class AdminState(rx.State):
             return None
         if authenticated:
             self._authenticated = True
+            # ==The instance's OPERATOR — not a member of anything.== Their business is the one they
+            # select (or the single default), and it is re-resolved server-side on every action.
+            self._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
+            self._principal_role = ""
+            self._principal_user_id = ""
+            self._business_tenant_id = ""
+            self._business_slug = ""
             for key in keys:
                 LOGIN_LIMITER.record_success(key)
             self.error = ""
@@ -753,9 +904,92 @@ class AdminState(rx.State):
         return None
 
     @rx.event
+    async def member_login(self, form_data: dict[str, str]) -> EventSpec | None:
+        """Sign a MEMBER of one business in — ==criterion 39, and the login is PER BUSINESS.==
+
+        The business comes from the route (``/admin/{tenant_slug}/login``), never from the address
+        alone, and the reason is a fact about the schema: ``users`` is unique on ``(tenant_id,
+        lower(email))``, so ``ana@example.com`` can be **two different people in two businesses**,
+        with two passwords and two roles. An address-only login would have to guess which of them
+        was
+        signing in — and every way of guessing is a defect (take the first row and you authenticate
+        somebody as a person they are not; search every business and the form becomes an oracle for
+        who exists where). With the slug in the route there is nothing left to guess.
+
+        The slug confers NO authority: it only selects whose password is about to be checked. What
+        authorises is the password, and what the session then carries is the business the SERVER
+        verified — never the one the browser named.
+
+        Rate-limited and off-loop exactly like the operator's login (the PBKDF2 is the same
+        deliberately slow derivation), and its refusals are the same single sentence: an unknown
+        business, an unknown address, a wrong password and a host with no membership are ONE
+        message.
+        """
+        tenant_slug = _clean(form_data, "tenant_slug")
+        email = _clean(form_data, "email")
+        # The rate-limit budget is per (ip, business, address): a login flood against Acme must not
+        # lock Globex's people out of their own panel.
+        keys = _rate_keys(self, f"{tenant_slug}:{email}")
+        if LOGIN_LIMITER.any_locked(keys):
+            self.error = _LOCKED_OUT_MESSAGE
+            return None
+        password = str(form_data.get("password", ""))
+        try:
+            async with PBKDF2_LIMITER.slot():
+                if LOGIN_LIMITER.any_locked(keys):
+                    self.error = _LOCKED_OUT_MESSAGE
+                    return None
+                principal = await bootstrap.member_login(
+                    current_runtime(),
+                    tenant_slug=tenant_slug,
+                    email=email,
+                    password=password,
+                )
+        except LoginThrottledError:
+            self.error = _LOCKED_OUT_MESSAGE
+            return None
+
+        if principal is None or principal.tenant_id is None or principal.user_id is None:
+            self._authenticated = False
+            for key in keys:
+                LOGIN_LIMITER.record_failure(key)
+            self.error = (
+                _LOCKED_OUT_MESSAGE
+                if LOGIN_LIMITER.any_locked(keys)
+                else "Invalid email or password."
+            )
+            return None
+
+        self._authenticated = True
+        self._principal_kind = PrincipalKind.MEMBER.value
+        self._principal_role = (principal.role or MemberRole.MEMBER).value
+        self._principal_user_id = str(principal.user_id)
+        # ==The authority, written by the server.== Every panel compares the business it is asked
+        # for
+        # against this; a member who names another business's slug is refused, not served.
+        self._business_tenant_id = str(principal.tenant_id)
+        self._business_slug = tenant_slug
+        for key in keys:
+            LOGIN_LIMITER.record_success(key)
+        self.error = ""
+        return rx.redirect(HOME_ROUTE)
+
+    @rx.event
     def logout(self) -> EventSpec:
-        """Clear the session and return to the login page."""
+        """Clear the session and return to the login page. ==Every field of it, not just the flag.==
+
+        A ``_principal_kind`` left behind by the last person to use this browser tab is a session
+        that outlives its logout: the next handler would rebuild THEIR principal. The flag is what
+        the guards read, but the identity is what the service layer acts on.
+        """
         self._authenticated = False
+        self._principal_kind = ""
+        self._principal_role = ""
+        self._principal_user_id = ""
+        self._business_tenant_id = ""
+        self._business_slug = ""
+        self.members = []
+        self.businesses = []
         return rx.redirect(LOGIN_ROUTE)
 
     @rx.event
@@ -764,6 +998,164 @@ class AdminState(rx.State):
         if not self._authenticated:
             return rx.redirect(LOGIN_ROUTE)
         return None
+
+    # -- the business selector (B-02, criterion 38) ----------------------------------
+
+    @rx.event
+    async def load_businesses(self) -> None:
+        """The businesses the OPERATOR may switch between. A member's list stays empty — refused.
+
+        Before B-02, an instance with two businesses and no ``AETHERCAL_ADMIN_TENANT_SLUG`` simply
+        raised at the admin's boot. This is what replaces that: the operator picks.
+        """
+        if not self._authenticated:
+            return
+        try:
+            rows = await bootstrap.list_businesses(current_runtime(), principal=self._principal)
+        except (service.AdminError, rbac.PermissionDeniedError):
+            # A member asking for the selector is refused, and correctly sees nothing to switch to.
+            self.businesses = []
+            return
+        self.businesses = [{"slug": row.slug, "name": row.name} for row in rows]
+
+    @rx.event
+    async def select_business(self, slug: str) -> None:
+        """Switch the OPERATOR to another business — ==criterion 38, and only they may do it.==
+
+        ``require_operator`` is not a capability and cannot be: ``owner`` means "everything **in my
+        business**", so an owner able to step into another one would be the cross-business
+        escalation
+        the whole batch exists to prevent. A member calling this handler directly over the websocket
+        (which a client can always do) is refused HERE, and would be refused again at every panel by
+        ``service._authorize`` — the slug they set would not match the business their membership was
+        verified against.
+        """
+        if not self._authenticated:
+            return
+        try:
+            rbac.require_operator(self._principal)
+        except rbac.PermissionDeniedError as exc:
+            self.error = str(exc)
+            return
+        self._business_slug = slug.strip()
+        self.error = ""
+        await self.load_bookings()
+
+    # -- members (B-02, criterion 37) -------------------------------------------------
+
+    @rx.event
+    async def load_members(self) -> None:
+        """Who is in this business. ==Owner only== — a member is REFUSED, not served an empty
+        list."""
+        if not self._authenticated:
+            return
+        try:
+            rows = await service.list_members_view(
+                current_runtime(), principal=self._principal, tenant_slug=self._business
+            )
+            self.hosts = await _fetch_hosts(self._caller)
+        except service.AdminError as exc:
+            self.members = []
+            self.error = _error_text(exc)
+            return
+        self.members = [member_row(row) for row in rows]
+        self.error = ""
+
+    @rx.event
+    async def create_member(self, form_data: dict[str, str]) -> None:
+        """Let one of the business's hosts into the panel, with a role and an initial password.
+
+        ==Invitation by email is F5, declared== — no mail round-trip, no reset link. The owner hands
+        the initial password over out of band, and the member changes it.
+        """
+        if not self._authenticated:
+            return
+        try:
+            form = service.MemberForm(
+                host_id=uuid.UUID(_clean(form_data, "host_id")),
+                role=MemberRole(_clean(form_data, "role")),
+                password=str(form_data.get("password", "")) or None,
+            )
+        except ValueError:
+            self.error = "Choose a host and a role."
+            return
+        try:
+            await service.create_member_action(
+                current_runtime(),
+                principal=self._principal,
+                tenant_slug=self._business,
+                form=form,
+            )
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+            return
+        await self.load_members()
+
+    @rx.event
+    async def update_member_role(self, form_data: dict[str, str]) -> None:
+        """Change what a member may do. The service refuses to demote the LAST owner."""
+        if not self._authenticated:
+            return
+        try:
+            membership_id = uuid.UUID(_clean(form_data, "membership_id"))
+            role = MemberRole(_clean(form_data, "role"))
+        except ValueError:
+            self.error = "Choose a role."
+            return
+        try:
+            await service.update_member_role_action(
+                current_runtime(),
+                principal=self._principal,
+                tenant_slug=self._business,
+                membership_id=membership_id,
+                role=role,
+            )
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+            return
+        await self.load_members()
+
+    @rx.event
+    async def set_member_password(self, form_data: dict[str, str]) -> None:
+        """An owner sets a member's password — the answer to "I lost mine" while recovery is F5."""
+        if not self._authenticated:
+            return
+        try:
+            membership_id = uuid.UUID(_clean(form_data, "membership_id"))
+        except ValueError:
+            self.error = "Choose a member."
+            return
+        try:
+            await service.set_member_password_action(
+                current_runtime(),
+                principal=self._principal,
+                tenant_slug=self._business,
+                membership_id=membership_id,
+                password=str(form_data.get("password", "")),
+            )
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+            return
+        await self.load_members()
+
+    @rx.event
+    async def delete_member(self, membership_id: str) -> None:
+        """Remove somebody from the panel. They stay a HOST; the service refuses the last owner."""
+        if not self._authenticated:
+            return
+        try:
+            await service.delete_member_action(
+                current_runtime(),
+                principal=self._principal,
+                tenant_slug=self._business,
+                membership_id=uuid.UUID(membership_id),
+            )
+        except (ValueError, service.AdminError) as exc:
+            self.error = (
+                _error_text(exc) if isinstance(exc, service.AdminError) else "Unknown member."
+            )
+            return
+        await self.load_members()
 
     # -- bookings -------------------------------------------------------------------
 
@@ -781,11 +1173,10 @@ class AdminState(rx.State):
         events_token = self.calendar_reload_seq
         rows_token = self.bookings_reload_seq
         try:
-            runtime = current_runtime()
-            rows, events = await _fetch_booking_views(runtime, **_window(self))
+            rows, events = await _fetch_booking_views(self._caller, **_window(self))
             # The timeline's rows (RF-28). They change only when a host is added or removed, so they
             # are loaded here rather than on every navigation.
-            resources = await _fetch_resources(runtime)
+            resources = await _fetch_resources(self._caller)
         except service.AdminError as exc:
             if events_token == self.calendar_reload_seq:
                 self.error = _error_text(exc)
@@ -807,14 +1198,15 @@ class AdminState(rx.State):
         try:
             await service.cancel_booking_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 booking_id=uuid.UUID(booking_id),
             )
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
             return
         self.selected_booking_id = ""
-        _settle_mutation(self, await _commit_calendar_view(self))
+        _settle_mutation(self, await _commit_calendar_view(self, self._caller))
 
     @rx.event
     async def mark_no_show(self, booking_id: str) -> None:
@@ -836,14 +1228,15 @@ class AdminState(rx.State):
         try:
             await service.mark_no_show_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 booking_id=uuid.UUID(booking_id),
             )
         except (ValueError, service.AdminError, SQLAlchemyError) as exc:
             self.error = _error_text(exc)
             return
         self.selected_booking_id = ""
-        _settle_mutation(self, await _commit_calendar_view(self))
+        _settle_mutation(self, await _commit_calendar_view(self, self._caller))
 
     @rx.event
     async def reschedule(self, form_data: dict[str, str]) -> None:
@@ -861,7 +1254,8 @@ class AdminState(rx.State):
             new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 booking_id=booking_id,
                 new_start=new_start,
             )
@@ -869,7 +1263,7 @@ class AdminState(rx.State):
             self.error = _error_text(exc)
             return
         self.selected_booking_id = ""
-        _settle_mutation(self, await _commit_calendar_view(self))
+        _settle_mutation(self, await _commit_calendar_view(self, self._caller))
 
     # -- calendar interactions (F2-F) -----------------------------------------------
 
@@ -893,7 +1287,7 @@ class AdminState(rx.State):
             return
         self.calendar_anchor = str(payload.get("from", ""))
         self.calendar_range_to = str(payload.get("to", ""))
-        await _reload_calendar(self)
+        await _reload_calendar(self, self._caller)
 
     @rx.event
     async def on_calendar_view_change(self, payload: dict[str, str]) -> None:
@@ -910,14 +1304,14 @@ class AdminState(rx.State):
         self.calendar_view = view
         self.calendar_anchor = str(payload.get("from", ""))
         self.calendar_range_to = str(payload.get("to", ""))
-        await _reload_calendar(self)
+        await _reload_calendar(self, self._caller)
 
     @rx.event
     async def on_calendar_event_drop(self, payload: dict[str, str]) -> AsyncIterator[None]:
         """Drag an event onto a new day/time → reschedule, optimistically (RF-21)."""
         if not self._authenticated:
             return
-        async for _ in _optimistic_reschedule(self, payload):
+        async for _ in _optimistic_reschedule(self, self._caller, payload):
             yield
 
     @rx.event
@@ -930,7 +1324,9 @@ class AdminState(rx.State):
         """
         if not self._authenticated:
             return
-        async for _ in _optimistic_reschedule(self, payload, require_start_change=True):
+        async for _ in _optimistic_reschedule(
+            self, self._caller, payload, require_start_change=True
+        ):
             yield
 
     @rx.event
@@ -973,7 +1369,8 @@ class AdminState(rx.State):
             new_start = _parse_admin_start(_clean(form_data, "new_start"))
             await service.reschedule_booking_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 booking_id=uuid.UUID(self.selected_booking_id),
                 new_start=new_start,
             )
@@ -983,7 +1380,7 @@ class AdminState(rx.State):
         # Committed: clear the now-stale panel (it pointed at the replaced booking), then refresh
         # the view token-guarded — a FAILED refresh asks for a reload, SUPERSEDED defers to the nav.
         self.selected_booking_id = ""
-        _settle_mutation(self, await _commit_calendar_view(self))
+        _settle_mutation(self, await _commit_calendar_view(self, self._caller))
 
     @rx.event
     def clear_selection(self) -> None:
@@ -1011,7 +1408,7 @@ class AdminState(rx.State):
                 guest_timezone=_clean(form_data, "guest_timezone") or "UTC",
             )
             await service.create_booking_action(
-                runtime, tenant_slug=runtime.config.tenant_slug, form=form
+                runtime, principal=self._principal, tenant_slug=self._business, form=form
             )
         except (ValueError, service.AdminError, SQLAlchemyError) as exc:
             self.error = _error_text(exc)
@@ -1020,7 +1417,7 @@ class AdminState(rx.State):
         # refresh the view token-guarded — FAILED asks for a reload, SUPERSEDED defers to the nav.
         self.show_new_booking = False
         self.new_booking_start = ""
-        _settle_mutation(self, await _commit_calendar_view(self))
+        _settle_mutation(self, await _commit_calendar_view(self, self._caller))
 
     # -- event types ----------------------------------------------------------------
 
@@ -1036,10 +1433,9 @@ class AdminState(rx.State):
             return
         self.error = ""
         try:
-            runtime = current_runtime()
-            self.event_types = await _fetch_event_types(runtime)
-            self.schedules = await _fetch_schedules(runtime)
-            self.hosts = await _fetch_hosts(runtime)
+            self.event_types = await _fetch_event_types(self._caller)
+            self.schedules = await _fetch_schedules(self._caller)
+            self.hosts = await _fetch_hosts(self._caller)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -1063,9 +1459,9 @@ class AdminState(rx.State):
                 description_translations=_en_translation(form_data, "description_en"),
             )
             await service.create_event_type_action(
-                runtime, tenant_slug=runtime.config.tenant_slug, form=form
+                runtime, principal=self._principal, tenant_slug=self._business, form=form
             )
-            self.event_types = await _fetch_event_types(runtime)
+            self.event_types = await _fetch_event_types(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1110,11 +1506,12 @@ class AdminState(rx.State):
             data = EventTypeUpdate.model_validate(update_fields)
             await service.update_event_type_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 event_type_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
             )
-            self.event_types = await _fetch_event_types(runtime)
+            self.event_types = await _fetch_event_types(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1128,10 +1525,11 @@ class AdminState(rx.State):
         try:
             existed = await service.deactivate_event_type_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 event_type_id=uuid.UUID(event_type_id),
             )
-            self.event_types = await _fetch_event_types(runtime)
+            self.event_types = await _fetch_event_types(self._caller)
             # Do not report success for a no-op: an unknown id must surface as an error, not
             # silently "succeed" (the service returns False rather than raising for an absent row).
             self.error = "" if existed else "Event type not found"
@@ -1147,9 +1545,8 @@ class AdminState(rx.State):
             return
         self.error = ""
         try:
-            runtime = current_runtime()
-            self.schedules = await _fetch_schedules(runtime)
-            self.hosts = await _fetch_hosts(runtime)
+            self.schedules = await _fetch_schedules(self._caller)
+            self.hosts = await _fetch_hosts(self._caller)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -1174,9 +1571,9 @@ class AdminState(rx.State):
                 ),
             )
             await service.create_schedule_action(
-                runtime, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, principal=self._principal, tenant_slug=self._business, data=data
             )
-            self.schedules = await _fetch_schedules(runtime)
+            self.schedules = await _fetch_schedules(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1210,11 +1607,12 @@ class AdminState(rx.State):
             data = ScheduleUpdate.model_validate(fields)
             await service.update_schedule_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 schedule_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
             )
-            self.schedules = await _fetch_schedules(runtime)
+            self.schedules = await _fetch_schedules(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1228,10 +1626,11 @@ class AdminState(rx.State):
         try:
             await service.delete_schedule_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 schedule_id=uuid.UUID(schedule_id),
             )
-            self.schedules = await _fetch_schedules(runtime)
+            self.schedules = await _fetch_schedules(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1250,8 +1649,9 @@ class AdminState(rx.State):
             return
         self.error = ""
         try:
-            runtime = current_runtime()
-            snapshot = await service.metrics_view(runtime, tenant_slug=runtime.config.tenant_slug)
+            snapshot = await service.metrics_view(
+                current_runtime(), principal=self._principal, tenant_slug=self._business
+            )
             self.metrics = metrics_rows(snapshot)
         except service.AdminError as exc:
             self.error = _error_text(exc)
@@ -1265,7 +1665,7 @@ class AdminState(rx.State):
             return
         self.error = ""
         try:
-            self.hosts = await _fetch_hosts(current_runtime())
+            self.hosts = await _fetch_hosts(self._caller)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -1278,14 +1678,15 @@ class AdminState(rx.State):
         try:
             await service.create_host_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 form=service.HostForm(
                     name=_clean(form_data, "name"),
                     email=_clean(form_data, "email"),
                     timezone=_clean(form_data, "timezone") or "UTC",
                 ),
             )
-            self.hosts = await _fetch_hosts(runtime)
+            self.hosts = await _fetch_hosts(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1299,7 +1700,8 @@ class AdminState(rx.State):
         try:
             await service.update_host_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 host_id=uuid.UUID(_clean(form_data, "id")),
                 form=service.HostForm(
                     name=_clean(form_data, "name"),
@@ -1307,7 +1709,7 @@ class AdminState(rx.State):
                     timezone=_clean(form_data, "timezone") or "UTC",
                 ),
             )
-            self.hosts = await _fetch_hosts(runtime)
+            self.hosts = await _fetch_hosts(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1321,10 +1723,11 @@ class AdminState(rx.State):
         try:
             await service.delete_host_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 host_id=uuid.UUID(host_id),
             )
-            self.hosts = await _fetch_hosts(runtime)
+            self.hosts = await _fetch_hosts(self._caller)
             if self.selected_host_id == host_id:
                 self.selected_host_id = ""
                 self.connections = []
@@ -1337,9 +1740,8 @@ class AdminState(rx.State):
         """Show a host's connected calendar accounts (so their write target can be designated)."""
         if not self._authenticated:
             return
-        runtime = current_runtime()
         try:
-            self.connections = await _fetch_connections(runtime, uuid.UUID(host_id))
+            self.connections = await _fetch_connections(self._caller, uuid.UUID(host_id))
             self.selected_host_id = host_id
             self.error = ""
         except (ValueError, service.AdminError) as exc:
@@ -1359,13 +1761,14 @@ class AdminState(rx.State):
         try:
             await service.designate_calendar_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 connection_id=uuid.UUID(_clean(form_data, "connection_id")),
                 calendar_id=_clean(form_data, "calendar_id"),
             )
             if self.selected_host_id:
                 self.connections = await _fetch_connections(
-                    runtime, uuid.UUID(self.selected_host_id)
+                    self._caller, uuid.UUID(self.selected_host_id)
                 )
             self.error = ""
         except (ValueError, service.AdminError) as exc:
@@ -1384,10 +1787,9 @@ class AdminState(rx.State):
             return
         self.error = ""
         try:
-            runtime = current_runtime()
-            self.workflows = await _fetch_workflows(runtime)
-            self.templates = await _fetch_templates(runtime)
-            self.event_types = await _fetch_event_types(runtime)
+            self.workflows = await _fetch_workflows(self._caller)
+            self.templates = await _fetch_templates(self._caller)
+            self.event_types = await _fetch_event_types(self._caller)
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
@@ -1407,9 +1809,9 @@ class AdminState(rx.State):
                 steps=_parse_steps(form_data),
             )
             await service.create_workflow_action(
-                runtime, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, principal=self._principal, tenant_slug=self._business, data=data
             )
-            self.workflows = await _fetch_workflows(runtime)
+            self.workflows = await _fetch_workflows(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1442,11 +1844,12 @@ class AdminState(rx.State):
             data = WorkflowUpdate.model_validate(fields)
             await service.update_workflow_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 workflow_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
             )
-            self.workflows = await _fetch_workflows(runtime)
+            self.workflows = await _fetch_workflows(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1475,11 +1878,12 @@ class AdminState(rx.State):
         try:
             await service.set_workflow_active_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 workflow_id=uuid.UUID(workflow_id),
                 active=active,
             )
-            self.workflows = await _fetch_workflows(runtime)
+            self.workflows = await _fetch_workflows(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1502,9 +1906,9 @@ class AdminState(rx.State):
                 body=_clean(form_data, "body"),
             )
             await service.create_template_action(
-                runtime, tenant_slug=runtime.config.tenant_slug, data=data
+                runtime, principal=self._principal, tenant_slug=self._business, data=data
             )
-            self.templates = await _fetch_templates(runtime)
+            self.templates = await _fetch_templates(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1532,11 +1936,12 @@ class AdminState(rx.State):
             data = WorkflowTemplateUpdate.model_validate(fields)
             await service.update_template_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 template_id=uuid.UUID(_clean(form_data, "id")),
                 data=data,
             )
-            self.templates = await _fetch_templates(runtime)
+            self.templates = await _fetch_templates(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
@@ -1551,10 +1956,11 @@ class AdminState(rx.State):
         try:
             await service.delete_template_action(
                 runtime,
-                tenant_slug=runtime.config.tenant_slug,
+                principal=self._principal,
+                tenant_slug=self._business,
                 template_id=uuid.UUID(template_id),
             )
-            self.templates = await _fetch_templates(runtime)
+            self.templates = await _fetch_templates(self._caller)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)

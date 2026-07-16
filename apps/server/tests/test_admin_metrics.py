@@ -43,6 +43,13 @@ from aethercal.server.admin.service import (
 from aethercal.server.db import Base
 from aethercal.server.db.models import Outbox, OutboxStatus, Tenant
 from aethercal.server.services.bookings import BookingParams, create_booking
+from aethercal.server.services.rbac import Principal
+
+# ==The instance's OPERATOR.== These tests drive the panels as the person whose credential is in the
+# environment — who drove them before B-02, when they were the only person who could sign in at
+# at all. WHO may do WHAT (and what a `member` is refused) is proven in `test_admin_rbac.py`; this
+# module is about the panels themselves, so it runs them as the principal that holds everything.
+_OPERATOR = Principal.bootstrap_operator()
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -94,16 +101,19 @@ async def _business(maker: Sessionmaker, *, slug: str) -> tuple[uuid.UUID, uuid.
 
     host = await create_host_action(
         _admin(maker),
+        principal=_OPERATOR,
         tenant_slug=slug,
         form=HostForm(name="Host", email=f"{slug}@x.com", timezone="UTC"),
     )
     schedule = await create_schedule_action(
         _admin(maker),
+        principal=_OPERATOR,
         tenant_slug=slug,
         data=ScheduleCreate(name="Weekly", timezone="UTC", rules=_WEEKLY_9_TO_5),
     )
     event_type = await create_event_type_action(
         _admin(maker),
+        principal=_OPERATOR,
         tenant_slug=slug,
         form=EventTypeForm(
             host_id=host.id,
@@ -183,7 +193,7 @@ async def test_the_panel_never_shows_another_businesss_backlog(maker: Sessionmak
             maker, tenant_id=beta_id, booking_id=beta_booking, send_at=_BEFORE, key=f"b:{n}"
         )
 
-    alpha = await metrics_view(_admin(maker), tenant_slug="alpha", now=_NOW)
+    alpha = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="alpha", now=_NOW)
 
     assert alpha.outbox_due == 1
     assert alpha.outbox_by_status[OutboxStatus.PENDING.value] == 1
@@ -206,7 +216,7 @@ async def test_a_reminder_queued_weeks_out_is_not_backlog(maker: Sessionmaker) -
         key="future",
     )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert metrics.outbox_by_status[OutboxStatus.PENDING.value] == 1  # it IS queued...
     assert metrics.outbox_due == 0  # ...and it is NOT backlog
@@ -228,7 +238,7 @@ async def test_an_overdue_intent_is_due_and_its_age_is_the_dead_mans_switch(
         key="overdue",
     )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert metrics.outbox_due == 1
     assert metrics.outbox_oldest_due_age_seconds == 2 * 60 * 60
@@ -239,7 +249,7 @@ async def test_every_status_is_present_even_at_zero(maker: Sessionmaker) -> None
     not exist, and "no dead intents" is not the same news as "we stopped counting dead intents"."""
     await _business(maker, slug="acme")
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert set(metrics.outbox_by_status) == {status.value for status in OutboxStatus}
     assert set(metrics.bookings_by_status) == {status.value for status in BookingStatus}
@@ -266,9 +276,11 @@ async def test_the_no_show_rate_counts_the_appointments_that_were_meant_to_happe
     await _book(
         maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT + timedelta(hours=2)
     )
-    await mark_no_show_action(_admin(maker), tenant_slug="acme", booking_id=no_show, now=_NOW)
+    await mark_no_show_action(
+        _admin(maker), principal=_OPERATOR, tenant_slug="acme", booking_id=no_show, now=_NOW
+    )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     # 1 no-show out of (1 no-show + 2 confirmed) — the three that were meant to happen.
     assert metrics.bookings_by_status[BookingStatus.NO_SHOW.value] == 1
@@ -281,7 +293,7 @@ async def test_a_business_with_no_appointments_has_no_no_show_rate(maker: Sessio
     when something has already gone wrong."""
     await _business(maker, slug="acme")
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert metrics.no_show_ratio == 0.0
 
@@ -291,9 +303,11 @@ async def test_the_no_show_rate_is_this_businesss_own(maker: Sessionmaker) -> No
     beta_id, beta_event = await _business(maker, slug="beta")
     await _book(maker, tenant_id=alpha_id, event_type_id=alpha_event, start=_SLOT)
     beta_booking = await _book(maker, tenant_id=beta_id, event_type_id=beta_event, start=_SLOT)
-    await mark_no_show_action(_admin(maker), tenant_slug="beta", booking_id=beta_booking, now=_NOW)
+    await mark_no_show_action(
+        _admin(maker), principal=_OPERATOR, tenant_slug="beta", booking_id=beta_booking, now=_NOW
+    )
 
-    alpha = await metrics_view(_admin(maker), tenant_slug="alpha", now=_NOW)
+    alpha = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="alpha", now=_NOW)
 
     assert alpha.no_show_ratio == 0.0  # beta's no-show is beta's business
     assert alpha.bookings_by_status[BookingStatus.NO_SHOW.value] == 0
@@ -320,9 +334,11 @@ async def test_a_future_booking_is_not_an_appointment_somebody_attended(
     tenant_id, event_type_id = await _business(maker, slug="acme")
     past = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
     await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_TOMORROW)
-    await mark_no_show_action(_admin(maker), tenant_slug="acme", booking_id=past, now=_NOW)
+    await mark_no_show_action(
+        _admin(maker), principal=_OPERATOR, tenant_slug="acme", booking_id=past, now=_NOW
+    )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     # One appointment was meant to happen. Nobody came to it.
     assert metrics.appointments_expected == 1
@@ -341,8 +357,10 @@ async def test_the_rate_does_not_improve_just_because_the_diary_filled_up(
     """
     tenant_id, event_type_id = await _business(maker, slug="acme")
     past = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
-    await mark_no_show_action(_admin(maker), tenant_slug="acme", booking_id=past, now=_NOW)
-    before = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    await mark_no_show_action(
+        _admin(maker), principal=_OPERATOR, tenant_slug="acme", booking_id=past, now=_NOW
+    )
+    before = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     # The diary fills up: nine more appointments tomorrow, not one of them yet held.
     for index in range(9):
@@ -353,7 +371,7 @@ async def test_the_rate_does_not_improve_just_because_the_diary_filled_up(
             start=_TOMORROW + timedelta(minutes=30 * index),
         )
 
-    after = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    after = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert before.no_show_ratio == 1.0
     assert after.no_show_ratio == 1.0, (
@@ -373,9 +391,11 @@ async def test_a_confirmed_appointment_that_has_ended_counts_as_attended(
     await _book(
         maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT + timedelta(hours=1)
     )
-    await mark_no_show_action(_admin(maker), tenant_slug="acme", booking_id=absent, now=_NOW)
+    await mark_no_show_action(
+        _admin(maker), principal=_OPERATOR, tenant_slug="acme", booking_id=absent, now=_NOW
+    )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=_NOW)
+    metrics = await metrics_view(_admin(maker), principal=_OPERATOR, tenant_slug="acme", now=_NOW)
 
     assert metrics.appointments_expected == 2  # both were meant to happen; both did, in time
     assert metrics.no_show_ratio == 0.5
@@ -395,10 +415,16 @@ async def test_an_appointment_still_running_has_not_happened_yet(maker: Sessionm
     )
     absent = await _book(maker, tenant_id=tenant_id, event_type_id=event_type_id, start=_SLOT)
     await mark_no_show_action(
-        _admin(maker), tenant_slug="acme", booking_id=absent, now=mid_appointment
+        _admin(maker),
+        principal=_OPERATOR,
+        tenant_slug="acme",
+        booking_id=absent,
+        now=mid_appointment,
     )
 
-    metrics = await metrics_view(_admin(maker), tenant_slug="acme", now=mid_appointment)
+    metrics = await metrics_view(
+        _admin(maker), principal=_OPERATOR, tenant_slug="acme", now=mid_appointment
+    )
 
     assert metrics.appointments_expected == 1  # only the 09:00 one is over
     assert metrics.no_show_ratio == 1.0
