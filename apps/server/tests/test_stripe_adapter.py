@@ -12,7 +12,9 @@ import hashlib
 import hmac
 import json
 
-from aethercal.server.integrations.stripe import StripeWebhookAdapter
+import httpx
+
+from aethercal.server.integrations.stripe import StripeGateway, StripeWebhookAdapter
 from aethercal.server.services.payment_webhooks import WebhookEventKind
 
 _SECRET = "whsec_test_NOT_A_REAL_KEY_x"
@@ -112,6 +114,31 @@ def test_charge_refunded_and_dispute_parse_to_their_kinds() -> None:
         ).encode("utf-8")
     )
     assert dispute is not None and dispute.kind is WebhookEventKind.DISPUTE
+
+
+async def test_the_refund_call_sends_a_deterministic_idempotency_key() -> None:
+    """==Finding 1 at the wire.== The refund POST carries the ``Idempotency-Key`` header, so Stripe
+    dedupes a retry after a crash — the money moves once even if the runner runs twice."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["idempotency_key"] = request.headers.get("Idempotency-Key", "")
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"id": "re_test"})
+
+    gateway = StripeGateway(transport=httpx.MockTransport(handler))
+    await gateway.refund(
+        provider="stripe",
+        provider_ref="pi_X",
+        amount_cents=5000,
+        idempotency_key="refund:pi_X",
+        secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x"},
+    )
+
+    assert captured["path"] == "/v1/refunds"
+    assert captured["idempotency_key"] == "refund:pi_X"
+    assert "pi_X" in captured["body"]  # the PaymentIntent being refunded
 
 
 def test_an_event_type_we_do_not_act_on_parses_to_none() -> None:

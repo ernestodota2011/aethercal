@@ -197,12 +197,24 @@ class StripeGateway:
         )
 
     async def refund(
-        self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Mapping[str, str]
-    ) -> None:  # pragma: no cover - live Stripe call, not verified in this cut
+        self,
+        *,
+        provider: str,
+        provider_ref: str,
+        amount_cents: int,
+        idempotency_key: str,
+        secrets: Mapping[str, str],
+    ) -> None:
         del provider, amount_cents  # a full refund keys on the PaymentIntent alone
         secret_key = secrets["secret_key"]
         async with self._client(secret_key) as client:
-            response = await client.post("/refunds", data={"payment_intent": provider_ref})
+            response = await client.post(
+                "/refunds",
+                data={"payment_intent": provider_ref},
+                # ==The idempotency key (finding 1).== A retry after a crash between the refund and
+                # our commit re-sends THIS key; Stripe returns the same refund, never a second.
+                headers={"Idempotency-Key": idempotency_key},
+            )
             response.raise_for_status()
 
 

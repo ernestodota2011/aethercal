@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
@@ -33,17 +34,41 @@ _REF = "pi_test_NOT_A_REAL_KEY_A"
 
 
 class _GatewaySpy:
-    """Records every ``refund`` call — the witness that the provider was (or was not) hit."""
+    """A refund gateway that models the PROVIDER's own idempotency (Stripe's ``Idempotency-Key``).
+
+    Every invocation is recorded, but a repeat of an ``idempotency_key`` already seen is a NO-OP at
+    the provider — the money moved once. So ``calls`` counts invocations (what the runner did) and
+    ``net_refunds`` counts DISTINCT keys (what the provider actually paid back). That gap is the
+    point of finding 1: the runner may fire twice after a lost commit, the provider refunds once.
+    """
 
     def __init__(self) -> None:
         self.refunds: list[tuple[str, str, int]] = []
+        self.keys: list[str] = []
 
     async def refund(
-        self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Mapping[str, str]
+        self,
+        *,
+        provider: str,
+        provider_ref: str,
+        amount_cents: int,
+        idempotency_key: str,
+        secrets: Mapping[str, str],
     ) -> None:
         # The BYOK secret must be the BUSINESS's own, never the instance's.
         assert secrets.get("secret_key", "").startswith("sk_test_")
+        self.keys.append(idempotency_key)
         self.refunds.append((provider, provider_ref, amount_cents))
+
+    @property
+    def calls(self) -> int:
+        """How many times the runner invoked ``refund`` (idempotent repeats included)."""
+        return len(self.keys)
+
+    @property
+    def net_refunds(self) -> int:
+        """DISTINCT idempotency keys — what the provider actually paid back (Stripe dedupes)."""
+        return len(set(self.keys))
 
 
 async def _tenant(session: AsyncSession) -> uuid.UUID:
@@ -200,6 +225,58 @@ async def test_the_refund_runner_is_fail_closed_without_a_business_credential(
     with pytest.raises(MissingCredentialError):
         await runner(_refund_work(tenant_id, booking_id), NOW)
     assert gateway.refunds == [], "no charge is refunded without the business's own account"
+
+
+async def test_the_refund_is_provider_idempotent_across_a_lost_commit(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Finding 1 (the double-refund window).== If the process dies AFTER Stripe refunds but BEFORE
+    the ``status = refunded`` commit lands, the next drain re-runs the REFUND — the status re-check
+    (1st line of defence) does NOT help, because it never committed. The real guarantee lives at the
+    PROVIDER: the refund call carries a deterministic ``Idempotency-Key`` (refund:provider_ref),
+    so a re-run hits the SAME key and Stripe returns the SAME refund, not a second one.
+
+    Here the runner fires TWICE (a PAID payment both times — the commit was lost), and the provider
+    nets ONE refund because both calls carried the same key."""
+    async with sqlite_maker() as s, s.begin():
+        tenant_id = await _tenant(s)
+        booking = await _booking(s, tenant_id, status=BookingStatus.CANCELLED)
+        s.add(
+            Payment(
+                tenant_id=tenant_id,
+                booking_id=booking.id,
+                provider="stripe",
+                provider_ref=_REF,
+                status=PaymentStatus.PAID,
+                amount_cents=5000,
+                currency="usd",
+            )
+        )
+        await _stripe_credential(s, tenant_id)
+        booking_id, payment_id = (
+            booking.id,
+            (await s.scalars(select(Payment).where(Payment.booking_id == booking.id))).one().id,
+        )
+
+    gateway = _GatewaySpy()
+    runner = make_refund_runner(sessionmaker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY])
+
+    # First run: the provider refunds, and the runner marks the payment refunded (committed).
+    await runner(_refund_work(tenant_id, booking_id), NOW)
+    # ==Simulate the LOST COMMIT== — the status write never landed, so the row is still PAID.
+    async with sqlite_maker() as s, s.begin():
+        payment = await s.get(Payment, payment_id)
+        assert payment is not None
+        payment.status = PaymentStatus.PAID
+    # Second run: the status re-check does NOT save us (it reads PAID), so the runner calls the
+    # provider again — but with the SAME idempotency key, so the provider nets one refund.
+    await runner(_refund_work(tenant_id, booking_id), NOW)
+
+    assert gateway.calls == 2, (
+        "the runner fired twice (the lost commit defeated the status re-check)"
+    )
+    assert gateway.net_refunds == 1, "the provider refunded ONCE — idempotent on the stable key"
+    assert set(gateway.keys) == {f"refund:{_REF}"}, "the key is deterministic across retries"
 
 
 async def test_the_expire_hold_runner_cancels_a_pending_hold_and_frees_the_slot(

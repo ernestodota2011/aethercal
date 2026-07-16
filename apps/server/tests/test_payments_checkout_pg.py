@@ -90,7 +90,13 @@ class _FakeGateway:
         return CheckoutSession(checkout_url=_CHECKOUT_URL, provider_ref=_PROVIDER_REF)
 
     async def refund(
-        self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Any
+        self,
+        *,
+        provider: str,
+        provider_ref: str,
+        amount_cents: int,
+        idempotency_key: str,
+        secrets: Any,
     ) -> None:
         raise AssertionError("refund is not part of the checkout flow")
 

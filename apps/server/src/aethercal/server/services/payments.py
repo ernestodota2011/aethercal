@@ -507,9 +507,19 @@ class PaymentGateway(Protocol):
         ...
 
     async def refund(
-        self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Mapping[str, str]
+        self,
+        *,
+        provider: str,
+        provider_ref: str,
+        amount_cents: int,
+        idempotency_key: str,
+        secrets: Mapping[str, str],
     ) -> None:
-        """Refund the charge ``provider_ref`` on the business's OWN account (its ``secrets``)."""
+        """Refund the charge ``provider_ref`` on the business's OWN account (its ``secrets``).
+
+        ==``idempotency_key`` is deterministic (one per charge), so a retry after a crash gets the
+        SAME refund, not a second one.== The provider dedupes on it — that is the real guarantee the
+        runner's status re-check cannot give across a lost commit."""
         ...
 
 
@@ -574,10 +584,17 @@ def make_refund_runner(
                 provider=CredentialProvider(provider),
                 fernet_key=fernet_keys,
             )
+            # ==The provider-level idempotency (finding 1).== The status re-check above is only the
+            # FIRST line: it does not survive a crash BETWEEN the provider refund and the
+            # ``status = refunded`` commit — the next drain re-runs this with the row still paid.
+            # So the refund carries a DETERMINISTIC key (stable across retries, one per charge), and
+            # the provider (Stripe) returns the SAME refund for a repeated key rather than a second
+            # one. The money moves once even if this code runs twice.
             await gateway.refund(
                 provider=provider,
                 provider_ref=provider_ref,
                 amount_cents=payment.amount_cents,
+                idempotency_key=refund_dedupe_key(provider_ref),
                 secrets=credential.secrets,
             )
             payment.status = PaymentStatus.REFUNDED
