@@ -2539,7 +2539,7 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
 # --------------------------------------------------------------------------------------
 
 
-def make_booking_effect_executor(
+def make_booking_effect_executor(  # noqa: PLR0913 - one injected handler per effect family
     *,
     sessionmaker: Sessionmaker,
     sender: EmailSender | None,

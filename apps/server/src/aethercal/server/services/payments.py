@@ -322,7 +322,7 @@ def make_refund_runner(
     can never fall back to the instance operator's account (criterion 41). ==Idempotent by
     re-check==: it re-reads ``payments.status`` and does NOT call the provider if the row is already
     ``refunded``, so the two enqueue paths collapsing to one row (criterion 30) and any re-drain
-stay effectively-once even if the dedupe ever let two rows through.
+    both stay effectively-once even if the dedupe ever let two rows through.
     """
 
     async def _run(work: OutboxWork, now: datetime) -> None:

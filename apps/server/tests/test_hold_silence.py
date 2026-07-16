@@ -156,6 +156,10 @@ def _payload_for(effect: OutboxEffect) -> dict[str, object]:
             return {"operation": GoogleOperation.UPSERT.value}
         case OutboxEffect.NOTIFY:
             return {"trigger": "on_booking", "channel": "whatsapp", "kind": "reminder"}
+        case OutboxEffect.REFUND:
+            return {"provider": "stripe", "provider_ref": "pi_test_NOT_A_REAL_KEY_x"}
+        case OutboxEffect.EXPIRE_HOLD:
+            return {"booking_id": "00000000-0000-0000-0000-000000000000"}
 
 
 def _dedupe_for(effect: OutboxEffect) -> str:
@@ -166,6 +170,10 @@ def _dedupe_for(effect: OutboxEffect) -> str:
             return google_dedupe_key(GoogleOperation.UPSERT)
         case OutboxEffect.NOTIFY:
             return "wf:test:step:whatsapp"
+        case OutboxEffect.REFUND:
+            return "refund:pi_test_NOT_A_REAL_KEY_x"
+        case OutboxEffect.EXPIRE_HOLD:
+            return "expire_hold:00000000-0000-0000-0000-000000000000"
 
 
 # --------------------------------------------------------------------------------------
@@ -175,17 +183,22 @@ def _dedupe_for(effect: OutboxEffect) -> str:
 
 @pytest.mark.parametrize("effect", list(OutboxEffect))
 @pytest.mark.asyncio
-async def test_an_unpaid_hold_queues_no_effect_of_any_kind(
+async def test_an_unpaid_hold_queues_no_CONFIRMATION_REQUIRING_effect(
     sqlite_session: AsyncSession, tenant_factory: Any, effect: OutboxEffect
 ) -> None:
-    """==Criterion 20.== A booking that was never confirmed queues NO effect. Not one, of any kind.
+    """==Criterion 20 + 20c, together.== A booking that was never confirmed queues no effect that
+    REQUIRES confirmation — and DOES queue the ones declared EXEMPT.
 
-    Parametrised over the WHOLE enum rather than the three names we happen to have today: a new
-    effect is silenced the day it is added, without anybody remembering to come back here.
+    Parametrised over the WHOLE enum (a new effect is classified the day it lands), and it branches
+    on :func:`confirmation_policy` rather than a fixed list:
 
-    ``GOOGLE`` is the one that looks harmless and is not. A calendar event carrying the guest as an
-    attendee makes **Google** send them the invitation — so an unpaid hold that reached this funnel
-    would announce itself, through a channel we do not even own.
+    * ``REQUIRES_CONFIRMATION`` (EMAIL / GOOGLE / NOTIFY) → **suppressed**, no row. ``GOOGLE`` is
+      the one that looks harmless and is not: a calendar event carrying the guest as an attendee
+      makes **Google** send the invitation, so an unpaid hold reaching this funnel would announce
+      itself through a channel we do not even own.
+    * ``EXEMPT`` (REFUND / EXPIRE_HOLD, B-05b) → ==**queued** (criterion 20c)==. Their entire reason
+      for existing is to act on a booking that was never confirmed — a belt that silenced them would
+      keep the guest's money and leave the slot blocked for ever.
     """
     tenant, event_type = await _seed(sqlite_session, tenant_factory)
     hold = await _hold(sqlite_session, tenant, event_type)
@@ -198,10 +211,15 @@ async def test_an_unpaid_hold_queues_no_effect_of_any_kind(
         payload=_payload_for(effect),
     )
 
-    assert isinstance(outcome, Suppressed)
-    assert outcome.booking_id == hold.id
-    assert outcome.effect is effect
-    assert await _outbox_of(sqlite_session, hold) == []
+    if confirmation_policy(effect) is Confirmation.EXEMPT:
+        # The money effects act on unpaid/cancelled bookings BY DEFINITION — they come out.
+        assert isinstance(outcome, Outbox)
+        assert [row.effect for row in await _outbox_of(sqlite_session, hold)] == [effect.value]
+    else:
+        assert isinstance(outcome, Suppressed)
+        assert outcome.booking_id == hold.id
+        assert outcome.effect is effect
+        assert await _outbox_of(sqlite_session, hold) == []
 
 
 @pytest.mark.parametrize("effect", list(OutboxEffect))
