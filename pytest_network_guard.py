@@ -9,7 +9,9 @@ modules this repo has.
 
 from __future__ import annotations
 
-from typing import NoReturn
+import ipaddress
+import socket
+from typing import Any, NoReturn
 
 import aiosmtplib
 import httplib2
@@ -37,6 +39,49 @@ class RealNetworkForbiddenError(RuntimeError):
     Raised in place of the socket, so the failure is a red test naming this module rather than a
     request — or an email — leaving the machine.
     """
+
+
+def _is_loopback(address: Any) -> bool:
+    """Whether ``address`` is this machine talking to itself. ==The ONLY thing let through.==
+
+    The rule is one sentence — *a test may talk to itself, and to nothing else* — and it is a rule,
+    not an allow-list: there is no host to keep current, and a service nobody has thought of yet is
+    covered by it the day it appears.
+
+    A non-network family (a UNIX socket, a socketpair) is not an address tuple at all and is let
+    through: it cannot leave the machine by construction. An address whose host will not parse as an
+    IP is a HOSTNAME, which means a real resolution was intended — so it is refused. ==Unparseable
+    is refused, not excused==: this is the door, and a door that guesses is a hallway.
+    """
+    if not isinstance(address, tuple) or len(address) < 2:
+        # AF_UNIX or a socketpair: no network involved.
+        return True
+    host = address[0]
+    try:
+        return ipaddress.ip_address(str(host)).is_loopback
+    except ValueError:
+        return False
+
+
+def _guarded_connect(sock: socket.socket, address: Any) -> Any:
+    """Refuse anything that is not this machine talking to itself.
+
+    ==The socket is CLOSED before the refusal, and that detail was earned.== A caller whose
+    ``connect`` raises is under no obligation to clean up, and ``urllib`` does not: the file
+    descriptor survives until an arbitrary later garbage collection, which then emits a
+    ``ResourceWarning`` — and with this repo's ``filterwarnings = ["error"]`` that lands as a hard
+    ERROR on whichever unrelated test is running at that moment. It cost one confusing failure in
+    ``test_notifications_service`` to find, and a per-test warning filter cannot fix it because the
+    GC does not happen during the test that leaked. A refused socket has no future, so closing it is
+    both safe and the only way the refusal stays local to the test that caused it.
+    """
+    if _is_loopback(address):
+        return _REAL_SOCKET_CONNECT(sock, address)
+    sock.close()
+    _forbidden()
+
+
+_REAL_SOCKET_CONNECT = socket.socket.connect
 
 
 def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
@@ -114,17 +159,47 @@ def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     fixture fails LOUDLY at setup, instead of silently patching nothing and quietly re-opening the
     door — the same failure mode the db gate exists to prevent, one layer down.
 
+    .. rubric:: ==And a FLOOR, because three doors is still a list==
+
+    Three named stacks is a photograph of what this repo imports today. ``requests``, ``aiohttp``, a
+    driver a dependency drags in next quarter — none of them are named above, and every one of them
+    would walk straight out. So underneath the three sits the rule they all obey:
+    ``socket.socket.connect``. ==A stack this plugin has never heard of is covered on the day it
+    arrives==, because it cannot open a socket either.
+
+    The rule is one sentence — *a test may talk to itself, and to nothing else* — and it lives in
+    :func:`_is_loopback`. Loopback is not an exception carved out for convenience: asyncio's own
+    event loop opens a loopback socketpair for its self-pipe, and refusing it takes the
+    interpreter's plumbing down with it.
+
+    .. rubric:: ==Why the database needs no exception, which is not what anyone expected==
+
+    The obvious design was to derive an allowance from ``AETHERCAL_TEST_DATABASE_URL`` — the test
+    database is on a tailnet address, not localhost, so a loopback-only rule looked certain to block
+    it. ==Measurement says otherwise: it never reaches this guard at all.== ``psycopg`` connects
+    through ``libpq``, in C, and never touches Python's ``socket`` module. Instrumenting
+    ``socket.socket.connect`` around a real ``SELECT 1`` records **zero** calls, and the ``-m db``
+    suite is green with this floor in place.
+
+    So the allowance was not written. ==A derived allowance nothing exercises is not robustness, it
+    is an untested claim== — precisely the kind of decoration this suite exists to catch. The DB's
+    isolation from the guard is a fact about its driver, and if that driver ever changes to a
+    pure-Python one (``asyncpg``), the ``-m db`` suite fails LOUDLY and immediately rather than
+    silently — which is the correct moment to derive the allowance, with a test that can prove it.
+
     What still passes: ``httpx.MockTransport`` (a different class entirely — the stub answers and
     the real transport is never built), ``ASGITransport`` (in-process, no socket), and ``respx``,
     which this module reconfigures to mock above the transport rather than below it (see
     :data:`respx.mocks.DEFAULT_MOCKER` at the top). Nothing lives at the ``aiosmtplib`` or
     ``httplib2`` layer: the suite fakes those at their own seams (the ``EmailSender`` protocol and
     an injected Google service), so this sits below both fakes and races neither. And the database,
-    which uses none of these stacks — so the ``-m db`` suite reaches its PostgreSQL untouched,
-    wherever it lives. That asymmetry is deliberate: this closes the doors that TOUCH THE WORLD,
+    per the rubric above. That asymmetry is deliberate: this closes the doors that TOUCH THE WORLD,
     not the one that stores.
     """
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     monkeypatch.setattr(aiosmtplib.SMTP, "connect", _forbidden, raising=True)
     monkeypatch.setattr(httplib2.Http, "request", _forbidden, raising=True)
+    # ==And the floor beneath all three.== The three above are known doors; this is the rule that
+    # makes a door nobody has built yet unusable too. See the class docstring.
+    monkeypatch.setattr(socket.socket, "connect", _guarded_connect, raising=True)

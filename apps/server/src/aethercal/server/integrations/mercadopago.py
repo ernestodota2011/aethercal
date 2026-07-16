@@ -22,10 +22,12 @@
 **1. The signature does not cover the body.** Stripe HMACs ``{t}.{raw_body}``, so a verified Stripe
 body is evidence. Mercado Pago HMACs a *manifest* — ``id:<data.id>;request-id:<x-request-id>;
 ts:<ts>;``, pairs omitted when absent, trailing ``;`` — built from the ``data.id`` QUERY PARAMETER
-and the ``x-request-id`` header. **The body is authenticated by nothing.** So this adapter treats
-the body as decoration: the payment's identity comes from the SIGNED ``data.id``, and everything
-that matters comes from the API. (Mirrored from ``mercadopago/sdk-python``'s
-``webhook/validator.py``; the Node/PHP/Go/Ruby/Java/.NET SDKs build the identical manifest.)
+and the ``x-request-id`` header. **The body is authenticated by nothing.** ==So this adapter never
+reads it — not for the payment's identity (that is the signed ``data.id``), not for the money (that
+comes from the API), and not even for the anti-replay key (that is the signed manifest itself).==
+The body arrives, and is ignored: an attacker who could rewrite every byte of it would change
+nothing. (Mirrored from ``mercadopago/sdk-python``'s ``webhook/validator.py``; the
+Node/PHP/Go/Ruby/Java/.NET SDKs build the identical manifest.)
 
 **2. The notification carries no money.** Mercado Pago POSTs ``{"id": …, "type": "payment",
 "action": "payment.updated", "data": {"id": "999"}}`` — an id, and nothing else. No amount, no
@@ -60,7 +62,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -450,9 +451,19 @@ class MercadoPagoWebhookAdapter:
         # original, cancelled row.
         external_reference = payment.get("external_reference")
 
+        event_id = self._event_id(request, data_id)
+        if event_id is None:  # pragma: no cover - verify_signature refuses this first
+            # ==Fail closed rather than invent an identity.== Without the signed manifest there is
+            # nothing authentic to dedupe on, and a made-up key is worse than no event: it would
+            # look like anti-replay while replaying freely.
+            _logger.error(
+                "mercado pago: no signed manifest to key payment %s on; refusing the event", data_id
+            )
+            return None
+
         return ParsedWebhookEvent(
             kind=kind,
-            event_id=self._event_id(request, data_id),
+            event_id=event_id,
             provider_ref=str(payment.get("id", data_id)),
             amount_cents=amount_cents,
             currency=currency if isinstance(currency, str) else None,
@@ -461,31 +472,63 @@ class MercadoPagoWebhookAdapter:
             ),
         )
 
-    def _event_id(self, request: InboundWebhook, data_id: str) -> str:
-        """The anti-replay key: Mercado Pago's own notification id.
+    def _event_id(self, request: InboundWebhook, data_id: str) -> str | None:
+        """The anti-replay key: ==the MANIFEST Mercado Pago signed. Nothing else.==
 
-        ==Read off the UNSIGNED body, and that is safe for what it is used for.== The body is not
-        authenticated, so a caller who could produce a valid signature could vary this id and defeat
-        the ``UNIQUE(tenant_id, provider, event_id)`` — which would buy them nothing: the arbiter's
-        real idempotency is the ``provider_ref``, and a second event for a payment that already
-        confirmed its booking is a REPLAY_NOOP, not a second confirmation. The anti-replay is an
-        optimisation here; the money's correctness does not rest on it.
+        .. rubric:: Why this used to read the body, and why that was wrong
 
-        Mercado Pago sends ``payment.created`` and ``payment.updated`` for one payment with distinct
-        notification ids — the same two-events-one-payment shape Stripe has, and the arbiter already
-        collapses it on the ``provider_ref`` chain. So these ids MUST stay distinct; keying on
-        ``data.id`` instead would silently drop the ``payment.updated`` that carries the approval.
+        It returned the notification's ``id`` from the JSON body, reasoning that a forged key would
+        buy an attacker nothing — the arbiter's real idempotency is the ``provider_ref`` chain, so a
+        replayed event ends in ``REPLAY_NOOP`` and no money moves twice.
+
+        That reasoning was true and beside the point. ==Mercado Pago does not sign the body.== So
+        one captured notification could be replayed indefinitely with a fresh body ``id`` each time:
+        the signature still validates, the ``UNIQUE(tenant_id, provider, event_id)`` never fires,
+        and every replay costs a real ``GET /v1/payments`` call, a ``payment_events`` row and an
+        arbiter run. ==The arbiter is the safety net; this is the door.== A door that holds only
+        because something behind it does is not a door.
+
+        .. rubric:: The manifest IS the notification's authenticated identity
+
+        ``id:<data.id>;request-id:<x-request-id>;ts:<ts>;`` is exactly what the HMAC covers, so
+        every component of this key is unforgeable: change any of them and :meth:`verify_signature`
+        rejects the request long before it reaches here.
+
+        ==And it had to survive a tension that rules out the obvious alternative.== Keying on
+        ``data.id`` alone — the one identifier always present and always signed — would collapse
+        every notification about one payment into a single row. Mercado Pago sends
+        ``payment.created`` and ``payment.updated`` for one payment, and another ``payment.updated``
+        if that payment is later REFUNDED. All of them carry the same ``data.id``. The refund would
+        be swallowed as a duplicate and the booking would stay confirmed: ==money returned AND the
+        service still delivered==, the precise outcome the arbiter's out-of-band branch exists to
+        prevent. The full manifest keeps them distinct, because ``ts`` — and ``x-request-id`` when
+        present — differ per notification, and both are signed.
+
+        .. rubric:: ==This does not rest on the retry question==
+
+        Whether a redelivery replays the original signed tuple or is re-signed is undocumented and
+        unverifiable without a live account (see :data:`_SIGNATURE_MAX_AGE`). It does not need to be
+        settled here, and that is deliberate: if a retry replays the tuple the key is identical and
+        the UNIQUE collapses it — the anti-replay working exactly as intended; if it is re-signed
+        the key differs, the event is applied again, and the arbiter's ``provider_ref`` idempotency
+        makes that a no-op. ==Safe under both, so the unknown is a matter of efficiency, not
+        correctness.==
+
+        Returns ``None`` when there is no signature to derive an identity from — which
+        :meth:`verify_signature` has already refused, so it is unreachable in the router's order and
+        fails closed if that order ever changes.
         """
-        try:
-            body = json.loads(request.raw_body)
-        except (json.JSONDecodeError, ValueError):
-            body = None
-        if isinstance(body, dict):
-            notification_id = body.get("id")
-            if isinstance(notification_id, str | int) and not isinstance(notification_id, bool):
-                return str(notification_id)
-        # No usable body id: fall back to the SIGNED x-request-id, then to the payment itself.
-        return _header(request, _REQUEST_ID_HEADER) or data_id
+        header = _header(request, _SIGNATURE_HEADER)
+        if not header:  # pragma: no cover - verify_signature refuses this first
+            return None
+        timestamp, _ = _parse_signature_header(header)
+        if timestamp is None:  # pragma: no cover - verify_signature refuses this first
+            return None
+        # Built from the SAME normalised components verify_signature hashes, so the key and the
+        # signature can never disagree about which notification this is.
+        return _build_manifest(
+            data_id.strip().lower(), _header(request, _REQUEST_ID_HEADER), timestamp
+        )
 
     async def _fetch_payment(self, payment_id: str, access_token: str) -> dict[str, Any] | None:
         """``GET /v1/payments/{id}`` on the BUSINESS's own token. ==The source of truth.=="""

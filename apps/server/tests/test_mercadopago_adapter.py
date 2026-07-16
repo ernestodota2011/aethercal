@@ -509,3 +509,99 @@ def test_a_non_numeric_timestamp_is_refused() -> None:
     assert not adapter.verify_signature(
         _inbound(signature="ts=not-a-number,v1=deadbeef"), secret=_SECRET
     )
+
+
+# --------------------------------------------------------------------------------------
+# ==The anti-replay key comes from SIGNED material== (Crisol r2, B-06).
+# --------------------------------------------------------------------------------------
+
+
+async def _event_id_of(inbound: InboundWebhook, *, payment: dict[str, object] | None = None) -> str:
+    adapter = MercadoPagoWebhookAdapter(
+        transport=_payment_transport(payment or _payment()), now=lambda: _SIGNED_AT
+    )
+    event = await adapter.parse(inbound, secrets=_SECRETS)
+    assert event is not None
+    return event.event_id
+
+
+async def test_tampering_the_unsigned_body_cannot_change_the_anti_replay_key() -> None:
+    """==The finding, closed at the door rather than at the safety net.==
+
+    Mercado Pago signs ``data.id``, ``x-request-id`` and ``ts`` — **not the body**. So a key read
+    off the body is a key an attacker can vary while the signature still validates: they replay one
+    captured notification with a fresh ``id`` each time, the ``UNIQUE(tenant, provider, event_id)``
+    never fires, and every replay costs a real ``GET /v1/payments`` and an arbiter run.
+
+    The arbiter would still refuse to move money twice (it dedupes on the ``provider_ref`` chain) —
+    ==but that is the safety net, not the door.== The key is now the signed manifest, so varying
+    anything that identifies the notification breaks the HMAC and never reaches here.
+    """
+    signature = _sign()
+    original = await _event_id_of(_inbound(signature=signature))
+    tampered = await _event_id_of(
+        _inbound(
+            body=b'{"id":999999,"type":"payment","data":{"id":"123456789"}}', signature=signature
+        )
+    )
+
+    assert tampered == original, "the body is not evidence; it must not decide identity"
+
+
+async def test_the_key_is_exactly_what_mercado_pago_signed() -> None:
+    """The identity IS the manifest — the string the HMAC covers, character for character."""
+    event_id = await _event_id_of(_inbound(signature=_sign()))
+    assert event_id == _manifest(data_id="123456789", request_id="req-abc", ts=_ts_ms(_SIGNED_AT))
+
+
+async def test_two_notifications_about_one_payment_stay_distinct() -> None:
+    """==The tension this had to survive.== ``payment.created`` and ``payment.updated`` are two
+    notifications about ONE payment. Keying on ``data.id`` alone would collapse them — and since a
+    payment's later ``refunded`` notification carries that same ``data.id``, an out-of-band refund
+    would be swallowed as a duplicate: money returned AND the service still delivered, which is the
+    exact outcome the arbiter's out-of-band branch exists to prevent. Distinct notifications carry
+    distinct ``x-request-id`` and ``ts``, both signed, so they stay distinct."""
+    created = await _event_id_of(
+        _inbound(signature=_sign(request_id="req-created"), request_id="req-created")
+    )
+    updated = await _event_id_of(
+        _inbound(signature=_sign(request_id="req-updated"), request_id="req-updated")
+    )
+    assert created != updated
+
+
+async def test_a_later_refund_of_the_same_payment_is_not_a_duplicate() -> None:
+    """The same ``data.id``, a different notification — and it MUST be applied, not deduped."""
+    paid = await _event_id_of(
+        _inbound(signature=_sign(request_id="req-paid"), request_id="req-paid")
+    )
+    refunded = await _event_id_of(
+        _inbound(signature=_sign(request_id="req-refund"), request_id="req-refund"),
+        payment=_payment(status="refunded"),
+    )
+    assert paid != refunded
+
+
+async def test_a_redelivery_of_the_SAME_notification_dedupes() -> None:
+    """==What the anti-replay is actually for.== Mercado Pago redelivers an unacknowledged
+    notification. If a retry replays the original signed tuple, the key is identical and the
+    UNIQUE collapses it — which is exactly what should happen."""
+    signature = _sign()
+    first = await _event_id_of(_inbound(signature=signature))
+    redelivered = await _event_id_of(_inbound(signature=signature))
+    assert first == redelivered
+
+
+async def test_a_notification_without_a_request_id_still_gets_a_distinct_key() -> None:
+    """``x-request-id`` is optional — the manifest omits its pair when absent. The signed ``ts``
+    still distinguishes one notification from the next, so the key never degrades to ``data.id``
+    alone (which would collapse a payment's whole lifetime into one row)."""
+    earlier = await _event_id_of(
+        _inbound(signature=_sign(request_id=None, ts=_ts_ms(_SIGNED_AT)), request_id=None)
+    )
+    later_ts = _ts_ms(_SIGNED_AT + timedelta(minutes=1))
+    later = await _event_id_of(
+        _inbound(signature=_sign(request_id=None, ts=later_ts), request_id=None)
+    )
+    assert earlier != later
+    assert "request-id:" not in earlier
