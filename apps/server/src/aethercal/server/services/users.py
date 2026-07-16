@@ -57,6 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # now — the rule was always about a timezone and an address, not about whose they are.)
 from aethercal.schemas.bookings import require_emailish, require_iana_zone
 from aethercal.server.db.models import EventType, Schedule, User
+from aethercal.server.passwords import hash_password
 
 
 # --------------------------------------------------------------------------------------
@@ -338,6 +339,29 @@ async def update_user(
     return row
 
 
+async def set_password(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID, password: str
+) -> User:
+    """Give this host a password to sign in with. ==The one writer of ``users.hashed_password``.==
+
+    That column has existed since migration 0001 and, until B-02, was **dead**: declared, never
+    written, never read — its single appearance in the entire repository was its own declaration. It
+    is alive now, and what lands in it is the same salted, stretched PBKDF2 string the instance
+    operator's own credential uses (``server.passwords``). ==Never the password itself, and never a
+    fast digest of it.==
+
+    This is the WRITE and nothing else. Whether a password is long enough is a membership rule
+    (``services.memberships.MIN_PASSWORD_LENGTH``, applied by every caller that takes one from a
+    human), and whether the CURRENT password must be produced first is a question about authority,
+    answered by whoever is asking: the member changing their own (``change_own_password``, which
+    verifies it) or an owner setting somebody else's (who never needs to know it).
+    """
+    row = await get_user(session, tenant_id=tenant_id, user_id=user_id)
+    row.hashed_password = hash_password(password)
+    await session.flush()
+    return row
+
+
 async def delete_user(session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID) -> None:
     """Remove a host — REFUSED while anything of the business still points at them.
 
@@ -392,5 +416,6 @@ __all__ = [
     "get_user",
     "get_user_by_email",
     "list_users",
+    "set_password",
     "update_user",
 ]
