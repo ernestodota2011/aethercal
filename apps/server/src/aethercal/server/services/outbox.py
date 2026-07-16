@@ -707,6 +707,37 @@ def expire_hold_dedupe_key(booking_id: uuid.UUID) -> str:
     return f"{OutboxEffect.EXPIRE_HOLD.value}:{booking_id}"
 
 
+RETAINED_DEDUPE_KEY: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], str]] = {
+    # `enqueue_refund` keys on the charge, and puts that same charge in the payload.
+    OutboxEffect.REFUND: lambda payload: refund_dedupe_key(str(payload["provider_ref"])),
+    # `enqueue_expire_hold` keys on the booking, and puts that same booking in the payload.
+    OutboxEffect.EXPIRE_HOLD: lambda payload: expire_hold_dedupe_key(
+        uuid.UUID(str(payload["booking_id"]))
+    ),
+}
+"""How to rebuild a RETAINED effect's ``dedupe_key`` from its own payload.
+
+==The other half of retaining a row: ``payload`` was never the only column.== Three rounds hardened
+the payload — an allowlist, a shape, a vocabulary — while ``dedupe_key``, a free-form
+``VARCHAR(128)``, rode along untouched on every retained row and nothing had ever looked at it.
+
+It cannot be redacted the way a payload can. :func:`we_queued_this_refund` matches on
+``(tenant_id, dedupe_key)``, so this column IS the r8 discriminator — the committed fact that tells
+our own refund from an operator's — and rewriting it would stop the money already on the wire from
+being recognised as ours, re-opening the bug this cut opened with. It survives verbatim, or the
+refund breaks.
+
+Something that survives verbatim has to be PII-free BY CONSTRUCTION, and that is what this makes
+checkable rather than hoped for: ==a retained row's dedupe_key must be REBUILDABLE from its own
+retained payload.== The payload is already proven to name nobody (:data:`RETAINED_PAYLOAD_KEYS` plus
+the funnel guard), so a key derived from nothing else can carry nothing else — and one that does not
+rebuild came from somewhere nothing can vouch for. ``refund:ada@example.com`` is not a hypothetical
+shape: it is what :func:`refund_dedupe_key` yields the day a ``provider_ref`` is an address, or a
+future caller keys a retained intent on "the person this is about".
+
+Exhaustive over the RETAINED effects (asserted in ``test_privacy``), and enforced at the funnel."""
+
+
 def workflow_step_dedupe_key(workflow_id: uuid.UUID, step_id: uuid.UUID, channel: Channel) -> str:
     """The idempotency key for one workflow step on one channel (RF-24's exactly-once guarantee).
 
@@ -727,6 +758,40 @@ def as_utc(moment: datetime) -> datetime:
     (``services/workflows.py``) and the deadline arithmetic (:func:`message_deadline`) need it — and
     two copies of "what does a naive timestamp from the database mean" is how two answers appear."""
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _refuse_underivable_retained_dedupe_key(
+    effect: OutboxEffect, dedupe_key: str, payload: Mapping[str, object]
+) -> None:
+    """Refuse a RETAINED intent whose ``dedupe_key`` cannot be rebuilt from its own payload.
+
+    ==The column the payload guard never looked at.== See :data:`RETAINED_DEDUPE_KEY` for why this
+    one cannot be redacted after the fact (it is the r8 discriminator) and therefore has to be
+    PII-free at the door instead.
+
+    Same funnel, same reasoning as the payload keys beside it: the rule lands on the enqueue path
+    nobody has written yet. It raises for the same reason too — a dedupe_key that does not rebuild
+    is a programming error, met by the suite long before a guest meets it.
+    """
+    rebuild = RETAINED_DEDUPE_KEY.get(effect)
+    if rebuild is None:  # PURGEABLE: the whole row goes on a purge, so its key outlives nothing.
+        return
+    try:
+        expected = rebuild(payload)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            f"and must be rebuildable from its (PII-free) payload — and it cannot be rebuilt at "
+            f"all: {exc!r}. Its payload must carry what its key is derived from."
+        ) from exc
+    if dedupe_key != expected:
+        # The KEY itself is never echoed: if it carries the guest, this message would too.
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            "verbatim — and this one is not the key its own payload rebuilds. It was derived from "
+            "something nothing has vouched for, which may be the person. Key it on the payload "
+            "(see RETAINED_DEDUPE_KEY), or this effect cannot be retained as it stands."
+        )
 
 
 def _refuse_undeclared_retained_keys(effect: OutboxEffect, payload: Mapping[str, object]) -> None:
@@ -832,7 +897,10 @@ async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are
         )
         return Suppressed(booking_id=booking.id, effect=effect)
 
+    # Everything a RETAINED row will still be carrying after an erasure, vetted at the one door it
+    # comes through: the payload's keys, and the dedupe_key those keys must rebuild.
     _refuse_undeclared_retained_keys(effect, payload)
+    _refuse_underivable_retained_dedupe_key(effect, dedupe_key, payload)
 
     row = Outbox(
         tenant_id=booking.tenant_id,
@@ -2769,6 +2837,7 @@ __all__ = [
     "PROVIDER_CALL_MARKER",
     "PROVIDER_TIMEOUT_CEILING",
     "PURGEABLE_EFFECTS",
+    "RETAINED_DEDUPE_KEY",
     "RETAINED_PAYLOAD_KEYS",
     "TERMINAL_MESSAGE_GRACE",
     "Clock",

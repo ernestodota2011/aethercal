@@ -241,7 +241,12 @@ async def test_a_confirmed_booking_still_queues_every_effect(
         sqlite_session,
         booking=booking,
         effect=effect,
-        dedupe_key=f"probe:{effect.value}",
+        # ``_dedupe_for``, not an arbitrary ``probe:`` string. A RETAINED effect's dedupe_key
+        # outlives a guest erasure verbatim, so the funnel now refuses one it cannot rebuild from
+        # the (PII-free) payload — see RETAINED_DEDUPE_KEY. A synthetic key is exactly the shape
+        # that guard exists to catch, and this test has no reason to be the thing it catches: the
+        # real key is what the product enqueues, and what this asserts about is unchanged.
+        dedupe_key=_dedupe_for(effect),
         payload=_payload_for(effect),
     )
 

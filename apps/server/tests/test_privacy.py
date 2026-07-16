@@ -52,6 +52,7 @@ from aethercal.server.db.models import (
     WebhookDelivery,
 )
 from aethercal.server.services.outbox import (
+    RETAINED_DEDUPE_KEY,
     RETAINED_PAYLOAD_KEYS,
     OutboxEffect,
     Purgeability,
@@ -66,6 +67,7 @@ from aethercal.server.services.privacy import (
     ERASED_EMAIL,
     ERASED_NAME,
     JSON_PII_KEYS,
+    RETAINED_OUTBOX_COLUMNS,
     TABLES_PURGED_BY_BOOKING,
     TABLES_RETAINED_OFF_BOOKING,
     purge_guest,
@@ -1349,3 +1351,173 @@ async def test_the_anomaly_lines_carry_no_trace_of_the_guest_at_all(
     assert report.purge_anomalies, "the haystack must contain something, or this proves nothing"
     for needle in (_EMAIL, _NAME, _PHONE, _NOTES, _ANSWER):
         assert needle not in said, f"the purge said {needle!r} out loud while erasing it"
+
+
+# --- B-05c re-Crisol r4: every COLUMN a retained row carries, not just the payload -------------
+
+
+_SAMPLE_RETAINED_PAYLOAD: dict[OutboxEffect, dict[str, object]] = {
+    OutboxEffect.REFUND: {"provider": "stripe", "provider_ref": "pi_sample"},
+    OutboxEffect.EXPIRE_HOLD: {"booking_id": "6f1c9a2e-0000-4000-8000-000000000001"},
+}
+"""One payload per RETAINED effect, shaped exactly as its declared allowlist. Exhaustiveness is
+asserted below, so a newly retained effect must bring its sample rather than be skipped."""
+
+
+def test_every_column_a_retained_row_carries_is_classified() -> None:
+    """==The question the payload allowlist never asked: what ELSE does the row carry?==
+
+    Three rounds went into ``payload`` — an allowlist, a shape, a vocabulary — while the row it sits
+    on has twelve other columns, and a RETAINED row keeps every one of them. ``dedupe_key`` is a
+    free-form ``VARCHAR(128)`` built from whatever the caller passed, and nothing had ever looked at
+    it. That is this batch's own doctrine arriving at its author: audit what the spec never looked
+    at.
+
+    So the classification is DERIVED FROM THE MODEL, not from memory — ``Outbox.__table__.columns``
+    is the source, exactly as ``BOOKING_PII_COLUMNS`` derives its own from ``bookings``. Add a
+    column tomorrow and this fails until somebody writes down why a retained row may keep it.
+    """
+    on_the_model = {column.name for column in Outbox.__table__.columns}
+
+    assert on_the_model == set(RETAINED_OUTBOX_COLUMNS), (
+        "a column of `outbox` is not classified, and a RETAINED row keeps every column it has: "
+        f"{on_the_model ^ set(RETAINED_OUTBOX_COLUMNS)}. Say why the erasure may keep it (and what "
+        "makes that true), or the row cannot be retained as it stands."
+    )
+    for column, reason in RETAINED_OUTBOX_COLUMNS.items():
+        assert reason.strip(), f"{column} is classified with an empty reason, which is no reason"
+
+
+def test_every_retained_effect_brings_a_sample_payload() -> None:
+    """The sample table above is exhaustive over the RETAINED effects, or the test below lies by
+    omission: a newly retained effect would simply never be checked."""
+    retained = {effect for effect in OutboxEffect if purge_policy(effect) is Purgeability.RETAINED}
+    assert retained == set(_SAMPLE_RETAINED_PAYLOAD)
+    assert retained == set(RETAINED_DEDUPE_KEY), (
+        "a RETAINED effect must declare how its dedupe_key is rebuilt from its payload: "
+        f"{retained ^ set(RETAINED_DEDUPE_KEY)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "effect", [effect for effect in OutboxEffect if purge_policy(effect) is Purgeability.RETAINED]
+)
+def test_a_retained_effects_dedupe_key_is_rebuildable_from_its_own_payload(
+    effect: OutboxEffect,
+) -> None:
+    """==The invariant that makes ``dedupe_key`` safe, and the reason it is not an allowlist.==
+
+    ``dedupe_key`` cannot be redacted the way ``payload`` is. ``we_queued_this_refund`` matches on
+    ``(tenant_id, dedupe_key)`` — it IS the r8 discriminator, the committed fact that tells our own
+    refund from an operator's — so rewriting it would stop the guest's money-in-flight from being
+    recognised as ours and re-open the very bug this cut opened with. It has to survive verbatim.
+
+    Something that survives verbatim has to be PII-free BY CONSTRUCTION, and this is what makes it
+    checkable: ==a retained row's dedupe_key must be rebuildable from its own retained payload.==
+    The payload is already proven to name nobody (``RETAINED_PAYLOAD_KEYS`` + the funnel guard), so
+    a key derived from nothing else can carry nothing else. Derived, not asserted in prose.
+    """
+    rebuild = RETAINED_DEDUPE_KEY[effect]
+    payload = _SAMPLE_RETAINED_PAYLOAD[effect]
+    key = rebuild(payload)
+
+    assert key, f"{effect.value} declares no way to rebuild its dedupe_key"
+    # It is built from the DECLARED keys and nothing else: drop any one and it can no longer build
+    # the same key. A rebuild that ignores its payload would be a rubber stamp.
+    depends_on_payload = False
+    for declared in RETAINED_PAYLOAD_KEYS[effect]:
+        thinner = {k: v for k, v in payload.items() if k != declared}
+        try:
+            rebuilt = rebuild(thinner)
+        except (KeyError, ValueError, TypeError):
+            depends_on_payload = True
+            continue
+        if rebuilt != key:
+            depends_on_payload = True
+    assert depends_on_payload, (
+        f"{effect.value}'s dedupe_key rebuild does not read its payload at all, so it proves "
+        "nothing about where the key came from"
+    )
+
+
+async def test_the_funnel_refuses_a_retained_intent_whose_dedupe_key_it_cannot_rebuild(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Gate the funnel, for the column nobody had looked at.==
+
+    A ``dedupe_key`` the guard cannot rebuild from the declared payload came from somewhere nothing
+    can vouch for — and it survives an erasure verbatim, in a UNIQUE index, for ever. A key like
+    ``refund:ada@example.com`` is not a hypothetical shape: it is exactly what ``refund_dedupe_key``
+    produces if a provider_ref is ever an address, or if a future caller keys a retained intent on
+    "the person this is about".
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+
+    with pytest.raises(ValueError, match="dedupe_key"):
+        await enqueue_effect(
+            sqlite_session,
+            booking=booking,
+            effect=OutboxEffect.REFUND,
+            # Not rebuildable from the payload below: it names the guest instead of the charge.
+            dedupe_key=f"refund:{_EMAIL}",
+            payload={"provider": "stripe", "provider_ref": "pi_1"},
+        )
+
+
+async def test_the_real_refund_path_still_passes_the_dedupe_guard(
+    sqlite_session: AsyncSession,
+) -> None:
+    """The guard must bind the REAL enqueue path, not only a test's idea of it.
+
+    ``enqueue_refund`` builds its key with ``refund_dedupe_key(provider_ref)`` and its payload from
+    the same ``provider_ref``. If the guard and the product ever disagreed about what "rebuildable
+    from the payload" means, refunds would stop being queued at all — the one failure this whole cut
+    exists to prevent, arriving through the guard meant to protect it.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+
+    await _owe_them_a_refund(sqlite_session, booking, provider_ref="pi_guarded")
+
+    rows = (
+        await sqlite_session.scalars(
+            sa.select(Outbox).where(Outbox.effect == OutboxEffect.REFUND.value)
+        )
+    ).all()
+    assert len(list(rows)) == 1, "the real refund path was refused by its own guard"
+
+
+def test_the_funnel_is_the_only_place_an_outbox_row_is_constructed() -> None:
+    """==The premise every other guard on this row rests on.==
+
+    ``enqueue_effect``'s docstring says ``Outbox(...)`` is built "here and nowhere else in the
+    source tree", and everything leans on it: the confirmation gate, the retained-payload allowlist,
+    the dedupe_key rebuild — and the anomaly reporter, which QUOTES ``row.effect`` on the assumption
+    that the column can only ever hold a word we chose. Build a row anywhere else and ``effect``
+    becomes free text that reaches an ERROR log unfiltered, while every guard above is bypassed in
+    silence.
+
+    It was a sentence in a docstring. Now it is asserted — that is the difference between a claim
+    and a lock, and this whole cut is what happens when a true sentence quietly stops being true.
+    """
+    offenders: dict[str, list[int]] = {}
+    for path in _shipped_modules():
+        if path.name == "outbox.py" and path.parent.name == "services":
+            continue  # The funnel itself.
+        hits = [
+            node.lineno
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Outbox"
+        ]
+        if hits:
+            offenders[path.relative_to(_SRC).as_posix()] = hits
+
+    assert offenders == {}, (
+        f"an Outbox row is constructed outside `enqueue_effect`: {offenders}. That funnel is where "
+        "the confirmation gate, the retained-payload allowlist and the dedupe_key rebuild all live "
+        "— a row built elsewhere skips every one of them, silently, and puts unvalidated text in "
+        "`effect`, which the purge's anomaly line quotes into a log."
+    )
