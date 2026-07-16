@@ -52,6 +52,7 @@ from aethercal.server.scheduler import build_drain_executor, resolve_senders_for
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 from aethercal.server.settings import Settings
+from aethercal.server.webhooks import ssrf
 from aethercal.server.worker import create_worker_app
 
 pytestmark = pytest.mark.db
@@ -83,6 +84,22 @@ _BUSINESS_SMTP = {"host": "smtp.the-business.example", "from_addr": "hello@the-b
 @pytest.fixture(autouse=True)
 def _clean_binding() -> None:
     reset_tenant_binding()
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the egress guard a deterministic answer. ==The DNS seam, NOT the guard.==
+
+    `resolve_senders_for` is the LIVE glue: it passes no resolver, so it uses the real
+    `getaddrinfo` — which is exactly right in production and useless here, where the fixtures use
+    `.example` names that resolve nowhere. Patching `ssrf.default_resolver` replaces DNS and leaves
+    every policy decision (https, public-only, resolved-address) fully under test.
+    """
+
+    async def _public(host: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(ssrf, "default_resolver", _public)
 
 
 @pytest_asyncio.fixture
@@ -165,6 +182,27 @@ class TestTheBootArmsTheResolver:
         assert booted_worker.state.instance_sender_defaults.whatsapp is not None
         assert booted_worker.state.fernet_keys, "the rotation reader is what decrypts a credential"
         assert booted_worker.state.http_client is not None, "a phone sender needs the HTTP client"
+
+    async def test_the_shared_http_client_does_not_follow_redirects(
+        self, booted_worker: FastAPI
+    ) -> None:
+        """==A redirect is a second destination, and nothing validated it.==
+
+        The egress guard admits a tenant's ``base_url`` and the sender POSTs to it. If this client
+        followed redirects, that public endpoint could answer ``302 Location: http://127.0.0.1:…``
+        and httpx would dial it — with no guard in the loop, because the guard already said yes to
+        the URL the tenant *declared*. The whole check would be undone by one response header.
+
+        It is off by default, which is exactly why this is an assertion rather than a change: a
+        default nobody pinned is a default somebody flips. Asserted against the REAL boot, so it is
+        the client the senders are actually handed, not one a test built to agree with itself.
+        """
+        assert booted_worker.state.http_client.follow_redirects is False, (
+            "the shared HTTP client follows redirects. A tenant's validated endpoint could then "
+            "302 this server into its own network, and the egress guard would never see the second "
+            "destination. If following them is ever needed, the redirect target has to go through "
+            "`_assert_target_reachable` too."
+        )
 
     async def test_the_worker_boot_builds_no_sender_of_its_own(
         self, booted_worker: FastAPI

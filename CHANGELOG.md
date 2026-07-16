@@ -35,6 +35,15 @@ credentials; nothing sent with them.
   A business that brings a phone credential to an instance with no caps declared keeps that channel
   off, and the worker logs which variables would turn it on.
 - `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY` (default `false`) is warned about at boot when enabled.
+- **A business's `base_url` is now guarded on egress.** Moving it out of the environment and into a
+  per-business credential turned it from operator configuration into input a third party controls
+  and the server obeys — so a tenant-supplied endpoint must be `https` and must resolve to a
+  **public** address. Loopback, link-local (including `169.254.169.254`, the cloud metadata
+  service), RFC1918, CGNAT and reserved ranges are refused, checked by **resolved IP** rather than
+  hostname, with one bad record poisoning the whole target. The operator's own
+  `AETHERCAL_*_BASE_URL` is unaffected — provenance decides — and the operator's private-target
+  allowlist is deliberately not honoured for a tenant: it exists so the operator can reach their own
+  LAN, not so a business can.
 - Removed `app.build_email_sender` / `app.build_channel_senders`, replaced by
   `app.build_instance_sender_defaults` (configuration, not clients). The web process no longer
   builds senders at all — it never read the ones it was building. Its half-configured-phone-channel

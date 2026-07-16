@@ -175,6 +175,98 @@ class TestALiveSenderIsBuiltInExactlyOnePlace:
         )
 
 
+class TestATenantsUrlCannotBeDialedWithoutTheEgressGuard:
+    """==The structural price of B-03bis, locked the same way as everything else here.==
+
+    Moving ``base_url`` out of the environment and into a per-business credential turned it from
+    operator configuration into ==third-party input this server obeys==. A guard closes that — and a
+    guard somebody must remember to call is not a guard, so the type does the remembering:
+    ``_build_phone_sender`` requires an ``_EgressTarget``, and only ``_assert_target_reachable``
+    constructs one.
+
+    Pyright enforces that a phone sender *has* a witness. These tests are the belt-and-braces: they
+    catch the day somebody mints one somewhere else — which would compile, read as a tidy refactor,
+    and silently re-open a hole onto the cloud metadata service.
+    """
+
+    def test_the_witness_is_minted_in_exactly_one_place(self) -> None:
+        """``_EgressTarget(...)`` appears in ONE function. ==Anywhere else forges the proof.==
+
+        The type-checker enforces that a phone sender *has* a witness. Only this enforces that the
+        witness ever meant anything: a second constructor is a second way to say "validated" without
+        having validated.
+        """
+        minted: dict[str, list[int]] = {}
+        for path in _modules():
+            hits = [
+                node.lineno
+                for node in ast.walk(_tree(path))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_EgressTarget"
+            ]
+            if hits:
+                minted[_rel(path)] = hits
+
+        assert list(minted) == ["services/tenant_senders.py"], (
+            f"`_EgressTarget` is constructed in {minted}. It is a WITNESS that a tenant's base_url "
+            "passed the egress guard — minting one anywhere but `_assert_target_reachable` forges "
+            "that proof, and `_build_phone_sender` dials the URL believing it."
+        )
+        guard = next(
+            node
+            for node in ast.walk(_tree(_FUNNEL))
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+            and node.name == "_assert_target_reachable"
+        )
+        inside = {
+            node.lineno
+            for node in ast.walk(guard)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_EgressTarget"
+        }
+        assert inside, "the guard mints no witness at all — this lock would be vacuous"
+        assert set(minted["services/tenant_senders.py"]) == inside, (
+            "a witness is minted in `tenant_senders.py` OUTSIDE `_assert_target_reachable`. That "
+            "is the one function allowed to say a URL was validated, because it is the one that "
+            "validates it."
+        )
+
+    def test_the_phone_sender_reads_the_url_off_the_witness_and_not_the_credential(self) -> None:
+        """==Validate one string and dial another, and the guard was theatre.==
+
+        ``_build_phone_sender`` must take its ``base_url`` from ``target.url`` — the value that went
+        through the guard — never back out of ``secrets``. The two are equal today, and a future
+        normalisation inside the guard (a punycode fold, a redirect chase) would silently make them
+        differ while every SSRF test stayed green.
+        """
+        builder = next(
+            node
+            for node in ast.walk(_tree(_FUNNEL))
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_phone_sender"
+        )
+        base_urls = [
+            keyword.value
+            for node in ast.walk(builder)
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg == "base_url"
+        ]
+        assert base_urls, "no base_url is set in the builder at all — this lock would be vacuous"
+        for value in base_urls:
+            assert (
+                isinstance(value, ast.Attribute)
+                and value.attr == "url"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "target"
+            ), (
+                "`_build_phone_sender` sets base_url from something other than `target.url`. The "
+                "witness carries the URL that was validated; reading `secrets['base_url']` again "
+                "dials a string nobody checked."
+            )
+
+
 class TestTheOfflineEscapeHatchIsNailedShut:
     def test_the_product_never_uses_the_offline_resolver(self) -> None:
         """``TenantSenders.for_offline_tests`` hands the SAME senders to every business.

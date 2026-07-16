@@ -64,6 +64,17 @@ def _whatsapp_secrets(name: str) -> dict[str, str]:
     }
 
 
+async def _public_dns(host: str) -> list[str]:
+    """One ordinary public address. ==The DNS seam, not a bypass of the guard.==
+
+    The egress guard resolves a tenant's `base_url` for real, and these fixtures use `.example`
+    names that resolve to nothing anywhere. Injecting the resolver is how `webhooks.ssrf` is tested
+    too: the policy under test is "which ADDRESS is allowed", and letting the CI box's DNS decide
+    the input would make the answer depend on the weather.
+    """
+    return ["93.184.216.34"]
+
+
 @pytest.fixture(autouse=True)
 def _clean_binding() -> None:
     reset_tenant_binding()
@@ -95,7 +106,7 @@ async def _resolve_as(
     *,
     defaults: InstanceSenderDefaults,
 ) -> object:
-    """Resolve exactly as ``scheduler._resolve_senders_for`` does: app role, in a tenant_scope."""
+    """Resolve exactly as ``scheduler.resolve_senders_for`` does: app role, in a tenant_scope."""
     with tenant_scope(tenant_id):
         async with app_maker() as session:
             return await resolve_tenant_senders(
@@ -105,6 +116,7 @@ async def _resolve_as(
                 defaults=defaults,
                 # type: ignore[arg-type] — only stored on the sender, never dialled here.
                 http_client=None,  # type: ignore[arg-type]
+                resolver=_public_dns,
             )
 
 

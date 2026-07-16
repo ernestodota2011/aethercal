@@ -97,6 +97,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import assert_never
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -119,6 +120,8 @@ from aethercal.server.services.tenant_credentials import (
     credential_class,
     resolve_infra_credential,
 )
+from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS
+from aethercal.server.webhooks.ssrf import BlockedUrlError, Resolver, assert_target_allowed
 
 _logger = logging.getLogger(__name__)
 
@@ -138,6 +141,22 @@ _SMS_CAP_PREFIX = "SMS"
 
 _DEFAULT_SMTP_PORT = 587
 """The submission port, matching :class:`SmtpConfig`'s own default for an unset ``port``."""
+
+_REQUIRED_TENANT_SCHEME = "https"
+"""What a TENANT-supplied endpoint must speak. The operator's own may still be http — see
+:func:`_assert_target_reachable`; the difference is provenance, not taste."""
+
+_DEFAULT_BASE_URLS: Mapping[CredentialProvider, str] = {
+    CredentialProvider.WHATSAPP: "",
+    CredentialProvider.SMS: "https://api.twilio.com",
+}
+"""The endpoint a phone provider uses when its credential names none.
+
+Only Twilio has one: its API lives at a fixed public address, and the override exists so an operator
+can point at a regional edge or a local mock. Evolution is self-hosted, so there is no default to
+have — an empty string fails the scheme check, which is the correct answer for a WhatsApp credential
+with no ``base_url``: ``required_fields`` demands one, so this is unreachable except from a row
+written before that rule, and it must not silently dial anywhere."""
 
 
 class UnusableCredentialError(CredentialError):
@@ -567,23 +586,138 @@ def _smtp_from_secrets(secrets: Mapping[str, str]) -> SmtpConfig:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _EgressTarget:
+    """==A WITNESS: this ``base_url`` has been through the egress guard.==
+
+    It carries no cleverness. Its whole job is to be **unforgeable outside**
+    :func:`_assert_target_reachable` — the only function that constructs one — so that
+    :func:`_build_phone_sender` can take it as a required argument and thereby ==cannot be called
+    with an unvalidated URL at all==.
+
+    That is the idiom the rest of this batch runs on, and the reason to spend a class on it:
+    ``PhoneChannelSender`` makes an uncapped sender unrepresentable; ``resolve_money_credential``
+    has
+    no ``instance_default`` parameter to pass. A check somebody must remember to call is not a
+    guard.
+    A parameter they cannot fabricate is.
+    """
+
+    url: str
+    """The validated URL, normalised. ==Read this, never ``secrets["base_url"]``.==
+
+    Taking it off the witness rather than back out of the credential is what stops the guard being
+    decorative: validate one string and dial another, and the check was theatre."""
+
+
+async def _assert_target_reachable(
+    provider: CredentialProvider,
+    secrets: Mapping[str, str],
+    *,
+    source: CredentialSource,
+    default_url: str,
+    resolver: Resolver | None,
+) -> _EgressTarget:
+    """Admit this provider's ``base_url``. ==The only constructor of :class:`_EgressTarget`.==
+
+    .. rubric:: Why this exists — it is B-03bis's own bill
+
+    Before this batch ``base_url`` came from the instance's environment: **operator configuration,
+    trusted because the operator is the person running the process.** Putting it in a per-business
+    credential turned it into ==input a third party controls and this server obeys==. The same
+    movement that closed the isolation leak opened a door onto the internal network: a business — or
+    whoever compromises its account — points ``base_url`` at ``169.254.169.254`` (the cloud metadata
+    service, which hands out this instance's own IAM credentials), at ``127.0.0.1``, or at the
+    operator's LAN, and **we make the request for them**, with our reachability instead of theirs.
+
+    .. rubric:: ==PROVENANCE decides, exactly as it does for the identity==
+
+    A ``CredentialSource.INSTANCE`` URL is the operator configuring their own instance, with the
+    same
+    hands that hold the app secret. A self-hoster running Evolution on ``http://192.168.1.50`` is
+    not
+    attacking themselves; putting them through this guard would treat the operator as their own
+    threat model and break a real deployment for nothing. A ``TENANT`` URL is third-party input.
+    Same
+    field, different provenance, different rule — the same distinction :func:`instance_fallback`
+    draws about the identity.
+
+    .. rubric:: What a tenant target must clear
+
+    * **https.** Not hygiene: that request carries the business's own API key in a header, and it
+      leaves the operator's network. (The operator's own URL may stay http — see above.)
+    * **a PUBLIC address**, via ``assert_target_allowed`` with :data:`NO_PRIVATE_TARGETS`. ==The
+      operator's allowlist is deliberately NOT passed.== It exists so the OPERATOR can send their
+      own
+      webhooks into their own LAN; a tenant reaching that LAN is the pivot itself. Widening this
+      guard by the operator's own declaration would hand every business a key to it.
+    * **by RESOLVED ADDRESS, never by hostname** — ``assert_target_allowed`` resolves and checks
+      every record, so ``evil.example`` pointing at ``127.0.0.1`` is refused, and one poisoned
+      record
+      in a mixed answer poisons the whole target (no shopping for a good IP).
+
+    Reusing that function rather than writing a second guard is the point: it already knows all of
+    that, and a copy would have to rediscover every rule the hard way.
+    """
+    raw = secrets.get("base_url") or default_url
+    if source is not CredentialSource.TENANT:
+        return _EgressTarget(url=raw.rstrip("/"))
+
+    if urlsplit(raw).scheme != _REQUIRED_TENANT_SCHEME:
+        raise UnusableCredentialError(
+            _unusable_message(
+                provider,
+                field="base_url",
+                expected="an https URL (a tenant's endpoint carries its API key off this network)",
+            )
+        )
+    try:
+        await assert_target_allowed(raw, resolver=resolver, allowlist=NO_PRIVATE_TARGETS)
+    except BlockedUrlError as exc:
+        # ==Refused, and the message names the FIELD and never the value.== Same rule as every other
+        # credential error here: a URL looks harmless, and the next field through this branch is a
+        # password. The cause is chained so the operator's own log keeps the detail — they hold the
+        # app secret and can decrypt any credential by design, so their log is not a new disclosure.
+        raise UnusableCredentialError(
+            _unusable_message(
+                provider,
+                field="base_url",
+                expected=(
+                    "a public internet address. It resolves somewhere inside this instance's own "
+                    "network — loopback, link-local (including the cloud metadata service), or a "
+                    "private range — and this server does not make that request on a business's "
+                    "behalf"
+                ),
+            )
+        ) from exc
+    # TargetUnresolvable deliberately flies: DNS being down is a NETWORK failure, not a policy one,
+    # and the drain must retry it rather than write the credential off as broken.
+    return _EgressTarget(url=raw.rstrip("/"))
+
+
 def _build_phone_sender(
     provider: CredentialProvider,
     secrets: Mapping[str, str],
     *,
+    target: _EgressTarget,
     caps: DailyCaps,
     http_client: httpx.AsyncClient,
 ) -> PhoneChannelSender:
-    """The live phone sender for ``provider``. ==Caps are a required argument, not a lookup.==
+    """The live phone sender for ``provider``. ==Both its guarantees are TYPES, not checks.==
 
-    :class:`PhoneChannelSender` makes an uncapped phone sender unrepresentable; taking the caps as a
-    parameter is what carries that guarantee down here, where the object is actually made.
+    ``caps`` makes an uncapped phone sender unrepresentable (:class:`PhoneChannelSender`), and
+    ``target`` makes an unvalidated destination unrepresentable: an :class:`_EgressTarget` can only
+    come from :func:`_assert_target_reachable`, so there is no shape of this program in which a
+    tenant's URL is dialed without having been through the egress guard.
+
+    ==The URL comes off the witness, never back out of ``secrets``.== Validating one string and then
+    dialing another is how a guard becomes decoration.
     """
     match provider:
         case CredentialProvider.WHATSAPP:
             return EvolutionWhatsAppSender(
                 EvolutionConfig(
-                    base_url=secrets["base_url"].rstrip("/"),
+                    base_url=target.url,
                     instance=secrets["instance"],
                     api_key=secrets["api_key"],
                     caps=caps,
@@ -597,7 +731,7 @@ def _build_phone_sender(
                     auth_token=secrets["auth_token"],
                     from_number=secrets["from_number"],
                     caps=caps,
-                    base_url=(secrets.get("base_url") or "https://api.twilio.com").rstrip("/"),
+                    base_url=target.url,
                 ),
                 http_client,
             )
@@ -638,13 +772,14 @@ async def _resolve_one(
     )
 
 
-async def resolve_tenant_senders(
+async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected seam (keys/env/net)
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     fernet_key: bytes | Sequence[bytes],
     defaults: InstanceSenderDefaults,
     http_client: httpx.AsyncClient,
+    resolver: Resolver | None = None,
 ) -> TenantSenders:
     """==The funnel.== The senders ONE business sends with. There is no way to ask for "a sender".
 
@@ -652,6 +787,10 @@ async def resolve_tenant_senders(
     product is constructed inside this module (pinned by ``tests/test_sender_belt.py``, which walks
     the source). Together those two facts are the belt: a caller cannot obtain a sender without
     saying whose it is, and cannot go around this function to build one.
+
+    ``resolver`` is the DNS seam the egress guard uses (:func:`_assert_target_reachable`), injected
+    so the whole path is deterministic and offline under test; production passes ``None`` and gets
+    the real ``getaddrinfo``. It is the same seam ``webhooks.ssrf`` takes, for the same reason.
 
     ``session`` must be bound to ``tenant_id`` — the drain calls this inside its per-item
     ``tenant_scope`` on the RLS pool, so the credential is read under exactly that business's
@@ -706,6 +845,17 @@ async def resolve_tenant_senders(
                 provider.value.upper(),
             )
             continue
+        # ==THE EGRESS GUARD, and it runs BEFORE the sender exists.== A `_EgressTarget` cannot be
+        # fabricated, and `_build_phone_sender` requires one — so a tenant's URL is never dialed
+        # without having been through it. See `_assert_target_reachable`: this is the bill B-03bis
+        # incurred by turning `base_url` from operator config into third-party input.
+        target = await _assert_target_reachable(
+            provider,
+            credential.secrets,
+            source=credential.source,
+            default_url=_DEFAULT_BASE_URLS[provider],
+            resolver=resolver,
+        )
         if credential.source is CredentialSource.INSTANCE:
             _logger.warning(
                 "business %s has no %s credential of its own and is sending from the OPERATOR's "
@@ -716,7 +866,7 @@ async def resolve_tenant_senders(
                 LEND_OPERATOR_PHONE_IDENTITY_ENV,
             )
         channels[channel_for(provider)] = _build_phone_sender(
-            provider, credential.secrets, caps=caps, http_client=http_client
+            provider, credential.secrets, target=target, caps=caps, http_client=http_client
         )
 
     return TenantSenders(tenant_id=tenant_id, email=email, channels=channels)

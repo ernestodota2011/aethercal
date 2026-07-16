@@ -41,9 +41,11 @@ from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     WrongCredentialClassError,
     credential_class,
+    required_fields,
     store_credential,
 )
 from aethercal.server.services.tenant_senders import (
+    _SPECS,
     LEND_OPERATOR_PHONE_IDENTITY_ENV,
     InstanceFallback,
     InstanceSenderDefaults,
@@ -85,6 +87,12 @@ _OPERATOR_ENV = {
     "AETHERCAL_WHATSAPP_API_KEY": "NOT_A_REAL_OPERATOR_KEY",
     "AETHERCAL_WHATSAPP_DAILY_CAP_PER_PHONE": "3",
     "AETHERCAL_WHATSAPP_DAILY_CAP_PER_IP": "5",
+    # The SMS CAPS but not the SMS credentials: the operator runs no Twilio of their own, and a
+    # business may still bring one. The caps are read independently of the credentials precisely so
+    # that case has a ceiling — without them the channel is refused before the egress guard is even
+    # reached, which would make every SSRF case below pass for the wrong reason.
+    "AETHERCAL_SMS_DAILY_CAP_PER_PHONE": "3",
+    "AETHERCAL_SMS_DAILY_CAP_PER_IP": "5",
 }
 
 _TENANT_WHATSAPP = {
@@ -166,12 +174,24 @@ def _defaults(**overrides: str) -> InstanceSenderDefaults:
     return InstanceSenderDefaults.from_env({**_OPERATOR_ENV, **overrides})
 
 
+async def _public_dns(host: str) -> list[str]:
+    """A resolver that answers with one ordinary public address.
+
+    Injected everywhere below, because the egress guard now does REAL DNS on a tenant's `base_url`
+    and these fixtures use `.example` names that resolve to nothing. That is the guard working, not
+    a nuisance: a test that reached the real resolver would be asserting against whatever the CI
+    box's DNS happened to say today.
+    """
+    return ["93.184.216.34"]
+
+
 async def _senders(
     session: AsyncSession,
     tenant: Tenant,
     *,
     defaults: InstanceSenderDefaults,
     client: httpx.AsyncClient,
+    resolver: object = _public_dns,
 ) -> object:
     return await resolve_tenant_senders(
         session,
@@ -179,6 +199,7 @@ async def _senders(
         fernet_key=KEY,
         defaults=defaults,
         http_client=client,
+        resolver=resolver,  # type: ignore[arg-type]
     )
 
 
@@ -399,6 +420,255 @@ class TestACredentialWithNoCeilingIsNotACeilingAtAll:
         caps = senders.channels[Channel.WHATSAPP].caps
         assert caps.per_phone == 3
         assert caps.per_ip == 5
+
+
+# The forbidden destinations as LITERAL addresses — each one a real attack, not a category. A tenant
+# sets its own `base_url`; the SERVER makes the request, with the SERVER's reachability.
+#
+# Literals only, deliberately: `assert_target_allowed` short-circuits an IP literal without DNS, so
+# these need no resolver to be meaningful. A forbidden destination reached by NAME is a different
+# mechanism and has its own test below (`..._RESOLVES_inward_...`) — folding the two together would
+# let an injected resolver quietly decide the answer to both.
+_INTERNAL_TARGETS = {
+    "cloud metadata": "https://169.254.169.254/latest/meta-data/",
+    "loopback": "https://127.0.0.1:8080/",
+    "RFC1918 private (192.168/16)": "https://192.168.1.23/",
+    "RFC1918 private (10/8)": "https://10.0.0.5/",
+    "RFC1918 private (172.16/12)": "https://172.16.0.9/",
+    "link-local": "https://169.254.10.10/",
+    "CGNAT shared": "https://100.64.0.1/",
+    "unspecified": "https://0.0.0.0/",
+    "IPv6 loopback": "https://[::1]:8080/",
+}
+
+
+def _phone_providers() -> list[CredentialProvider]:
+    """Every phone provider the funnel knows — ==derived from ``_SPECS``, not typed out here.==
+
+    A fourth phone provider must add a spec (``test_every_sending_provider_has_a_spec``), and the
+    day it does, every SSRF case below runs against it without anybody remembering this file. An
+    enumeration would have covered WhatsApp and SMS and missed the one that arrives next.
+    """
+    return [
+        provider
+        for provider in _SPECS
+        if instance_fallback(provider) is InstanceFallback.OPERATOR_IDENTITY
+    ]
+
+
+def _secrets_pointing_at(provider: CredentialProvider, url: str) -> dict[str, str]:
+    """This provider's minimal credential, aimed at ``url``. Derived from ``required_fields``."""
+    return {field: "x" for field in required_fields(provider)} | {"base_url": url}
+
+
+class TestATenantsBaseUrlCannotReachTheInternalNetwork:
+    """==The structural price of this whole cut, and it has to be paid here.==
+
+    Before B-03bis, ``base_url`` came from the instance's environment: **operator configuration,
+    trusted by construction**. Moving it into a per-business credential turned it into ==input a
+    third party controls and the server obeys==. The cut that closes the isolation leak opens, in
+    the same movement, a door onto the internal network: a business (or whoever compromises its
+    account) points ``base_url`` at the cloud metadata service, at loopback, or at the operator's
+    LAN, and **our server makes the request for them** — with our reachability, not theirs.
+
+    So the tenant's target is validated like the third-party input it now is, with the guard this
+    repository already built for user-configured webhook URLs. Not a new one.
+    """
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    @pytest.mark.parametrize("target", _INTERNAL_TARGETS.values(), ids=_INTERNAL_TARGETS.keys())
+    async def test_an_internal_target_is_refused_for_every_phone_provider(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+        target: str,
+    ) -> None:
+        """==The finding, closed, across every provider the funnel will ever have.==
+
+        ``169.254.169.254`` is the one to read twice: the cloud metadata service hands out the
+        instance's own IAM credentials to anything that can reach it, and a tenant would be reaching
+        it *through us*.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"ssrf-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, target),
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError) as caught:
+                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        message = str(caught.value)
+        assert "base_url" in message, "the error must name the field a human has to go and fix"
+        assert target not in message, "the stored value is never echoed — not even a URL"
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_a_public_hostname_that_RESOLVES_inward_is_refused(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """==Validating the hostname would be theatre. The RESOLVED address is the destination.==
+
+        ``evil.example`` is a perfectly ordinary public name. It resolves to ``127.0.0.1``. A filter
+        that reads the URL and approves it has checked a string, not a target.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"dns-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "https://evil.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _resolves_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError):
+                await resolve_tenant_senders(
+                    sqlite_session,
+                    tenant_id=business.id,
+                    fernet_key=KEY,
+                    defaults=_defaults(),
+                    http_client=client,
+                    resolver=_resolves_inward,
+                )
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_one_poisoned_record_in_a_mixed_answer_refuses_the_whole_target(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """No shopping for a good IP in a mixed answer — one forbidden record poisons the target.
+
+        This is ``assert_target_allowed``'s rule, and inheriting it is the reason to reuse that
+        function rather than write a second guard that would have to rediscover it.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"mix-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "https://mixed.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _mixed(host: str) -> list[str]:
+            return ["93.184.216.34", "10.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError):
+                await resolve_tenant_senders(
+                    sqlite_session,
+                    tenant_id=business.id,
+                    fernet_key=KEY,
+                    defaults=_defaults(),
+                    http_client=client,
+                    resolver=_mixed,
+                )
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_plaintext_http_is_refused_for_a_tenant_supplied_target(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """==https, because the api_key travels on that wire.==
+
+        The instance's OWN configuration may still be http (below) — a self-hoster's Evolution on
+        their LAN is a real deployment. A TENANT's target is a different object: it is third-party
+        input, it leaves the operator's network, and it carries that business's API key in a header.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"http-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "http://evolution.public.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError, match="https"):
+                await resolve_tenant_senders(
+                    sqlite_session,
+                    tenant_id=business.id,
+                    fernet_key=KEY,
+                    defaults=_defaults(),
+                    http_client=client,
+                    resolver=_public,
+                )
+
+    async def test_a_public_https_target_is_allowed(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Anti-vacuity: the guard must not simply refuse everything.==
+
+        Every test above asserts a refusal. Without this one they would all pass against a guard
+        that had broken BYOK entirely — no business could send at all, and the suite would be green
+        about it.
+        """
+        business = await _business(sqlite_session, tenant_factory, "ssrf-ok")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                http_client=client,
+                resolver=_public,
+            )
+
+        assert senders.channels[Channel.WHATSAPP]._config.instance == (_TENANT_WHATSAPP["instance"])
+
+    async def test_the_OPERATORS_own_target_is_not_put_through_the_tenant_guard(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The trust boundary is PROVENANCE, and that is the whole distinction being drawn.==
+
+        The env is the operator configuring their own instance — the same hands that hold the app
+        secret. A self-hoster running Evolution on ``http://192.168.1.50`` is not attacking
+        themselves, and refusing them would be treating the operator as their own threat model. A
+        TENANT's URL is third-party input. Same field, different provenance, different rule.
+        """
+        business = await _business(sqlite_session, tenant_factory, "lent-lan")
+        lan = InstanceSenderDefaults.from_env(
+            {
+                **_OPERATOR_ENV,
+                "AETHERCAL_WHATSAPP_BASE_URL": "http://192.168.1.50:8080",
+                LEND_OPERATOR_PHONE_IDENTITY_ENV: "true",
+            }
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=lan, client=client)
+
+        assert senders.channels[Channel.WHATSAPP]._config.base_url == ("http://192.168.1.50:8080")
 
 
 class TestAStoredCredentialWhoseValueCannotBeUsed:

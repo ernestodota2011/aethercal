@@ -58,6 +58,30 @@ AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=true
 instance serving more than one business: with it on, every business without its own credential
 messages guests from a number none of them own.
 
+### A business's endpoint must be on the public internet
+
+A WhatsApp or SMS credential carries a `base_url`, and this server makes requests to it. That makes
+it **your endpoint, our network** — so it is validated like any other URL a third party hands us:
+
+| Rule | Why |
+|---|---|
+| **`https` only** | that request carries your API key in a header, and it leaves the operator's network |
+| **a public address** | loopback, link-local (**including `169.254.169.254`**, the cloud metadata service), RFC1918, CGNAT and reserved ranges are all refused |
+| **checked by resolved IP** | a public hostname pointing at `127.0.0.1` is refused. The destination is the address, not the string |
+| **every record must pass** | one internal address in a mixed DNS answer refuses the whole target |
+
+A credential that fails this is **not usable**: the channel stays off, and the worker logs which
+field is wrong (never its value). Fix it with `credentials set` and the next attempt goes through.
+
+> [!NOTE]
+> The instance's own `AETHERCAL_WHATSAPP_BASE_URL` is **not** subject to this — that is the operator
+> configuring their own instance, so a self-hoster's Evolution on `http://192.168.1.50` keeps
+> working. The rule follows the value's **provenance**, not its name.
+>
+> The operator's private-target allowlist is deliberately **not** honoured here either. It exists so
+> the operator can send *their own* webhooks into *their own* LAN; letting a business's credential
+> reach it would turn that declaration into a key handed to every tenant.
+
 ### The caps stay the operator's policy
 
 A business's own phone sender is still bounded by the instance's
