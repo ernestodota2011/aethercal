@@ -293,9 +293,7 @@ async def test_a_member_reads_the_branding_and_is_refused_the_write(
     business = await _seed(sessionmaker)
     admin = _runtime(sessionmaker)
 
-    assert await service.branding_view(
-        admin, principal=business.member, tenant_slug=business.slug
-    )
+    assert await service.branding_view(admin, principal=business.member, tenant_slug=business.slug)
 
     with pytest.raises(service.AdminPermissionError):
         await service.update_branding_action(
