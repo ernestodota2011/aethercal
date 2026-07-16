@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from typing import Annotated, Any, overload
+from typing import Annotated, Any, Protocol, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -188,12 +188,33 @@ def resolve_translation(
     return translations.get(locale) or canonical
 
 
-def resolve_title(event: EventTypeRead, locale: str) -> str:
+class Translatable(Protocol):
+    """Anything carrying the translatable text of an event type — ==a SHAPE, not a class.==
+
+    These resolvers used to be typed against :class:`EventTypeRead` specifically, and the type was a
+    lie about what they do: they read four attributes and nothing else. It was already being told
+    that lie at runtime — the e-mail composer passes the SQLAlchemy ORM row — and the day the PUBLIC
+    projection arrived (``schemas/public.PublicEventTypeRead``: the same text, minus a business's
+    internal ids) the checker refused it, for no reason anybody could act on except "make a copy".
+
+    ==A second copy of "which title do we show this person?" is exactly the bug this rule exists to
+    prevent==: it once had four copies, three of them broken in the same way. So the parameter is
+    typed by what it must HAVE, and every shape that has it — the authenticated model, the public
+    one, the ORM row — is admitted by the one rule.
+    """
+
+    title: str
+    description: str | None
+    title_translations: dict[str, str]
+    description_translations: dict[str, str]
+
+
+def resolve_title(event: Translatable, locale: str) -> str:
     """Return the title for ``locale``: the per-locale override, or the canonical fallback."""
     return resolve_translation(event.title, event.title_translations, locale)
 
 
-def resolve_description(event: EventTypeRead, locale: str) -> str | None:
+def resolve_description(event: Translatable, locale: str) -> str | None:
     """Return the description for ``locale``: the per-locale override, or the canonical fallback.
 
     Unlike ``resolve_title``, the canonical fallback (``event.description``) may itself be ``None``
@@ -207,6 +228,7 @@ __all__ = [
     "EventTypeCreate",
     "EventTypeRead",
     "EventTypeUpdate",
+    "Translatable",
     "resolve_description",
     "resolve_title",
     "resolve_translation",

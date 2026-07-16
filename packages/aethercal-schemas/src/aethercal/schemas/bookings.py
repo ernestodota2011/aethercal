@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -102,8 +102,20 @@ def require_emailish(value: str) -> str:
     return candidate
 
 
-class BookingCreate(BaseModel):
-    """Request body to book a slot (RF-07). Only ``start`` is sent; ``end`` is server-derived.
+class GuestBookingBase(BaseModel):
+    """Everything a GUEST supplies to book a slot — and every rule those values are held to.
+
+    ==Extracted so there is exactly ONE of it.== Two request bodies now open a booking: this
+    contract's :class:`BookingCreate` (authenticated — the tenant's own API key, naming the event
+    type by id) and the PUBLIC router's ``PublicBookingCreate`` (unauthenticated — the event type
+    comes from the ROUTE, as ``(tenant_slug, event_slug)``, and a captcha token comes with it).
+
+    They differ in *how the appointment is identified*, and in nothing else. Copying the guest
+    fields
+    into a second model would have copied the four validators with them — the E.164 normalizer, the
+    IANA-zone rule, the e-mail check, and the refusal of a consent that names no number — and the
+    copies would then have drifted, on the endpoint with no authentication in front of it. The rules
+    live here, once, and both bodies inherit them.
 
     ``guest_phone`` / ``guest_phone_consent`` carry RF-24's consent box across the wire. The consent
     is a **boolean whoever fills the form actively set**, not a timestamp the client invents: the
@@ -115,7 +127,6 @@ class BookingCreate(BaseModel):
     verifies they possess it. Verifying possession is a declared gap (``docs/phone-channels.md``).
     """
 
-    event_type_id: uuid.UUID
     start: datetime
     guest_name: GuestName
     guest_email: GuestEmail
@@ -154,7 +165,7 @@ class BookingCreate(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _consent_needs_a_number(self) -> BookingCreate:
+    def _consent_needs_a_number(self) -> Self:
         """Refuse consent that references no number — it consents to nothing, and cannot be proven.
 
         Accepting it would write ``guest_phone_consent_at`` onto a row with no phone: a stamp
@@ -164,6 +175,20 @@ class BookingCreate(BaseModel):
         if self.guest_phone_consent and self.guest_phone is None:
             raise ValueError("guest_phone_consent requires a guest_phone to consent about")
         return self
+
+
+class BookingCreate(GuestBookingBase):
+    """Request body to book a slot with the tenant's API key (RF-07).
+
+    Only ``start`` is sent; ``end`` is server-derived from the event type's duration, so the two can
+    never disagree. The appointment is named by ``event_type_id`` — which is the authenticated
+    contract's way of saying it, and is exactly what the PUBLIC body does NOT have: there, the
+    business and the event type come from the route, because a guest holds no ids and because a body
+    field naming the event type beside a route that already names it would be two sources of truth
+    for one fact.
+    """
+
+    event_type_id: uuid.UUID
 
 
 class BookingReschedule(BaseModel):
@@ -201,6 +226,7 @@ __all__ = [
     "BookingCreate",
     "BookingRead",
     "BookingReschedule",
+    "GuestBookingBase",
     "normalize_phone",
     "require_emailish",
     "require_iana_zone",
