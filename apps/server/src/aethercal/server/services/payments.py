@@ -48,20 +48,32 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from sqlalchemy import CursorResult, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus
-from aethercal.server.services.outbox import OutboxEffect, enqueue_effect, refund_dedupe_key
+from aethercal.server.services.outbox import (
+    OutboxEffect,
+    OutboxExecutor,
+    OutboxWork,
+    enqueue_effect,
+    refund_dedupe_key,
+)
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    resolve_money_credential,
+)
 
 _logger = logging.getLogger(__name__)
+
+_Sessionmaker = async_sessionmaker[AsyncSession]
 
 # The side-effects that fire when a payment CONFIRMS its booking — the email, the Google sync, the
 # workflow steps. Injected rather than imported so this module owns only the arbitration and never
@@ -140,18 +152,21 @@ def _mark_payment_paid(payment: Payment) -> None:
         payment.status = PaymentStatus.PAID
 
 
-async def _enqueue_refund(session: AsyncSession, *, booking: Booking, provider_ref: str) -> None:
+async def enqueue_refund(
+    session: AsyncSession, *, booking: Booking, provider: str, provider_ref: str
+) -> None:
     """Queue a REFUND for ``provider_ref``. Confirmation-EXEMPT, so it queues on a cancelled hold.
 
     Keyed on the ``provider_ref`` (:func:`refund_dedupe_key`), so this path and ``cancel_booking``'s
     collapse to ONE refund row via the outbox UNIQUE — and a double payment (two provider_refs)
-    produces two refunds, one per charge."""
+    produces two refunds, one per charge. The payload carries ``provider`` so the refund runner can
+    resolve THAT provider's BYOK money credential (Stripe vs Mercado Pago) without a lookup."""
     await enqueue_effect(
         session,
         booking=booking,
         effect=OutboxEffect.REFUND,
         dedupe_key=refund_dedupe_key(provider_ref),
-        payload={"provider_ref": provider_ref},
+        payload={"provider": provider, "provider_ref": provider_ref},
     )
 
 
@@ -202,7 +217,7 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
         # ==Wrong money — never confirm.== Refund and ALERT. This runs before the conditional UPDATE
         # so a mismatched payment can never win a confirmation.
         _mark_payment_paid(payment)
-        await _enqueue_refund(session, booking=booking, provider_ref=provider_ref)
+        await enqueue_refund(session, booking=booking, provider=provider, provider_ref=provider_ref)
         _logger.error(
             "arbiter ALERT: payment %s amount/currency (%d %s) does not match event type %s "
             "(%s %s) — refunding, NOT confirming",
@@ -247,7 +262,7 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
     if booking.status is BookingStatus.CANCELLED:
         # The hold expired or the guest cancelled. ==Refund, never confirm== — the slot may be
         # somebody else's now, and confirming over them breaks RF-04.
-        await _enqueue_refund(session, booking=booking, provider_ref=provider_ref)
+        await enqueue_refund(session, booking=booking, provider=provider, provider_ref=provider_ref)
         _logger.info(
             "arbiter: payment %s arrived for CANCELLED booking %s — refunding, not confirming",
             payment.id,
@@ -268,7 +283,7 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
 
     # Confirmed by ANOTHER payment (or by none, which cannot happen for a confirmed booking but is
     # handled as an orphan for safety): a DOUBLE PAYMENT. Refund THIS one.
-    await _enqueue_refund(session, booking=booking, provider_ref=provider_ref)
+    await enqueue_refund(session, booking=booking, provider=provider, provider_ref=provider_ref)
     _logger.info(
         "arbiter: payment %s is a double payment on booking %s (confirmed by %s) — refunding it",
         payment.id,
@@ -278,10 +293,121 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
     return ArbiterResult(ArbiterOutcome.REFUNDED_DOUBLE, booking.id, payment.id)
 
 
+# --------------------------------------------------------------------------------------
+# The money effect RUNNERS — injected into the outbox executor (no outbox->payments cycle).
+# --------------------------------------------------------------------------------------
+
+
+class PaymentGateway(Protocol):
+    """The provider side of a refund — ==injected==, so the money-moving call is a seam, not a
+    hard-wired Stripe import. A test passes a spy; production passes the real BYOK adapter."""
+
+    async def refund(
+        self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Mapping[str, str]
+    ) -> None:
+        """Refund the charge ``provider_ref`` on the business's OWN account (its ``secrets``)."""
+        ...
+
+
+def make_refund_runner(
+    *,
+    sessionmaker: _Sessionmaker,
+    gateway: PaymentGateway,
+    fernet_keys: Sequence[bytes],
+) -> OutboxExecutor:
+    """Build the REFUND handler the drain dispatches (via ``make_booking_effect_executor``).
+
+    ==BYOK, fail-closed.== The money goes back on the BUSINESS's own account, resolved through
+    :func:`resolve_money_credential` — which RAISES if the business has no credential, so a refund
+    can never fall back to the instance operator's account (criterion 41). ==Idempotent by
+    re-check==: it re-reads ``payments.status`` and does NOT call the provider if the row is already
+    ``refunded``, so the two enqueue paths collapsing to one row (criterion 30) and any re-drain
+stay effectively-once even if the dedupe ever let two rows through.
+    """
+
+    async def _run(work: OutboxWork, now: datetime) -> None:
+        async with sessionmaker() as session, session.begin():
+            provider = str(work.payload["provider"])
+            provider_ref = str(work.payload["provider_ref"])
+            payment = await resolve_payment(
+                session, tenant_id=work.tenant_id, provider=provider, provider_ref=provider_ref
+            )
+            if payment is None:  # pragma: no cover - a refund enqueued for a payment that vanished
+                _logger.error(
+                    "refund runner: no payment for %s (tenant %s); nothing to refund",
+                    provider_ref,
+                    work.tenant_id,
+                )
+                return
+            if payment.status is PaymentStatus.REFUNDED:
+                # ==The re-check that makes this effectively-once== even under a duplicate row or a
+                # re-drain: the money already went back, so the provider is NOT called again.
+                _logger.info("refund runner: payment %s already refunded; no-op", payment.id)
+                return
+
+            credential = await resolve_money_credential(
+                session,
+                tenant_id=work.tenant_id,
+                provider=CredentialProvider(provider),
+                fernet_key=fernet_keys,
+            )
+            await gateway.refund(
+                provider=provider,
+                provider_ref=provider_ref,
+                amount_cents=payment.amount_cents,
+                secrets=credential.secrets,
+            )
+            payment.status = PaymentStatus.REFUNDED
+            _logger.info("refund runner: refunded payment %s (%s)", payment.id, provider_ref)
+
+    return _run
+
+
+def make_expire_hold_runner(*, sessionmaker: _Sessionmaker) -> OutboxExecutor:
+    """Build the EXPIRE_HOLD handler: cancel a hold whose TTL has passed, freeing its slot.
+
+    ==No external I/O== — it is a single conditional UPDATE, so ANY exception it raises is anomalous
+    by definition (a dead EXPIRE_HOLD is a slot blocked for ever), and it propagates so the
+    drain logs and alerts. The cancel is conditional on ``status='pending'``: if the payment won the
+    race and confirmed the booking first, this matches zero rows and is a clean no-op — the hold and
+    the confirmation are serialised by Postgres on the same row lock. A cancelled hold is never
+    announced (``confirmed_at`` stayed NULL, so the B-05a silence gate suppresses everything).
+    """
+
+    async def _run(work: OutboxWork, now: datetime) -> None:
+        async with sessionmaker() as session, session.begin():
+            booking_id = uuid.UUID(str(work.payload["booking_id"]))
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(Booking)
+                    .where(
+                        Booking.id == booking_id,
+                        Booking.status == BookingStatus.PENDING.value,
+                    )
+                    .values(status=BookingStatus.CANCELLED.value, cancelled_at=now)
+                    .execution_options(synchronize_session=False),
+                ),
+            )
+            if result.rowcount == 1:
+                _logger.info("expire-hold runner: cancelled unpaid hold %s, slot freed", booking_id)
+            else:
+                # The payment confirmed it first (or it was already cancelled). Nothing to do.
+                _logger.debug(
+                    "expire-hold runner: hold %s was no longer pending; no-op", booking_id
+                )
+
+    return _run
+
+
 __all__ = [
     "ArbiterOutcome",
     "ArbiterResult",
     "ConfirmEffects",
+    "PaymentGateway",
     "apply_paid_event",
+    "enqueue_refund",
+    "make_expire_hold_runner",
+    "make_refund_runner",
     "resolve_payment",
 ]
