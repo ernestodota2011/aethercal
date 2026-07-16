@@ -68,6 +68,7 @@ from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import (
     Booking,
     EventType,
+    Outbox,
     Payment,
     PaymentEvent,
     PaymentEventStatus,
@@ -275,6 +276,55 @@ async def enqueue_refund(
         dedupe_key=refund_dedupe_key(provider_ref),
         payload={"provider": provider, "provider_ref": provider_ref},
     )
+
+
+async def we_queued_this_refund(
+    session: AsyncSession, *, tenant_id: uuid.UUID, provider_ref: str
+) -> bool:
+    """Whether WE decided to refund this charge. ==The discriminator that is already committed when
+    the provider is called (r8)== — which is the whole reason it exists.
+
+    ``payment.status`` cannot answer this question, and that is not a bug in the status: it is a
+    fact about WHEN it is written. :func:`make_refund_runner` sets ``refunded`` only AFTER
+    ``gateway.refund`` returns, and commits later still, while the provider fires
+    ``charge.refunded`` the instant the refund succeeds. Between those two moments our own refund
+    is on the wire and the payment row still reads ``paid`` — indistinguishable, to the status,
+    from a refund the operator issued by hand. The webhook lands in that window and the arbiter
+    calls its own money "out of band".
+
+    That misreading is not cosmetic. A DOUBLE payment's booking is CONFIRMED on the OTHER charge, so
+    the out-of-band branch's ``status is not CANCELLED`` guard does not hold it back: it cancels a
+    live, paid appointment, deletes the host's calendar event and emails the guest that the meeting
+    they paid for is off — while the winning charge's money stays with us. Refunding a live
+    appointment is the exact outcome this module's header opens by saying it cannot get wrong.
+
+    The REFUND INTENT answers it correctly, because :func:`enqueue_refund` commits it in the SAME
+    transaction as the decision to refund — strictly BEFORE any drain can reach the provider. So if
+    the row is here, the money moving out there is ours, whatever the payment row has caught up to.
+    The ordering is the guarantee; the status was only ever a proxy for it.
+
+    ==Existence alone is the answer, with no status filter, and ``voidability_policy`` is why==: a
+    REFUND is ``NON_VOIDABLE``, so once queued it is never retired — the fact is monotonic. Were it
+    voidable, a retired intent would mean the provider was never called and this would have to tell
+    a live intent from a dead one.
+
+    Matched on ``(tenant_id, dedupe_key)`` and deliberately NOT on ``booking_id``: a reschedule
+    re-points ``payment.booking_id`` at the successor while the intent keeps the booking id it was
+    queued under, so keying on the booking would miss our own intent and re-open the very hole this
+    closes. The charge reference inside the key is what identifies the money, which is the same
+    reason :func:`refund_dedupe_key` is built from it.
+    """
+    return (
+        await session.scalars(
+            select(Outbox.id)
+            .where(
+                Outbox.tenant_id == tenant_id,
+                Outbox.effect == OutboxEffect.REFUND.value,
+                Outbox.dedupe_key == refund_dedupe_key(provider_ref),
+            )
+            .limit(1)
+        )
+    ).first() is not None
 
 
 def is_refund_eligible(event_type: EventType, *, booking: Booking, now: datetime) -> bool:
@@ -495,12 +545,19 @@ async def apply_refunded_event(  # noqa: PLR0913 - the event's identity + the in
 ) -> ArbiterResult:
     """Apply a ``charge.refunded`` event (B-05b, criterion 35). ==Out-of-band vs our own echo.==
 
-    The discriminator is ``payment.status``. Our refund runner sets it to ``refunded`` BEFORE the
-    provider echoes ``charge.refunded`` back — so an event on an already-``refunded`` payment
-    is that echo, and a NO-OP. An event on a still-``paid`` payment is a refund the OPERATOR issued
-    from the provider's dashboard, which we did not cause: leaving the booking confirmed would be
-    money returned AND the service still delivered, so the booking is CANCELLED (freeing the slot),
-    the guest is told, and the host is alerted.
+    ==The discriminator is "did WE queue a refund of this charge", NOT ``payment.status`` (r8).== A
+    refund of ours is announced by the provider the moment it succeeds, which is BEFORE the runner
+    records it — so ``paid`` does not mean "not ours", it means "ours, still in flight", and reading
+    it as out-of-band cancels a live appointment on the double-payment path. The intent in the
+    outbox is the fact that is already committed by then: :func:`we_queued_this_refund` carries the
+    reasoning, and it is the load-bearing part of this function.
+
+    So an event is OUR echo when the payment is already ``refunded`` (the runner's commit landed, or
+    we recorded an out-of-band refund earlier) OR when a REFUND intent exists for the charge (the
+    commit has not landed yet) — both are NO-OPs on the booking. Only an event on a charge we never
+    queued a refund for is a refund the OPERATOR issued from the provider's dashboard: leaving the
+    booking confirmed would be money returned AND the service still delivered, so the booking is
+    CANCELLED (freeing the slot), the guest is told, and the host is alerted.
 
     ==The cancellation runs the FULL chain, not a partial copy (r5 finding 2).== After flipping the
     status the arbiter fires the injected ``cancel_effects`` — the SAME chain ``cancel_booking``
@@ -521,10 +578,30 @@ async def apply_refunded_event(  # noqa: PLR0913 - the event's identity + the in
         return ArbiterResult(ArbiterOutcome.REFUND_ECHO)
 
     if payment.status is PaymentStatus.REFUNDED:
-        # Our OWN refund, echoed back by the provider. The booking is already cancelled; do NOT
-        # cancel it again.
+        # Our OWN refund, echoed back by the provider AFTER the runner's commit landed — or a
+        # duplicate of an out-of-band event we already applied. Either way the ledger already says
+        # so; do NOT cancel anything again.
         _logger.info(
             "arbiter: charge.refunded echoes our own refund of payment %s; no-op", payment.id
+        )
+        return ArbiterResult(ArbiterOutcome.REFUND_ECHO, payment.booking_id, payment.id)
+
+    if await we_queued_this_refund(session, tenant_id=tenant_id, provider_ref=provider_ref):
+        # ==Our own refund, echoed back INSIDE the runner's window (r8).== The status above still
+        # reads ``paid`` only because ``gateway.refund`` has returned but its commit has not landed
+        # — see :func:`we_queued_this_refund`. Treating this as out-of-band would cancel a booking
+        # that is still live whenever the refunded charge is a double payment, and would page a
+        # human on every ordinary refund besides.
+        #
+        # The echo is PROOF the money went back, so converge the ledger here rather than wait for
+        # the runner: this row is what makes the runner's own re-check (and any re-drain, and the
+        # crash the runner's docstring anticipates BETWEEN the provider call and its commit) a clean
+        # no-op instead of asking the provider to refund an already-refunded charge.
+        payment.status = PaymentStatus.REFUNDED
+        _logger.info(
+            "arbiter: charge.refunded is the echo of the refund we queued for payment %s "
+            "(the runner's commit has not landed yet); recording it, no-op",
+            payment.id,
         )
         return ArbiterResult(ArbiterOutcome.REFUND_ECHO, payment.booking_id, payment.id)
 
