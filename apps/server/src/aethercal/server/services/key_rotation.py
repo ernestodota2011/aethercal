@@ -30,6 +30,35 @@ The OWNER role, from the CLI (``aethercal-admin credentials rotate-key``). It ha
 business's rows, and under row-level security the app role sees only the business bound to its
 session — which, for this operation, is none of them. It is the same reason ``guest purge`` runs as
 the owner, and it is why this function is not reachable from the web process at all.
+
+.. rubric:: ==THE RUNBOOK — a rotation is a coordinated operation, not one safe command==
+
+A rotation is three ORDERED steps, and the order is the whole safety. Between them the database
+holds ciphertext under both keys, and the running processes decide whether that gap is safe:
+
+1. **Deploy both secrets to EVERY process, and restart them.** Set ``AETHERCAL_APP_SECRET`` = the
+   NEW secret and ``AETHERCAL_PREVIOUS_APP_SECRET`` = the one being retired, on the web, the worker
+   and the CLI host alike, and restart. Every process now ENCRYPTS with the new key and DECRYPTS
+   with both (:meth:`~aethercal.server.settings.Settings.decryption_fernet_keys` →
+   :func:`~aethercal.server.crypto.decrypt_secret`). ==This step is what removes the window:== once
+   it is done, no live process writes under the key about to be retired, and none fails to read a
+   row still on it.
+
+2. **Run** ``aethercal-admin credentials rotate-key``. It re-encrypts every stored secret from the
+   previous key onto the new one, in ONE transaction, as the owner. It is resumable (a row already
+   on the new key needs nothing) and refuses on a row that opens under neither key.
+
+3. **Remove ``AETHERCAL_PREVIOUS_APP_SECRET`` and restart.** With every row now on the new key, the
+   retiring secret opens nothing — a secret with no job and a full blast radius — so it is unset and
+   the processes go back to one key.
+
+==The residual risk is OPERATIONAL, not in the code, and it is named on purpose.== The code makes a
+process reading under both keys and writing under the new one *possible*; it cannot make the
+operator run step 1 before step 2. Running step 2 while some process still holds only the OLD
+secret (step 1 skipped or half-rolled-out) re-opens the very window this design closes: that
+process writes under the old key onto rows the rotation has already moved, and those writes are
+stranded once step 3 retires the old secret. So the sequence above is the operation — not
+``rotate-key`` on its own.
 """
 
 from __future__ import annotations

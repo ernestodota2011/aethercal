@@ -312,3 +312,22 @@ class Settings(BaseSettings):
         """
         secret = (self.previous_app_secret or "").strip()
         return derive_fernet_key(secret) if secret else None
+
+    def decryption_fernet_keys(self) -> tuple[bytes, ...]:
+        """The keys a reader tries, IN ORDER: the current one, then the retiring one if set.
+
+        ==This is the READ side of a key rotation, and the reason writes never strand a row.== Every
+        process that decrypts stored secrets — the worker delivering webhooks, the ticks reading a
+        host's Google token, and (once wired) the request path resolving a BYOK payment credential —
+        is handed this, not the bare :meth:`fernet_key`. In the steady state it is one key. While a
+        rotation is in flight (``AETHERCAL_PREVIOUS_APP_SECRET`` set) it is ``(current, previous)``:
+        a row already moved onto the new key opens on the first, and a row the rotation has not
+        reached opens on the second — so a process restarted onto the new secret can read EITHER and
+        write under the new one, leaving nothing on the key about to be retired. See
+        :func:`~aethercal.server.crypto.decrypt_secret`.
+
+        The current key comes FIRST because :meth:`fernet_key` is what every write uses; ordering
+        the reader the same way keeps the common case (a freshly written row) a first-key hit.
+        """
+        previous = self.previous_fernet_key()
+        return (self.fernet_key(),) if previous is None else (self.fernet_key(), previous)

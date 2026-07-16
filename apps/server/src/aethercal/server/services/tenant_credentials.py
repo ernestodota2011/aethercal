@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import assert_never
@@ -332,7 +332,9 @@ async def list_credential_providers(
     return tuple(CredentialProvider(value) for value in rows)
 
 
-def _decrypt(row: TenantCredential, provider: CredentialProvider, key: bytes) -> ResolvedCredential:
+def _decrypt(
+    row: TenantCredential, provider: CredentialProvider, key: bytes | Sequence[bytes]
+) -> ResolvedCredential:
     payload = json.loads(decrypt_secret(row.encrypted_payload, key).decode("utf-8"))
     return ResolvedCredential(
         provider=provider,
@@ -346,13 +348,17 @@ async def resolve_money_credential(
     *,
     tenant_id: uuid.UUID,
     provider: CredentialProvider,
-    fernet_key: bytes,
+    fernet_key: bytes | Sequence[bytes],
 ) -> ResolvedCredential:
     """The business's OWN payment credential. ==No fallback exists here.== Criteria 40 and 41.
 
     ==There is no ``instance_default`` parameter, and that is the design.== A caller cannot pass one
     in a hurry, a reviewer does not have to catch that they did, and putting one back is an edit to
     this signature — which a test asserts against, by name.
+
+    ``fernet_key`` is one key normally, and the ``(current, previous)`` reader during a key rotation
+    (``Settings.decryption_fernet_keys()``): a credential the rotation has not reached yet — still
+    on the retiring key — must stay chargeable throughout the window, or a guest cannot pay.
 
     Raises :class:`MissingCredentialError` when the business has no credential of its own: it does
     not charge. Raises :class:`WrongCredentialClassError` if handed an INFRA provider — the two
@@ -386,7 +392,7 @@ async def resolve_infra_credential(
     *,
     tenant_id: uuid.UUID,
     provider: CredentialProvider,
-    fernet_key: bytes,
+    fernet_key: bytes | Sequence[bytes],
     instance_default: Mapping[str, str] | None,
 ) -> ResolvedCredential | None:
     """The business's own SENDING credential if it has one, else the instance's. ==Precedence.==

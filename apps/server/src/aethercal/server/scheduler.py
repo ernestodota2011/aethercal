@@ -24,13 +24,13 @@ from __future__ import annotations
 import functools
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from sqlalchemy import select
 
 from aethercal.core.model import TimeInterval
@@ -178,7 +178,7 @@ async def run_webhook_delivery_once(
     *,
     pools: WorkerPools,
     http_client: httpx.AsyncClient,
-    fernet_key: bytes,
+    fernet_key: bytes | Sequence[bytes],
     allowlist: PrivateTargetAllowlist,
     now: datetime | None = None,
 ) -> DeliveryReport | None:
@@ -360,6 +360,13 @@ async def run_busy_refresh_once(
 # --------------------------------------------------------------------------------------
 
 
+def _decryption_fernet(app: FastAPI) -> MultiFernet:  # pragma: no cover - live
+    """The MultiFernet a live tick decrypts with: the current key first, and the retiring one during
+    a rotation. ``app.state.fernet_keys`` is ``Settings.decryption_fernet_keys()`` — so a row the
+    rotation has not reached yet, still on the old key, is readable throughout the window."""
+    return MultiFernet([Fernet(key) for key in app.state.fernet_keys])
+
+
 def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     """Bind a webhook-delivery tick to the WORKER app's state (pools / http_client / fernet_key).
 
@@ -375,7 +382,9 @@ def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
         await run_webhook_delivery_once(
             pools=app.state.pools,
             http_client=app.state.http_client,
-            fernet_key=app.state.fernet_key,
+            # The ROTATION READER — current key, plus the retiring one during a rotation — so a
+            # subscription created before the rotation reached it stays signable across the window.
+            fernet_key=app.state.fernet_keys,
             allowlist=app.state.webhook_allowlist,
         )
 
@@ -386,7 +395,9 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     """Bind a busy-cache refresh tick to the worker's state (pools + a Fernet-built factory)."""
 
     async def _tick() -> None:
-        fernet = Fernet(app.state.fernet_key)
+        # The ROTATION READER: a MultiFernet over the current key (and the retiring one during a
+        # rotation), so a Google token stored before the rotation reached it is still decryptable.
+        fernet = _decryption_fernet(app)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
         await run_busy_refresh_once(pools=app.state.pools, service_factory=service_factory)
 
@@ -407,7 +418,9 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
 
     async def _tick() -> None:
         pools: WorkerPools = app.state.pools
-        fernet = Fernet(app.state.fernet_key)
+        # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key
+        # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
+        fernet = _decryption_fernet(app)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
         execute = make_booking_effect_executor(
             sessionmaker=pools.exec_maker,

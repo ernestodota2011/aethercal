@@ -68,6 +68,29 @@ def test_database_config_normalizes_the_url_to_psycopg() -> None:
     assert config.url == "postgresql+psycopg://user:pw@db.example:5432/aethercal"
 
 
+def test_decryption_fernet_keys_is_the_current_key_alone_in_steady_state() -> None:
+    """No rotation in flight → the reader holds ONE key, the current one. Nothing extra to try."""
+    settings = _settings(app_secret="the-secret")
+    assert settings.decryption_fernet_keys() == (derive_fernet_key("the-secret"),)
+
+
+def test_decryption_fernet_keys_offers_current_then_previous_during_a_rotation() -> None:
+    """==The window.== With the retiring secret set, the reader offers the CURRENT key FIRST
+    (what every write now uses) and the PREVIOUS one after (the rows not yet rotated)."""
+    settings = _settings(app_secret="new-secret", previous_app_secret="old-secret")
+    assert settings.decryption_fernet_keys() == (
+        derive_fernet_key("new-secret"),
+        derive_fernet_key("old-secret"),
+    )
+
+
+def test_decryption_fernet_keys_ignores_a_blank_previous_secret() -> None:
+    """A left-behind ``AETHERCAL_PREVIOUS_APP_SECRET=`` is a line in an env file, not a key —
+    it must not become a second Fernet that opens nothing (and derives from the empty string)."""
+    settings = _settings(app_secret="the-secret", previous_app_secret="   ")
+    assert settings.decryption_fernet_keys() == (derive_fernet_key("the-secret"),)
+
+
 def test_echo_sql_flows_into_the_database_config() -> None:
     config = _settings(echo_sql=True).database_config()
     assert config.echo is True

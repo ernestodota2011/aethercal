@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections.abc import Sequence
 
 from cryptography.fernet import Fernet, MultiFernet
 
@@ -48,9 +49,29 @@ def encrypt_secret(plaintext: bytes, fernet_key: bytes) -> bytes:
     return Fernet(fernet_key).encrypt(plaintext)
 
 
-def decrypt_secret(token: bytes, fernet_key: bytes) -> bytes:
-    """Decrypt a token produced by :func:`encrypt_secret` back to its plaintext bytes."""
-    return Fernet(fernet_key).decrypt(token)
+def decrypt_secret(token: bytes, fernet_key: bytes | Sequence[bytes]) -> bytes:
+    """Decrypt a token produced by :func:`encrypt_secret`, trying each offered key IN ORDER.
+
+    ==One key in the steady state, two during a rotation.== ``fernet_key`` is a single key
+    (``bytes``) normally, and the CURRENT-then-PREVIOUS pair (``[current, previous]``) while a key
+    rotation is in flight — the reader every app process is handed once
+    ``AETHERCAL_PREVIOUS_APP_SECRET`` is set (:meth:`~aethercal.server.settings.Settings.\
+decryption_fernet_keys`). A :class:`~cryptography.fernet.MultiFernet` tries the keys left to right,
+    so a row already re-encrypted onto the new key opens on the first, and a row the rotation has
+    not reached yet — still on the retiring key — opens on the second.
+
+    ==This is what closes the write-under-the-retiring-key window.== With reads limited to a single
+    key, a process on the new secret could not open a row still on the old one; the only way to stay
+    readable was to write under the old key — and those writes then sat outside a rotation already
+    run, unreadable for ever once the old secret was retired. Reading under BOTH keys means every
+    process can be restarted onto the new secret (and write under it) while the rotation moves the
+    remaining rows across, with nothing stranded on the key about to be retired.
+
+    A token that NO offered key opens raises :class:`~cryptography.fernet.InvalidToken` — a lost row
+    is loud, never a silent empty read.
+    """
+    keys = [fernet_key] if isinstance(fernet_key, bytes) else list(fernet_key)
+    return MultiFernet([Fernet(key) for key in keys]).decrypt(token)
 
 
 def rotate_secret(token: bytes, *, new_key: bytes, previous_key: bytes) -> bytes:

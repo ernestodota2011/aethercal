@@ -66,8 +66,13 @@ async def create_webhook(
     return webhook, plaintext
 
 
-def decrypt_webhook_secret(webhook: Webhook, fernet_key: bytes) -> bytes:
-    """Return the plaintext HMAC secret bytes for ``webhook`` (used by the delivery worker)."""
+def decrypt_webhook_secret(webhook: Webhook, fernet_key: bytes | Sequence[bytes]) -> bytes:
+    """Return the plaintext HMAC secret bytes for ``webhook`` (used by the delivery worker).
+
+    ``fernet_key`` is one key normally, and the ``(current, previous)`` reader during a key rotation
+    (``Settings.decryption_fernet_keys()``): a subscription created before the rotation reached it —
+    still on the retiring key — must keep signing throughout the window, or its deliveries fail.
+    """
     return decrypt_secret(webhook.secret, fernet_key)
 
 
