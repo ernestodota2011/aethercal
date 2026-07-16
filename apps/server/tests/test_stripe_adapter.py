@@ -1,0 +1,127 @@
+"""The Stripe adapter's verifiable half: signature + event parsing (B-05b, offline).
+
+The outgoing API calls (checkout, refund) are NOT verified against live Stripe in this cut — see the
+module docstring. What IS proven here is the security-critical, network-free part: that the
+``Stripe-Signature`` HMAC is checked correctly (a forged/absent signature fails) and that Stripe's
+four event types translate to the normalised event the arbiter reads.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+
+from aethercal.server.integrations.stripe import StripeWebhookAdapter
+from aethercal.server.services.payment_webhooks import WebhookEventKind
+
+_SECRET = "whsec_test_NOT_A_REAL_KEY_x"
+
+
+def _sign(raw: bytes, *, timestamp: int = 1_700_000_000, secret: str = _SECRET) -> str:
+    payload = f"{timestamp}.".encode() + raw
+    mac = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"t={timestamp},v1={mac}"
+
+
+def test_a_valid_stripe_signature_verifies() -> None:
+    adapter = StripeWebhookAdapter()
+    raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
+    header = _sign(raw)
+    assert adapter.verify_signature(
+        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": header}
+    )
+
+
+def test_a_forged_or_absent_signature_fails() -> None:
+    adapter = StripeWebhookAdapter()
+    raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
+    assert not adapter.verify_signature(
+        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": "t=1,v1=deadbeef"}
+    )
+    assert not adapter.verify_signature(raw_body=raw, secret=_SECRET, headers={})
+    # A body tampered after signing no longer verifies.
+    header = _sign(raw)
+    assert not adapter.verify_signature(
+        raw_body=raw + b" ", secret=_SECRET, headers={"Stripe-Signature": header}
+    )
+
+
+def test_a_signature_under_the_wrong_secret_fails() -> None:
+    adapter = StripeWebhookAdapter()
+    raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
+    header = _sign(raw, secret="whsec_test_OTHER_KEY")
+    assert not adapter.verify_signature(
+        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": header}
+    )
+
+
+def test_checkout_session_completed_parses_to_a_paid_event() -> None:
+    adapter = StripeWebhookAdapter()
+    obj = {"payment_intent": "pi_X", "amount_total": 5000, "currency": "usd"}
+    raw = json.dumps(
+        {"id": "evt_A", "type": "checkout.session.completed", "data": {"object": obj}}
+    ).encode("utf-8")
+    event = adapter.parse(raw)
+    assert event is not None
+    assert event.kind is WebhookEventKind.PAID
+    assert event.event_id == "evt_A"
+    assert event.provider_ref == "pi_X"
+    assert event.amount_cents == 5000
+    assert event.currency == "usd"
+
+
+def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_intent() -> None:
+    adapter = StripeWebhookAdapter()
+    raw = json.dumps(
+        {
+            "id": "evt_B",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {"id": "pi_X", "amount": 5000, "currency": "usd"}},
+        }
+    ).encode("utf-8")
+    event = adapter.parse(raw)
+    assert event is not None
+    assert event.kind is WebhookEventKind.PAID
+    # ==Same provider_ref as checkout.session.completed above== — the two events Stripe sends for
+    # one payment share the PaymentIntent id, which is what the arbiter's idempotency anchors on.
+    assert event.provider_ref == "pi_X"
+
+
+def test_charge_refunded_and_dispute_parse_to_their_kinds() -> None:
+    adapter = StripeWebhookAdapter()
+    refunded = adapter.parse(
+        json.dumps(
+            {
+                "id": "evt_R",
+                "type": "charge.refunded",
+                "data": {"object": {"payment_intent": "pi_X"}},
+            }
+        ).encode("utf-8")
+    )
+    assert refunded is not None and refunded.kind is WebhookEventKind.REFUNDED
+    assert refunded.provider_ref == "pi_X"
+
+    dispute = adapter.parse(
+        json.dumps(
+            {
+                "id": "evt_D",
+                "type": "charge.dispute.created",
+                "data": {"object": {"payment_intent": "pi_X"}},
+            }
+        ).encode("utf-8")
+    )
+    assert dispute is not None and dispute.kind is WebhookEventKind.DISPUTE
+
+
+def test_an_event_type_we_do_not_act_on_parses_to_none() -> None:
+    adapter = StripeWebhookAdapter()
+    assert (
+        adapter.parse(
+            json.dumps({"id": "evt_Z", "type": "customer.created", "data": {"object": {}}}).encode(
+                "utf-8"
+            )
+        )
+        is None
+    )
+    assert adapter.parse(b"not json") is None

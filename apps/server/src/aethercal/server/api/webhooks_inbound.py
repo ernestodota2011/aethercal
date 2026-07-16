@@ -93,7 +93,8 @@ async def receive_payment_webhook(
     # (1) the RAW body, before FastAPI parses anything from it — the HMAC is over these exact bytes.
     raw_body = await request.body()
 
-    adapter = PAYMENT_WEBHOOK_ADAPTERS.get(provider)
+    adapters = getattr(request.app.state, "webhook_adapters", PAYMENT_WEBHOOK_ADAPTERS)
+    adapter = adapters.get(provider)
     if adapter is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown provider")
     try:

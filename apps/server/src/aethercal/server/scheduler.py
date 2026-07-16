@@ -35,18 +35,25 @@ from sqlalchemy import select
 
 from aethercal.core.model import TimeInterval
 from aethercal.server.db.guc import tenant_scope
-from aethercal.server.db.models import ExternalConnection
+from aethercal.server.db.models import Booking, ExternalConnection
 from aethercal.server.db.pools import BypassReason, WorkerPools
+from aethercal.server.services.bookings import BookingEffects, confirm_paid_booking_effects
 from aethercal.server.services.calendars import (
     ServiceFactory,
     build_live_service,
     refresh_busy_cache,
 )
+from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
     OutboxExecutor,
     OutboxReport,
     drain_outbox,
     make_booking_effect_executor,
+)
+from aethercal.server.services.payments import (
+    make_expire_hold_runner,
+    make_refund_runner,
+    run_parked_payment_tick,
 )
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
@@ -404,6 +411,21 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     return _tick
 
 
+def _payment_confirm_effects(app: FastAPI):
+    """The arbiter's ``confirm_effects`` for the parked tick: the same chain a free booking runs.
+
+    Built here in the worker, the one place that may hold both the booking service and the arbiter.
+    """
+    settings = app.state.settings
+    base = (settings.booking_base_url or "http://localhost").rstrip("/")
+    effects = BookingEffects(signer=GuestTokenSigner(settings.app_secret), booking_base_url=base)
+
+    async def _run(session: Any, booking: Booking, now: Any) -> None:
+        await confirm_paid_booking_effects(session, booking=booking, effects=effects, now=now)
+
+    return _run
+
+
 def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     """Bind an outbox-drain tick to the worker's state (pools + SMTP sender + a Fernet-built Google
     factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
@@ -422,6 +444,19 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
         # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
         fernet = _decryption_fernet(app)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+        # ==The money runners (B-05b).== The REFUND handler needs the BYOK gateway + the rotation
+        # keys; EXPIRE_HOLD needs neither (one conditional UPDATE, no external I/O). Both run on
+        # the exec pool under RLS, bound per item like every other effect. With no gateway wired a
+        # REFUND intent raises loudly rather than silently stranding a guest's money.
+        fernet_keys = app.state.fernet_keys
+        gateway = getattr(app.state, "payment_gateway", None)
+        refund_runner = (
+            make_refund_runner(
+                sessionmaker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
+            )
+            if gateway is not None
+            else None
+        )
         execute = make_booking_effect_executor(
             sessionmaker=pools.exec_maker,
             sender=app.state.email_sender,
@@ -433,8 +468,21 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
             # Email is deliberately NOT here: it goes through the full composer, which carries the
             # .ics invite that a plain-body ChannelSender cannot.
             channels=getattr(app.state, "channel_senders", None),
+            refund_runner=refund_runner,
+            expire_hold_runner=make_expire_hold_runner(sessionmaker=pools.exec_maker),
         )
         await run_outbox_drain_once(pools=pools, execute=execute)
+
+        # ==The parked-payment tick (criterion 29).== Runs on the same interval as the drain: re-run
+        # the arbiter for events that beat their checkout's commit, and dead-letter the ones that
+        # never resolve. It swallows its own failures (like every guarded tick) so a bad pass never
+        # kills the loop.
+        try:
+            await run_parked_payment_tick(
+                pools, now=datetime.now(UTC), confirm_effects=_payment_confirm_effects(app)
+            )
+        except Exception:
+            _logger.exception("parked-payment tick failed; scheduler continues")
 
     return _tick
 

@@ -8,6 +8,8 @@ path binds the business exactly as production does.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -30,9 +32,16 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
-from aethercal.server.webhooks.signing import signature_header
 
 pytestmark = pytest.mark.db
+
+
+def _stripe_sig(raw: bytes, *, timestamp: int = 1_700_000_000) -> str:
+    """A valid ``Stripe-Signature`` header over ``raw`` (the scheme the real adapter verifies)."""
+    payload = f"{timestamp}.".encode() + raw
+    mac = hmac.new(_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"t={timestamp},v1={mac}"
+
 
 _KEY = derive_fernet_key("test-app-secret")  # the app fixture's app_secret
 _SECRET = "whsec_test_NOT_A_REAL_KEY_x"
@@ -103,13 +112,12 @@ async def _seed(owner_maker: async_sessionmaker[AsyncSession]) -> tuple[str, uui
 
 
 def _paid_body(event_id: str = "evt_1") -> bytes:
+    """A Stripe ``payment_intent.succeeded`` event, the shape the real adapter parses."""
     return json.dumps(
         {
-            "kind": "paid",
-            "event_id": event_id,
-            "provider_ref": _REF,
-            "amount_cents": _PRICE,
-            "currency": _CUR,
+            "id": event_id,
+            "type": "payment_intent.succeeded",
+            "data": {"object": {"id": _REF, "amount": _PRICE, "currency": _CUR}},
         }
     ).encode("utf-8")
 
@@ -129,7 +137,7 @@ async def test_an_invalid_signature_is_401_with_zero_writes(
     response = await client.post(
         f"/webhooks/stripe/{slug}",
         content=_paid_body(),
-        headers={"X-Webhook-Signature": "sha256=deadbeef", "content-type": "application/json"},
+        headers={"Stripe-Signature": "t=1,v1=deadbeef", "content-type": "application/json"},
     )
 
     assert response.status_code == 401
@@ -142,12 +150,12 @@ async def test_a_valid_signature_records_the_event_and_confirms_the_hold(
     """A correctly-signed paid event is recorded and the arbiter confirms the hold."""
     slug, booking_id = await _seed(owner_maker)
     body = _paid_body()
-    sig = signature_header(body, _SECRET.encode("utf-8"))
+    sig = _stripe_sig(body)
 
     response = await client.post(
         f"/webhooks/stripe/{slug}",
         content=body,
-        headers={"X-Webhook-Signature": sig, "content-type": "application/json"},
+        headers={"Stripe-Signature": sig, "content-type": "application/json"},
     )
 
     assert response.status_code == 200
@@ -167,8 +175,8 @@ async def test_a_replayed_event_id_writes_only_one_row(
     UNIQUE."""
     slug, _booking_id = await _seed(owner_maker)
     body = _paid_body(event_id="evt_dup")
-    sig = signature_header(body, _SECRET.encode("utf-8"))
-    headers = {"X-Webhook-Signature": sig, "content-type": "application/json"}
+    sig = _stripe_sig(body)
+    headers = {"Stripe-Signature": sig, "content-type": "application/json"}
 
     first = await client.post(f"/webhooks/stripe/{slug}", content=body, headers=headers)
     second = await client.post(f"/webhooks/stripe/{slug}", content=body, headers=headers)
@@ -185,12 +193,12 @@ async def test_an_unknown_business_is_401(
 ) -> None:
     """An unknown slug is a 401, indistinguishable from a bad signature (no enumeration)."""
     body = _paid_body()
-    sig = signature_header(body, _SECRET.encode("utf-8"))
+    sig = _stripe_sig(body)
 
     response = await client.post(
         f"/webhooks/stripe/does-not-exist-{uuid.uuid4().hex[:6]}",
         content=body,
-        headers={"X-Webhook-Signature": sig, "content-type": "application/json"},
+        headers={"Stripe-Signature": sig, "content-type": "application/json"},
     )
 
     assert response.status_code == 401
