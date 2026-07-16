@@ -37,12 +37,12 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
-from aethercal.server.db.models import Booking, EventType
+from aethercal.server.db.models import Booking, EventType, Payment
 from aethercal.server.db.models.booking import guest_columns
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import load_active_connections
@@ -739,6 +739,11 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         # A predecessor is always confirmed here (the guard above refuses anything else), so this is
         # never NULL in practice. It is the same chain B-05b re-points the payment onto.
         confirmed_at=old.confirmed_at,
+        # ==The successor inherits the WINNER discriminator too (B-05b, C-4).== Without it a late
+        # webhook, after resolving the payment to this successor, would read confirmed_by_payment_id
+        # IS NULL`` and treat its own paying charge as an orphan → refund a live, paid appointment.
+        # The payment rows are re-pointed to this row just below, in the same transaction.
+        confirmed_by_payment_id=old.confirmed_by_payment_id,
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
         # increase (RFC 5545, F1-08); the drained reschedule email snapshots this value.
@@ -764,6 +769,14 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         source_ip=old.source_ip,
     )
     await _swap_booking(session, old=old, new=new, now=now, start=start)
+    # ==Tie the payment to the CHAIN, not the row (B-05b, critical C-4).== A reschedule opens a NEW
+    # booking id; if the payment stayed on the old, cancelled row the arbiter would refund a live
+    # appointment (pay→reschedule) or keep the money on a cancelled one (pay→reschedule→cancel).
+    # So EVERY payment of the predecessor moves to the successor here — ALL of them, not just the
+    # winner: with a double payment the orphan row must follow the chain too, or it can never be
+    # refunded. Same transaction as the swap, after the successor's flush gave it an id, and no
+    # commit in between (the whole reschedule is one transaction), so this is atomic with the move.
+    await _repoint_payments(session, old_id=old.id, new_id=new.id)
     await enqueue_event(
         session,
         booking=new,
@@ -805,6 +818,21 @@ async def _swap_booking(
             await session.flush()
     except IntegrityError as exc:
         raise SlotUnavailableError(f"slot {start.isoformat()} is already booked") from exc
+
+
+async def _repoint_payments(session: AsyncSession, *, old_id: uuid.UUID, new_id: uuid.UUID) -> None:
+    """Move EVERY payment from the predecessor booking to its reschedule successor (B-05b, C-4).
+
+    All rows, not only the confirming one: a double payment leaves an extra ``payments`` row on the
+    old booking, and it must follow the chain too — otherwise it can never be refunded once the old
+    row is cancelled. A bulk UPDATE, so a booking with zero payments (every reschedule before this
+    wave, and every free booking) costs one statement matching nothing and changes nothing."""
+    await session.execute(
+        update(Payment)
+        .where(Payment.booking_id == old_id)
+        .values(booking_id=new_id)
+        .execution_options(synchronize_session=False)
+    )
 
 
 # --------------------------------------------------------------------------------------
