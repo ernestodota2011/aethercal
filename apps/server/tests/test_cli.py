@@ -12,11 +12,14 @@ from cryptography.fernet import Fernet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from typer.testing import CliRunner
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.cli import (
     ReplayOutcome,
     RevokeKeyOutcome,
+    _credential_fields,
+    credentials_app,
     run_connect_google,
     run_create_tenant,
     run_credentials_delete,
@@ -612,3 +615,87 @@ async def test_rotate_key_moves_every_business_onto_the_new_key(
 
     # And the summary the operator reads back is counts — never a secret.
     assert "sk_test" not in report.summary()
+
+
+# ======================================================================================
+# `credentials set` — the JSON piped in must be an object of field → NON-EMPTY STRING.
+#
+# `json.loads` yields values of ANY JSON type, but a credential field is a string. The old code
+# coerced every value with `str(value)`, so `{"secret_key": {"nested": "x"}}` was stored as the
+# literal text `"{'nested': 'x'}"` — a credential that looks perfectly configured and fails only
+# once a guest's money has already left their card. The parse step now refuses any value that is not
+# already a non-empty string, at the door, with exit code 2, and WITHOUT echoing the value.
+#
+# The rule lives at the CLI because the CLI is the ONLY place untyped JSON becomes a credential:
+# `store_credential`'s type is `Mapping[str, str]`, so every other (typed, Python) caller cannot
+# reach it with a non-string, and the service's own `_validate` still guards completeness for them.
+# ======================================================================================
+
+
+CLI_RUNNER = CliRunner()
+
+
+def test_credential_fields_accepts_an_object_of_non_empty_strings() -> None:
+    """The happy path: a scalar object is returned unchanged, ready for the service."""
+    scalar = {"secret_key": "sk_test_x", "webhook_secret": "whsec_x"}
+    assert _credential_fields(scalar) == scalar
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param({"secret_key": {"a": 1}}, id="nested-object"),
+        pytest.param({"secret_key": [1, 2, 3]}, id="array"),
+        pytest.param({"secret_key": None}, id="null"),
+        pytest.param({"secret_key": 123}, id="number"),
+        pytest.param({"secret_key": True}, id="boolean"),
+        pytest.param({"secret_key": ""}, id="empty-string"),
+        pytest.param({"secret_key": "   "}, id="whitespace-only"),
+    ],
+)
+def test_credential_fields_refuses_anything_that_is_not_a_non_empty_string(
+    bad: dict[str, object],
+) -> None:
+    """A dict/list/null/number/boolean or a blank string is not a credential value — it is refused,
+    and the message names the FIELD (not a secret) but never the value."""
+    with pytest.raises(ValueError, match="secret_key"):
+        _credential_fields(bad)
+
+
+def test_credential_fields_never_echoes_the_rejected_value() -> None:
+    """==The value is a secret, even when it is the wrong shape.== The refusal names the field and
+    the JSON type, and nothing that was piped in."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields({"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}})
+    assert "sk_live_MUST_NOT_APPEAR" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param('{"secret_key": {"a": 1}}', id="nested-object"),
+        pytest.param('{"secret_key": [1]}', id="array"),
+        pytest.param('{"secret_key": ""}', id="empty-string"),
+    ],
+)
+def test_credentials_set_command_exits_2_on_a_non_scalar_field(payload: str) -> None:
+    """Through the real command over STDIN: a non-scalar (or blank) field is a usage error (exit 2),
+    refused before the credential ever reaches the database."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input=payload,
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_value() -> None:
+    """The command's stderr names the field, never the value piped in."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}',
+    )
+    assert result.exit_code == 2
+    assert "sk_live_MUST_NOT_APPEAR" not in result.output

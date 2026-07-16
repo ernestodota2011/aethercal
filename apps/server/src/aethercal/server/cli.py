@@ -418,6 +418,66 @@ async def run_rotate_key(
         return await rotate_fernet_key(session, new_key=new_key, previous_key=previous_key)
 
 
+class _CredentialInputError(ValueError):
+    """A credential piped to the CLI was not an object of field → non-empty STRING."""
+
+
+def _json_type(value: object) -> str:
+    """The JSON type name of a parsed value — for a refusal that says WHAT was wrong without ever
+    echoing the value itself."""
+    match value:
+        case bool():
+            return "boolean"
+        case int() | float():
+            return "number"
+        case None:
+            return "null"
+        case list():
+            return "array"
+        case dict():
+            return "object"
+        case _:
+            return type(value).__name__
+
+
+def _credential_fields(parsed: Mapping[str, Any]) -> dict[str, str]:
+    """Marshal parsed JSON into the service's ``Mapping[str, str]`` contract, or REFUSE at the door.
+
+    ``json.loads`` yields values of any JSON type; a credential field is a string. Coercing with
+    ``str(value)`` — as this once did — turns ``{"secret_key": {"nested": "x"}}`` into the literal
+    text ``"{'nested': 'x'}"`` and stores it as a credential that looks configured and fails only
+    when a guest's money has already left their card. So every value must ALREADY be a non-empty
+    string; a nested object, an array, a number, a boolean, ``null`` or a blank string is refused.
+
+    ==The refusal never echoes the value — it is a secret, wrong shape or not.== It names the field
+    (a field name is not a secret; :class:`ResolvedCredential`'s repr already exposes them) and the
+    JSON type, which is enough for the operator to fix the input and safe to write to a log.
+
+    This is the ONE place untyped JSON becomes a credential: ``store_credential`` is typed
+    ``Mapping[str, str]``, so no other (typed, Python) caller can reach it with a non-string, and
+    the service's own ``_validate`` still guards field COMPLETENESS for every caller. The
+    value-shape rule therefore lives here, not duplicated in the service.
+    """
+    fields: dict[str, str] = {}
+    for field, value in parsed.items():
+        name = str(field)
+        if not isinstance(value, str):
+            raise _CredentialInputError(
+                f"the credential field {name!r} must be a JSON string, but it is a "
+                f"{_json_type(value)}. Every field is a single string value; a nested object, an "
+                "array, a number, a boolean or null is not a credential. (The value is not shown — "
+                "it is a secret.)"
+            )
+        if not value.strip():
+            raise _CredentialInputError(
+                f"the credential field {name!r} is empty. A blank value looks configured and fails "
+                "at the moment it is used — which, for a payment provider, is after the guest's "
+                "money has already left their card."
+            )
+        fields[name] = value
+    return fields
+
+
 @credentials_app.command("set")
 def credentials_set_command(
     tenant_slug: Annotated[str, typer.Option(help="Slug of the business it belongs to.")],
@@ -466,8 +526,14 @@ def credentials_set_command(
         typer.echo("stdin must be a JSON object of field → value.", err=True)
         raise typer.Exit(code=2)
 
+    try:
+        secrets = _credential_fields(cast(dict[Any, Any], parsed))
+    except _CredentialInputError as exc:
+        # Names the field and the JSON type; never the value — it is a secret, wrong shape or not.
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
     settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
-    secrets = {str(field): str(value) for field, value in cast(dict[Any, Any], parsed).items()}
     try:
         asyncio.run(
             run_credentials_set(
