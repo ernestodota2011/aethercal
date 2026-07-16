@@ -281,6 +281,33 @@ async def test_a_member_reads_the_agenda_and_is_refused_the_scheduling_writes(
         )
 
 
+async def test_a_member_reads_the_branding_and_is_refused_the_write(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """Branding is business configuration: a ``member`` SEES it (it is what a guest already sees)
+    but MAY NOT change it. This pins the two capabilities the panel chose — read behind ``VIEW``,
+    write behind ``MANAGE_SCHEDULING`` — so a regression to a weaker one (a ``member`` who could
+    edit the public page's colour/logo, values that land in a ``<style>``/``<img src>`` served to
+    strangers) goes RED here rather than shipping green. The structural tests prove SOME authorizer
+    runs; only this proves it is the RIGHT one."""
+    business = await _seed(sessionmaker)
+    admin = _runtime(sessionmaker)
+
+    assert await service.branding_view(
+        admin, principal=business.member, tenant_slug=business.slug
+    )
+
+    with pytest.raises(service.AdminPermissionError):
+        await service.update_branding_action(
+            admin,
+            principal=business.member,
+            tenant_slug=business.slug,
+            form=service.BrandingForm(
+                public_name="Nope", logo_url="", accent_color="", timezone="UTC"
+            ),
+        )
+
+
 # ======================================================================================
 # "Their own bookings" — the half a capability cannot express.
 # ======================================================================================
