@@ -263,6 +263,37 @@ def _to_minor_units(amount: object, currency: str) -> int | None:
         return None
 
 
+_TS_MILLISECONDS_FLOOR = 100_000_000_000
+"""Above this, a Unix timestamp is MILLISECONDS; at or below it, SECONDS.
+
+==This is not a tuned constant, it is where the two units stop overlapping.== In seconds, 1e11 is
+the year 5138; in milliseconds it is 1973. So for any date between 1973 and 5138 — every date this
+software will ever see — the magnitude names the unit with no ambiguity at all."""
+
+
+def _signed_at(timestamp: int) -> datetime:
+    """A signed ``ts`` as an instant, ==reading its UNIT from its magnitude rather than guessing.==
+
+    .. rubric:: Mercado Pago's own doc and its own SDK disagree, and this one is expensive
+
+    The SDK documents ``ts=<ms>`` and does millisecond arithmetic (``time.time() * 1000``). Mercado
+    Pago's webhook page shows ``x-signature: ts=1704908010,…`` — **ten digits, which is SECONDS**,
+    and reads as a real date (2024-01-10); as milliseconds the same number is 1970. ==Only one can
+    be true, and there is no account to ask.==
+
+    Guessing has no symmetric cost. Reading seconds as milliseconds puts every signature in 1970,
+    ages it at ~56 years, and :data:`_SIGNATURE_MAX_AGE` then refuses **every notification, for
+    ever** — no payment would confirm, which is the worst outcome this system can produce. (Reading
+    milliseconds as seconds fails the other way: every signature dated in the year 58000, refused
+    as being in the future. Both directions are fatal; neither is survivable by picking a side.)
+
+    So the unit is not picked. It is measured, against a boundary the two units cannot both sit on.
+    """
+    if timestamp > _TS_MILLISECONDS_FLOOR:
+        return datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+    return datetime.fromtimestamp(timestamp, tz=UTC)
+
+
 def _parse_signature_header(header: str) -> tuple[str | None, str | None]:
     """Split ``ts=<ms>,v1=<hex>`` into ``(timestamp, v1)``. Mirrors the official SDK's parser."""
     timestamp: str | None = None
@@ -366,7 +397,7 @@ class MercadoPagoWebhookAdapter:
             # cannot be trusted.
             _logger.warning("mercado pago: non-numeric ts in x-signature; refusing")
             return False
-        signed_at = datetime.fromtimestamp(int(timestamp) / 1000, tz=UTC)
+        signed_at = _signed_at(int(timestamp))
         age = self._now() - signed_at
         if age > _SIGNATURE_MAX_AGE:
             _logger.warning(
@@ -451,7 +482,7 @@ class MercadoPagoWebhookAdapter:
         # original, cancelled row.
         external_reference = payment.get("external_reference")
 
-        event_id = self._event_id(request, data_id)
+        event_id = self._event_id(request, data_id, status)
         if event_id is None:  # pragma: no cover - verify_signature refuses this first
             # ==Fail closed rather than invent an identity.== Without the signed manifest there is
             # nothing authentic to dedupe on, and a made-up key is worse than no event: it would
@@ -472,8 +503,10 @@ class MercadoPagoWebhookAdapter:
             ),
         )
 
-    def _event_id(self, request: InboundWebhook, data_id: str) -> str | None:
-        """The anti-replay key: ==the MANIFEST Mercado Pago signed. Nothing else.==
+    def _event_id(
+        self, request: InboundWebhook, data_id: str, status: MercadoPagoPaymentStatus
+    ) -> str | None:
+        """The anti-replay key: ==what Mercado Pago SIGNED, plus the state we OBSERVED.==
 
         .. rubric:: Why this used to read the body, and why that was wrong
 
@@ -504,15 +537,43 @@ class MercadoPagoWebhookAdapter:
         prevent. The full manifest keeps them distinct, because ``ts`` — and ``x-request-id`` when
         present — differ per notification, and both are signed.
 
+        .. rubric:: ==Why the manifest ALONE was not enough: it can collide==
+
+        Keying on the manifest closed the replay direction — *can the same event be processed
+        twice?* — where a collision is the mechanism WORKING. It left the opposite question open:
+        ==can two notifications that MEAN DIFFERENT THINGS collide?== If they can, one is swallowed
+        as a duplicate, and the one swallowed is whichever arrives second — an approval, or a
+        refund.
+
+        And they can. ``x-request-id`` is OPTIONAL, and the manifest OMITS the pair when it is
+        absent (the SDKs' rule, mirrored in :func:`_build_manifest`), so the key collapses to
+        ``id:X;ts:Z;`` — identical for any two notifications about one payment inside one ``ts``
+        tick. Whether ``x-request-id`` is even present per notification is on the list of things no
+        account exists to check.
+
+        .. rubric:: The rule: ==the key must distinguish everything the MEANING distinguishes==
+
+        :func:`_kind_for_status` is a function of ``status``, so the key carries ``status``. Two
+        notifications can now only collide when they resolve to the same state — and collapsing two
+        events that mean the same thing is precisely what an anti-replay is for. An approval and a
+        refund can never share a key, whatever the manifest does.
+
+        ==And this does not reopen what the manifest fixed.== ``status`` is not the ``action`` in
+        the body. It is the value this adapter FETCHED from ``GET /v1/payments/{id}`` over its own
+        TLS with the business's own token — evidence we obtained, not evidence we were handed. A
+        caller who rewrites every byte of the body still cannot move this key. The body remains read
+        for nothing.
+
         .. rubric:: ==This does not rest on the retry question==
 
         Whether a redelivery replays the original signed tuple or is re-signed is undocumented and
         unverifiable without a live account (see :data:`_SIGNATURE_MAX_AGE`). It does not need to be
-        settled here, and that is deliberate: if a retry replays the tuple the key is identical and
-        the UNIQUE collapses it — the anti-replay working exactly as intended; if it is re-signed
-        the key differs, the event is applied again, and the arbiter's ``provider_ref`` idempotency
-        makes that a no-op. ==Safe under both, so the unknown is a matter of efficiency, not
-        correctness.==
+        settled here, and that is deliberate: a redelivery that replays the tuple observes the same
+        state, so the key is identical and the UNIQUE collapses it — the anti-replay working as
+        intended; if it is re-signed the key differs, the event is applied again, and the arbiter's
+        ``provider_ref`` idempotency makes that a no-op. ==Safe under both.== And a redelivery that
+        arrives after the payment's state has genuinely MOVED is not a duplicate at all: it now
+        means something new, gets its own key, and is applied — which is the outcome we want.
 
         Returns ``None`` when there is no signature to derive an identity from — which
         :meth:`verify_signature` has already refused, so it is unreachable in the router's order and
@@ -526,9 +587,10 @@ class MercadoPagoWebhookAdapter:
             return None
         # Built from the SAME normalised components verify_signature hashes, so the key and the
         # signature can never disagree about which notification this is.
-        return _build_manifest(
+        manifest = _build_manifest(
             data_id.strip().lower(), _header(request, _REQUEST_ID_HEADER), timestamp
         )
+        return f"{manifest}status:{status.value};"
 
     async def _fetch_payment(self, payment_id: str, access_token: str) -> dict[str, Any] | None:
         """``GET /v1/payments/{id}`` on the BUSINESS's own token. ==The source of truth.=="""

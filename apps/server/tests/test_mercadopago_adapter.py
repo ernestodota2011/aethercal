@@ -23,8 +23,10 @@ from aethercal.server.integrations.mercadopago import (
     _SIGNATURE_MAX_AGE,
     _SIGNATURE_MAX_SKEW_AHEAD,
     MercadoPagoGateway,
+    MercadoPagoPaymentStatus,
     MercadoPagoWebhookAdapter,
     UnsupportedCurrencyError,
+    _kind_for_status,
 )
 from aethercal.server.services.payment_webhooks import InboundWebhook, WebhookEventKind
 
@@ -72,7 +74,12 @@ def _sign(
 
 
 def _ts_ms(moment: datetime) -> str:
-    """Mercado Pago's ``ts`` is Unix MILLISECONDS, not seconds."""
+    """``ts`` in Unix MILLISECONDS — what Mercado Pago's SDK documents.
+
+    ==Its own webhook page shows SECONDS instead, and only one can be true.== Most tests here use
+    the SDK's unit because it has to work; the two ``whatever_unit`` tests drive BOTH, because the
+    adapter reads the unit from the magnitude rather than betting on either.
+    """
     return str(int(moment.timestamp() * 1000))
 
 
@@ -548,10 +555,22 @@ async def test_tampering_the_unsigned_body_cannot_change_the_anti_replay_key() -
     assert tampered == original, "the body is not evidence; it must not decide identity"
 
 
-async def test_the_key_is_exactly_what_mercado_pago_signed() -> None:
-    """The identity IS the manifest — the string the HMAC covers, character for character."""
+async def test_the_key_is_what_was_signed_plus_the_state_that_was_observed() -> None:
+    """==Every component is evidence, and neither half is optional.==
+
+    The manifest is what the HMAC covers, character for character — unforgeable. The status is what
+    the adapter FETCHED over its own TLS with the business's own token — equally not the caller's to
+    choose. Together they identify *this notification, about this state*.
+
+    The manifest alone was round 2's answer and it was incomplete: it can collide (see
+    ``test_the_key_survives_a_missing_request_id_in_the_same_clock_tick``). Neither half is dropped
+    here — the signed part keeps a forger out, the observed part keeps two different meanings apart.
+    """
     event_id = await _event_id_of(_inbound(signature=_sign()))
-    assert event_id == _manifest(data_id="123456789", request_id="req-abc", ts=_ts_ms(_SIGNED_AT))
+    signed = _manifest(data_id="123456789", request_id="req-abc", ts=_ts_ms(_SIGNED_AT))
+
+    assert event_id.startswith(signed), "the signed manifest is still the spine of the key"
+    assert event_id == f"{signed}status:approved;"
 
 
 async def test_two_notifications_about_one_payment_stay_distinct() -> None:
@@ -605,3 +624,140 @@ async def test_a_notification_without_a_request_id_still_gets_a_distinct_key() -
     )
     assert earlier != later
     assert "request-id:" not in earlier
+
+
+# --------------------------------------------------------------------------------------
+# ==Two DIFFERENT legitimate notifications must never share a key== (Crisol r3, B-06).
+#
+# The replay direction asks "can the same event be processed twice?" — there a collision is the
+# mechanism WORKING. This asks the opposite: can two events that MEAN different things collide?
+# If they can, one is swallowed as a duplicate — and the one swallowed would be the approval.
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_key_survives_a_missing_request_id_in_the_same_clock_tick() -> None:
+    """==The collision, at the exact spot it is reachable.==
+
+    ``x-request-id`` is OPTIONAL and the manifest OMITS its pair when absent — so the key collapses
+    to ``id:X;ts:Z;`` and two notifications about one payment in the same ``ts`` tick produce the
+    identical manifest. Verified: ``_build_manifest("1", None, "T") == _build_manifest("1", None,
+    "T")``.
+
+    ==What saves it is that the key is not the manifest alone.== The event's MEANING comes from the
+    status this adapter FETCHES, and the key carries that status — so the only notifications that
+    can collide are ones that mean the same thing, and collapsing those is what the anti-replay is
+    for. Here: same payment, same tick, no request-id, but the payment was REFUNDED between the two
+    fetches. Distinct meanings, therefore distinct keys, therefore the refund is applied.
+    """
+    same_tick = _sign(request_id=None, ts=_ts_ms(_SIGNED_AT))
+    inbound = _inbound(signature=same_tick, request_id=None)
+
+    approved = await _event_id_of(inbound, payment=_payment(status="approved"))
+    refunded = await _event_id_of(inbound, payment=_payment(status="refunded"))
+
+    assert approved != refunded, (
+        "an out-of-band refund sharing a tick with the approval would be swallowed as a duplicate: "
+        "money returned AND the service still delivered"
+    )
+
+
+async def test_the_key_is_at_least_as_fine_as_the_meaning_it_produces() -> None:
+    """==The rule, stated as a property rather than a case.==
+
+    ``kind`` is a function of the fetched ``status``. So the key must distinguish anything
+    ``status`` distinguishes, or two different outcomes can collapse onto one row. This walks every
+    actionable status and asserts all their keys differ — under the WORST manifest (no request-id,
+    one frozen tick), where the signed part is identical for all of them.
+    """
+    frozen = _inbound(signature=_sign(request_id=None, ts=_ts_ms(_SIGNED_AT)), request_id=None)
+    keys = {
+        status: await _event_id_of(frozen, payment=_payment(status=status))
+        for status in ("approved", "refunded", "charged_back", "in_mediation")
+    }
+    assert len(set(keys.values())) == len(keys), (
+        f"different meanings collapsed onto one key: {keys}"
+    )
+
+
+async def test_the_status_in_the_key_comes_from_the_api_not_the_body() -> None:
+    """==This must not reopen what round 2 closed.== The distinguisher is the status the adapter
+    FETCHED over its own TLS with its own token — not the ``action`` in the unsigned body. A body
+    claiming anything at all still cannot move the key."""
+    signature = _sign()
+    honest = await _event_id_of(_inbound(signature=signature))
+    lying = await _event_id_of(
+        _inbound(
+            body=b'{"id":42,"action":"payment.refunded","data":{"id":"999"}}', signature=signature
+        )
+    )
+    assert honest == lying, "the body is still not evidence"
+
+
+async def test_an_identical_redelivery_still_dedupes() -> None:
+    """The anti-replay must keep working: same tuple AND same observed state is the same event."""
+    signature = _sign()
+    first = await _event_id_of(_inbound(signature=signature))
+    again = await _event_id_of(_inbound(signature=signature))
+    assert first == again
+
+
+# --------------------------------------------------------------------------------------
+# ==Mercado Pago's own doc and its own SDK disagree about the ts unit== — and getting it
+# wrong refuses EVERY notification.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("unit", ["seconds", "milliseconds"])
+def test_a_fresh_signature_verifies_whatever_unit_the_ts_is_in(unit: str) -> None:
+    """==The third doc-vs-SDK contradiction from this provider, and the costliest.==
+
+    Mercado Pago's SDK documents ``ts=<ms>`` and does millisecond arithmetic. Mercado Pago's own
+    webhook page shows ``ts=1704908010`` — ten digits, which is SECONDS (and reads as a real date,
+    2024-01-10; as milliseconds it is 1970). ==Only one can be true, and no account exists to ask.==
+
+    The cost of guessing is not symmetric with anything else here: reading seconds as milliseconds
+    puts every signature in 1970, ages it at ~56 years, and the freshness window refuses **every
+    notification forever**. No payment would ever confirm. So the adapter does not guess — it reads
+    the magnitude, which is unambiguous for any date this century.
+    """
+    epoch = _SIGNED_AT.timestamp()
+    ts = str(int(epoch)) if unit == "seconds" else str(int(epoch * 1000))
+    adapter = _at(_SIGNED_AT + timedelta(seconds=30))
+    assert adapter.verify_signature(_inbound(signature=_sign(ts=ts)), secret=_SECRET)
+
+
+@pytest.mark.parametrize("unit", ["seconds", "milliseconds"])
+def test_an_ancient_signature_is_refused_whatever_unit_the_ts_is_in(unit: str) -> None:
+    """==Anti-vacuity.== Accepting both units must not become accepting everything: the window has
+    to still bite in each unit, or the fix would have quietly deleted the replay bound."""
+    ancient = _SIGNED_AT - _SIGNATURE_MAX_AGE - timedelta(days=1)
+    epoch = ancient.timestamp()
+    ts = str(int(epoch)) if unit == "seconds" else str(int(epoch * 1000))
+    adapter = _at(_SIGNED_AT)
+    assert not adapter.verify_signature(_inbound(signature=_sign(ts=ts)), secret=_SECRET)
+
+
+async def test_no_two_actionable_statuses_can_ever_share_a_key() -> None:
+    """==The lock, derived from the enum rather than from a list I typed.==
+
+    ``_kind_for_status`` is exhaustive over :class:`MercadoPagoPaymentStatus` with ``assert_never``.
+    This walks that SAME enum — so a status Mercado Pago adds tomorrow lands here automatically —
+    and proves every ACTIONABLE one gets its own key under the worst possible manifest: no
+    ``x-request-id``, one frozen ``ts``, so the entire signed half is identical for all of them.
+
+    A test that listed the statuses by hand would be a second photograph going stale beside the
+    first. This one cannot pass by omission.
+    """
+    frozen = _inbound(signature=_sign(request_id=None, ts=_ts_ms(_SIGNED_AT)), request_id=None)
+    actionable = [s for s in MercadoPagoPaymentStatus if _kind_for_status(s) is not None]
+    assert actionable, "if nothing is actionable this test proves nothing"
+
+    keys = {
+        s.value: await _event_id_of(frozen, payment=_payment(status=s.value)) for s in actionable
+    }
+
+    assert len(set(keys.values())) == len(keys), f"two meanings share a key: {keys}"
+    # And the signed half really is identical for all of them — otherwise the collision this
+    # guards against was never reachable and the test would be vacuous.
+    signed_halves = {k.split("status:")[0] for k in keys.values()}
+    assert len(signed_halves) == 1, "the manifest must be the SAME, or nothing is being proven"
