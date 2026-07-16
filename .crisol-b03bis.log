@@ -1,0 +1,4 @@
+=== intento 1 2026-07-16T16:56:20-04:00 ===
+crisol-remote: GO  [motor: codex (codex)]
+  [high·low·correctness] apps/server/src/aethercal/server/services/outbox.py:2334 [71f442eb-174b-4124-bf5f-4335a58c23fe::0] Los errores SMTP se ignoran en los efectos NOTIFY
+=== VEREDICTO OBTENIDO ===

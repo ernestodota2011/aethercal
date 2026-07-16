@@ -423,6 +423,8 @@ async def test_the_echo_of_a_mismatch_refund_is_not_read_as_an_out_of_band_refun
         "our own mismatch refund was read as an operator's out-of-band refund"
     )
     assert cancelled == [], "the arbiter cancelled a booking over the echo of its own refund"
+
+
 # --------------------------------------------------------------------------------------
 # ==Two charges under ONE checkout reference== — the shape Mercado Pago can produce and
 # Stripe cannot (B-06).
