@@ -105,6 +105,29 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     sequence: Mapped[int] = mapped_column(
         sa.Integer, server_default=sa.text("0"), default=0, nullable=False
     )
+    # ==THE ADDRESS THE BOOKING CAME FROM — the column a boot-time cap has been demanding since
+    # RF-24.== ``DailyCaps.per_ip`` failed the boot when unset and enforced NOTHING, for the one
+    # reason its own docstring spelled out: no client IP ever reached the send path, because a
+    # booking did not record the address it was made from. A ceiling with nothing to count is not a
+    # ceiling — it is a knob that everybody downstream believes in.
+    #
+    # NULL = this booking did NOT come through the public form. The admin's own booking and the
+    # tenant's API key carry no client address, and neither may be throttled by a stranger's traffic
+    # (:func:`~aethercal.server.integrations.messaging.guard.enforce_ip_cap`). So NULL means "not
+    # capped", never "capped at zero" — the exact opposite of the per-PHONE rule, where a missing
+    # number REFUSES the send, because there the missing value is the thing being messaged.
+    #
+    # ==It is PERSONAL DATA== (roughly: where a person was), so ``guest purge`` erases it —
+    # ``services/privacy.BOOKING_PII_COLUMNS``. It is deliberately NOT named ``guest_*``: that
+    # prefix
+    # drives :func:`guest_columns`, which is the reschedule's copy list, and this is an observation
+    # the SERVER made about a request, not a value the guest supplied. Both seams that must carry it
+    # (the reschedule successor, and the purge) therefore name it explicitly, with a test each.
+    #
+    # 45 characters: the longest IPv6 text form (the IPv4-mapped ``::ffff:255.255.255.255``, at 45).
+    # Whatever lands here has already been through ``ipaddress.ip_address`` — a header value that is
+    # not an address never becomes one on the way in.
+    source_ip: Mapped[str | None] = mapped_column(sa.String(45))
 
     __table_args__ = (
         sa.Index(

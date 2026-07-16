@@ -1,9 +1,12 @@
 """Console entrypoint: ``python -m aethercal.booking`` serves the booking app with uvicorn.
 
-Reads its configuration from the environment (``AETHERCAL_API_URL`` + the server-side
-``AETHERCAL_API_KEY``, plus the optional ``AETHERCAL_BOOKING_HOST`` / ``AETHERCAL_BOOKING_PORT``),
-builds a real (non-mock) SDK ``client_factory``, and runs the ASGI app. No secret is ever hard-coded
-here — the key comes only from the environment.
+Reads its configuration from the environment (``AETHERCAL_API_URL``, ``AETHERCAL_TENANT_SLUG``,
+``AETHERCAL_TURNSTILE_SITE_KEY``, plus the optional ``AETHERCAL_BOOKING_HOST`` /
+``AETHERCAL_BOOKING_PORT``), builds a real (non-mock) SDK ``client_factory``, and runs the ASGI app.
+
+==There is no ``AETHERCAL_API_KEY`` any more.== This process held a key with the tenant's full
+permissions and is the one exposed to the open internet; it now talks to the public API and holds no
+credential at all. Nothing here to leak, and nothing here to rotate.
 """
 
 from __future__ import annotations
@@ -26,7 +29,8 @@ def build_app() -> FastHTML:
     settings = BookingSettings.from_env(os.environ)
     return create_app(
         settings=settings,
-        client_factory=lambda: AetherCalClient(settings.api_url, api_key=settings.api_key),
+        # No `api_key=`. The page is an anonymous client now — see the module docstring.
+        client_factory=lambda: AetherCalClient(settings.api_url),
     )
 
 

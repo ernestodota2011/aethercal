@@ -25,11 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
 from aethercal.core.model import BookingStatus
+from aethercal.schemas import Page
 from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
 from aethercal.server.api.auth import AuthContext, require_api_key
 from aethercal.server.db.guc import bind_tenant
 from aethercal.server.deps import get_session
 from aethercal.server.services.bookings import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
     AvailabilityUnavailableError,
     BookingEffects,
     BookingError,
@@ -42,6 +45,7 @@ from aethercal.server.services.bookings import (
     EventTypeNotFoundError,
     SlotUnavailableError,
     cancel_booking,
+    count_bookings,
     create_booking,
     get_booking,
     list_bookings,
@@ -79,8 +83,14 @@ def _http(code: int, error: str, message: str) -> HTTPException:
     return HTTPException(status_code=code, detail={"error": error, "message": message})
 
 
-def _map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - it IS the table
+def map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - it IS the table
     """Translate a service domain error to its clean HTTP status (fixed, non-leaking messages).
+
+    ==Public, because the PUBLIC router consumes it.== Both routers open a booking through the same
+    service, so they must answer the same domain error with the same machine code — the booking page
+    localises off those codes, and a second table would fork them. ``api/public.py`` narrows exactly
+    one arm (the two event-type errors collapse into its own indistinguishable ``not_found``) and
+    inherits the rest of this one.
 
     One return per domain error is the contract, not a smell: every arm is a distinct machine code
     the API promises its callers. Collapsing arms to satisfy a return-count lint is exactly how two
@@ -261,27 +271,62 @@ async def create(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 
-@router.get("/", response_model=list[BookingRead])
-async def list_all(
+@router.get("/", response_model=Page[BookingRead])
+async def list_all(  # noqa: PLR0913 - FastAPI declares each query param + dependency as a parameter
     session: SessionDep,
     ctx: AuthDep,
     status_filter: Annotated[BookingStatus | None, Query(alias="status")] = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
-) -> list[BookingRead]:
-    """List the tenant's bookings, filtered by ``status`` and a ``from``/``to`` date window."""
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Page[BookingRead]:
+    """A PAGE of the tenant's bookings, filtered by ``status`` and a ``from``/``to`` date window.
+
+    ==This route stays behind the API key.== It answers with ``guest_name``, ``guest_email``,
+    ``guest_notes`` and ``answers`` for every booking a business ever took — the PII dump of an
+    entire diary. It is not mounted under ``/public``, and it never will be.
+
+    Unbounded, it was also an availability problem *for the owner of the data*: a busy year of
+    appointments, materialised into one response, on a route anybody holding the key can call in a
+    loop. So ``limit`` defaults to 100 and is HARD-capped at 500 — a caller-chosen limit with no
+    maximum is the same unbounded query wearing a parameter.
+
+    ==And the answer is an ENVELOPE, not a bare array.== A default limit on a route that used to
+    return everything means a caller now receives a hundred of their bookings; handed back as a
+    plain
+    list, that is a SILENT TRUNCATION — the integration believes it holds the whole diary and holds
+    a
+    hundredth of it, with nothing anywhere to say so. ``total`` is what makes the missing rows
+    visible, and it is why this is the breaking change that gets made rather than the quiet one that
+    does not.
+    """
     rows = await list_bookings(
         session,
         tenant_id=ctx.tenant_id,
         status=status_filter,
         date_from=date_from,
         date_to=date_to,
+        limit=limit,
+        offset=offset,
     )
-    return [BookingRead.model_validate(row) for row in rows]
+    total = await count_bookings(
+        session,
+        tenant_id=ctx.tenant_id,
+        status=status_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return Page(
+        items=[BookingRead.model_validate(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{booking_id}", response_model=BookingRead)
@@ -313,7 +358,7 @@ async def cancel(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 
@@ -335,7 +380,7 @@ async def no_show(booking_id: uuid.UUID, session: SessionDep, ctx: AuthDep) -> B
             session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now()
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 
@@ -361,7 +406,7 @@ async def reschedule(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 

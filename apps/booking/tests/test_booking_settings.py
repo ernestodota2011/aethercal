@@ -14,7 +14,12 @@ from aethercal.booking.settings import (
 def test_from_env_uses_defaults_when_absent() -> None:
     settings = BookingSettings.from_env({})
     assert settings.api_url == DEFAULT_API_URL
-    assert settings.api_key is None
+    # ==No ``api_key`` any more.== The page held a full-permission key in the most exposed
+    # process in the system; the public API removed the need, so the field is DELETED, not
+    # defaulted.
+    assert not hasattr(settings, "api_key")
+    assert settings.tenant_slug is None
+    assert settings.turnstile_site_key is None
     assert settings.default_locale == "es"
 
 
@@ -22,12 +27,14 @@ def test_from_env_reads_provided_values() -> None:
     settings = BookingSettings.from_env(
         {
             "AETHERCAL_API_URL": "https://api.aethercal.test",
-            "AETHERCAL_API_KEY": "ack_live_secret",
+            "AETHERCAL_TENANT_SLUG": "acme",
+            "AETHERCAL_TURNSTILE_SITE_KEY": "0x_public_site_key",
             "AETHERCAL_BOOKING_DEFAULT_LOCALE": "en",
         }
     )
     assert settings.api_url == "https://api.aethercal.test"
-    assert settings.api_key == "ack_live_secret"
+    assert settings.tenant_slug == "acme"
+    assert settings.turnstile_site_key == "0x_public_site_key"
     assert settings.default_locale == "en"
 
 
@@ -36,9 +43,16 @@ def test_from_env_strips_trailing_slash_from_api_url() -> None:
     assert settings.api_url == "https://api.test"
 
 
-def test_from_env_treats_blank_api_key_as_absent() -> None:
-    settings = BookingSettings.from_env({"AETHERCAL_API_KEY": "   "})
-    assert settings.api_key is None
+def test_from_env_treats_a_blank_tenant_slug_as_absent() -> None:
+    settings = BookingSettings.from_env({"AETHERCAL_TENANT_SLUG": "   "})
+    assert settings.tenant_slug is None
+
+
+def test_from_env_treats_a_blank_turnstile_site_key_as_absent() -> None:
+    """A blank public key renders no widget — which is not a bypass: the API verifies the token
+    server-side and refuses a booking with none. The page can fail to ask; it cannot answer."""
+    settings = BookingSettings.from_env({"AETHERCAL_TURNSTILE_SITE_KEY": "   "})
+    assert settings.turnstile_site_key is None
 
 
 def test_from_env_falls_back_to_es_for_unsupported_locale() -> None:

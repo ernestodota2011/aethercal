@@ -19,14 +19,23 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.schemas.bookings import require_iana_zone
 from aethercal.schemas.slots import SlotRead, SlotsResponse
 from aethercal.server.api.auth import AuthContext, require_api_key
+from aethercal.server.db.guc import bind_tenant
 from aethercal.server.deps import get_session
+from aethercal.server.services.guest_tokens import (
+    GuestTokenPurpose,
+    GuestTokenSigner,
+    hash_token,
+    verify_guest_token,
+)
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_resolution import tenant_by_guest_token_hash
+from aethercal.server.settings import Settings
 
 router = APIRouter(prefix="/slots", tags=["slots"])
 
@@ -119,25 +128,121 @@ def _require_window_in_bounds(window_from: date, window_to: date, today: date) -
         )
 
 
+# --------------------------------------------------------------------------------------
+# The two seams the PUBLIC router consumes. ==Shared, not copied.==
+#
+# ``/public/{tenant_slug}/{event_slug}/slots`` asks exactly the same question of exactly the same
+# engine, so it is held to exactly the same guards: a real IANA zone, an ordered range, a span
+# within
+# ``MAX_QUERY_DAYS``, and dates inside the sane near-future band. Two copies of "how wide a window
+# may a caller ask for" is how the UNAUTHENTICATED one ends up being the generous one — and the
+# generous one is the one anybody can call.
+#
+# The private helpers keep their names (their own tests import them); these are the doors.
+# --------------------------------------------------------------------------------------
+
+
+async def _authorize_read(
+    request: Request, session: AsyncSession, *, token: str | None
+) -> uuid.UUID:
+    """Authorize a slots read by a guest's RESCHEDULE token, or by the tenant's API key.
+
+    The same two-door shape ``api/bookings.py`` already uses for cancel/reschedule (RF-09), and the
+    same forced order — resolve the business from the token's hash through the ``SECURITY DEFINER``
+    resolver, BIND it, and only then read anything scoped. ``guest_tokens`` is itself a
+    tenant-scoped
+    table: read it under RLS with no business bound and it returns zero rows, and every link in
+    every
+    guest's inbox stops working.
+
+    ==VERIFIED, never CONSUMED.== ``consume_guest_token`` stamps ``used_at``, and a token spent on a
+    page render is a guest who may look at the available times exactly once and then never actually
+    reschedule.
+    """
+    if token is None:
+        ctx = await require_api_key(request, session)
+        return ctx.tenant_id
+
+    tenant_id = await tenant_by_guest_token_hash(session, hash_token(token))
+    if tenant_id is None:
+        raise _forbidden()
+    await bind_tenant(session, tenant_id)
+
+    signer = GuestTokenSigner(_settings(request).app_secret)
+    row = await verify_guest_token(
+        session, signer, token, expected_purpose=GuestTokenPurpose.RESCHEDULE
+    )
+    if row is None:
+        raise _forbidden()
+    return row.tenant_id
+
+
+def _forbidden() -> HTTPException:
+    """One answer for every bad link — expired, used, tampered, wrong purpose (RF-09: no oracle)."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "forbidden", "message": "Invalid or expired link"},
+    )
+
+
+def _settings(request: Request) -> Settings:
+    value: Settings = request.app.state.settings
+    return value
+
+
+def require_iana_zone_or_422(tz: str) -> None:
+    """Reject a ``tz`` that is not a real IANA zone, with the API's published 422."""
+    _require_iana_zone(tz)
+
+
+def require_window_is_sane(window_from: date, window_to: date, *, today: date) -> None:
+    """Reject an inverted, over-wide or absurdly-dated window, with the API's published 422s."""
+    _require_ordered_window(window_from, window_to)
+    _require_window_within_cap(window_from, window_to)
+    _require_window_in_bounds(window_from, window_to, today)
+
+
 @router.get("/", response_model=SlotsResponse)
 async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + dependency as a parameter
+    request: Request,
     session: SessionDep,
-    ctx: AuthDep,
     event_type: Annotated[uuid.UUID, Query(description="Event type id to compute slots for")],
     window_from: Annotated[date, Query(alias="from", description="Inclusive window start (date)")],
     window_to: Annotated[date, Query(alias="to", description="Inclusive window end (date)")],
     tz: Annotated[str, Query(description="IANA display timezone, echoed back in the response")],
+    token: Annotated[
+        str | None, Query(description="Signed guest token (a reschedule link from an e-mail)")
+    ] = None,
 ) -> SlotsResponse:
-    """Bookable slots for one of the tenant's event types (404 unknown, 422 bad tz / range)."""
+    """Bookable slots for one of the tenant's event types (404 unknown, 422 bad tz / range).
+
+    ==Authenticated by the tenant's API KEY, **or** by a guest's signed RESCHEDULE token.== That
+    second door is new, and it is not a convenience — it is what keeps RF-09 alive on the day the
+    booking page loses its key.
+
+    The reschedule link already sitting in a guest's inbox carries a token, a booking id and an
+    event
+    type ID, and nothing else — no business, no slug. To render the picker, the page must ask this
+    endpoint for that event type's slots. With no API key left in the page, and this route
+    key-only, ==every reschedule link ever e-mailed would have stopped rendering its times== — while
+    the cancel and reschedule POSTs, which already accept a token, kept working. A half-broken flow,
+    reachable only from a real customer's inbox, and invisible to every test that speaks in slugs.
+
+    The token is VERIFIED, never CONSUMED: it is single-use, and spending it on a page render would
+    mean the guest could look at the times exactly once and never actually reschedule. It also leaks
+    nothing new — the same slots are readable, with no credentials at all, from
+    ``/public/{tenant_slug}/{event_slug}/slots``.
+    """
     _require_iana_zone(tz)
     _require_ordered_window(window_from, window_to)
     _require_window_within_cap(window_from, window_to)
     now = datetime.now(UTC)
     _require_window_in_bounds(window_from, window_to, now.date())
 
+    tenant_id = await _authorize_read(request, session, token=token)
     result = await compute_slots(
         session,
-        tenant_id=ctx.tenant_id,
+        tenant_id=tenant_id,
         event_type_id=event_type,
         window_from=window_from,
         window_to=window_to,
@@ -159,4 +264,4 @@ async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + d
     )
 
 
-__all__ = ["router"]
+__all__ = ["require_iana_zone_or_422", "require_window_is_sane", "router"]

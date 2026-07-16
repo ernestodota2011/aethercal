@@ -60,6 +60,7 @@ _NAME = "Ada Lovelace"
 _PHONE = "+13055551234"
 _NOTES = "Please call me on my mobile, I am Ada Lovelace."
 _ANSWER = "A friend told me"
+_SOURCE_IP = "203.0.113.9"
 _START = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
 
 
@@ -111,6 +112,7 @@ async def _guest_booking(
         guest_timezone="America/New_York",
         guest_notes=_NOTES,
         answers={"how_did_you_hear": _ANSWER, "contact": email},
+        source_ip=_SOURCE_IP,
     )
     session.add(booking)
     await session.flush()
@@ -208,6 +210,11 @@ async def test_the_guests_pii_is_gone_from_every_column_of_the_booking(
     assert booking.guest_notes is None
     assert booking.answers == {}
     assert booking.guest_timezone == "UTC"
+    # ==Criterion 19.== The address the booking was made from is personal data, and it goes with the
+    # person. It is also the one column here without a ``guest_`` prefix, so no derived lock
+    # demanded
+    # it — a person had to classify it, and this is the test that says they did.
+    assert booking.source_ip is None
 
 
 async def test_the_booking_itself_survives_the_purge_and_keeps_its_slot(
@@ -426,10 +433,38 @@ def test_every_guest_column_on_bookings_is_classified() -> None:
 
     classified = set(BOOKING_PII_COLUMNS) | set(BOOKING_RETAINED_GUEST_COLUMNS)
 
-    assert guest_columns == classified, (
-        "a guest-bearing column on `bookings` is not classified by the purge: "
-        f"{guest_columns ^ classified}. Add it to BOOKING_PII_COLUMNS (with the value it is erased "
-        "to), or to BOOKING_RETAINED_GUEST_COLUMNS (with the reason it is not the guest's data)."
+    missing = guest_columns - classified
+    assert not missing, (
+        f"a guest-bearing column on `bookings` is not classified by the purge: {sorted(missing)}. "
+        "Add it to BOOKING_PII_COLUMNS (with the value it is erased to), or to "
+        "BOOKING_RETAINED_GUEST_COLUMNS (with the reason it is not the guest's data)."
+    )
+
+
+def test_everything_the_purge_claims_to_erase_is_a_real_column() -> None:
+    """==The lock's second half — and ``bookings.source_ip`` is why it now has one.==
+
+    The half above derives what MUST be classified from the ``guest_`` prefix. It used to be a set
+    EQUALITY, which quietly FORBADE the purge from classifying anything the prefix does not cover —
+    and then ``source_ip`` arrived: personal data (roughly, where a person was), with no ``guest_``
+    in its name, because it is an observation the SERVER made rather than a value the guest typed.
+
+    Equality left two bad answers: rename the column to fit the test (and it would then have been
+    swept into the reschedule's copy by ``guest_columns()`` for reasons nobody could later
+    reconstruct), or leave a personal-data column out of the erasure entirely. So the lock is SPLIT:
+
+    * every ``guest_*`` column must be CLASSIFIED — the anti-drift property, unchanged;
+    * everything CLASSIFIED must be a REAL column — which catches the typo, the column somebody
+      dropped, and the entry a rename left behind. Without this half, loosening the first one would
+      have let ``BOOKING_PII_COLUMNS`` accumulate ghosts that erase nothing and report success.
+    """
+    columns = {column.name for column in Booking.__table__.columns}
+    classified = set(BOOKING_PII_COLUMNS) | set(BOOKING_RETAINED_GUEST_COLUMNS)
+
+    ghosts = classified - columns
+    assert not ghosts, (
+        f"the purge claims to erase columns that do not exist on `bookings`: {sorted(ghosts)}. A "
+        "purge that writes to a ghost erases nothing — and reports success."
     )
 
 

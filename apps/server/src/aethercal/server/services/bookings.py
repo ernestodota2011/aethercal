@@ -37,7 +37,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +64,15 @@ from aethercal.server.services.webhooks import enqueue_event
 from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
 
 _logger = logging.getLogger(__name__)
+
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 500
+"""The ceiling on ``GET /bookings``. ==Unbounded, that route is an availability problem for the
+OWNER
+of the data==: every booking a business ever took — each carrying the guest's name, address and
+free-text notes — materialised into one response, on a route anybody holding the key can call in a
+loop. A caller-chosen ``limit`` with no maximum is the same unbounded query wearing a parameter, so
+the maximum is enforced at the edge and the default is modest."""
 
 
 # --------------------------------------------------------------------------------------
@@ -150,6 +159,11 @@ class BookingParams:
     #: an absent field mean the same thing — no consent. It records a TICK, not verified permission
     #: from the number's owner (declared gap — ``docs/phone-channels.md``).
     guest_phone_consent: bool = False
+    #: The address this booking was made from, or ``None``. ==Only the PUBLIC router ever sets it==
+    #: (``api/public.py``), because that is the only path a stranger can reach: the admin's own
+    #: bookings and the tenant's API key carry no client address, and must not be throttled by one.
+    #: It is what the per-IP daily cap — required at boot since RF-24 — finally has to count.
+    source_ip: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +488,7 @@ async def create_booking(
         guest_phone_consent_at=_consent_stamp(params, now=now),
         guest_notes=params.guest_notes,
         answers=dict(params.answers) if params.answers is not None else {},
+        source_ip=params.source_ip,
     )
     await _insert_active(session, booking, start=start)
     await enqueue_event(
@@ -692,6 +707,21 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         # without this the strictly-increasing sequence would be spread across distinct UIDs and a
         # client would treat each reschedule as a brand-new event instead of an update.
         ical_uid=old.ical_uid,
+        # ==The successor inherits the ADDRESS the appointment came from, and it must.==
+        #
+        # ``source_ip`` does not start with ``guest_``, so :func:`guest_columns` — which carries
+        # every
+        # guest field across this swap precisely because a hand-written list already drifted once —
+        # does not see it. Named here, deliberately, rather than renamed to fit the prefix: it is an
+        # observation the SERVER made about a request, not a value the guest supplied, and the purge
+        # classifies it on those terms too.
+        #
+        # Dropping it would open a free reset of the per-IP cap: book, reschedule, and the successor
+        # (whose reminders are the ones that actually go out) has no address to count against. The
+        # ceiling would hold perfectly in a unit test and mean nothing against anyone who read the
+        # code. It is the ORIGINAL address, not the rescheduling one — the appointment is the same
+        # appointment, moved, and the traffic being bounded is the traffic that created it.
+        source_ip=old.source_ip,
     )
     await _swap_booking(session, old=old, new=new, now=now, start=start)
     await enqueue_event(
@@ -814,28 +844,81 @@ async def get_booking(
     return await _load_booking(session, tenant_id=tenant_id, booking_id=booking_id)
 
 
-async def list_bookings(
+def _booking_filters(
+    tenant_id: uuid.UUID,
+    *,
+    status: BookingStatus | None,
+    date_from: date | None,
+    date_to: date | None,
+) -> list[Any]:
+    """The WHERE clauses shared by a page and its count. ==Declared once, on purpose.==
+
+    A ``total`` computed over a different predicate from the ``items`` beside it is worse than no
+    total at all: the caller pages towards a number that never arrives, or stops early believing
+    they
+    have everything. Two predicates would eventually disagree, and the disagreement would be silent.
+    """
+    clauses: list[Any] = [Booking.tenant_id == tenant_id]
+    if status is not None:
+        clauses.append(Booking.status == status)
+    if date_from is not None:
+        clauses.append(Booking.start_at >= datetime.combine(date_from, time.min, tzinfo=UTC))
+    if date_to is not None:
+        upper = datetime.combine(date_to, time.min, tzinfo=UTC) + timedelta(days=1)
+        clauses.append(Booking.start_at < upper)
+    return clauses
+
+
+async def list_bookings(  # noqa: PLR0913 - each parameter is one filter of a single query
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     status: BookingStatus | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[Booking]:
     """List the tenant's bookings, optionally filtered by ``status`` and a start-date window.
 
     ``date_from`` / ``date_to`` are inclusive calendar dates matched against ``start_at`` (UTC).
-    Ordered by start then id for a stable page."""
-    stmt = select(Booking).where(Booking.tenant_id == tenant_id)
-    if status is not None:
-        stmt = stmt.where(Booking.status == status)
-    if date_from is not None:
-        stmt = stmt.where(Booking.start_at >= datetime.combine(date_from, time.min, tzinfo=UTC))
-    if date_to is not None:
-        upper = datetime.combine(date_to, time.min, tzinfo=UTC) + timedelta(days=1)
-        stmt = stmt.where(Booking.start_at < upper)
-    stmt = stmt.order_by(Booking.start_at, Booking.id)
+    Ordered by start then id — which is what makes ``offset`` mean anything: paging over an
+    unordered
+    query is how one row gets served twice and another is never served at all.
+
+    ``limit=None`` means "no ceiling", and it stays the default because the ADMIN reads through here
+    with a date window it chose itself. ==The HTTP route never passes ``None``==: it is capped at
+    :data:`MAX_PAGE_SIZE` at the edge (``api/bookings.py``).
+    """
+    stmt = (
+        select(Booking)
+        .where(*_booking_filters(tenant_id, status=status, date_from=date_from, date_to=date_to))
+        .order_by(Booking.start_at, Booking.id)
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
     return list((await session.scalars(stmt)).all())
+
+
+async def count_bookings(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    status: BookingStatus | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> int:
+    """How many bookings those same filters match — the ``total`` that travels beside a page.
+
+    Without it, a page is a SILENT TRUNCATION: a caller asks for their bookings, receives a hundred,
+    and has no way to learn that four thousand exist.
+    """
+    total = await session.scalar(
+        select(func.count())
+        .select_from(Booking)
+        .where(*_booking_filters(tenant_id, status=status, date_from=date_from, date_to=date_to))
+    )
+    return int(total or 0)
 
 
 # --------------------------------------------------------------------------------------
@@ -1114,6 +1197,7 @@ __all__ = [
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",
+    "count_bookings",
     "create_booking",
     "get_booking",
     "list_bookings",

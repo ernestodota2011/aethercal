@@ -54,11 +54,11 @@ def _event_json(  # noqa: PLR0913 - each field is a distinct fixture knob caller
     title_translations: dict[str, str] | None = None,
     description_translations: dict[str, str] | None = None,
 ):
+    # The PUBLIC projection the page now consumes: a slug, display text, a duration, the questions —
+    # and none of a business's internal ids. `active` is not here either: the public listing only
+    # ever contains what is on sale, so an inactive event simply never appears (see `_event_types`).
+    del active  # kept in the signature so callers reading the old fixture still compile
     return {
-        "id": event_id,
-        "tenant_id": str(uuid.uuid4()),
-        "host_id": str(uuid.uuid4()),
-        "schedule_id": str(uuid.uuid4()),
         "slug": slug,
         "title": title,
         "description": description,
@@ -66,18 +66,26 @@ def _event_json(  # noqa: PLR0913 - each field is a distinct fixture knob caller
         "description_translations": description_translations or {},
         "location": "Google Meet",
         "duration_seconds": 1800,
-        "buffer_before_seconds": 0,
-        "buffer_after_seconds": 0,
-        "min_notice_seconds": 0,
-        "max_advance_seconds": 2592000,
-        "increment_seconds": None,
-        "max_per_day": None,
         "questions": questions,
-        "active": active,
+        "collects_phone": False,
     }
 
 
-def _slots_json(event_type_id: str, tz: str):
+def _slots_json(event_slug: str, tz: str):
+    return {
+        "event_slug": event_slug,
+        "timezone": tz,
+        "availability": "ok",
+        "slots": [
+            {"start": "2026-07-14T13:00:00Z", "end": "2026-07-14T13:30:00Z"},
+            {"start": "2026-07-14T14:00:00Z", "end": "2026-07-14T14:30:00Z"},
+        ],
+    }
+
+
+def _private_slots_json(event_type_id: str, tz: str):
+    # The AUTHENTICATED /api/v1/slots/ route — reached only by the reschedule flow now, with a guest
+    # token — still answers the private shape keyed by event_type_id.
     return {
         "event_type_id": event_type_id,
         "timezone": tz,
@@ -89,7 +97,19 @@ def _slots_json(event_type_id: str, tz: str):
     }
 
 
+def _public_booking_json(*, status: str = "confirmed"):
+    # ==Four fields, and there is no fifth.== The public POST answers {id, start, end, status} — no
+    # guest PII, no meeting_url — because the endpoint asked for no credentials.
+    return {
+        "id": BOOKING_ID,
+        "start": "2026-07-14T13:00:00Z",
+        "end": "2026-07-14T13:30:00Z",
+        "status": status,
+    }
+
+
 def _booking_json(*, status: str = "confirmed"):
+    # The private mutation routes (cancel/reschedule via guest token) still answer BookingRead.
     return {
         "id": BOOKING_ID,
         "event_type_id": INTRO_ID,
@@ -113,6 +133,7 @@ class FakeAPI:
 
     def __init__(self) -> None:
         self.last_auth: str | None = None
+        self.forwarded_for: str | None = None
         self.created_bookings: list[dict[str, Any]] = []
         # Failure injection: when set, the matching endpoint answers with a 500 that carries an
         # internal message (LEAK_MARKER) the guest must never see.
@@ -163,17 +184,20 @@ class FakeAPI:
             ],
         )
 
-    def _create_booking(self, request: httpx.Request) -> httpx.Response:
+    def _create_public_booking(self, request: httpx.Request) -> httpx.Response:
         if self.fail_create_booking:
             return self._boom()
         body = json.loads(request.content.decode())
+        # The forwarded guest address: the page resolves it through its own proxy contract and
+        # forwards it, and the per-IP cap on the real API counts on it arriving.
+        self.forwarded_for = request.headers.get("X-Forwarded-For")
         self.created_bookings.append(body)
         if body.get("guest_email") == "taken@example.com":
             return httpx.Response(
                 409,
                 json={"error": "slot_unavailable", "message": "That time is no longer available"},
             )
-        return httpx.Response(201, json=_booking_json())
+        return httpx.Response(201, json=_public_booking_json())
 
     def _mutate_booking(self, request: httpx.Request, *, status: str) -> httpx.Response:
         if request.url.params.get("token") == "expired":
@@ -185,23 +209,38 @@ class FakeAPI:
     def _boom(self) -> httpx.Response:
         return httpx.Response(500, json={"error": "internal", "message": LEAK_MARKER})
 
-    def _slots(self, request: httpx.Request) -> httpx.Response:
+    def _public_slots(self, request: httpx.Request, event_slug: str) -> httpx.Response:
+        if self.fail_slots:
+            return self._boom()
+        return httpx.Response(
+            200, json=_slots_json(event_slug, request.url.params.get("tz", "UTC"))
+        )
+
+    def _private_slots(self, request: httpx.Request) -> httpx.Response:
+        # The reschedule picker: /api/v1/slots/?event_type=...&token=... — the token authorizes it
+        # now that the page holds no API key.
         if self.fail_slots:
             return self._boom()
         event_type = request.url.params.get("event_type", INTRO_ID)
         return httpx.Response(
-            200, json=_slots_json(event_type, request.url.params.get("tz", "UTC"))
+            200, json=_private_slots_json(event_type, request.url.params.get("tz", "UTC"))
         )
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911 - the route table
         self.last_auth = request.headers.get("Authorization")
         path, method = request.url.path, request.method
-        if method == "GET" and path == "/api/v1/event-types/":
+        # ==The PUBLIC surface the page talks to now — NO API key on any of these.==
+        if method == "GET" and re.fullmatch(r"/api/v1/public/[^/]+/event-types", path):
             return self._boom() if self.fail_event_types else self._event_types()
+        public_slots = re.fullmatch(r"/api/v1/public/[^/]+/([^/]+)/slots", path)
+        if method == "GET" and public_slots:
+            return self._public_slots(request, public_slots.group(1))
+        if method == "POST" and re.fullmatch(r"/api/v1/public/[^/]+/[^/]+/bookings", path):
+            return self._create_public_booking(request)
+        # The reschedule flow still uses the AUTHENTICATED slots route, authorized by a guest token.
         if method == "GET" and path == "/api/v1/slots/":
-            return self._slots(request)
-        if method == "POST" and path == "/api/v1/bookings/":
-            return self._create_booking(request)
+            return self._private_slots(request)
+        # cancel/reschedule still ride the private booking routes with the guest token.
         if method == "POST" and path.endswith("/cancel"):
             return self._mutate_booking(request, status="cancelled")
         if method == "POST" and path.endswith("/reschedule"):
@@ -224,14 +263,19 @@ def _make_client(
     fake = FakeAPI()
     settings = BookingSettings(
         api_url="http://api.test",
-        api_key=API_KEY,
+        # ==No api_key.== The page is an anonymous client of the public API now. `tenant_slug` is
+        # the
+        # business it serves when the route names none — which keeps the unprefixed routes
+        # (`/e/intro`, the single-business self-hoster's URLs) working.
+        tenant_slug="acme",
+        turnstile_site_key=None,
         default_locale="es",
         trusted_proxies=trusted_proxies,
     )
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory, rate_limiter=rate_limiter)
     # The real deployment sits behind NPM/compose, so the transport peer is a private/loopback
@@ -261,6 +305,29 @@ def test_index_lists_events_in_spanish_by_default() -> None:
     assert '<html lang="es">' in response.text
     assert "Intro Call" in response.text
     assert "/e/intro" in response.text
+
+
+def test_index_event_links_stay_in_the_tenant_route_space() -> None:
+    # A guest on business ``/t/bravo`` who clicks an event must land on THAT business's event —
+    # ``/t/bravo/e/intro`` — never the default business's ``/e/intro``. The index used to hardcode
+    # the ``/e`` prefix, dropping the route tenant and bouncing the guest onto the wrong business:
+    # the same "links follow the route" bug already fixed for the event page, another instance.
+    client, _ = _make_client()
+    response = client.get("/t/bravo")
+    assert response.status_code == 200
+    assert "Intro Call" in response.text
+    assert "/t/bravo/e/intro" in response.text
+    assert 'href="/e/intro' not in response.text
+
+
+def test_index_event_links_carry_no_tenant_prefix_for_the_self_hoster() -> None:
+    # The single-business self-hoster arrives on the unprefixed ``/`` — its event links must stay
+    # unprefixed (``/e/intro``) and never gain a ``/t/...`` space their URLs never had.
+    client, _ = _make_client()
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'href="/e/intro' in response.text
+    assert "/t/" not in response.text
 
 
 def test_index_respects_accept_language_english() -> None:
@@ -400,10 +467,16 @@ def test_happy_path_booking_confirms_and_sends_server_side_key() -> None:
     )
     assert response.status_code == 200
     assert "confirmed" in response.text.lower()
+    # Shown because the guest typed it into the form we just rendered the answer to — NOT because
+    # the
+    # API echoed it back (the public response is {id, start, end, status}, no PII).
     assert "ada@example.com" in response.text
-    assert "https://meet.example/xyz" in response.text
-    # D4: the guest never supplies a key; the server-side key rode the SDK call.
-    assert fake.last_auth == f"Bearer {API_KEY}"
+    # ==No meeting link on the confirmation.== The public response carries none; it reaches the
+    # guest
+    # by e-mail, off an endpoint that must not hand out meeting URLs keyed by a booking id.
+    assert "https://meet.example/xyz" not in response.text
+    # ==No API key on the public call.== The page holds none; the booking POST carried no auth.
+    assert fake.last_auth is None
     assert fake.created_bookings  # a booking was actually POSTed
 
 
@@ -834,12 +907,16 @@ def test_og_meta_uses_the_configured_base_url_not_just_the_default() -> None:
     custom_base_url = "https://staging-book.example.com"
     fake = FakeAPI()
     settings = BookingSettings(
-        api_url="http://api.test", api_key=API_KEY, default_locale="es", base_url=custom_base_url
+        api_url="http://api.test",
+        tenant_slug="acme",
+        turnstile_site_key=None,
+        default_locale="es",
+        base_url=custom_base_url,
     )
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory)
     client = TestClient(app)

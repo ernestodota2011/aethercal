@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import UTC, datetime
 
 from aethercal.booking.forms import (
@@ -13,15 +12,17 @@ from aethercal.booking.forms import (
 )
 from aethercal.booking.i18n import Locale
 
-EVENT_TYPE_ID = uuid.uuid4()
 START_ISO = "2026-07-14T13:00:00+00:00"
 
 
 def _request(
     *, start_iso: str = START_ISO, guest_timezone: str = "UTC", locale: Locale = "es"
 ) -> BookingRequest:
+    # ==No ``event_type_id``.== The booking now goes to the PUBLIC route, which names the
+    # appointment
+    # in its path (/public/{tenant}/{event}/bookings) — a body field naming it too would be a second
+    # source of truth for one fact.
     return BookingRequest(
-        event_type_id=EVENT_TYPE_ID,
         start_iso=start_iso,
         guest_timezone=guest_timezone,
         locale=locale,
@@ -42,7 +43,7 @@ def test_valid_form_builds_booking_create() -> None:
     )
     assert not result.errors
     assert result.booking is not None
-    assert result.booking.event_type_id == EVENT_TYPE_ID
+    assert not hasattr(result.booking, "event_type_id")
     assert result.booking.start == datetime(2026, 7, 14, 13, 0, tzinfo=UTC)
     assert result.booking.guest_name == "Ada Lovelace"
     assert result.booking.guest_email == "ada@example.com"

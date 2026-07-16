@@ -8,9 +8,12 @@ depending on process environment.
 
 from __future__ import annotations
 
+from typing import Self
+
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from aethercal.server.client_ip import TrustedProxies
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.config import (
     OWNER_DATABASE_URL_ENV,
@@ -18,6 +21,10 @@ from aethercal.server.db.config import (
     DatabaseConfig,
     normalize_database_url,
     require_database_url,
+)
+from aethercal.server.integrations.turnstile import (
+    TEST_SECRET_ALWAYS_PASSES,
+    TURNSTILE_SECRET_ENV,
 )
 from aethercal.server.scheduler import (
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
@@ -135,6 +142,41 @@ class Settings(BaseSettings):
     # this feature and an SSRF hole, and it is why the value can never come from a row or a request.
     webhook_private_target_cidrs: str = ""
 
+    # ------------------------------------------------------------------------------------
+    # The PUBLIC router — the booking page's keyless door, and the controls that flank it.
+    # ------------------------------------------------------------------------------------
+    #
+    # OFF by default, and that is a decision rather than timidity: this switch opens an
+    # UNAUTHENTICATED WRITE endpoint. An instance that only serves its own integrations over API
+    # keys
+    # must not be obliged to obtain a captcha key in order to boot, and must not silently acquire an
+    # anonymous write surface because it upgraded. The deployment that wants the public booking page
+    # turns it on in one place, on purpose (deploy/docker-compose.yml).
+    public_api_enabled: bool = False
+
+    # The Cloudflare Turnstile SECRET (server side). ==Required whenever the public API is on — see
+    # the validator below, which refuses to build the settings without it.==
+    turnstile_secret: str | None = None
+
+    # The networks whose ``X-Forwarded-For`` this instance may believe, as CIDRs (e.g. the compose
+    # network the booking page runs on).
+    #
+    # EMPTY = trust nobody, count the transport peer. Secure (nothing can be forged) and WRONG
+    # behind
+    # a proxy: every guest collapses onto the proxy's single address, exhausts the per-IP cap
+    # between
+    # them, and is denied service — a self-inflicted outage that looks exactly like an attack.
+    # Declaring the proxy is therefore part of deploying the public page. BOTH failure modes are
+    # silent, which is why ``api/client_ip.py`` refuses a malformed CIDR at BOOT rather than
+    # dropping
+    # it.
+    trusted_proxies: str = ""
+
+    # The per-address ceiling on the public router, per minute. ==The API had NO rate limit of any
+    # kind before this cut==: the only limiter in the product lived in the booking PAGE, so anyone
+    # calling the API directly walked straight past it.
+    public_rate_limit_per_minute: int = Field(default=30, gt=0)
+
     # Descriptive.
     app_name: str = "AetherCal"
     environment: str = "production"
@@ -248,6 +290,66 @@ class Settings(BaseSettings):
             "(it uses AETHERCAL_OWNER_DATABASE_URL). The web process then REFUSES to start if the "
             "schema is behind head, so serving on a stale schema is not a state it can reach."
         )
+
+    @field_validator("trusted_proxies", mode="after")
+    @classmethod
+    def _validate_trusted_proxies(cls, value: str) -> str:
+        """Parse the CIDR list AT BOOT, so a typo is a startup error and never a silent nothing.
+
+        Dropped instead, it produces the worst outcome available: the operator declares their proxy,
+        the process comes up, the header is never trusted — and every guest on the instance shares
+        the proxy's single rate-limit bucket, so the endpoint denies service to everyone, configured
+        in writing by somebody who did everything right.
+        """
+        TrustedProxies.parse(value)  # raises a ValueError naming AETHERCAL_TRUSTED_PROXIES
+        return value
+
+    def trusted_proxy_networks(self) -> TrustedProxies:
+        """The peers whose ``X-Forwarded-For`` this instance believes. Empty (fail-safe) by
+        default."""
+        return TrustedProxies.parse(self.trusted_proxies)
+
+    @model_validator(mode="after")
+    def _the_public_api_may_not_run_without_a_captcha(self) -> Self:
+        """==Criterion 14. The public API + no Turnstile secret = the process does NOT start.==
+
+        Removing the authentication from a WRITE endpoint is the most dangerous change in this
+        project, and the captcha is the only control around it that makes an attempt *cost* an
+        attacker something: a per-email cap is beaten with an alias, a per-IP cap with a proxy pool.
+        Ceilings, both of them — not gates.
+
+        So the captcha cannot be the thing somebody means to configure later. Booting without it
+        would produce exactly the failure this codebase keeps unearthing: a protection everybody
+        believes is in place, standing in front of nothing, and no error anywhere to say so. The
+        alternatives were a warning (which nobody reads) or a default-on bypass (which reaches
+        production inside an ``.env`` file). This refuses.
+
+        For development and CI, configure Cloudflare's documented ALWAYS-PASSES test pair
+        (``integrations/turnstile.TEST_SECRET_ALWAYS_PASSES``) — a real captcha that always says
+        yes,
+        rather than a flag that turns the captcha off.
+        """
+        if not self.public_api_enabled:
+            return self
+        if self.turnstile_secret is None or not self.turnstile_secret.strip():
+            raise ValueError(
+                f"{TURNSTILE_SECRET_ENV} is required when AETHERCAL_PUBLIC_API_ENABLED is on.\n"
+                "\n"
+                "The public router is an UNAUTHENTICATED WRITE endpoint: anybody on the internet "
+                "can "
+                "create a booking, which fills a real diary and fans out real e-mail/WhatsApp/SMS "
+                "and a real outbound webhook. The daily caps around it are ceilings, not gates (an "
+                "e-mail cap is evaded with an alias, an IP cap with a proxy pool). ==The captcha "
+                "is "
+                "the defence.== Starting without it would leave a protection everybody assumes is "
+                "there standing in front of nothing.\n"
+                "\n"
+                "Set the Turnstile SECRET from your Cloudflare dashboard. For dev/CI, use "
+                "Cloudflare's documented always-passes test secret "
+                f"({TEST_SECRET_ALWAYS_PASSES!r}) — a captcha that always says yes, never a flag "
+                "that switches the captcha off."
+            )
+        return self
 
     def database_config(self) -> DatabaseConfig:
         """The APP role's config (``aethercal_app``) — the request path and the admin, under RLS."""

@@ -174,6 +174,60 @@ async def list_event_types(session: AsyncSession, *, tenant_id: uuid.UUID) -> li
     return list(result.all())
 
 
+async def get_bookable_event_type_by_slug(
+    session: AsyncSession, *, tenant_id: uuid.UUID, slug: str
+) -> EventType | None:
+    """The bookable event type a PUBLIC caller named by slug — the second half of the resolver.
+
+    ==The slug is unique per BUSINESS, not globally== (``UniqueConstraint("tenant_id", "slug")`` —
+    ``db/models/scheduling.py``). So ``discovery-call`` exists in every business on the instance,
+    and
+    a lookup by slug alone finds several rows in one table. Whatever such a lookup returned — the
+    first, the newest, whichever the planner felt like — would be **somebody's booking filed in
+    somebody else's diary**, and, from the payments cut onward, somebody else's money.
+
+    The resolver is therefore the PAIR ``(tenant_slug, event_slug)``: the business is resolved first
+    (``services/tenant_resolution.tenant_by_slug`` — ``tenants.slug`` IS globally unique) and bound
+    to the session, and only then is this called. Under RLS the query is already confined to that
+    business; the explicit ``tenant_id`` predicate stays anyway, because a belt that only holds
+    while
+    the other belt holds is one belt.
+
+    ``one_or_none`` is the fail-closed half, and it is not decoration: were this ever to see two
+    rows, it RAISES rather than picking one. The database says that cannot happen; this says that if
+    the database is ever wrong, nobody gets a booking rather than somebody getting a stranger's.
+
+    ``None`` for an unknown slug AND for a deactivated one, deliberately — the router answers both
+    with the same 404, so a stranger cannot enumerate which of a business's services are switched
+    off.
+    """
+    row = (
+        await session.scalars(
+            select(EventType).where(EventType.tenant_id == tenant_id, EventType.slug == slug)
+        )
+    ).one_or_none()
+    return row if row is not None and row.active else None
+
+
+async def list_bookable_event_types(
+    session: AsyncSession, *, tenant_id: uuid.UUID
+) -> list[EventType]:
+    """The business's event types that are ON SALE, oldest first — the PUBLIC listing.
+
+    Not :func:`list_event_types`, which is the OPERATOR's view and deliberately includes the
+    withdrawn ones. The booking page used to receive all of them and filter ``active`` in memory —
+    but that is the CLIENT, and a server may never lean on its client to enforce what the business
+    decided. With no API key in front of this, "the page filters it" stops being untidy and becomes
+    the whole of the protection.
+    """
+    result = await session.scalars(
+        select(EventType)
+        .where(EventType.tenant_id == tenant_id, EventType.active.is_(True))
+        .order_by(EventType.created_at, EventType.id)
+    )
+    return list(result.all())
+
+
 async def update_event_type(
     session: AsyncSession,
     *,
@@ -257,7 +311,9 @@ __all__ = [
     "create_event_type",
     "deactivate_event_type",
     "get_bookable_event_type",
+    "get_bookable_event_type_by_slug",
     "get_event_type",
+    "list_bookable_event_types",
     "list_event_types",
     "to_core_event_type",
     "update_event_type",

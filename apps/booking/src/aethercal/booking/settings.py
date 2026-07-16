@@ -1,9 +1,25 @@
 """Environment-driven configuration for the public booking page.
 
-Stateless by design: the app holds no session store, only the API base URL it talks to and the
-**server-side** API key it presents on the guest's behalf (the guest never sees a key — the D4
-rule). Both come from the environment so no secret is ever written in source. Nothing here reaches
-the network; ``BookingSettings.from_env`` is a pure mapping read, which keeps it trivially testable.
+.. rubric:: ==THE API KEY IS GONE.==
+
+This page used to hold one — server-side, never shown to the guest, but a key with the tenant's FULL
+permissions, sitting in the most exposed process in the system. It could read every booking a
+business had ever taken, with the guest's name, e-mail and notes on each, and it could write
+anything. It was also what made the page MONO-BUSINESS by construction: a key names exactly one.
+
+The public API (``/api/v1/public/*``) removes the need for it, so the field is DELETED rather than
+deprecated. The risk is not mitigated: it is gone. In its place the page carries ``tenant_slug`` —
+the business it serves by default — and serves any other business named in the ROUTE, which is what
+lets ONE deployment host N businesses.
+
+``turnstile_site_key`` is the captcha's PUBLIC half (the private half lives on the API, which
+refuses
+to boot without it). Absent, the page renders no widget, submits no token — and every booking is
+then
+refused by the API. The page can fail to ASK the question; it can never answer it.
+
+Stateless by design: no session store, and nothing here reaches the network — ``from_env`` is a pure
+mapping read, which keeps it trivially testable.
 """
 
 from __future__ import annotations
@@ -43,7 +59,8 @@ DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ()
 DEFAULT_EMBED_ALLOWED_ORIGINS: tuple[str, ...] = ()
 
 _ENV_API_URL = "AETHERCAL_API_URL"
-_ENV_API_KEY = "AETHERCAL_API_KEY"
+_ENV_TENANT_SLUG = "AETHERCAL_TENANT_SLUG"
+_ENV_TURNSTILE_SITE_KEY = "AETHERCAL_TURNSTILE_SITE_KEY"
 _ENV_DEFAULT_LOCALE = "AETHERCAL_BOOKING_DEFAULT_LOCALE"
 _ENV_BASE_URL = "AETHERCAL_BOOKING_BASE_URL"
 _ENV_TRUSTED_PROXIES = "AETHERCAL_BOOKING_TRUSTED_PROXIES"
@@ -55,7 +72,13 @@ class BookingSettings:
     """Immutable runtime configuration for the booking app."""
 
     api_url: str
-    api_key: str | None
+    #: The business this deployment serves when the route does not name one. ``None`` = the page has
+    #: no default and every route must carry a business (``/t/{tenant_slug}/...``).
+    tenant_slug: str | None
+    #: The captcha's PUBLIC key. ``None`` renders no widget — which is not a bypass: the API
+    #: verifies
+    #: server-side and refuses a booking with no token.
+    turnstile_site_key: str | None
     default_locale: Locale
     base_url: str = DEFAULT_BASE_URL
     trusted_proxies: tuple[str, ...] = DEFAULT_TRUSTED_PROXIES
@@ -65,8 +88,8 @@ class BookingSettings:
     def from_env(cls, environ: Mapping[str, str]) -> BookingSettings:
         """Build settings from an environment mapping (defaults applied, secrets never logged)."""
         api_url = environ.get(_ENV_API_URL, DEFAULT_API_URL).strip().rstrip("/") or DEFAULT_API_URL
-        raw_key = environ.get(_ENV_API_KEY, "").strip()
-        api_key = raw_key or None
+        tenant_slug = environ.get(_ENV_TENANT_SLUG, "").strip() or None
+        turnstile_site_key = environ.get(_ENV_TURNSTILE_SITE_KEY, "").strip() or None
         default_locale = normalize_locale(environ.get(_ENV_DEFAULT_LOCALE)) or DEFAULT_LOCALE
         base_url = (
             environ.get(_ENV_BASE_URL, DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
@@ -77,7 +100,8 @@ class BookingSettings:
         )
         return cls(
             api_url=api_url,
-            api_key=api_key,
+            tenant_slug=tenant_slug,
+            turnstile_site_key=turnstile_site_key,
             default_locale=default_locale,
             base_url=base_url,
             trusted_proxies=trusted_proxies,
