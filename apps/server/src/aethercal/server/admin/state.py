@@ -1045,7 +1045,11 @@ class AdminState(rx.State):
             self.error = str(exc)
             return
         self._business_slug = slug.strip()
-        self.error = ""
+        # ==Drop the previous business's panels BEFORE loading this one.== Every panel caches what
+        # it loaded for the business that was selected a moment ago (members, hosts, metrics, the
+        # calendar, the current selection). Left in place, they render business A's rows under
+        # business B until each panel happens to reload — a cross-business leak in the UI's state.
+        _reset_business_scoped_state(self)
         await self.load_bookings()
 
     # -- members (B-02, criterion 37) -------------------------------------------------
@@ -1971,6 +1975,49 @@ class AdminState(rx.State):
             self.error = ""
         except (ValueError, service.AdminError) as exc:
             self.error = _error_text(exc)
+
+
+# --------------------------------------------------------------------------------------
+# Switching business (B-02) — dropping the previous business's panels.
+# --------------------------------------------------------------------------------------
+#
+# ==A module-level function, not a method, on purpose.== Reflex wraps every PUBLIC method of an
+# ``rx.State`` into a client-callable event handler; clearing a session's panels is not something
+# the websocket should be able to invoke. A plain function is never wrapped, so this stays off wire.
+
+
+def _reset_business_scoped_state(state: AdminState) -> None:
+    """Drop every panel's business-scoped data, so switching business cannot show A's rows under B.
+
+    ==Fail-safe by construction.== This resets everything a panel loads FOR ONE BUSINESS. The four
+    things it deliberately leaves alone are the ones that are NOT one business's data: the session
+    identity, the operator's instance-wide selector (``businesses``), the view preference
+    (``calendar_view``) and the monotonic load-order guards (which must never rewind). Everything
+    else is business-scoped, so a NEW panel var is cleared here BY DEFAULT — forget it and the panel
+    fails toward EMPTY (safe), never toward business A's data under B (a cross-business leak). The
+    structural test ``test_the_business_scoped_reset_covers_every_business_scoped_var`` holds that
+    line: a new var that is neither reset here nor declared to survive the switch fails it.
+    """
+    state.error = ""
+    state.bookings = []
+    state.event_types = []
+    state.schedules = []
+    state.workflows = []
+    state.templates = []
+    state.hosts = []
+    state.metrics = []
+    state.connections = []
+    state.selected_host_id = ""
+    state.calendar_events = []
+    state.calendar_resources = []
+    state.calendar_anchor = ""
+    state.calendar_range_to = ""
+    state.selected_booking_id = ""
+    state.selected_booking_start = ""
+    state.selected_booking_guest = ""
+    state.new_booking_start = ""
+    state.show_new_booking = False
+    state.members = []
 
 
 __all__ = ["HOME_ROUTE", "LOGIN_ROUTE", "AdminState"]

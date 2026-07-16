@@ -9,11 +9,13 @@ state and asserting it is a no-op that never even reaches the runtime/service.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import threading
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -22,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from aethercal.server.admin import runtime as runtime_mod
+from aethercal.server.admin import state as state_module
 from aethercal.server.admin.config import AdminConfig
 from aethercal.server.admin.format import SHARED_SCHEDULE
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER
@@ -755,3 +758,141 @@ async def test_a_schedule_cannot_be_given_to_another_businesss_host(
 
     assert state.error != ""
     assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE  # untouched
+
+
+# ======================================================================================
+# ==Switching business must not leave a panel holding the previous business's data.== (B-02)
+# ======================================================================================
+
+#: The state vars that SURVIVE an operator's business switch — because none of them is one
+#: business's data. Everything else is business-scoped and MUST be cleared, so a forgotten new panel
+#: var fails SAFE (cleared), not leaking A's rows under B. Named here so a var is added to the
+#: keep-list by a deliberate decision in a diff, never by a panel that quietly forgot to clear.
+_SURVIVES_BUSINESS_SWITCH = frozenset(
+    {
+        # The session's identity — who is signed in and (for the operator) which business they just
+        # picked. Clearing these would log the operator out on every switch.
+        "_authenticated",
+        "_principal_kind",
+        "_principal_role",
+        "_principal_user_id",
+        "_business_tenant_id",
+        "_business_slug",
+        # The operator's instance-wide selector list — every business on the box, not one's data.
+        "businesses",
+        # A view preference (month/week/...), not business data.
+        "calendar_view",
+        # Monotonic out-of-order guards for the async loads: they must NEVER rewind, or a stale
+        # in-flight response from business A could land after the switch.
+        "calendar_reload_seq",
+        "bookings_reload_seq",
+    }
+)
+
+
+def _declared_state_vars() -> set[str]:
+    """Every rx var declared on ``AdminState`` — read from the SOURCE, so a new one is seen here the
+    moment it is added, without importing the (asset-building) module."""
+    tree = ast.parse(Path(state_module.__file__).read_text(encoding="utf-8"))
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AdminState"
+    )
+    return {
+        stmt.target.id
+        for stmt in cls.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+
+
+def _vars_reset_by(func_name: str) -> set[str]:
+    """The ``state.<name>`` attributes assigned inside the module-level function ``func_name``."""
+    tree = ast.parse(Path(state_module.__file__).read_text(encoding="utf-8"))
+    func = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == func_name
+    )
+    assigned: set[str] = set()
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "state"
+            ):
+                assigned.add(target.attr)
+    return assigned
+
+
+def test_the_business_scoped_reset_covers_every_business_scoped_var() -> None:
+    """==The lock on the leak.== A new panel adds a state var; if the switch handler does not clear
+    it, business A's data shows under business B. So the fact is asserted about the TREE:
+    ``_reset_business_scoped_state`` assigns EVERY declared var not on the keep-list, or this
+    goes red. The next panel cannot forget to clear its var — it fails here until it is either reset
+    or deliberately declared to survive the switch.
+    """
+    declared = _declared_state_vars()
+    # The keep-list is real (a typo would silently exempt nothing / everything).
+    assert declared >= _SURVIVES_BUSINESS_SWITCH, sorted(_SURVIVES_BUSINESS_SWITCH - declared)
+
+    business_scoped = declared - _SURVIVES_BUSINESS_SWITCH
+    assert business_scoped, "canary: found no business-scoped vars at all — the parser missed them"
+
+    reset = _vars_reset_by("_reset_business_scoped_state")
+    assert business_scoped - reset == set(), (
+        "these business-scoped vars are NOT cleared on switch (A's data would show under "
+        f"B): {sorted(business_scoped - reset)}"
+    )
+    # And the reset never touches an identity/keep var — clearing those would break the session.
+    assert reset & _SURVIVES_BUSINESS_SWITCH == set(), sorted(reset & _SURVIVES_BUSINESS_SWITCH)
+
+
+async def test_select_business_clears_the_previous_businesss_panels(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==Not one datum of business A survives the switch.== The operator loads A's panels, switches
+    to another business, and every business-scoped list/selection comes back empty — while the
+    instance-wide selector and their view preference are untouched, because neither is A's data."""
+    state = await _authenticated_state(seeded_maker)
+
+    # Business A's panels, fully loaded.
+    state.members = [{"id": "a-owner", "role": "owner"}]
+    state.hosts = [{"id": "a-host"}]
+    state.event_types = [{"id": "a-et"}]
+    state.schedules = [{"id": "a-sched"}]
+    state.workflows = [{"id": "a-wf"}]
+    state.templates = [{"id": "a-tpl"}]
+    state.metrics = [{"k": "v"}]
+    state.connections = [{"id": "a-conn"}]
+    state.selected_host_id = "a-host"
+    state.selected_booking_id = "a-booking"
+    state.selected_booking_guest = "Guest A"
+    state.new_booking_start = "2026-01-01T10:00"
+    state.show_new_booking = True
+    state.error = "a stale message about business A"
+    # Kept across the switch: the operator's list of businesses, and their view preference.
+    state.businesses = [{"slug": "acme", "name": "Acme"}, {"slug": "globex", "name": "Globex"}]
+    state.calendar_view = "week"
+
+    await AdminState.select_business.fn(state, "acme")
+
+    assert state.members == []
+    assert state.hosts == []
+    assert state.event_types == []
+    assert state.schedules == []
+    assert state.workflows == []
+    assert state.templates == []
+    assert state.metrics == []
+    assert state.connections == []
+    assert state.selected_host_id == ""
+    assert state.selected_booking_id == ""
+    assert state.selected_booking_guest == ""
+    assert state.new_booking_start == ""
+    assert state.show_new_booking is False
+    assert state.error == ""
+    # The selector and the view preference are not one business's data — they survive.
+    assert state.businesses == [
+        {"slug": "acme", "name": "Acme"},
+        {"slug": "globex", "name": "Globex"},
+    ]
+    assert state.calendar_view == "week"
