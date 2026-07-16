@@ -50,25 +50,32 @@ from aethercal.server.services.outbox import (
     DEFAULT_LEASE,
     DEFAULT_MAX_ATTEMPTS,
     PROVIDER_TIMEOUT_CEILING,
+    Confirmation,
     GoogleOperation,
     OutboxEffect,
     OutboxReport,
     OutboxSkipped,
     OutboxWork,
     Staleness,
+    Voidability,
     _Outcome,
     _settle,
     backoff_delay,
     claim_one,
+    confirmation_policy,
     drain_outbox,
     email_dedupe_key,
     enqueue_effect,
+    expire_hold_dedupe_key,
     google_dedupe_key,
     make_booking_effect_executor,
     recover_expired_leases,
+    refund_dedupe_key,
     run_google_effect,
+    select_due,
     staleness_policy,
     trigger_staleness,
+    voidability_policy,
 )
 from aethercal.server.services.workflows import seed_default_workflows
 
@@ -564,6 +571,12 @@ def test_every_effect_declares_a_staleness_policy() -> None:
         OutboxEffect.EMAIL: {"kind": "confirmation"},
         OutboxEffect.GOOGLE: {"operation": "upsert"},
         OutboxEffect.NOTIFY: {"trigger": WorkflowTrigger.BEFORE_START.value},
+        # The 5th suture point of a new effect (B-05b): a sample payload here, so this loop keeps
+        # staleness table exhaustive over EVERY effect. The refund carries the provider_ref it
+        # dedupes on; the hold-expiry carries only its booking. Neither reads its payload for
+        # staleness — both are unconditionally EXEMPT — but the entry has to exist or this fails.
+        OutboxEffect.REFUND: {"provider_ref": "pi_test_NOT_A_REAL_KEY_abc"},
+        OutboxEffect.EXPIRE_HOLD: {"booking_id": str(uuid.uuid4())},
     }
     for effect in OutboxEffect:
         assert staleness_policy(effect, payloads[effect]) in set(Staleness)
@@ -608,6 +621,89 @@ def test_the_informational_effects_are_subject_to_the_staleness_guard() -> None:
     assert staleness_policy(OutboxEffect.EMAIL, {"kind": "reschedule"}) is Staleness.SUBJECT
     assert staleness_policy(OutboxEffect.EMAIL, {"kind": "reminder"}) is Staleness.SUBJECT
     assert staleness_policy(OutboxEffect.GOOGLE, {"operation": "upsert"}) is Staleness.SUBJECT
+
+
+# --------------------------------------------------------------------------------------
+# B-05b: the money effects — REFUND and EXPIRE_HOLD — and their four exhaustive tables.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_money_effects_are_staleness_exempt() -> None:
+    """A refund/expiry acts on a cancelled booking BY DEFINITION, and ``_is_chain_current`` is False
+    for a cancelled booking BY CONSTRUCTION. SUBJECT would mark them delivered and never send them —
+    the guest's money kept, the slot blocked (criterion 32)."""
+    assert staleness_policy(OutboxEffect.REFUND, {"provider_ref": "x"}) is Staleness.EXEMPT
+    assert staleness_policy(OutboxEffect.EXPIRE_HOLD, {"booking_id": "x"}) is Staleness.EXEMPT
+
+
+def test_the_money_effects_are_confirmation_exempt() -> None:
+    """The silence gate (B-05a) refuses to queue anything for a never-confirmed booking — but a
+    refund/expiry EXISTS to act on exactly such a booking, so they are exempt (criterion 32/20c)."""
+    assert confirmation_policy(OutboxEffect.REFUND) is Confirmation.EXEMPT
+    assert confirmation_policy(OutboxEffect.EXPIRE_HOLD) is Confirmation.EXEMPT
+    # The messaging effects still require confirmation — the exemption is narrow, not a hole.
+    assert confirmation_policy(OutboxEffect.EMAIL) is Confirmation.REQUIRES_CONFIRMATION
+    assert confirmation_policy(OutboxEffect.GOOGLE) is Confirmation.REQUIRES_CONFIRMATION
+    assert confirmation_policy(OutboxEffect.NOTIFY) is Confirmation.REQUIRES_CONFIRMATION
+
+
+def test_every_effect_has_a_confirmation_and_a_voidability_policy() -> None:
+    """Both tables are exhaustive over EVERY effect — a new one must declare both or fail the type
+    check / raise, never inherit a default."""
+    for effect in OutboxEffect:
+        assert confirmation_policy(effect) in set(Confirmation)
+        assert voidability_policy(effect) in set(Voidability)
+
+
+def test_the_money_effects_are_non_voidable() -> None:
+    """==Criterion 31: a cancel must NOT anul a REFUND in flight.== ``void_pending_steps`` retires
+    only VOIDABLE effects; a refund is NON_VOIDABLE, so a cancellation can never sweep it up — that
+    would be money that never comes back. EXPIRE_HOLD likewise. Only NOTIFY is voidable today."""
+    assert voidability_policy(OutboxEffect.REFUND) is Voidability.NON_VOIDABLE
+    assert voidability_policy(OutboxEffect.EXPIRE_HOLD) is Voidability.NON_VOIDABLE
+    assert voidability_policy(OutboxEffect.NOTIFY) is Voidability.VOIDABLE
+    assert voidability_policy(OutboxEffect.EMAIL) is Voidability.NON_VOIDABLE
+    assert voidability_policy(OutboxEffect.GOOGLE) is Voidability.NON_VOIDABLE
+
+
+def test_the_money_dedupe_keys_are_anchored_where_they_must_be() -> None:
+    """A refund keys on the ``provider_ref`` (a double payment = two refunds, one per charge); an
+    expiry keys on the booking (a hold IS one booking). Both collapse re-enqueues to one row via the
+    outbox UNIQUE(tenant_id, booking_id, dedupe_key)."""
+    ref = "pi_test_NOT_A_REAL_KEY_abc"
+    assert refund_dedupe_key(ref) == f"refund:{ref}"
+    booking_id = uuid.uuid4()
+    assert expire_hold_dedupe_key(booking_id) == f"expire_hold:{booking_id}"
+
+
+async def test_select_due_runs_money_ahead_of_everything(maker: Sessionmaker) -> None:
+    """==Criterion 29b: a REFUND does not wait behind a backlog.== ``select_due`` puts REFUND and
+    EXPIRE_HOLD first, ahead of even ``created_at`` — a refund enqueued now must not queue behind a
+    reminder enqueued a week ago for a booking three weeks out."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    email_id = await _enqueue(
+        maker, tenant_id, booking_id, effect=OutboxEffect.EMAIL, dedupe_key="email:confirmation"
+    )
+    google_id = await _enqueue(
+        maker,
+        tenant_id,
+        booking_id,
+        effect=OutboxEffect.GOOGLE,
+        dedupe_key=google_dedupe_key(GoogleOperation.UPSERT),
+        payload={"operation": "upsert"},
+    )
+    refund_id = await _enqueue(
+        maker,
+        tenant_id,
+        booking_id,
+        effect=OutboxEffect.REFUND,
+        dedupe_key=refund_dedupe_key("pi_test_NOT_A_REAL_KEY_x"),
+        payload={"provider_ref": "pi_test_NOT_A_REAL_KEY_x"},
+    )
+    async with maker() as session:
+        due = await select_due(session, now=NOW + timedelta(days=5))
+    assert due[0] == refund_id, "money must be first in the due order"
+    assert due.index(refund_id) < due.index(google_id) < due.index(email_id)
 
 
 # --------------------------------------------------------------------------------------
