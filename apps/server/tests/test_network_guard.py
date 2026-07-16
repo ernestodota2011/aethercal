@@ -12,12 +12,17 @@ keys exported, the same mistake bills a real person.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from email.message import EmailMessage
 
+import aiosmtplib
+import httplib2
 import httpx
 import pytest
 from pytest_network_guard import RealNetworkForbiddenError
 
 from aethercal.server.integrations.mercadopago import MercadoPagoGateway
+from aethercal.server.integrations.smtp.config import SmtpConfig
+from aethercal.server.integrations.smtp.sender import SmtpEmailSender
 from aethercal.server.integrations.stripe import StripeGateway
 
 
@@ -76,3 +81,55 @@ async def test_a_stubbed_transport_still_works() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         response = await client.get("https://api.stripe.com/v1/anything")
     assert response.json() == {"ok": True}
+
+
+# --------------------------------------------------------------------------------------
+# ==The other two doors: SMTP and Google Calendar.==
+#
+# Neither spends money, and that was never the test. The test is "can this process touch the
+# world?" — and both can: `aiosmtplib` writes to a REAL PERSON's inbox, and googleapiclient
+# writes or deletes an event on a REAL calendar. Leaving two of three doors shut is worse than
+# admitting they are open, because the guard then LOOKS complete.
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_real_smtp_sender_cannot_email_a_human_during_a_test() -> None:
+    """==The incident, in the stack that writes to people.==
+
+    This product exists to email real guests. Export ``AETHERCAL_SMTP_*`` to debug something
+    else, let a fake miss its seam, and the suite writes to somebody's inbox — and unlike a
+    charge, a sent email cannot be refunded.
+    """
+    sender = SmtpEmailSender(SmtpConfig(host="smtp.example.com", from_addr="a@example.com"))
+    message = EmailMessage()
+    message["To"] = "guest@example.com"
+    message["Subject"] = "this must never be sent"
+    message.set_content("nor this")
+
+    with pytest.raises(RealNetworkForbiddenError):
+        await sender.send(message)
+
+
+async def test_the_smtp_door_is_the_connection_not_the_send_helper() -> None:
+    """==The door, not the convenience function.==
+
+    ``aiosmtplib.send()`` is a helper that builds an ``SMTP`` client and connects; a caller may
+    equally construct ``SMTP`` itself. Guarding ``send()`` would cover today's one caller and
+    miss tomorrow's. The socket is opened by ``connect``, so that is what is shut — and both
+    ways in stop at the same place.
+    """
+    client = aiosmtplib.SMTP(hostname="smtp.example.com", port=587)
+    with pytest.raises(RealNetworkForbiddenError):
+        await client.connect()
+
+
+def test_the_google_api_client_cannot_touch_a_real_calendar() -> None:
+    """==The door every Google Calendar call goes through.==
+
+    ``googleapiclient`` reaches the wire through ``httplib2`` — ``HttpRequest.execute()`` ends at
+    ``Http.request``, and ``google_auth_httplib2.AuthorizedHttp`` (what ``build(credentials=...)``
+    wraps it in) delegates to the same method. So one door covers the discovery fetch, an event
+    insert, and an event DELETE on somebody's real calendar alike.
+    """
+    with pytest.raises(RealNetworkForbiddenError):
+        httplib2.Http().request("https://www.googleapis.com/calendar/v3/users/me/calendarList")

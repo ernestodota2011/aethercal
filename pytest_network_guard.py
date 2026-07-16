@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+import aiosmtplib
+import httplib2
 import httpx
 import pytest
 import respx.mocks
@@ -30,24 +32,27 @@ once, at import, before any test builds a client.
 
 
 class RealNetworkForbiddenError(RuntimeError):
-    """A test tried to open a REAL outbound HTTP connection. ==It never gets to.==
+    """A test tried to reach the REAL outside world. ==It never gets to.==
 
     Raised in place of the socket, so the failure is a red test naming this module rather than a
-    request leaving the machine.
+    request — or an email — leaving the machine.
     """
 
 
 def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
     raise RealNetworkForbiddenError(
-        "a test tried to make a REAL outbound HTTP request.\n"
+        "a test tried to reach the REAL outside world (HTTP, SMTP or the Google API).\n"
         "\n"
         "Nothing under test is allowed to leave this machine. If you are seeing this, a fake did "
-        "not take effect and the REAL provider adapter was reached — check that the test injected "
-        "its stub where the code actually READS it (`httpx.MockTransport`, `respx`, or the "
-        "`app.state` key the router looks up), not merely somewhere adjacent.\n"
+        "not take effect and the REAL adapter was reached — check that the test injected its stub "
+        "where the code actually READS it (`httpx.MockTransport`, `respx`, the `EmailSender` "
+        "seam, an injected Google service, or the `app.state` key the router looks up), not "
+        "merely somewhere adjacent.\n"
         "\n"
-        "This is not a lint. A payment adapter that reaches the real API during a test run charges "
-        "whatever account the environment happens to hold credentials for.\n"
+        "This is not a lint. Whatever credentials the environment happens to hold, this process "
+        "can act on: a payment adapter charges a real account, SMTP writes to a real person's "
+        "inbox, and the Google client edits or DELETES an event on a real calendar. A charge can "
+        "at least be refunded; an email cannot be unsent.\n"
         "\n"
         "See pytest_network_guard.py."
     )
@@ -70,25 +75,56 @@ def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     mistake bills a real person. The rule this product runs on is that a business's money moves only
     on that business's own account, by its own decision — and a test suite is not a decision.
 
-    .. rubric:: Why it closes the door instead of asking callers to behave
+    .. rubric:: ==Three stacks, because the question is not "what does it cost?"==
 
-    Every provider adapter in this codebase speaks HTTP through ``httpx`` — Stripe, Mercado Pago,
-    Twilio, Evolution/WhatsApp, Turnstile, cal.com, the outbound webhook delivery. And whatever an
-    ``httpx`` client is asked to fetch, it reaches the wire through exactly one of two transport
-    classes. ==So the door is shut, rather than the callers enumerated.== There is no allow-list of
-    hosts to keep current and no adapter that can be forgotten: a provider added tomorrow is covered
-    on the day it is written, because it cannot get out either.
+    ``httpx`` was shut first because a payment adapter reaching a real API spends money. But cost
+    was never the test — ==**"can this process touch the world?"** is==, and three stacks can:
 
-    ``raising=True`` is part of the guarantee. If ``httpx`` ever renames these methods this fixture
-    fails LOUDLY at setup, instead of silently patching nothing and quietly re-opening the door —
-    the same failure mode the db gate exists to prevent, one layer down.
+    * ``httpx`` — the payment gateways and every other provider adapter. It charges;
+    * ``aiosmtplib`` — SMTP. ==It writes to a REAL PERSON'S INBOX.== This product exists to email
+      guests; that is not a side effect, it is the job. Export ``AETHERCAL_SMTP_*`` to debug
+      something else, let a fake miss its seam, and the suite mails somebody. ==And unlike a
+      charge, a sent email cannot be refunded==;
+    * ``httplib2`` — what ``googleapiclient`` reaches the wire through. It writes and DELETES
+      events on somebody's real calendar.
+
+    Leaving two of the three shut would have been worse than admitting they were open, because the
+    guard would LOOK complete. It was not a hypothetical: before this, ``SmtpEmailSender.send()``
+    under test resolved DNS for its configured host and only failed because ``smtp.example.com``
+    does not exist — the same luck as the 401 from api.stripe.com, wearing a different name.
+
+    Each stack is shut at ITS door, chosen the same way: ==the narrowest place every caller must
+    pass through==, so callers are never enumerated. There is no allow-list of hosts to keep
+    current and no adapter that can be forgotten — one added tomorrow is covered the day it is
+    written, because it cannot get out either.
+
+    * ``httpx``: its two real transport classes. Whatever a client is asked to fetch — Stripe,
+      Mercado Pago, Twilio, Evolution/WhatsApp, Turnstile, cal.com, the outbound webhook
+      delivery — it leaves through one of them.
+    * ``aiosmtplib``: ``SMTP.connect``. ==Not ``aiosmtplib.send()``== — that is a convenience
+      helper which builds an ``SMTP`` and connects, so guarding it would cover today's one caller
+      and miss a future one that constructs ``SMTP`` itself. ``connect`` is where the socket is
+      opened, and both ways in stop there.
+    * ``googleapiclient``: ``httplib2.Http.request``. ``HttpRequest.execute()`` ends there, and
+      ``google_auth_httplib2.AuthorizedHttp`` — what ``build(credentials=…)`` wraps the client in —
+      delegates to the same method. One door covers the discovery fetch, an event insert and an
+      event delete alike.
+
+    ``raising=True`` is part of the guarantee. If any of these libraries renames a method this
+    fixture fails LOUDLY at setup, instead of silently patching nothing and quietly re-opening the
+    door — the same failure mode the db gate exists to prevent, one layer down.
 
     What still passes: ``httpx.MockTransport`` (a different class entirely — the stub answers and
     the real transport is never built), ``ASGITransport`` (in-process, no socket), and ``respx``,
     which this module reconfigures to mock above the transport rather than below it (see
-    :data:`respx.mocks.DEFAULT_MOCKER` at the top). And the database, which does not go through
-    ``httpx`` at all — so the ``-m db`` suite reaches its PostgreSQL untouched, wherever it lives.
-    That asymmetry is deliberate: this closes the door that SPENDS, not the one that stores.
+    :data:`respx.mocks.DEFAULT_MOCKER` at the top). Nothing lives at the ``aiosmtplib`` or
+    ``httplib2`` layer: the suite fakes those at their own seams (the ``EmailSender`` protocol and
+    an injected Google service), so this sits below both fakes and races neither. And the database,
+    which uses none of these stacks — so the ``-m db`` suite reaches its PostgreSQL untouched,
+    wherever it lives. That asymmetry is deliberate: this closes the doors that TOUCH THE WORLD,
+    not the one that stores.
     """
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
+    monkeypatch.setattr(aiosmtplib.SMTP, "connect", _forbidden, raising=True)
+    monkeypatch.setattr(httplib2.Http, "request", _forbidden, raising=True)
