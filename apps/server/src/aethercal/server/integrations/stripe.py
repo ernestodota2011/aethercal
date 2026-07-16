@@ -35,7 +35,11 @@ from datetime import datetime
 
 import httpx
 
-from aethercal.server.services.payment_webhooks import ParsedWebhookEvent, WebhookEventKind
+from aethercal.server.services.payment_webhooks import (
+    InboundWebhook,
+    ParsedWebhookEvent,
+    WebhookEventKind,
+)
 from aethercal.server.services.payments import CheckoutSession
 
 _logger = logging.getLogger(__name__)
@@ -59,9 +63,17 @@ def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
 
 
 class StripeWebhookAdapter:
-    """Stripe's signature + event layout. ==Pure crypto and JSON; unit-tested, no network.=="""
+    """Stripe's signature + event layout. ==Pure crypto and JSON; unit-tested, no network.==
 
-    def verify_signature(self, *, raw_body: bytes, secret: str, headers: Mapping[str, str]) -> bool:
+    ==Stripe signs the BODY==, so a verified body IS the evidence and nothing needs fetching — which
+    is why ``parse`` here performs no I/O and ignores the ``secrets`` the protocol hands it. That is
+    a fact about Stripe, not about payment providers: Mercado Pago signs a manifest that does not
+    cover the body, and sends no money in the notification at all, so its adapter must call the
+    API. The seam carries both; see :mod:`aethercal.server.services.payment_webhooks`.
+    """
+
+    def verify_signature(self, request: InboundWebhook, *, secret: str) -> bool:
+        headers = request.headers
         header = headers.get(_STRIPE_SIGNATURE_HEADER) or headers.get(
             _STRIPE_SIGNATURE_HEADER.lower()
         )
@@ -70,15 +82,18 @@ class StripeWebhookAdapter:
         timestamp, signatures = _parse_stripe_signature(header)
         if timestamp is None or not signatures:
             return False
-        signed_payload = f"{timestamp}.".encode() + raw_body
+        signed_payload = f"{timestamp}.".encode() + request.raw_body
         expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
         # Constant-time against EVERY presented v1 (Stripe may send more than one during a secret
         # rotation). Any match authorises.
         return any(hmac.compare_digest(expected, presented) for presented in signatures)
 
-    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:  # noqa: PLR0911 - one return per Stripe event type + the guards
+    async def parse(  # noqa: PLR0911 - one return per Stripe event type + the guards
+        self, request: InboundWebhook, *, secrets: Mapping[str, str]
+    ) -> ParsedWebhookEvent | None:
+        del secrets  # Stripe's signed body is self-describing; no lookup is needed or wanted
         try:
-            event = json.loads(raw_body)
+            event = json.loads(request.raw_body)
         except (json.JSONDecodeError, ValueError):
             return None
         if not isinstance(event, dict):

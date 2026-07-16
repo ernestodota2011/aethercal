@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 import httpx
 
 from aethercal.server.integrations.stripe import StripeGateway, StripeWebhookAdapter
-from aethercal.server.services.payment_webhooks import WebhookEventKind
+from aethercal.server.services.payment_webhooks import InboundWebhook, WebhookEventKind
 
 _SECRET = "whsec_test_NOT_A_REAL_KEY_x"
 
@@ -27,39 +27,39 @@ def _sign(raw: bytes, *, timestamp: int = 1_700_000_000, secret: str = _SECRET) 
     return f"t={timestamp},v1={mac}"
 
 
+def _inbound(raw: bytes, headers: dict[str, str] | None = None) -> InboundWebhook:
+    """Stripe reads only the body and the headers — it signs the body, so the query is nothing to
+    it. The parameter exists on the seam for Mercado Pago, whose manifest is built from it."""
+    return InboundWebhook(raw_body=raw, headers=headers or {}, query={})
+
+
 def test_a_valid_stripe_signature_verifies() -> None:
     adapter = StripeWebhookAdapter()
     raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
     header = _sign(raw)
-    assert adapter.verify_signature(
-        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": header}
-    )
+    assert adapter.verify_signature(_inbound(raw, {"Stripe-Signature": header}), secret=_SECRET)
 
 
 def test_a_forged_or_absent_signature_fails() -> None:
     adapter = StripeWebhookAdapter()
     raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
-    assert not adapter.verify_signature(
-        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": "t=1,v1=deadbeef"}
-    )
-    assert not adapter.verify_signature(raw_body=raw, secret=_SECRET, headers={})
-    # A body tampered after signing no longer verifies.
-    header = _sign(raw)
-    assert not adapter.verify_signature(
-        raw_body=raw + b" ", secret=_SECRET, headers={"Stripe-Signature": header}
-    )
+    forged = _inbound(raw, {"Stripe-Signature": "t=1,v1=deadbeef"})
+    assert not adapter.verify_signature(forged, secret=_SECRET)
+    assert not adapter.verify_signature(_inbound(raw), secret=_SECRET)
+    # A body tampered after signing no longer verifies. ==Stripe signs the BODY== — which is
+    # exactly what Mercado Pago does NOT do, and why its adapter must re-fetch the payment.
+    tampered = _inbound(raw + b" ", {"Stripe-Signature": _sign(raw)})
+    assert not adapter.verify_signature(tampered, secret=_SECRET)
 
 
 def test_a_signature_under_the_wrong_secret_fails() -> None:
     adapter = StripeWebhookAdapter()
     raw = b'{"id":"evt_1","type":"payment_intent.succeeded"}'
     header = _sign(raw, secret="whsec_test_OTHER_KEY")
-    assert not adapter.verify_signature(
-        raw_body=raw, secret=_SECRET, headers={"Stripe-Signature": header}
-    )
+    assert not adapter.verify_signature(_inbound(raw, {"Stripe-Signature": header}), secret=_SECRET)
 
 
-def test_checkout_session_completed_parses_to_a_paid_event() -> None:
+async def test_checkout_session_completed_parses_to_a_paid_event() -> None:
     adapter = StripeWebhookAdapter()
     # ==Finding 1.== The completed session carries BOTH the session id (``obj["id"]``, the
     # creation-time anchor) and the now-real PaymentIntent (``obj["payment_intent"]``).
@@ -67,7 +67,7 @@ def test_checkout_session_completed_parses_to_a_paid_event() -> None:
     raw = json.dumps(
         {"id": "evt_A", "type": "checkout.session.completed", "data": {"object": obj}}
     ).encode("utf-8")
-    event = adapter.parse(raw)
+    event = await adapter.parse(_inbound(raw), secrets={})
     assert event is not None
     assert event.kind is WebhookEventKind.PAID
     assert event.event_id == "evt_A"
@@ -77,7 +77,7 @@ def test_checkout_session_completed_parses_to_a_paid_event() -> None:
     assert event.currency == "usd"
 
 
-def test_checkout_session_completed_without_the_intent_yet_is_not_parsed() -> None:
+async def test_checkout_session_completed_without_the_intent_yet_is_not_parsed() -> None:
     """The confirming event MUST carry the real intent to backfill; a session object still missing
     ``payment_intent`` (which a completed payment should not) is not a usable PAID event."""
     adapter = StripeWebhookAdapter()
@@ -88,10 +88,10 @@ def test_checkout_session_completed_without_the_intent_yet_is_not_parsed() -> No
             "data": {"object": {"id": "cs_X", "amount_total": 5000, "currency": "usd"}},
         }
     ).encode("utf-8")
-    assert adapter.parse(raw) is None
+    assert await adapter.parse(_inbound(raw), secrets={}) is None
 
 
-def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_intent() -> None:
+async def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_intent() -> None:
     adapter = StripeWebhookAdapter()
     raw = json.dumps(
         {
@@ -100,7 +100,7 @@ def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_inten
             "data": {"object": {"id": "pi_X", "amount": 5000, "currency": "usd"}},
         }
     ).encode("utf-8")
-    event = adapter.parse(raw)
+    event = await adapter.parse(_inbound(raw), secrets={})
     assert event is not None
     assert event.kind is WebhookEventKind.PAID
     # ==Same provider_ref as checkout.session.completed above== — the two events Stripe sends for
@@ -108,29 +108,23 @@ def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_inten
     assert event.provider_ref == "pi_X"
 
 
-def test_charge_refunded_and_dispute_parse_to_their_kinds() -> None:
+async def test_charge_refunded_and_dispute_parse_to_their_kinds() -> None:
     adapter = StripeWebhookAdapter()
-    refunded = adapter.parse(
-        json.dumps(
-            {
-                "id": "evt_R",
-                "type": "charge.refunded",
-                "data": {"object": {"payment_intent": "pi_X"}},
-            }
-        ).encode("utf-8")
-    )
+    refunded_raw = json.dumps(
+        {"id": "evt_R", "type": "charge.refunded", "data": {"object": {"payment_intent": "pi_X"}}}
+    ).encode("utf-8")
+    refunded = await adapter.parse(_inbound(refunded_raw), secrets={})
     assert refunded is not None and refunded.kind is WebhookEventKind.REFUNDED
     assert refunded.provider_ref == "pi_X"
 
-    dispute = adapter.parse(
-        json.dumps(
-            {
-                "id": "evt_D",
-                "type": "charge.dispute.created",
-                "data": {"object": {"payment_intent": "pi_X"}},
-            }
-        ).encode("utf-8")
-    )
+    dispute_raw = json.dumps(
+        {
+            "id": "evt_D",
+            "type": "charge.dispute.created",
+            "data": {"object": {"payment_intent": "pi_X"}},
+        }
+    ).encode("utf-8")
+    dispute = await adapter.parse(_inbound(dispute_raw), secrets={})
     assert dispute is not None and dispute.kind is WebhookEventKind.DISPUTE
 
 
@@ -193,14 +187,10 @@ async def test_the_refund_call_sends_a_deterministic_idempotency_key() -> None:
     assert "pi_X" in captured["body"]  # the PaymentIntent being refunded
 
 
-def test_an_event_type_we_do_not_act_on_parses_to_none() -> None:
+async def test_an_event_type_we_do_not_act_on_parses_to_none() -> None:
     adapter = StripeWebhookAdapter()
-    assert (
-        adapter.parse(
-            json.dumps({"id": "evt_Z", "type": "customer.created", "data": {"object": {}}}).encode(
-                "utf-8"
-            )
-        )
-        is None
-    )
-    assert adapter.parse(b"not json") is None
+    unmodelled = json.dumps(
+        {"id": "evt_Z", "type": "customer.created", "data": {"object": {}}}
+    ).encode("utf-8")
+    assert await adapter.parse(_inbound(unmodelled), secrets={}) is None
+    assert await adapter.parse(_inbound(b"not json"), secrets={}) is None

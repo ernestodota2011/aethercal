@@ -47,16 +47,16 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.roles import DbRole, assert_engine_role
 from aethercal.server.integrations.messaging.guard import PhoneChannelSender
+from aethercal.server.integrations.money import build_webhook_adapters
 from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
-from aethercal.server.integrations.stripe import StripeGateway, StripeWebhookAdapter
+from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.integrations.turnstile import CloudflareTurnstile
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import WEBHOOK_HTTP_TIMEOUT_SECONDS
-from aethercal.server.services.payment_webhooks import PAYMENT_WEBHOOK_ADAPTERS
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -210,14 +210,23 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.fernet_keys = settings.decryption_fernet_keys()
     app.include_router(webhooks_inbound.router)
 
-    # ==The payment providers (B-05b).== The webhook adapters (signature scheme + event parsing) per
-    # provider, and the outgoing gateway (checkout + refund). Stripe is the primary; its ``stripe``
-    # webhook adapter REPLACES the generic HMAC default. Held per-app rather than mutating the
-    # global, so a test can swap in a fake without leaking across the suite. The gateway's HTTP half
-    # is NOT verified against live Stripe in this cut (see integrations/stripe) — a test injects a
-    # fake; a paid booking on an instance with no gateway answers 503, and a free booking is
-    # unaffected.
-    app.state.webhook_adapters = {**PAYMENT_WEBHOOK_ADAPTERS, "stripe": StripeWebhookAdapter()}
+    # ==The payment providers (B-05b, B-06).== The webhook adapters (signature scheme + event
+    # parsing) per provider, and the outgoing gateway (checkout + refund). Held per-app rather than
+    # mutating a global, so a test can swap in a fake without leaking across the suite.
+    #
+    # The adapter map is DERIVED from the MONEY credential providers, not typed out here: the dict
+    # this replaced named ``mercado_pago`` and gave it a generic HMAC adapter that could never have
+    # verified a real Mercado Pago notification. ``build_webhook_adapters`` is exhaustive over the
+    # enum, so a provider cannot be advertised without an adapter that can actually verify it.
+    app.state.webhook_adapters = build_webhook_adapters()
+    # ==ONE gateway for the whole instance, and it is Stripe's.== So is ``api/public.py``'s
+    # hardcoded ``CredentialProvider.STRIPE``. A business whose only money credential is Mercado
+    # Pago therefore cannot be charged, even though its adapter now exists and its webhooks would
+    # verify: WHICH provider a business charges with is a product decision that B-06 deliberately
+    # did not invent. See ``integrations/money.gateway_for`` and the B-06 findings. The gateway's
+    # HTTP half is NOT verified against live Stripe in this cut (see integrations/stripe) — a test
+    # injects a fake; a paid booking on an instance with no gateway answers 503, and a free booking
+    # is unaffected.
     app.state.payment_gateway = StripeGateway()
 
     # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
