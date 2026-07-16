@@ -60,6 +60,7 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from sqlalchemy import CursorResult, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model.booking import BookingStatus
@@ -182,6 +183,58 @@ async def resolve_payment_by_checkout_session(
             )
         )
     ).one_or_none()
+
+
+async def record_checkout_intent(  # noqa: PLR0913 - the payment's fields ARE the row
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    booking_id: uuid.UUID,
+    provider: str,
+    checkout_session_id: str,
+    amount_cents: int,
+    currency: str,
+) -> Payment:
+    """Ensure the ONE INTENT payment for a booking's checkout session — ==TOCTOU-safe (finding 1)==.
+
+    The public checkout path and its resume endpoint both open a checkout — by the booking-id
+    Idempotency-Key the provider returns the SAME session — and then record this row. Two concurrent
+    resumes of one hold both read "no payment yet" and both INSERT the same session id; the
+    ``UNIQUE(tenant, provider, checkout_session_id)`` refuses the second. So the check-then-insert
+    is made safe the way :func:`record_payment_event` and ``store_credential`` are: the INSERT runs
+    inside a SAVEPOINT and a duplicate is ABSORBED by re-reading the row the other writer just
+    committed. The caller never sees a raw ``IntegrityError``, and exactly one row survives.
+    """
+    existing = await resolve_payment_by_checkout_session(
+        session, tenant_id=tenant_id, provider=provider, checkout_session_id=checkout_session_id
+    )
+    if existing is not None:
+        return existing
+
+    row = Payment(
+        tenant_id=tenant_id,
+        booking_id=booking_id,
+        provider=provider,
+        checkout_session_id=checkout_session_id,
+        provider_ref=None,
+        status=PaymentStatus.INTENT,
+        amount_cents=amount_cents,
+        currency=currency,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        # A concurrent writer inserted the same checkout session first; the SAVEPOINT rolled back
+        # only this INSERT. Re-read and use THAT row — the SAME session via the Idempotency-Key.
+        conflicting = await resolve_payment_by_checkout_session(
+            session, tenant_id=tenant_id, provider=provider, checkout_session_id=checkout_session_id
+        )
+        if conflicting is None:  # pragma: no cover - the conflict must be re-readable
+            raise
+        return conflicting
+    return row
 
 
 def _amount_matches(event_type: EventType, *, amount_cents: int, currency: str) -> bool:
@@ -933,6 +986,7 @@ __all__ = [
     "is_refund_eligible",
     "make_expire_hold_runner",
     "make_refund_runner",
+    "record_checkout_intent",
     "resolve_payment",
     "resolve_payment_by_checkout_session",
     "run_parked_payment_tick",

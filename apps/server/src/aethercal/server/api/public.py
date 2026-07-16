@@ -38,7 +38,6 @@ from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
@@ -54,7 +53,7 @@ from aethercal.server.api.bookings import map_booking_error
 from aethercal.server.api.slots import require_iana_zone_or_422, require_window_is_sane
 from aethercal.server.client_ip import TrustedProxies, resolve_client_ip
 from aethercal.server.db.guc import bind_tenant
-from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus
+from aethercal.server.db.models import Booking, EventType
 from aethercal.server.deps import get_session
 from aethercal.server.integrations.turnstile import TurnstileVerifier
 from aethercal.server.services.bookings import (
@@ -78,6 +77,7 @@ from aethercal.server.services.payments import (
     CheckoutSession,
     PaymentGateway,
     enqueue_expire_hold,
+    record_checkout_intent,
 )
 from aethercal.server.services.slots import compute_slots
 from aethercal.server.services.tenant_credentials import (
@@ -548,10 +548,10 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     (finding 2)==, so both derive the SAME session for one booking and neither can double-charge.
 
     A failure of the provider call becomes a 502 carrying the ``booking_id`` — the hold is already
-    persisted, so the guest resumes rather than losing the slot. The Payment row is inserted only if
-    this booking has none yet: a resume after the row was written (or a double resume) re-derives
-    the SAME session via the idempotency key and must not insert a second (the
-    ``checkout_session_id`` UNIQUE would reject it in any case)."""
+    persisted, so the guest resumes rather than losing the slot. Recording the INTENT row is
+    delegated to :func:`record_checkout_intent`, which is TOCTOU-safe (r4 finding 1): two concurrent
+    resumes of one hold both open the SAME session and both try to record it, and the loser absorbs
+    the UNIQUE conflict instead of handing the caller an ``IntegrityError``."""
     try:
         checkout: CheckoutSession = await gateway.create_checkout_session(
             idempotency_key=str(booking.id),
@@ -573,23 +573,15 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
         _logger.exception("checkout: provider call failed for booking %s", booking.id)
         raise _checkout_unavailable(booking.id) from exc
 
-    existing = await session.scalar(select(Payment).where(Payment.booking_id == booking.id))
-    if existing is None:
-        session.add(
-            Payment(
-                tenant_id=tenant_id,
-                booking_id=booking.id,
-                provider=CredentialProvider.STRIPE.value,
-                # ==Finding 1.== Anchor on the Checkout Session id; ``provider_ref`` stays NULL
-                # until the confirming webhook backfills the real intent.
-                checkout_session_id=checkout.checkout_session_id,
-                provider_ref=None,
-                status=PaymentStatus.INTENT,
-                amount_cents=price_cents,
-                currency=currency,
-            )
-        )
-        await session.flush()
+    await record_checkout_intent(
+        session,
+        tenant_id=tenant_id,
+        booking_id=booking.id,
+        provider=CredentialProvider.STRIPE.value,
+        checkout_session_id=checkout.checkout_session_id,
+        amount_cents=price_cents,
+        currency=currency,
+    )
     return checkout.checkout_url
 
 
