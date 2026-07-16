@@ -188,6 +188,28 @@ async def test_a_replayed_event_id_writes_only_one_row(
     assert await _payment_event_count(owner_maker) == 1
 
 
+async def test_a_signed_but_unsupported_event_is_acked_200_with_no_write(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """==Finding 4.== A VALID-SIGNED event of a type we do not handle is ACKed 200 (received, not
+    interesting), NOT 400 — a non-2xx makes Stripe retry it for ever. Nothing is written; 400/401
+    stay reserved for a body we cannot parse / a signature we cannot verify."""
+    slug, _booking_id = await _seed(owner_maker)
+    body = json.dumps(
+        {"id": "evt_unsupported", "type": "customer.created", "data": {"object": {}}}
+    ).encode("utf-8")
+    sig = _stripe_sig(body)
+
+    response = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=body,
+        headers={"Stripe-Signature": sig, "content-type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert await _payment_event_count(owner_maker) == 0, "an event we ignore writes nothing"
+
+
 async def test_an_unknown_business_is_401(
     client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
 ) -> None:

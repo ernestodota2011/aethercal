@@ -134,11 +134,14 @@ async def receive_payment_webhook(
         raise _unauthorized()
 
     # (5) only now: parse, record (idempotent / anti-replay), dispatch.
+    # ==Finding 4.== The signature has ALREADY authorised this — it is genuinely from the provider.
+    # An event we do not model (``customer.created``, …) is therefore ACKed 200 and NOT written, not
+    # rejected: any non-2xx makes the provider retry it for ever. 401 (bad signature) is the only
+    # rejection; there is no 400 here, because a verified body we choose not to act on is not an
+    # error, it is an event we are simply not interested in.
     event = adapter.parse(raw_body)
     if event is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="unparseable webhook body"
-        )
+        return {"status": "ignored"}
 
     row, is_new = await record_payment_event(
         session, tenant_id=tenant_id, provider=provider, event=event
