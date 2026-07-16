@@ -208,7 +208,7 @@ requires-dist = [
     { name = "reflex", specifier = ">=0.9.6.post1,<0.10" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
 ]
 provides-extras = ["google"]
 
