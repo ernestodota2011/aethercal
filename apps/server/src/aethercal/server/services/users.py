@@ -56,7 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # disagree about it. (They were private to the schema; this is the second caller, so they are public
 # now — the rule was always about a timezone and an address, not about whose they are.)
 from aethercal.schemas.bookings import require_emailish, require_iana_zone
-from aethercal.server.db.models import EventType, Schedule, User
+from aethercal.server.db.models import EventType, Membership, Schedule, User
 from aethercal.server.passwords import hash_password
 
 
@@ -85,7 +85,10 @@ class InvalidUserError(UserServiceError):
 
 
 class UserInUseError(UserServiceError):
-    """The host still holds event types or schedules; deleting them would cascade or orphan."""
+    """The host still holds event types or schedules, or a membership; deleting them would cascade
+    or orphan. The membership case is a SECURITY refusal, not a data one: ``memberships`` references
+    ``users`` ``ON DELETE CASCADE``, so deleting a host who is also a member would revoke that
+    membership by the side door — past ``MANAGE_MEMBERS`` and past the last-owner guard."""
 
 
 class AmbiguousUserEmailError(UserServiceError):
@@ -369,8 +372,31 @@ async def delete_user(session: AsyncSession, *, tenant_id: uuid.UUID, user_id: u
     and the booking page loses event types nobody asked to remove (and their bookings with them);
     let it ORPHAN and the page keeps offering slots for a host who no longer exists. So the refusal
     names what is holding them, and the operator decides.
+
+    ==A membership is the THIRD thing that holds them, and its refusal is a security boundary.==
+    ``memberships`` references ``users`` ``ON DELETE CASCADE`` (migration 0009), so a host who is
+    also a member cannot simply be deleted: doing so would silently revoke — or delete — that
+    membership. The panel gates ``delete_host_action`` on ``MANAGE_SCHEDULING`` (which an ``admin``
+    holds), but revoking a member is ``MANAGE_MEMBERS`` (which they do NOT), and it is the members
+    path that applies the last-owner guard. Deleting a host to drop their membership is therefore a
+    side door onto both. The refusal closes it: the ONLY way to remove a member — owner or not — is
+    the members gate, which alone protects the last owner.
     """
     row = await get_user(session, tenant_id=tenant_id, user_id=user_id)
+
+    member = (
+        await session.scalars(
+            select(Membership.id).where(
+                Membership.tenant_id == tenant_id, Membership.user_id == row.id
+            )
+        )
+    ).first()
+    if member is not None:
+        raise UserInUseError(
+            f"host '{row.name}' is a member of this business: deleting them here would revoke that "
+            "membership by the side door — past the member-management gate that protects the last "
+            "owner. Remove their membership through the members panel first"
+        )
 
     hosted = (
         await session.scalars(

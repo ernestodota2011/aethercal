@@ -367,3 +367,125 @@ class TestStaleRoleIsRevalidatedUnderRls:
 
         with pytest.raises(service.SessionRevokedError):
             await service.list_bookings_view(admin, principal=principal, tenant_slug="globex")
+
+
+# ==========================================================================================
+# ==An `admin` cannot revoke an OWNER through the host door== — the side door onto the members gate.
+# ==========================================================================================
+
+
+class TestDeletingAnOwnerHostDoesNotRevokeThemByCascade:
+    """``delete_host_action`` is gated by ``MANAGE_SCHEDULING``, which an ``admin`` holds. But a
+    host is a ``users`` row, and ``memberships`` references it ``ON DELETE CASCADE`` (migration
+    0009), so deleting a host who is ALSO an owner would revoke that owner as a SIDE EFFECT: past
+    ``MANAGE_MEMBERS`` (which an admin does not hold) and past the last-owner guard, both of which
+    live on the members path. ``delete_user`` refuses while a membership holds the host, and these
+    prove it on the REAL cascade — which only a genuine PostgreSQL performs. SQLite does not enforce
+    the foreign key, so offline the owner's row would merely be orphaned and the bug would be
+    invisible; this is exactly why the test is ``-m db``.
+    """
+
+    async def test_an_admin_deleting_an_owner_host_is_refused_and_the_owner_survives(
+        self,
+        app_maker: async_sessionmaker[AsyncSession],
+        owner_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The attack in one line: an ``admin`` deletes the owner's HOST row. Before the fix the
+        cascade silently revokes the owner — the business loses its only owner through a door the
+        members gate never saw. The refusal closes it, and the owner's membership AND user row are
+        both still there afterwards."""
+        password = "correct horse battery staple"
+        async with owner_maker() as session, session.begin():
+            tenant = Tenant(slug="acme", name="Acme")
+            session.add(tenant)
+            await session.flush()
+            tenant_id = tenant.id
+            owner = User(
+                tenant_id=tenant_id,
+                email="owner@acme.example",
+                name="Owner",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            adm = User(
+                tenant_id=tenant_id,
+                email="adm@acme.example",
+                name="Adm",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            session.add_all([owner, adm])
+            await session.flush()
+            owner_user_id = owner.id
+            session.add(Membership(tenant_id=tenant_id, user_id=owner.id, role=MemberRole.OWNER))
+            session.add(Membership(tenant_id=tenant_id, user_id=adm.id, role=MemberRole.ADMIN))
+
+        admin = _runtime(app_maker)
+        principal = await bootstrap.member_login(
+            admin, tenant_slug="acme", email="adm@acme.example", password=password
+        )
+        assert principal is not None
+        assert principal.role is MemberRole.ADMIN
+
+        # The admin holds the scheduling gate, so it lets them INTO delete_host_action — and the
+        # owner is a host. The membership refusal is the only thing standing between that gate and a
+        # revoked owner.
+        with pytest.raises(service.AdminActionError, match="member of this business"):
+            await service.delete_host_action(
+                admin, principal=principal, tenant_slug="acme", host_id=owner_user_id
+            )
+
+        # Read back on the BYPASSRLS owner engine: the owner's membership — and their user row — are
+        # both untouched.
+        async with owner_maker() as session, session.begin():
+            membership = await memberships_service.get_membership_for_user(
+                session, tenant_id=tenant_id, user_id=owner_user_id
+            )
+            assert membership is not None
+            assert membership.role is MemberRole.OWNER
+            assert (await session.get(User, owner_user_id)) is not None
+
+    async def test_an_admin_may_still_delete_a_plain_host_who_is_not_a_member(
+        self,
+        app_maker: async_sessionmaker[AsyncSession],
+        owner_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The refusal must not become an outage. A host with NO membership (and no event types or
+        schedules) is still deletable by an ``admin``, exactly as before — a guard that also blocked
+        the ordinary delete would be a regression, not a fix."""
+        password = "correct horse battery staple"
+        async with owner_maker() as session, session.begin():
+            tenant = Tenant(slug="globex", name="Globex")
+            session.add(tenant)
+            await session.flush()
+            tenant_id = tenant.id
+            adm = User(
+                tenant_id=tenant_id,
+                email="adm@globex.example",
+                name="Adm",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            plain = User(
+                tenant_id=tenant_id,
+                email="plain@globex.example",
+                name="Plain",
+                timezone="UTC",
+            )
+            session.add_all([adm, plain])
+            await session.flush()
+            plain_user_id = plain.id
+            session.add(Membership(tenant_id=tenant_id, user_id=adm.id, role=MemberRole.ADMIN))
+
+        admin = _runtime(app_maker)
+        principal = await bootstrap.member_login(
+            admin, tenant_slug="globex", email="adm@globex.example", password=password
+        )
+        assert principal is not None
+
+        await service.delete_host_action(
+            admin, principal=principal, tenant_slug="globex", host_id=plain_user_id
+        )
+
+        async with owner_maker() as session, session.begin():
+            assert (await session.get(User, plain_user_id)) is None
