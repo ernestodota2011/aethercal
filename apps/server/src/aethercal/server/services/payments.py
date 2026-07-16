@@ -62,6 +62,7 @@ from typing import Any, Protocol, cast
 from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.attributes import set_committed_value
 
 from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db.guc import tenant_scope
@@ -387,6 +388,49 @@ async def enqueue_cancellation_refunds(
     return count
 
 
+async def _claim_provider_ref(session: AsyncSession, *, payment: Payment, provider_ref: str) -> str:
+    """Take ownership of a payment row's still-NULL ``provider_ref``. ==Conditional, not assigned.==
+
+    ==Returns the reference that now OWNS the row== — ``provider_ref`` if this charge won it, the
+    winner's if it did not. Returning the owner rather than a boolean is what lets the caller ask
+    the only question that matters ("is the owner someone else?") without re-reading a value the
+    type system has every reason to still believe is ``None``.
+
+    ==The ``WHERE provider_ref IS NULL`` is the whole point.== ``payment.provider_ref = ref`` reads
+    and then writes, and two concurrent charges both read NULL before either commits — so both
+    "backfill", neither notices the other, and the second charge is swallowed downstream as a replay
+    (Crisol r4). Making it a conditional UPDATE hands the decision to Postgres: it serialises the
+    two writers on the row lock, and the loser — under READ COMMITTED — re-evaluates this predicate
+    against the winner's now-committed row, matches zero rows, and learns it lost. If the winner
+    rolls back instead, the predicate holds again and the claim succeeds, so nothing is stranded.
+    """
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            update(Payment)
+            .where(Payment.id == payment.id, Payment.provider_ref.is_(None))
+            .values(provider_ref=provider_ref)
+            .execution_options(synchronize_session=False),
+        ),
+    )
+    if result.rowcount == 1:
+        # Keep the in-memory row in step with what we just wrote, WITHOUT marking it dirty: setting
+        # it through the instance state means the next flush does not re-issue it.
+        set_committed_value(payment, "provider_ref", provider_ref)
+        return provider_ref
+
+    # We lost. Re-read to see WHOSE it is — the winner's value is committed by now, which is the
+    # only reason our UPDATE unblocked at all.
+    await session.refresh(payment)
+    owner = payment.provider_ref
+    if owner is None:  # pragma: no cover - the claim can only fail because somebody else set it
+        raise RuntimeError(
+            f"payment {payment.id} refused a provider_ref claim yet still reads NULL; the "
+            "conditional UPDATE and the re-read disagree, which must never happen"
+        )
+    return owner
+
+
 async def _refund_second_charge(  # noqa: PLR0913 - the second charge's identity IS the argument list
     session: AsyncSession,
     *,
@@ -510,9 +554,32 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
         return ArbiterResult(ArbiterOutcome.PARKED)
 
     if payment.provider_ref is None:
-        # ==Backfill the intent (finding 1).== We resolved by the session id; record the real charge
-        # reference now, so ``payment_intent.succeeded`` (and any refund) then resolves on it.
-        payment.provider_ref = provider_ref
+        # ==CLAIM the reference; do not merely assign it (Crisol r4).== We resolved by the session
+        # id, so the row's intent is still NULL and this charge wants to own it. Reading NULL and
+        # then writing is a read-then-write, and TWO concurrent charges can both read NULL before
+        # either commits — so both take this branch, neither sees the other as different, and the
+        # second charge falls through to the conditional UPDATE below, finds the booking confirmed
+        # by THIS VERY ROW's payment id, and is dismissed as a replay. ==A guest pays twice and
+        # the second charge is never refunded and never logged.== Reproduced against real
+        # PostgreSQL in ``test_payments_double_charge_concurrency_pg``.
+        #
+        # So the claim is a CONDITIONAL UPDATE, exactly like the booking's below: Postgres
+        # serialises the two writers on the row lock, the loser re-evaluates its WHERE against the
+        # winner's committed row, matches nothing, and learns it lost from ``rowcount``.
+        owner = await _claim_provider_ref(session, payment=payment, provider_ref=provider_ref)
+        if owner != provider_ref:
+            # A DIFFERENT charge won the reference: this is a second payment on one checkout
+            # reference, and it must be refunded rather than dismissed. (If the owner were THIS
+            # charge we simply raced ourselves on a redelivery, and the replay path below is right.)
+            return await _refund_second_charge(
+                session,
+                anchor=payment,
+                tenant_id=tenant_id,
+                provider=provider,
+                provider_ref=provider_ref,
+                amount_cents=amount_cents,
+                currency=currency,
+            )
     elif resolved_by_session and payment.provider_ref != provider_ref:
         # ==A SECOND, DIFFERENT charge under ONE checkout reference (B-06).== Refund it.
         #
