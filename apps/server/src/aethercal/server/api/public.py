@@ -50,7 +50,7 @@ from aethercal.server.api.bookings import map_booking_error
 from aethercal.server.api.slots import require_iana_zone_or_422, require_window_is_sane
 from aethercal.server.client_ip import TrustedProxies, resolve_client_ip
 from aethercal.server.db.guc import bind_tenant
-from aethercal.server.db.models import EventType
+from aethercal.server.db.models import EventType, Payment, PaymentStatus
 from aethercal.server.deps import get_session
 from aethercal.server.integrations.turnstile import TurnstileVerifier
 from aethercal.server.services.bookings import (
@@ -67,7 +67,17 @@ from aethercal.server.services.event_types import (
     list_bookable_event_types,
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.payments import (
+    HOLD_TTL,
+    PaymentGateway,
+    enqueue_expire_hold,
+)
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    MissingCredentialError,
+    resolve_money_credential,
+)
 from aethercal.server.services.tenant_resolution import tenant_by_slug
 from aethercal.server.services.workflow_rules import PhoneChannelScope, phone_channel_scope
 from aethercal.server.settings import Settings
@@ -296,6 +306,14 @@ async def create_public_booking(
         # writes a value into it, because this is the one path a stranger can reach.
         source_ip=client_ip,
     )
+    # ==Paid types HOLD; free types confirm on the spot.== Only the public path creates a hold — the
+    # admin and the API key are trusted and confirm directly (B-05b). A hold occupies the slot while
+    # the guest pays, and the arbiter confirms it when the payment lands.
+    if event_type.price_cents is not None:
+        return await _start_paid_booking(
+            session, request=request, event_type=event_type, params=params
+        )
+
     try:
         booking = await create_booking(
             session,
@@ -312,6 +330,97 @@ async def create_public_booking(
 
     await session.refresh(booking)
     return PublicBookingRead.model_validate(booking)
+
+
+async def _start_paid_booking(
+    session: AsyncSession,
+    *,
+    request: Request,
+    event_type: EventType,
+    params: BookingParams,
+) -> PublicBookingRead:
+    """Open a paid hold: BYOK credential (fail-closed) → hold + EXPIRE_HOLD → COMMIT → checkout.
+
+    ==The order is the design (§4.4).== The credential is resolved FIRST, so a business that cannot
+    charge never even opens a hold (fail-closed, no orphan). The hold and its self-cancel are
+    committed BEFORE the provider I/O — *persist the intent before the call* — so a failed checkout
+    leaves a hold that lapses in 30 minutes, never a charge. The checkout session's idempotency key
+    is the ``booking_id``, so a retry returns the same session, never a second charge.
+    """
+    price_cents = event_type.price_cents
+    currency = event_type.currency
+    if price_cents is None or currency is None:
+        # pragma: no cover - the caller only enters here for a priced type; a price with no
+        # currency is a misconfiguration.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "misconfigured", "message": "This service is not configured for pay"},
+        )
+    gateway: PaymentGateway | None = getattr(request.app.state, "payment_gateway", None)
+    if gateway is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "payments_unavailable", "message": "Payments are not configured"},
+        )
+    fernet_keys = request.app.state.fernet_keys
+    try:
+        credential = await resolve_money_credential(
+            session,
+            tenant_id=event_type.tenant_id,
+            provider=CredentialProvider.STRIPE,
+            fernet_key=fernet_keys,
+        )
+    except MissingCredentialError as exc:
+        # ==Fail-closed: no BYOK account, no charge.== Never fall back to the instance's account.
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "payment_unavailable",
+                "message": "This service cannot take payment right now",
+            },
+        ) from exc
+
+    try:
+        booking = await create_booking(
+            session,
+            tenant_id=event_type.tenant_id,
+            params=params,
+            now=_now(),
+            effects=None,
+            hold_ttl=HOLD_TTL,
+        )
+    except BookingError as exc:
+        raise _public_booking_error(exc) from exc
+
+    assert booking.hold_expires_at is not None  # create_booking with hold_ttl always sets it
+    await enqueue_expire_hold(session, booking=booking, hold_expires_at=booking.hold_expires_at)
+    # Persist the hold + its self-cancel BEFORE the provider I/O. The GUC re-stamps the next
+    # transaction (the listener + ContextVar), so the writes below stay bound to this business.
+    await session.commit()
+
+    checkout = await gateway.create_checkout_session(
+        idempotency_key=str(booking.id),
+        amount_cents=price_cents,
+        currency=currency,
+        expires_at=booking.hold_expires_at,
+        secrets=credential.secrets,
+    )
+    session.add(
+        Payment(
+            tenant_id=event_type.tenant_id,
+            booking_id=booking.id,
+            provider=CredentialProvider.STRIPE.value,
+            provider_ref=checkout.provider_ref,
+            status=PaymentStatus.INTENT,
+            amount_cents=price_cents,
+            currency=currency,
+        )
+    )
+    await session.flush()
+    await session.refresh(booking)
+    return PublicBookingRead.model_validate(booking).model_copy(
+        update={"checkout_url": checkout.checkout_url}
+    )
 
 
 def _booking_base_url(request: Request, settings: Settings) -> str:

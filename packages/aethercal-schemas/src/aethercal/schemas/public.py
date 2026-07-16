@@ -89,7 +89,7 @@ class PublicBookingCreate(GuestBookingBase):
 
 
 class PublicBookingRead(BaseModel):
-    """What the public POST answers with. ==Four fields, and there is no fifth.==
+    """What the public POST answers with. ==Five fields, and the fifth carries no PII.==
 
     Not ``BookingRead``. That model would echo the guest's name, e-mail, notes and answers back out
     of an endpoint that asked for no credentials — and the day somebody points it at a booking id
@@ -100,6 +100,11 @@ class PublicBookingRead(BaseModel):
     confirmation e-mail instead — the channel that proves they own the address they typed. A
     public endpoint that hands out a meeting link keyed only by a booking id is a public endpoint
     that hands out meeting links.
+
+    ``checkout_url`` (B-05b) is the fifth, and it is the ONE field a hold adds: where to send the
+    guest to pay. It is ``None`` for a free booking (confirmed on the spot, nothing to pay) and it
+    carries no personal data — it is a payment-redirect URL, not a booking dump. A PAID booking
+    comes back ``status = pending`` with this set; the arbiter confirms it once the payment lands.
     """
 
     # ``populate_by_name`` so this ONE model works both directions without a hand-rolled remap:
@@ -114,6 +119,8 @@ class PublicBookingRead(BaseModel):
     start: datetime = Field(validation_alias="start_at")
     end: datetime = Field(validation_alias="end_at")
     status: BookingStatus
+    #: Where to send the guest to pay (a hold), or ``None`` for a free booking. Not PII.
+    checkout_url: str | None = None
 
 
 __all__ = [

@@ -77,6 +77,7 @@ from aethercal.server.services.outbox import (
     as_utc,
     email_dedupe_key,
     enqueue_effect,
+    expire_hold_dedupe_key,
     refund_dedupe_key,
 )
 from aethercal.server.services.tenant_credentials import (
@@ -469,15 +470,66 @@ async def apply_dispute_event(
 # --------------------------------------------------------------------------------------
 
 
+HOLD_TTL = timedelta(minutes=30)
+"""How long an unpaid hold lives — and the checkout session's ``expires_at``, to the minute.
+
+==30 minutes, because Stripe imposes a ~30-minute MINIMUM on a Checkout Session's ``expires_at``.==
+If the hold TTL were shorter than the session's, there would always be a window in which the guest
+could pay against a hold that had already lapsed — a charge to capture and immediately refund (a bad
+experience and a lost fee). Tying the two to the same instant closes that window."""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckoutSession:
+    """What a gateway hands back when a checkout is opened: where to send the guest, and the
+    ``provider_ref`` (the charge/payment-intent id) the arbiter resolves the payment by later."""
+
+    checkout_url: str
+    provider_ref: str
+
+
 class PaymentGateway(Protocol):
-    """The provider side of a refund — ==injected==, so the money-moving call is a seam, not a
+    """The provider side of the money — ==injected==, so every provider call is a seam, not a
     hard-wired Stripe import. A test passes a spy; production passes the real BYOK adapter."""
+
+    async def create_checkout_session(
+        self,
+        *,
+        idempotency_key: str,
+        amount_cents: int,
+        currency: str,
+        expires_at: datetime,
+        secrets: Mapping[str, str],
+    ) -> CheckoutSession:
+        """Open a hosted checkout on the business's OWN account. ==``idempotency_key`` is derived
+        from the ``booking_id``, so a retry returns the SAME session, never a second charge.==
+        ``expires_at`` is the hold's TTL, to the minute."""
+        ...
 
     async def refund(
         self, *, provider: str, provider_ref: str, amount_cents: int, secrets: Mapping[str, str]
     ) -> None:
         """Refund the charge ``provider_ref`` on the business's OWN account (its ``secrets``)."""
         ...
+
+
+async def enqueue_expire_hold(
+    session: AsyncSession, *, booking: Booking, hold_expires_at: datetime
+) -> None:
+    """Queue the EXPIRE_HOLD that self-cancels an unpaid hold at ``hold_expires_at``.
+
+    ==Enqueued in the SAME transaction as the hold, BEFORE the provider I/O.== If the checkout
+    call then fails, the hold is not orphaned: this intent is committed and cancels it at the
+    TTL, freeing the slot. Keyed on the booking (one hold, one booking), and due at the TTL via
+    ``next_retry_at`` — the outbox doubles as the durable scheduler."""
+    await enqueue_effect(
+        session,
+        booking=booking,
+        effect=OutboxEffect.EXPIRE_HOLD,
+        dedupe_key=expire_hold_dedupe_key(booking.id),
+        payload={"booking_id": str(booking.id)},
+        next_retry_at=hold_expires_at,
+    )
 
 
 def make_refund_runner(
@@ -720,8 +772,10 @@ async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's
 
 __all__ = [
     "DEFAULT_PARKED_MAX_ATTEMPTS",
+    "HOLD_TTL",
     "ArbiterOutcome",
     "ArbiterResult",
+    "CheckoutSession",
     "ConfirmEffects",
     "ParkedPaymentReport",
     "PaymentGateway",
@@ -729,6 +783,7 @@ __all__ = [
     "apply_paid_event",
     "apply_refunded_event",
     "enqueue_cancellation_refunds",
+    "enqueue_expire_hold",
     "enqueue_refund",
     "is_refund_eligible",
     "make_expire_hold_runner",

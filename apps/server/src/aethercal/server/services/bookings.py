@@ -443,17 +443,30 @@ async def create_booking(
     params: BookingParams,
     now: datetime,
     effects: BookingEffects | None = None,
+    hold_ttl: timedelta | None = None,
 ) -> Booking:
     """Book ``params.start`` for a tenant's event type (RF-04/RF-07).
 
-    Validates the slot is on offer, serializes the host (layer 1), inserts the ``confirmed`` booking
-    catching the partial-index conflict as :class:`SlotUnavailableError` (layer 2), and durably
-    queues the ``booking.created`` webhook in the SAME transaction. When ``effects`` is supplied it
-    then mints the cancel/reschedule guest tokens, best-effort sends the confirmation email, syncs
-    the Google event (keeping the booking on failure), and schedules the 24 h reminder. Raises
+    Validates the slot is on offer, serializes the host (layer 1), inserts the booking catching the
+    partial-index conflict as :class:`SlotUnavailableError` (layer 2). Raises
     :class:`EventTypeNotFoundError` (404), :class:`SlotUnavailableError` (409) or
     :class:`AvailabilityUnavailableError` (503). Flushes; the caller owns the commit.
+
+    .. rubric:: ``hold_ttl`` — a PENDING HOLD instead of a confirmed booking (B-05b)
+
+    ``None`` (the default) is the historical path: a ``CONFIRMED`` booking, stamped confirmed_at,
+    with its whole chain fired (the ``booking.created`` webhook, the CONFIRM workflow transition,
+    and — with an ``effects`` bundle — the tokens/Google/email). ==This is what the admin + the API
+    key always get: they are trusted, so they confirm directly.==
+
+    A ``hold_ttl`` makes a ``PENDING`` hold instead — ``confirmed_at`` NULL, hold_expires_at set,
+    and ==NONE of the confirmation chain fires==. Only the PUBLIC path passes it, for a PAID event
+    type: the hold occupies the slot (the ``status <> 'cancelled'`` partial index counts it) while
+    the guest pays, and the ARBITER is what later confirms it and fires the chain. Firing nothing
+    here is not merely the B-05a silence gate doing its job downstream — it is this function
+    to build an announcement for an appointment nobody has paid for.
     """
+    is_hold = hold_ttl is not None
     event_type = await get_event_type(
         session, tenant_id=tenant_id, event_type_id=params.event_type_id
     )
@@ -481,16 +494,14 @@ async def create_booking(
         event_type_id=event_type.id,
         start_at=start,
         end_at=end,
-        status=BookingStatus.CONFIRMED,
-        # The stamp moves WITH the status, in the same statement — never in a later one. It is what
-        # licenses every outbound this booking will ever produce (B-05a), so a confirmed booking
-        # that reached the database without it would be one nothing ever speaks for: no email, no
-        # reminder, no webhook, no calendar event — and no error to say so.
-        #
-        # Today every booking is born confirmed, on every path (the public page, the admin and the
-        # API key alike). When holds arrive (B-05b) this line becomes the ARBITER's: the payment
-        # that wins the conditional UPDATE stamps it, and nothing else may.
-        confirmed_at=now,
+        # A hold is PENDING and unstamped; a confirmed booking carries ``confirmed_at`` in the SAME
+        # statement — never a later one. ``confirmed_at`` licenses every outbound this booking
+        # will ever produce (B-05a): a confirmed booking without it would be one nothing speaks for
+        # (no email, reminder, webhook or calendar event) and no error to say so. For a hold it is
+        # deliberately NULL — the ARBITER stamps it when a payment wins the conditional UPDATE.
+        status=BookingStatus.PENDING if is_hold else BookingStatus.CONFIRMED,
+        confirmed_at=None if is_hold else now,
+        hold_expires_at=(now + hold_ttl) if hold_ttl is not None else None,
         guest_name=params.guest_name,
         guest_email=params.guest_email,
         guest_timezone=params.guest_timezone,
@@ -501,6 +512,11 @@ async def create_booking(
         source_ip=params.source_ip,
     )
     await _insert_active(session, booking, start=start)
+    if is_hold:
+        # ==A hold announces NOTHING.== No ``booking.created`` webhook, no CONFIRM transition, no
+        # create-effects: an appointment nobody paid for is not one anybody may be told about. The
+        # arbiter runs this chain (:func:`confirm_paid_booking_effects`) once a payment confirms it.
+        return booking
     await enqueue_event(
         session,
         booking=booking,

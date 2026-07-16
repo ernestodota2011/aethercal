@@ -208,6 +208,11 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.fernet_keys = settings.decryption_fernet_keys()
     app.include_router(webhooks_inbound.router)
 
+    # The BYOK payment gateway the public paid path opens a checkout on. ``None`` until a provider
+    # adapter is wired (the Stripe test-mode adapter lands in its own cut): a paid booking with an
+    # instance with no gateway answers 503, and a free booking is unaffected. A test injects a fake.
+    app.state.payment_gateway = None
+
     # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
     #
     # It is mounted only where the operator asked for it. An instance that serves nobody but its own
