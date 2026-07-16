@@ -513,7 +513,7 @@ class TenantSenders:
     email: EmailSender | None
     channels: Mapping[Channel, PhoneChannelSender]
 
-    channel_errors: Mapping[Channel, CredentialError] = field(default_factory=dict)
+    channel_errors: Mapping[Channel, Exception] = field(default_factory=dict)
     """Why a channel that IS configured could not be built. ==One channel's fault stays its own.==
 
     A refused credential used to escape :func:`resolve_tenant_senders` entirely, which meant a
@@ -533,7 +533,20 @@ class TenantSenders:
       deliver.
 
     Collapsing the two would silence a real misconfiguration, which is the no-op this codebase is
-    built to refuse."""
+    built to refuse.
+
+    .. rubric:: ==``Exception``, not a curated union — and the narrower type WAS the bug==
+
+    This began as ``Mapping[Channel, CredentialError]``, matching a resolver that caught
+    ``CredentialError``. Both were an ENUMERATION of the failures their author happened to know, and
+    a ``TargetUnresolvable`` — DNS down, which is a NETWORK fault and not a credential one — walked
+    straight past it, escaped the resolver, and took the business's EMAIL down all over again. The
+    defect was not the missing branch. It was answering *"which failures do I catch?"* instead of
+    *"what is the scope of a failure?"*.
+
+    ==The scope is one channel. So anything that fails while resolving one channel belongs to that
+    channel==, whatever its class, including the class nobody has written yet. The type says so, and
+    :func:`resolve_tenant_senders` catches ``Exception`` to match."""
 
     @classmethod
     def for_offline_tests(
@@ -1194,21 +1207,21 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
     (:class:`~aethercal.server.services.outbox.OutboxSkipped`); it is never a failure, and never a
     silent success.
     """
-    channel_errors: dict[Channel, CredentialError] = {}
+    channel_errors: dict[Channel, Exception] = {}
 
     email: EmailSender | None = None
-    smtp_credential = await _resolve_one(
-        session,
-        tenant_id=tenant_id,
-        provider=CredentialProvider.SMTP,
-        fernet_key=fernet_key,
-        defaults=defaults,
-    )
-    if smtp_credential is not None:
-        # ==Scoped to EMAIL, and the symmetry with the loop below is the point.== A refused SMTP
-        # credential used to escape this whole function, so a business with a bad relay host lost
-        # its WhatsApp too. One channel's fault stays its own — in both directions.
-        try:
+    # ==The boundary is the SCOPE — resolving ONE channel — not a list of error types.== Every read,
+    # decrypt, validation and construction for EMAIL happens inside it, so whatever goes wrong in
+    # there is this channel failing, by definition. The argument is spelled out on the loop below.
+    try:
+        smtp_credential = await _resolve_one(
+            session,
+            tenant_id=tenant_id,
+            provider=CredentialProvider.SMTP,
+            fernet_key=fernet_key,
+            defaults=defaults,
+        )
+        if smtp_credential is not None:
             smtp_target = await _assert_smtp_host_reachable(
                 smtp_credential.secrets, source=smtp_credential.source, resolver=resolver
             )
@@ -1216,87 +1229,132 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
                 _smtp_from_secrets(smtp_credential.secrets, target=smtp_target),
                 connect=smtp_target.connect,
             )
-        except CredentialError as exc:
-            _logger.warning(
-                "business %s: its email channel is configured and unusable, so THAT channel is off "
-                "and no other — %s",
-                tenant_id,
-                exc,
-            )
-            channel_errors[Channel.EMAIL] = exc
+    except Exception as exc:
+        _logger.warning(
+            "business %s: resolving its email channel failed, so THAT channel is off and no "
+            "other — %s: %s",
+            tenant_id,
+            type(exc).__name__,
+            exc,
+        )
+        channel_errors[Channel.EMAIL] = exc
 
     channels: dict[Channel, PhoneChannelSender] = {}
     for provider in (CredentialProvider.WHATSAPP, CredentialProvider.SMS):
-        credential = await _resolve_one(
-            session,
-            tenant_id=tenant_id,
-            provider=provider,
-            fernet_key=fernet_key,
-            defaults=defaults,
-        )
-        if credential is None:
-            continue
-        caps = defaults.phone_caps.get(provider)
-        if caps is None:
-            # ==Fail-closed, loudly.== The business HAS a credential; the operator has not declared
-            # the ceilings for the public form it sits behind. Building an uncapped sender is the
-            # one state `PhoneChannelSender` exists to make unrepresentable, so the channel stays
-            # off — and says exactly which variables would turn it on, because a channel that is
-            # silently absent is indistinguishable from one nobody wanted.
-            _logger.warning(
-                "business %s has a %s credential but this instance declares no daily caps for that "
-                "channel, so it stays OFF: set AETHERCAL_%s_DAILY_CAP_PER_PHONE and "
-                "AETHERCAL_%s_DAILY_CAP_PER_IP. The recipient comes from a PUBLIC form, so an "
-                "uncapped channel can be made to message strangers on that business's account.",
-                tenant_id,
-                provider.value,
-                provider.value.upper(),
-                provider.value.upper(),
-            )
-            continue
-        # ==THE EGRESS GUARD, and it runs BEFORE the sender exists.== A `_EgressTarget` cannot be
-        # fabricated, and `_build_phone_sender` requires one — so a tenant's URL is never dialed
-        # without having been through it. See `_assert_target_reachable`: this is the bill B-03bis
-        # incurred by turning `base_url` from operator config into third-party input.
-        #
-        # ==And its refusal stays on THIS channel.== It used to escape the whole function, so a
-        # business whose WhatsApp base_url pointed inward stopped receiving its EMAIL — a
-        # fail-closed applied per BUSINESS when the design says per CHANNEL. The channel that is
-        # configured correctly does not pay for the one that is not.
         try:
-            target = await _assert_target_reachable(
+            await _resolve_phone_channel(
                 provider,
-                credential.secrets,
-                source=credential.source,
-                default_url=_DEFAULT_BASE_URLS[provider],
+                session,
+                tenant_id=tenant_id,
+                fernet_key=fernet_key,
+                defaults=defaults,
                 resolver=resolver,
                 clients=clients,
+                into=channels,
             )
-        except CredentialError as exc:
+        except Exception as exc:
+            # ==DERIVED FROM THE SCOPE, and that correction is the whole point of this block.==
+            #
+            # This caught `CredentialError` — the failures its author had in mind. A
+            # `TargetUnresolvable` (DNS down: a NETWORK fault, not a credential one) walked straight
+            # past that list, escaped this function, and took the business's EMAIL down along with
+            # its WhatsApp — the bug the previous round fixed, re-entering through the door the fix
+            # left open. ==A list of error types is a photograph==: the third failure mode is not on
+            # it either.
+            #
+            # So the question is not "which exceptions do I catch?" but *what is the scope of a
+            # failure?* — and the scope is ONE CHANNEL. `_resolve_phone_channel` does all of that
+            # channel's work and nothing else, so anything it raises is that channel's fault without
+            # anybody having to classify it. The same shape `refresh_all_busy_caches` already uses
+            # per connection, for the same reason.
+            #
+            # `Exception`, not `BaseException`: a cancellation or a shutdown is not "this channel
+            # failed", it is the process being told to stop, and it must keep rising. A genuinely
+            # global fault (the database gone) surfaces as EVERY channel failing — which is true,
+            # retryable, and never silent.
             _logger.warning(
-                "business %s: its %s channel is configured and unusable, so THAT channel "
-                "is off and no other — %s",
+                "business %s: resolving its %s channel failed, so THAT channel is off and no "
+                "other — %s: %s",
                 tenant_id,
                 provider.value,
+                type(exc).__name__,
                 exc,
             )
             channel_errors[channel_for(provider)] = exc
-            continue
-        if credential.source is CredentialSource.INSTANCE:
-            _logger.warning(
-                "business %s has no %s credential of its own and is sending from the OPERATOR's "
-                "account, because %s is on. The guest will see, and reply to, a number this "
-                "business does not own.",
-                tenant_id,
-                provider.value,
-                LEND_OPERATOR_PHONE_IDENTITY_ENV,
-            )
-        channels[channel_for(provider)] = _build_phone_sender(
-            provider, credential.secrets, target=target, caps=caps
-        )
 
     return TenantSenders(
         tenant_id=tenant_id, email=email, channels=channels, channel_errors=channel_errors
+    )
+
+
+async def _resolve_phone_channel(  # noqa: PLR0913 - one keyword per injected seam (keys/env/net)
+    provider: CredentialProvider,
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    fernet_key: bytes | Sequence[bytes],
+    defaults: InstanceSenderDefaults,
+    resolver: Resolver | None,
+    clients: SenderClients,
+    into: dict[Channel, PhoneChannelSender],
+) -> None:
+    """Resolve ONE phone channel into ``into``. ==Everything it can get wrong belongs to it.==
+
+    Extracted so the isolation boundary in :func:`resolve_tenant_senders` has a function-shaped
+    scope instead of an indented block. The caller does not need to know what this can raise — only
+    that whatever it raises is this channel's fault. ==That is what makes the guard a rule rather
+    than a list of the failures somebody happened to think of.==
+    """
+    credential = await _resolve_one(
+        session,
+        tenant_id=tenant_id,
+        provider=provider,
+        fernet_key=fernet_key,
+        defaults=defaults,
+    )
+    if credential is None:
+        return
+    caps = defaults.phone_caps.get(provider)
+    if caps is None:
+        # ==Fail-closed, loudly.== The business HAS a credential; the operator has not declared
+        # the ceilings for the public form it sits behind. Building an uncapped sender is the one
+        # state `PhoneChannelSender` exists to make unrepresentable, so the channel stays off — and
+        # says exactly which variables would turn it on, because a channel that is silently absent
+        # is indistinguishable from one nobody wanted.
+        _logger.warning(
+            "business %s has a %s credential but this instance declares no daily caps for that "
+            "channel, so it stays OFF: set AETHERCAL_%s_DAILY_CAP_PER_PHONE and "
+            "AETHERCAL_%s_DAILY_CAP_PER_IP. The recipient comes from a PUBLIC form, so an "
+            "uncapped channel can be made to message strangers on that business's account.",
+            tenant_id,
+            provider.value,
+            provider.value.upper(),
+            provider.value.upper(),
+        )
+        return
+    # ==THE EGRESS GUARD, and it runs BEFORE the sender exists.== A `_EgressTarget` cannot be
+    # fabricated, and `_build_phone_sender` requires one — so a tenant's URL is never dialed without
+    # having been through it. See `_assert_target_reachable`: this is the bill B-03bis incurred by
+    # turning `base_url` from operator config into third-party input.
+    target = await _assert_target_reachable(
+        provider,
+        credential.secrets,
+        source=credential.source,
+        default_url=_DEFAULT_BASE_URLS[provider],
+        resolver=resolver,
+        clients=clients,
+    )
+    if credential.source is CredentialSource.INSTANCE:
+        _logger.warning(
+            "business %s has no %s credential of its own and is sending from the OPERATOR's "
+            "account, because %s is on. The guest will see, and reply to, a number this "
+            "business does not own.",
+            tenant_id,
+            provider.value,
+            LEND_OPERATOR_PHONE_IDENTITY_ENV,
+        )
+    into[channel_for(provider)] = _build_phone_sender(
+        provider, credential.secrets, target=target, caps=caps
     )
 
 

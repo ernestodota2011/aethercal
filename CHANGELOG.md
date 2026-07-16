@@ -56,11 +56,13 @@ credentials; nothing sent with them.
   the other's certificate. Keep-alive is off for tenant egress (HTTP/2 stays off too, and is now
   asserted): every send stands up its own connection, handshaked for its own hostname. The cost is
   a TLS handshake per send.
-- **One broken channel no longer silences the others.** A refused credential escaped the resolver
-  entirely, so a business with a bad WhatsApp `base_url` stopped receiving its *email*. The failure
-  is now scoped to the channel that owns it — and it stays a failure, with its reason: a channel
-  that is configured and refused FAILS and retries (fixable with `credentials set`), while a channel
-  that was never configured is still skipped.
+- **One broken channel no longer silences the others — whatever breaks it.** A failure while
+  resolving one channel escaped the resolver entirely, so a business with a bad WhatsApp `base_url`
+  (or simply a DNS outage on it) stopped receiving its *email*. Isolation is now scoped to the
+  operation — resolving one channel — rather than to a list of error types, so it holds for failures
+  nobody has enumerated. A channel that is configured and fails to resolve FAILS and retries,
+  carrying its own reason; one that was never configured is still skipped. A cancellation or
+  shutdown is not a channel failure and still rises.
 - **A tenant's SMTP relay host is guarded too, and pinned at connect.** `host: 127.0.0.1, port: 25`
   relayed a business's mail through the operator's own local MTA — an open relay on the operator's
   IP reputation. It is the same trust-boundary bug without the HTTP, and scoping it out was

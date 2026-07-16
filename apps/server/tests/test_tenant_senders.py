@@ -14,6 +14,7 @@ These tests pin the two halves of the fix:
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import uuid
 from collections.abc import Awaitable, Callable
@@ -66,7 +67,7 @@ from aethercal.server.services.tenant_senders import (
     instance_fallback,
     resolve_tenant_senders,
 )
-from aethercal.server.webhooks.ssrf import BlockedUrlError
+from aethercal.server.webhooks.ssrf import BlockedUrlError, TargetUnresolvable
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -1140,6 +1141,124 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
         assert Channel.WHATSAPP in senders.channels, (
             "the business lost its WhatsApp because its SMTP relay host was bad"
         )
+
+    async def test_a_DNS_failure_on_one_channel_does_not_take_the_others(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The finding, and it is the same bug through a different door.==
+
+        The first fix caught ``CredentialError``. A ``TargetUnresolvable`` — DNS down, a NETWORK
+        fault and not a credential one — is not in that family, so it walked straight past the
+        catch, escaped the resolver, and took the business's EMAIL down with its WhatsApp all over
+        again. The defect was never the missing branch; it was catching a LIST instead of scoping a
+        FAILURE.
+        """
+        business = await _business(sqlite_session, tenant_factory, "dns-down")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _dns_is_down(host: str) -> list[str]:
+            raise TargetUnresolvable(f"could not resolve {host!r}: the resolver is down")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(
+                sqlite_session, business, defaults=_defaults(), client=client, resolver=_dns_is_down
+            )
+
+        assert senders.email is not None, (
+            "a DNS outage on the WhatsApp endpoint stopped the business's EMAIL. DNS being down is "
+            "not a credential fault — which is exactly why enumerating credential errors missed it."
+        )
+        assert Channel.WHATSAPP not in senders.channels
+        assert Channel.WHATSAPP in senders.channel_errors
+
+    async def test_a_failure_NOBODY_ENUMERATED_still_stays_on_its_own_channel(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The real assertion: a class this codebase has never heard of.==
+
+        Every other test here uses a failure somebody already thought about — which is the same
+        photograph in test form. This invents one that exists nowhere in the product, because the
+        rule is not "the failures we listed stay put", it is ==resolving ONE channel cannot take
+        down the others, whatever happens==. If this needs a new branch to pass, the guard was a
+        list again.
+        """
+
+        class _AFailureNobodyForesaw(Exception):
+            """Not a CredentialError, not a TargetUnresolvable, not anything. That is the point."""
+
+        business = await _business(sqlite_session, tenant_factory, "novel-failure")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _explodes_oddly(host: str) -> list[str]:
+            raise _AFailureNobodyForesaw("something nobody wrote a branch for")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(
+                sqlite_session,
+                business,
+                defaults=_defaults(),
+                client=client,
+                resolver=_explodes_oddly,
+            )
+
+        assert senders.email is not None, (
+            "an unforeseen failure on one channel silenced the others. The rule must hold for "
+            "the exception nobody has written yet — otherwise it is an enumeration wearing a "
+            "rule's clothes."
+        )
+        # The reason survives, chained. `ssrf._resolve` translates ANY resolver failure into
+        # `TargetUnresolvable` — honest, since a resolver that raises IS a DNS failure — and keeps
+        # the original as `__cause__`. What must not happen is the channel going quiet, or the cause
+        # being flattened into something an operator cannot act on.
+        recorded = senders.channel_errors[Channel.WHATSAPP]
+        assert isinstance(recorded.__cause__, _AFailureNobodyForesaw), (
+            f"the channel recorded {recorded!r}, losing the real cause. A reason nobody can act on "
+            "is barely better than no reason at all."
+        )
+
+    async def test_a_shutdown_is_NOT_a_channel_error_and_keeps_rising(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The other extreme, and it matters as much as the first.==
+
+        "Catch everything" is not the rule either. A cancellation is not "this channel failed", it
+        is the process being told to stop — swallowing it would turn a shutdown into a business
+        quietly losing a channel, and a worker that refuses to die. ``Exception`` and not
+        ``BaseException`` is what draws that line.
+        """
+        business = await _business(sqlite_session, tenant_factory, "shutdown")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _cancelled(host: str) -> list[str]:
+            raise asyncio.CancelledError
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(asyncio.CancelledError):
+                await _senders(
+                    sqlite_session,
+                    business,
+                    defaults=_defaults(),
+                    client=client,
+                    resolver=_cancelled,
+                )
 
     async def test_a_refused_channels_step_still_FAILS_with_its_own_reason(self) -> None:
         """==Not silent, and not somebody else's problem.==
