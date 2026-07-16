@@ -75,7 +75,9 @@ anything else a third party hands us and we obey:
 The same applies to a **tenant SMTP relay host** — `host: 127.0.0.1, port: 25` would relay your mail
 through the operator's own MTA, which is an open relay on their IP reputation. There is no `https`
 rule there (SMTP has no such scheme), and no certificate to fall back on: the address check is the
-whole defence.
+whole defence. It is pinned at connect too — the socket is opened to the validated address and
+handed to the SMTP client, so it performs no lookup of its own, while TLS stays bound to your
+hostname.
 
 A credential that fails this is **not usable**: the channel stays off, and the worker logs which
 field is wrong (never its value). Fix it with `credentials set` and the next attempt goes through.

@@ -14,9 +14,11 @@ These tests pin the two halves of the fix:
 
 from __future__ import annotations
 
+import socket
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from unittest import mock
 
 import httpx
@@ -40,6 +42,7 @@ from aethercal.server.services.outbox import (
 from aethercal.server.services.tenant_credentials import (
     CredentialClass,
     CredentialProvider,
+    CredentialSource,
     WrongCredentialClassError,
     credential_class,
     required_fields,
@@ -55,12 +58,15 @@ from aethercal.server.services.tenant_senders import (
     SenderClients,
     TenantSenders,
     UnusableCredentialError,
+    _assert_smtp_host_reachable,
+    _open_pinned_socket,
     _smtp_from_secrets,
     _SmtpTarget,
     channel_for,
     instance_fallback,
     resolve_tenant_senders,
 )
+from aethercal.server.webhooks.ssrf import BlockedUrlError
 
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
@@ -855,6 +861,123 @@ class TestTheWitnessPairsTheUrlWithTheClientThatMayDialIt:
             await tenant.aclose()
 
 
+class TestTheSmtpConnectorClosesRebinding:
+    """==The last flippable path — and the one with no certificate to fall back on.==
+
+    Pinning the HTTP path made SMTP the only one a resolver could still turn. An attacker does not
+    use the average path; they use the weakest — and this was the weakest **and** the one with no
+    backstop: ``use_tls`` is the business's own field, and port 25 on loopback talks plaintext.
+
+    So a business's relay is dialed through a connector that re-validates and pins at connect, and
+    ``aiosmtplib`` is handed the socket. These prove the connector refuses a rebind, that the
+    witness
+    carries it for a tenant and not for the operator, and that the sender actually uses it.
+    """
+
+    async def test_the_connector_refuses_a_rebind_and_opens_no_socket(self) -> None:
+        """==The attack, executed.== The build-time guard already said yes; DNS changes its mind."""
+
+        async def _rebinds_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        with pytest.raises(BlockedUrlError):
+            await _open_pinned_socket("relay.business.example", 587, resolver=_rebinds_inward)
+
+    async def test_a_tenants_witness_carries_a_connector_and_the_operators_does_not(self) -> None:
+        """==The pairing — and the test must be able to tell the two apart.==
+
+        A witness saying "this host passed the guard" can be true while ``aiosmtplib`` resolves the
+        name again and lands on loopback. The connector is what makes it attest the CONNECTION, so
+        the assertion is that a TENANT gets one and the OPERATOR does not.
+        """
+        own = await _assert_smtp_host_reachable(
+            _TENANT_SMTP, source=CredentialSource.TENANT, resolver=_public_dns
+        )
+        lent = await _assert_smtp_host_reachable(
+            {"host": "smtp.operator.example", "from_addr": "a@b.example"},
+            source=CredentialSource.INSTANCE,
+            resolver=_public_dns,
+        )
+
+        assert own.connect is not None, (
+            "a business's own relay was left to aiosmtplib's own DNS. The build-time guard would "
+            "still pass and the socket could still land on the operator's local MTA — which is the "
+            "open relay this exists to close."
+        )
+        assert lent.connect is None, (
+            "the operator's own relay was pinned to public addresses; a self-hoster's LAN relay "
+            "would stop working."
+        )
+
+    async def test_the_sender_dials_through_the_connector_and_closes_the_socket(self) -> None:
+        """==The sender really USES it, and owns the socket completely.==
+
+        A connector can be minted, carried, and never called — the witness would be true and the
+        socket would still be aiosmtplib's own. So this asserts the call happened, that
+        ``aiosmtplib`` was handed the socket with ``port=None`` (it refuses both), that ``hostname``
+        survived for TLS, and that the socket is closed.
+        """
+        opened = socket.socket()
+        calls: list[dict[str, object]] = []
+
+        async def _connector() -> socket.socket:
+            return opened
+
+        async def _fake_send(message: object, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        sender = SmtpEmailSender(
+            SmtpConfig(host="smtp.business.example", from_addr="a@b.example", port=587),
+            connect=_connector,
+        )
+        with mock.patch("aiosmtplib.send", side_effect=_fake_send):
+            await sender.send(EmailMessage())
+
+        assert calls[0]["sock"] is opened, "the pinned socket never reached aiosmtplib"
+        assert calls[0]["port"] is None, (
+            "aiosmtplib refuses `port` alongside `sock` — and a second opinion about the "
+            "destination is a second chance to disagree with the one we validated"
+        )
+        assert calls[0]["hostname"] == "smtp.business.example", (
+            "hostname is what aiosmtplib uses as the TLS server_hostname. Lose it and the "
+            "certificate is verified against nothing, or the send raises outright."
+        )
+        assert opened.fileno() == -1, "the socket was left open — a descriptor per drain item"
+
+    async def test_the_socket_is_closed_even_when_the_send_raises(self) -> None:
+        """Ownership is complete, or it is a leak. A relay hanging up must not cost a
+        descriptor."""
+        opened = socket.socket()
+
+        async def _connector() -> socket.socket:
+            return opened
+
+        sender = SmtpEmailSender(
+            SmtpConfig(host="smtp.business.example", from_addr="a@b.example"), connect=_connector
+        )
+        with (
+            mock.patch("aiosmtplib.send", side_effect=RuntimeError("the relay hung up")),
+            pytest.raises(RuntimeError),
+        ):
+            await sender.send(EmailMessage())
+
+        assert opened.fileno() == -1, "a failed send leaked its socket"
+
+    async def test_the_operators_sender_still_lets_aiosmtplib_dial(self) -> None:
+        """==Anti-vacuity.== Without it, a connector refusing everything would pass the lot."""
+        calls: list[dict[str, object]] = []
+
+        async def _fake_send(message: object, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        sender = SmtpEmailSender(SmtpConfig(host="smtp.operator.example", from_addr="a@b.example"))
+        with mock.patch("aiosmtplib.send", side_effect=_fake_send):
+            await sender.send(EmailMessage())
+
+        assert calls[0]["sock"] is None
+        assert calls[0]["port"] == 587, "the operator's relay lost its port along with its DNS"
+
+
 class TestTheGuardedTransportClosesRebinding:
     """==The pre-flight guard is a TOCTOU window, and this is what shuts it.==
 
@@ -952,7 +1075,7 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
         with pytest.raises(UnusableCredentialError) as caught:
             _smtp_from_secrets(
                 {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
-                target=_SmtpTarget(host="smtp.x.example"),
+                target=_SmtpTarget(host="smtp.x.example", connect=None),
             )
 
         message = str(caught.value)
@@ -974,7 +1097,7 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
         with pytest.raises(UnusableCredentialError) as caught:
             _smtp_from_secrets(
                 {"host": "smtp.x.example", "from_addr": "a@x.example", "use_tls": "maybe"},
-                target=_SmtpTarget(host="smtp.x.example"),
+                target=_SmtpTarget(host="smtp.x.example", connect=None),
             )
 
         message = str(caught.value)

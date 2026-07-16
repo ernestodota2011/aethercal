@@ -233,6 +233,70 @@ class TestATenantsUrlCannotBeDialedWithoutTheEgressGuard:
             "validates it."
         )
 
+    def test_the_smtp_witness_is_minted_in_exactly_one_place(self) -> None:
+        """``_SmtpTarget(...)`` too. ==The relay has no URL and no HTTP client, and the same rule.==
+
+        It attests that a business's relay host passed the guard AND carries the connector that pins
+        it at connect. Minting one anywhere else claims both without having done either — and SMTP
+        is the path with no certificate to catch the mistake.
+        """
+        minted = {
+            _rel(path)
+            for path in _modules()
+            for node in ast.walk(_tree(path))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_SmtpTarget"
+        }
+        assert minted == {"services/tenant_senders.py"}, (
+            f"`_SmtpTarget` is constructed in {sorted(minted)}. Only `_assert_smtp_host_reachable` "
+            "may say a relay host was validated, because it is the one that validates it."
+        )
+        guard = next(
+            node
+            for node in ast.walk(_tree(_FUNNEL))
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+            and node.name == "_assert_smtp_host_reachable"
+        )
+        inside = [
+            node
+            for node in ast.walk(guard)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_SmtpTarget"
+        ]
+        assert inside, "the SMTP guard mints no witness at all — this lock would be vacuous"
+
+    def test_the_email_sender_is_wired_with_the_witnesss_connector(self) -> None:
+        """==The connector must actually reach the sender, or the witness is decoration.==
+
+        ``_SmtpTarget`` can carry a perfectly good connector that nobody passes on — the witness
+        would be true, and ``aiosmtplib`` would resolve the host itself and land wherever DNS said.
+        So every ``SmtpEmailSender`` the funnel builds must be given ``connect=`` off the witness.
+        """
+        calls = [
+            node
+            for node in ast.walk(_tree(_FUNNEL))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "SmtpEmailSender"
+        ]
+        assert calls, "the funnel builds no SmtpEmailSender — this lock would be vacuous"
+        for call in calls:
+            wired = [keyword.value for keyword in call.keywords if keyword.arg == "connect"]
+            assert wired, (
+                "an SmtpEmailSender is built without `connect=`. aiosmtplib would then resolve the "
+                "host itself at connect time, and a business's relay could rebind onto the "
+                "operator's own MTA — the open relay this batch closed."
+            )
+            assert all(
+                isinstance(value, ast.Attribute)
+                and value.attr == "connect"
+                and isinstance(value.value, ast.Name)
+                and value.value.id.endswith("target")
+                for value in wired
+            ), "the connector must come off the witness, not from somewhere the guard never saw"
+
     def test_the_phone_sender_reads_the_url_off_the_witness_and_not_the_credential(self) -> None:
         """==Validate one string and dial another, and the guard was theatre.==
 

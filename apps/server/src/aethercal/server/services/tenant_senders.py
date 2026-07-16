@@ -91,8 +91,11 @@ table rather than to a cut about senders.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import ipaddress
 import logging
+import socket
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -108,7 +111,11 @@ from aethercal.server.integrations.messaging.guard import DailyCaps, PhoneChanne
 from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
-from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
+from aethercal.server.integrations.smtp.sender import (
+    EmailSender,
+    SmtpConnector,
+    SmtpEmailSender,
+)
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.services.tenant_credentials import (
@@ -591,6 +598,20 @@ class _SmtpTarget:
     host: str
     """The validated host. ==Read this, never ``secrets["host"]``.=="""
 
+    connect: SmtpConnector | None
+    """==The connector that dials the validated address — what makes this witness honest.==
+
+    Its first version attested *"this host passed the guard at build time"*. That is true and nearly
+    worthless: ``aiosmtplib`` resolves the host again when it opens the socket, so the witness could
+    be true while the connection went to ``127.0.0.1``. ==A witness that can be true while the
+    socket
+    goes elsewhere is a witness that lies.==
+
+    So it carries the connector, and the two are paired by the one function that validated them
+    together: a ``TENANT`` host with a connector that re-pins at connect, an ``INSTANCE`` host with
+    ``None`` — meaning "resolve as you always did", which is right for the operator's own relay and
+    for nothing else."""
+
 
 def _as_literal_ip(host: str) -> str | None:
     """The host as an IP literal, or ``None`` when it is a name that needs DNS.
@@ -639,6 +660,45 @@ async def _assert_host_public(host: str, *, resolver: Resolver | None) -> None:
             )
 
 
+SMTP_CONNECT_TIMEOUT_SECONDS = 15.0
+"""How long a pinned SMTP connect may take. ==Bounded, like every other provider call here.==
+
+Well under ``outbox.PROVIDER_TIMEOUT_CEILING`` (2 min), which is itself under the drain's lease: a
+send that outlives its own lease is a message the recovery pass hands to a second worker while the
+first is still making it. Mirrors ``whatsapp.sender.SEND_TIMEOUT_SECONDS``."""
+
+
+async def _open_pinned_socket(host: str, port: int, *, resolver: Resolver | None) -> socket.socket:
+    """Connect to the address ``host`` resolves to NOW, re-validated. ==No later lookup.==
+
+    The SMTP counterpart of :class:`EgressGuardedTransport`, and it exists for the identical reason:
+    the build-time guard checks an answer to a question ``aiosmtplib`` asks AGAIN when it opens the
+    socket, and a business running its own DNS can give the two questions different answers. Handing
+    over an already-connected socket removes the second question entirely.
+
+    ``pinned_ip_for`` is the same connect-time pin the webhook path uses — the policy is reused, not
+    restated. With :data:`NO_PRIVATE_TARGETS` "allowed" collapses to "public", so its identity check
+    (private-but-validated) is unreachable here and ``validated=frozenset()`` is exact, not lazy.
+
+    ==Ownership is complete.== The socket is closed on every failure between here and the caller's
+    ``finally`` — a refusal, a timeout, a connect error. A descriptor leaked per drain item is not a
+    tidy failure mode, and the egress path is the last place to be casual about one.
+    """
+    address = await pinned_ip_for(
+        host, resolver=resolver, allowlist=NO_PRIVATE_TARGETS, validated=frozenset()
+    )
+    family = socket.AF_INET6 if ipaddress.ip_address(address).version == 6 else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setblocking(False)
+        async with asyncio.timeout(SMTP_CONNECT_TIMEOUT_SECONDS):
+            await asyncio.get_running_loop().sock_connect(sock, (address, port))
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 async def _assert_smtp_host_reachable(
     secrets: Mapping[str, str], *, source: CredentialSource, resolver: Resolver | None
 ) -> _SmtpTarget:
@@ -665,7 +725,10 @@ async def _assert_smtp_host_reachable(
     """
     host = secrets["host"].strip()
     if source is not CredentialSource.TENANT:
-        return _SmtpTarget(host=host)
+        # The operator's own relay: `aiosmtplib` resolves it as it always has. Pinning it to public
+        # addresses would break the self-hoster whose relay sits on their LAN — which is not a
+        # threat model, it is their deployment.
+        return _SmtpTarget(host=host, connect=None)
     try:
         await _assert_host_public(host, resolver=resolver)
     except BlockedUrlError as exc:
@@ -682,7 +745,20 @@ async def _assert_smtp_host_reachable(
             )
         ) from exc
     # TargetUnresolvable flies, as on the HTTP side: DNS down is a network failure, not a policy.
-    return _SmtpTarget(host=host)
+    #
+    # ==Paired with a PINNING connector, and that pairing is the whole point.== Everything above is
+    # a pre-flight check, and a pre-flight check is exactly what a rebind defeats. The connector
+    # re-validates at connect and hands `aiosmtplib` the socket, so this witness attests the
+    # CONNECTION rather than a string that was true a moment ago.
+    return _SmtpTarget(
+        host=host,
+        connect=functools.partial(
+            _open_pinned_socket,
+            host,
+            _credential_port(secrets.get("port")),
+            resolver=resolver,
+        ),
+    )
 
 
 def _smtp_from_secrets(secrets: Mapping[str, str], *, target: _SmtpTarget) -> SmtpConfig:
@@ -1085,7 +1161,10 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
         smtp_target = await _assert_smtp_host_reachable(
             smtp_credential.secrets, source=smtp_credential.source, resolver=resolver
         )
-        email = SmtpEmailSender(_smtp_from_secrets(smtp_credential.secrets, target=smtp_target))
+        email = SmtpEmailSender(
+            _smtp_from_secrets(smtp_credential.secrets, target=smtp_target),
+            connect=smtp_target.connect,
+        )
 
     channels: dict[Channel, PhoneChannelSender] = {}
     for provider in (CredentialProvider.WHATSAPP, CredentialProvider.SMS):
@@ -1146,6 +1225,7 @@ async def resolve_tenant_senders(  # noqa: PLR0913 - one keyword per injected se
 
 __all__ = [
     "LEND_OPERATOR_PHONE_IDENTITY_ENV",
+    "SMTP_CONNECT_TIMEOUT_SECONDS",
     "EgressBlocked",
     "EgressGuardedTransport",
     "InstanceFallback",
