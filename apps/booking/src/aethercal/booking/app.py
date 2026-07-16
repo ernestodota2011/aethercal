@@ -60,6 +60,7 @@ from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
 from aethercal.client import AetherCalAPIError, AetherCalClient
 from aethercal.core.tz import require_iana_zone
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.event_types import resolve_title
 from aethercal.schemas.public import PublicEventTypeRead
 
@@ -72,8 +73,13 @@ logger = logging.getLogger(__name__)
 
 #: The status a slot-conflict `AetherCalAPIError` carries — the PRG-redirect trigger (I4).
 HTTP_409_CONFLICT = 409
-#: The default display zone when a guest hasn't chosen one yet (the browser then auto-detects).
+#: The FLOOR display zone: what a page falls back to when the API cannot say whose page this is.
+#: A business that has set its own timezone (B-07) overrides it — see `_default_tz`.
 DEFAULT_TZ = "UTC"
+
+#: A sentinel distinguishing "the brand has not been fetched for this request" from "it was
+#: fetched and the answer was None" — which are different, and `None` cannot say which.
+_UNSET = object()
 #: How many days of availability a single window shows (and the prev/next navigation step).
 WINDOW_DAYS = 14
 #: Curated zones offered in the selector (Americas-heavy for the Latino ICP); the guest's detected
@@ -151,7 +157,22 @@ def _content_security_policy(
         "default-src 'self'; "
         f"script-src {' '.join(sources)}; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
+        # ==`https:` is here so a business's LOGO can actually load (B-07).==
+        #
+        # It used to be `'self' data:`, and under that policy the branding feature would have
+        # SHIPPED BROKEN AND SILENT: an operator pastes `https://cdn.theirsite.com/logo.png` into
+        # the admin, the form saves happily, the API returns it, the page renders the <img> — and
+        # the guest's browser refuses the request. No server error, no log, no clue. The logo is
+        # simply never there. A feature whose failure is invisible is the feature that ships.
+        #
+        # Widening images (and ONLY images) is the narrowest fix that makes the value renderable:
+        # an image cannot execute, `script-src` stays `'self'`, and `logo_url` is validated
+        # https-only, so `http:` (mixed content), `data:` (an SVG that runs script) and
+        # `javascript:` never reach the attribute. What it does buy the operator is a request from
+        # their guest's browser to a host THEY chose — the same host they chose for every other byte
+        # of their page. See `require_logo_url`'s docstring for why the webhook SSRF allowlist is
+        # NOT the right instrument here: the server never fetches this URL.
+        "img-src 'self' data: https:; "
         "font-src 'self'; "
         "connect-src 'self'; "
         f"frame-ancestors {frame_ancestors};{frame_src}"
@@ -504,7 +525,15 @@ class _RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
     def _too_many_requests(self, request: Request) -> Response:
-        """The friendly, localized 429 for a rate-limited request (never a stack, never a body)."""
+        """The friendly, localized 429 for a rate-limited request (never a stack, never a body).
+
+        ==Deliberately UNBRANDED (B-07).== Every other page asks the API whose page this is; this
+        one must not. It is the response to a client the limiter has just decided is sending too
+        many requests, and answering it with an outbound API call — one per rejection — would hand
+        that client an amplifier pointed at our own backend. A rate-limited visitor gets the
+        product's chrome and their answer, cheaply. That is the right trade, and it is a decision,
+        not an omission.
+        """
         locale = select_locale(
             query_lang=request.query_params.get("lang"),
             accept_language=request.headers.get("accept-language"),
@@ -572,9 +601,25 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _tz_of(request: Request) -> tuple[str, bool]:
+def _default_tz(brand: TenantBrandingRead | None) -> str:
+    """The zone a guest sees before they choose one: ==the BUSINESS's==, else the product's.
+
+    ``DEFAULT_TZ`` remains the floor — it is what a page falls back to when the API cannot say whose
+    page this is — but it is no longer the answer for everybody. It never should have been: a clinic
+    in Miami showing its hours in UTC is not "neutral", it is wrong, and until B-07 there was
+    nowhere for that clinic to say so.
+    """
+    return brand.timezone if brand is not None else DEFAULT_TZ
+
+
+def _tz_of(request: Request, default: str = DEFAULT_TZ) -> tuple[str, bool]:
+    """The display zone for this request, and whether the GUEST chose it.
+
+    The guest's explicit ``?tz=`` always wins. The business's zone is a *default*, not a decision
+    made on the guest's behalf — a booker in Chicago who picks Chicago keeps Chicago.
+    """
     chosen = _valid_tz(request.query_params.get("tz"))
-    return (chosen, True) if chosen else (DEFAULT_TZ, False)
+    return (chosen, True) if chosen else (default, False)
 
 
 def _today_in(tz: str) -> date:
@@ -639,7 +684,13 @@ def _shifted_url(
     return f"{path}?{urlencode({**base, 'from': new_from.isoformat()})}"
 
 
-def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
+def _not_found(
+    request: Request,
+    locale: Locale,
+    *,
+    base_url: str,
+    brand: TenantBrandingRead | None = None,
+) -> Response:
     # Derived from `request` (not threaded as a param — keeps this at the PLR0913 budget): an
     # /embed/* 404 (e.g. an unknown slug inside the iframe) must stay compact, chrome-less (B1).
     body = views.message_page(
@@ -648,6 +699,7 @@ def _not_found(request: Request, locale: Locale, *, base_url: str) -> Response:
         message=t(locale, "not_found_body"),
         lang_urls=_lang_links_here(request),
         base_url=base_url,
+        brand=brand,
         is_error=True,
         embed=_is_embed_request(request),
     )
@@ -805,6 +857,57 @@ class _BookingApp:
             logger.exception("booking page: failed to load event types for %s", tenant)
             return None
 
+    async def _brand(self, request: Request) -> TenantBrandingRead | None:
+        """Whose page is this? (B-07) — the business's name, mark, colour and timezone, or ``None``.
+
+        ==Resolved from the tenant SLUG in the ROUTE (B-04), never from an API key — the page holds
+        none.== The business is the one the path names (``/t/{slug}/…``), falling back to the
+        deployment's own ``AETHERCAL_TENANT_SLUG`` for the single-business self-hoster's unprefixed
+        URLs — the SAME business ``_events`` and ``_slots_section`` talk to, resolved by the SAME
+        ``_tenant``. That is what makes criterion 44 hold here: A's page asks the public branding
+        endpoint for A's slug and can no more obtain B's brand than it can post a booking into B's
+        diary — the slug it holds is A's, and there is no key to point anywhere else.
+
+        No route tenant AND no configured default is no business at all: there is nothing to ask and
+        nothing to render, so it is ``None`` without a wasted round-trip.
+
+        ``None`` is a first-class answer, not an error path, and it means one of two things that
+        should look identical to a guest: the business has set no branding (every row, on the day
+        the migration lands), or the API could not tell us. Both fall back to the product's own
+        chrome. ==A backend that cannot say whose page this is must cost the guest a LOGO, not their
+        booking== — the same RF-16 trust boundary ``_events`` above draws, and drawn the same way.
+
+        Memoised on ``request.state`` because a single response can build the shell more than once
+        (a handler that renders a form, fails, and re-renders it) and the brand cannot change
+        mid-request. It is deliberately NOT cached across requests: an operator who fixes a typo in
+        their name should see it on the next reload, not in fifteen minutes, and a TTL cache is a
+        staleness bug waiting for the one page nobody re-tests.
+        """
+        cached = getattr(request.state, "brand", _UNSET)
+        if cached is not _UNSET:
+            return cached  # type: ignore[no-any-return]  # only ever set by this method
+        tenant = self._tenant(request)
+        if tenant is None:
+            request.state.brand = None
+            return None
+        try:
+            brand = await self._call(lambda c: c.get_public_branding(tenant))
+        except Exception:
+            logger.exception("booking page: failed to load branding")
+            brand = None
+        request.state.brand = brand
+        return brand
+
+    async def _shell(self, request: Request) -> tuple[TenantBrandingRead | None, str]:
+        """The two things every page needs from the business: its brand, and its display timezone.
+
+        The timezone is the guest's if they chose one, and the BUSINESS's if they did not. It used
+        to be a hard-coded ``DEFAULT_TZ = "UTC"`` — which was never a neutral default, it was a
+        wrong one for every business that does not work in UTC, and there was nowhere to say so.
+        """
+        brand = await self._brand(request)
+        return brand, _tz_of(request, _default_tz(brand))[0]
+
     def _service_error(
         self,
         locale: Locale,
@@ -812,6 +915,7 @@ class _BookingApp:
         lang_urls: dict[Locale, str],
         retry_url: str,
         embed: bool = False,
+        brand: TenantBrandingRead | None = None,
     ) -> Response:
         """The friendly 'service temporarily unavailable' page (503) with a retry affordance."""
         body = views.message_page(
@@ -820,6 +924,7 @@ class _BookingApp:
             message=t(locale, "error_generic"),
             lang_urls=lang_urls,
             base_url=self._settings.base_url,
+            brand=brand,
             back_url=retry_url,
             back_label=t(locale, "retry"),
             is_error=True,
@@ -836,6 +941,7 @@ class _BookingApp:
         lang_urls: dict[Locale, str],
         retry: tuple[str, str] | None = None,
         embed: bool = False,
+        brand: TenantBrandingRead | None = None,
     ) -> Response:
         """A friendly, localized error page with the correct HTTP status — never leaks internals.
 
@@ -861,6 +967,7 @@ class _BookingApp:
             message=message,
             lang_urls=lang_urls,
             base_url=self._settings.base_url,
+            brand=brand,
             back_url=retry_url,
             back_label=retry_label,
             is_error=True,
@@ -873,12 +980,16 @@ class _BookingApp:
     async def index(self, request: Request) -> object:
         locale = self._locale(request)
         tenant = self._tenant(request)
+        brand = await self._brand(request)
         if tenant is None:
-            return _not_found(request, locale, base_url=self._settings.base_url)
+            return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         events = await self._events(tenant)
         if events is None:
             return self._service_error(
-                locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
+                locale,
+                lang_urls=_lang_links_here(request),
+                retry_url=str(request.url),
+                brand=brand,
             )
         # No `active` filter here any more: the PUBLIC listing only ever contains what is on sale.
         # Filtering in the client was never a defence — it was the server trusting its client.
@@ -894,6 +1005,7 @@ class _BookingApp:
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
             event_base=_booking_prefix(embed, self._route_tenant(request)),
+            brand=brand,
         )
 
     async def event(self, request: Request) -> object:
@@ -905,7 +1017,8 @@ class _BookingApp:
         tenant = self._tenant(request)
         embed = _is_embed_request(request)
         event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
-        tz, tz_explicit = _tz_of(request)
+        brand, tz = await self._shell(request)
+        _, tz_explicit = _tz_of(request, _default_tz(brand))
         today = _today_in(tz)
         window_from = _window_of(request, today)
         if tenant is None:
@@ -917,10 +1030,11 @@ class _BookingApp:
                 lang_urls=_lang_links_here(request),
                 retry_url=str(request.url),
                 embed=embed,
+                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale, base_url=self._settings.base_url)
+            return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         section = await self._slots_section(
             found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
@@ -944,6 +1058,7 @@ class _BookingApp:
             lang_urls=_lang_links_here(request),
             notice=notice,
             base_url=self._settings.base_url,
+            brand=brand,
             embed=embed,
         )
 
@@ -959,7 +1074,10 @@ class _BookingApp:
                 f"{event_path}?{query}" if query else event_path, status_code=303
             )
         locale = self._locale(request)
-        tz, _ = _tz_of(request)
+        # The slot list is an HTMX FRAGMENT — no shell, so no brand to render. The business's
+        # timezone still applies (it is what the guest sees before choosing one), and the 404 this
+        # can still emit is a full page, so it gets the brand like every other page.
+        brand, tz = await self._shell(request)
         today = _today_in(tz)
         window_from = _window_of(request, today)
         if tenant is None:
@@ -970,7 +1088,7 @@ class _BookingApp:
             return views.slots_unavailable_fragment(locale)
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale, base_url=self._settings.base_url)
+            return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         return await self._slots_section(
             found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
@@ -982,7 +1100,7 @@ class _BookingApp:
         tenant = self._tenant(request)
         embed = _is_embed_request(request)
         event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
-        tz, _ = _tz_of(request)
+        brand, tz = await self._shell(request)
         start = request.query_params.get("start", "")
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
@@ -993,10 +1111,11 @@ class _BookingApp:
                 lang_urls=_lang_links_here(request),
                 retry_url=str(request.url),
                 embed=embed,
+                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale, base_url=self._settings.base_url)
+            return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         instant = _parse_instant(start)
         if instant is None:
             return RedirectResponse(
@@ -1015,11 +1134,19 @@ class _BookingApp:
             lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
             turnstile_site_key=self._settings.turnstile_site_key,
             base_url=self._settings.base_url,
+            brand=brand,
             embed=embed,
         )
 
-    def _honeypot_response(
-        self, request: Request, *, form: Mapping[str, str], slug: str, start: str, tz: str
+    def _honeypot_response(  # noqa: PLR0913 - `brand` is the shell's, not this page's (B-07)
+        self,
+        request: Request,
+        *,
+        form: Mapping[str, str],
+        slug: str,
+        start: str,
+        tz: str,
+        brand: TenantBrandingRead | None = None,
     ) -> Response | None:
         """The honeypot post-parse check for ``book_submit`` (the rate-limit check runs BEFORE the
         body is even parsed, so it is not here). Returns a short-circuit response, or ``None``.
@@ -1039,6 +1166,7 @@ class _BookingApp:
                 message=t(locale, "honeypot_received_message"),
                 lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
                 base_url=self._settings.base_url,
+                brand=brand,
                 embed=embed,
             )
         return None
@@ -1052,6 +1180,7 @@ class _BookingApp:
         locale: Locale,
         tz: str,
         tenant: str,
+        brand: TenantBrandingRead | None = None,
     ) -> object:
         """Validate the submitted form and either create the booking or return the outcome page:
         inline validation errors, a 409-conflict PRG redirect (I4), a friendly backend-failure
@@ -1097,6 +1226,7 @@ class _BookingApp:
                 lang_urls=lang_urls,
                 turnstile_site_key=self._settings.turnstile_site_key,
                 base_url=self._settings.base_url,
+                brand=brand,
                 embed=embed,
             )
         guest_ip = self._guest_ip(request)
@@ -1120,6 +1250,7 @@ class _BookingApp:
                 lang_urls=lang_urls,
                 retry=(back, t(locale, "back_to_times")),
                 embed=embed,
+                brand=brand,
             )
         return views.confirmation_page(
             locale,
@@ -1132,6 +1263,7 @@ class _BookingApp:
             when_label=label,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
+            brand=brand,
             embed=embed,
         )
 
@@ -1144,9 +1276,14 @@ class _BookingApp:
         tenant = self._tenant(request)
         embed = _is_embed_request(request)
         event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
-        tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
+        brand = await self._brand(request)
+        # A POSTed `tz` comes from the form the guest just submitted, so the business's zone is the
+        # fallback here exactly as it is on the GET — the form carries the zone the picker showed.
+        tz = _valid_tz(form.get("tz")) or _default_tz(brand)
         start = form.get("start", "")
-        honeypot = self._honeypot_response(request, form=form, slug=slug, start=start, tz=tz)
+        honeypot = self._honeypot_response(
+            request, form=form, slug=slug, start=start, tz=tz, brand=brand
+        )
         if honeypot is not None:
             return honeypot
         locale = self._locale(request, form.get("lang"))
@@ -1159,16 +1296,18 @@ class _BookingApp:
                 lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
                 retry_url=f"{event_path}?{urlencode({'tz': tz, 'lang': locale})}",
                 embed=embed,
+                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:
-            return _not_found(request, locale, base_url=self._settings.base_url)
+            return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         return await self._complete_booking(
-            request, form=form, event=found, locale=locale, tz=tz, tenant=tenant
+            request, form=form, event=found, locale=locale, tz=tz, tenant=tenant, brand=brand
         )
 
     async def cancel_form(self, request: Request) -> object:
         locale = self._locale(request)
+        brand = await self._brand(request)
         booking_id = _parse_uuid(request.query_params.get("booking", ""))
         token = request.query_params.get("token", "")
         if booking_id is None or not token:
@@ -1178,6 +1317,7 @@ class _BookingApp:
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
                 base_url=self._settings.base_url,
+                brand=brand,
                 is_error=True,
             )
         return views.cancel_confirm_page(
@@ -1187,12 +1327,14 @@ class _BookingApp:
             action="/cancel",
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
+            brand=brand,
         )
 
     async def cancel_submit(self, request: Request) -> object:
         # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
+        brand = await self._brand(request)
         booking_id = _parse_uuid(form.get("booking", ""))
         token = form.get("token", "")
         lang_urls = _lang_links("/cancel", {})
@@ -1203,6 +1345,7 @@ class _BookingApp:
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
                 base_url=self._settings.base_url,
+                brand=brand,
                 is_error=True,
             )
         try:
@@ -1213,6 +1356,7 @@ class _BookingApp:
                 title=t(locale, "cancel_title"),
                 exc=exc,
                 lang_urls=lang_urls,
+                brand=brand,
             )
         return views.message_page(
             locale,
@@ -1220,10 +1364,12 @@ class _BookingApp:
             message=t(locale, "cancel_done"),
             lang_urls=lang_urls,
             base_url=self._settings.base_url,
+            brand=brand,
         )
 
     async def reschedule_form(self, request: Request) -> object:
         locale = self._locale(request)
+        brand = await self._brand(request)
         booking_id = _parse_uuid(request.query_params.get("booking", ""))
         event_id = _parse_uuid(request.query_params.get("event_type", ""))
         token = request.query_params.get("token", "")
@@ -1234,9 +1380,10 @@ class _BookingApp:
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=_lang_links_here(request),
                 base_url=self._settings.base_url,
+                brand=brand,
                 is_error=True,
             )
-        tz, tz_explicit = _tz_of(request)
+        tz, tz_explicit = _tz_of(request, _default_tz(brand))
         today = _today_in(tz)
         window_from = _window_of(request, today)
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
@@ -1294,12 +1441,14 @@ class _BookingApp:
             section=section,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
+            brand=brand,
         )
 
     async def reschedule_submit(self, request: Request) -> object:
         # Rate limiting runs in _RateLimitMiddleware, before the body is parsed.
         form = _form_dict(await request.form())
         locale = self._locale(request, form.get("lang"))
+        brand = await self._brand(request)
         booking_id = _parse_uuid(form.get("booking", ""))
         token = form.get("token", "")
         new_start = _parse_instant(form.get("new_start", ""))
@@ -1311,6 +1460,7 @@ class _BookingApp:
                 message=t(locale, "reschedule_missing_context"),
                 lang_urls=lang_urls,
                 base_url=self._settings.base_url,
+                brand=brand,
                 is_error=True,
             )
         try:
@@ -1330,6 +1480,7 @@ class _BookingApp:
             message=t(locale, "reschedule_done"),
             lang_urls=lang_urls,
             base_url=self._settings.base_url,
+            brand=brand,
         )
 
     def robots_txt(self, request: Request) -> Response:
@@ -1362,13 +1513,21 @@ class _BookingApp:
         del request  # Starlette passes the request; liveness ignores it.
         return PlainTextResponse("ok")
 
-    def catch_all(self, request: Request) -> Response:
+    async def catch_all(self, request: Request) -> Response:
         """The branded 404 for any path with no registered route (never Starlette's bare default).
 
         Registered LAST in ``create_app`` so every specific route still matches first — this only
         catches what nothing else did.
+
+        ==Async now, and it had to become async (B-07).== "Branded" used to mean the product's
+        chrome; it now means the BUSINESS's, and learning whose page this is takes an API call. A
+        404 rendered in the product's colours, on a page every other route renders in the
+        business's, is exactly the kind of seam a guest notices and nobody tests.
         """
-        return _not_found(request, self._locale(request), base_url=self._settings.base_url)
+        brand = await self._brand(request)
+        return _not_found(
+            request, self._locale(request), base_url=self._settings.base_url, brand=brand
+        )
 
 
 def create_app(

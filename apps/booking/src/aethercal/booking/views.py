@@ -40,6 +40,7 @@ from fasthtml.common import (
     Head,
     Header,
     Html,
+    Img,
     Input,
     Label,
     Li,
@@ -73,6 +74,7 @@ from aethercal.booking.forms import (
 from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.event_types import resolve_description, resolve_title
 from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 from aethercal.schemas.slots import Availability
@@ -115,7 +117,13 @@ main { max-width: var(--maxw); margin: 0 auto; padding: 2rem 1.25rem 4rem; }
 }
 .site-footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--border);
   margin-top: 2rem; }
-.brand { font-weight: 600; letter-spacing: -0.01em; color: var(--text); text-decoration: none; }
+.brand {
+  font-weight: 600; letter-spacing: -0.01em; color: var(--text); text-decoration: none;
+  display: inline-flex; align-items: center; gap: .55rem; min-width: 0;
+}
+/* The business's mark. Height-bounded and `width: auto`, so ANY logo an operator uploads sits on
+   the baseline of the header instead of resizing it — a tall PNG must not push the page down. */
+.brand-logo { height: 1.75rem; width: auto; max-width: 10rem; object-fit: contain; }
 .langs a { color: var(--muted); text-decoration: none; font-size: .85rem; padding: 0 .35rem; }
 .langs a[aria-current="true"] { color: var(--text); font-weight: 600; }
 h1 { font-size: 1.6rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 .5rem; }
@@ -246,9 +254,57 @@ def _lang_switcher(locale: Locale, lang_urls: Mapping[Locale, str]) -> Any:
     return Nav(*links, cls="langs", aria_label=t(locale, "language"))
 
 
-def _header(locale: Locale, lang_urls: Mapping[Locale, str]) -> Any:
+def site_name(locale: Locale, brand: TenantBrandingRead | None) -> str:
+    """What this page calls itself: the BUSINESS's name, or the product's when there is no brand.
+
+    One function, because the answer is needed in three places that must not drift — the header, the
+    ``<title>``, and ``og:site_name``. A page whose tab says "AetherCal" and whose header says
+    "Clínica Sol" is a page that has half-shipped its own feature.
+    """
+    return brand.display_name if brand is not None else t(locale, "app_name")
+
+
+def _brand_mark(brand: TenantBrandingRead | None) -> list[Any]:
+    """The business's logo, or nothing at all.
+
+    ``alt=""`` on purpose: the business's name sits immediately beside it, in text, so a screen
+    reader that also announced the logo would say the name twice. The mark is decorative *because*
+    the name is not (RNF-7).
+    """
+    if brand is None or not brand.logo_url:
+        return []
+    return [Img(src=brand.logo_url, alt="", cls="brand-logo")]
+
+
+def _brand_style(brand: TenantBrandingRead | None) -> list[Any]:
+    """The business's accent colour, as an override of the theme's two accent variables.
+
+    An OVERRIDE, not a replacement: the whole stylesheet keeps working (contrast, focus rings, the
+    light-mode block), and a business that has chosen no colour gets no element at all — which is
+    what ``id="brand"`` lets a test, and a person reading the source, actually see.
+
+    ==The value is safe to interpolate because of its FORMAT, not because it is escaped.==
+    ``accent_color`` is a hex triplet or it does not exist: :func:`require_accent_color` refuses it
+    at the write edge (the admin, 422) *and* at this read edge (``TenantBrandingRead`` validates on
+    parse), so a string carrying ``;``, ``}`` or ``</style>`` cannot reach this f-string — not from
+    the API, and not from a row somebody edited by hand in ``psql``.
+    """
+    if brand is None or not brand.accent_color:
+        return []
+    accent = brand.accent_color
+    return [Style(f":root {{ --accent: {accent}; --focus: {accent}; }}", id="brand")]
+
+
+def _header(
+    locale: Locale, lang_urls: Mapping[Locale, str], brand: TenantBrandingRead | None
+) -> Any:
     return Header(
-        A(t(locale, "app_name"), href=_with_lang("/", locale), cls="brand"),
+        A(
+            *_brand_mark(brand),
+            Span(site_name(locale, brand)),
+            href=_with_lang("/", locale),
+            cls="brand",
+        ),
         _lang_switcher(locale, lang_urls),
         cls="site-header",
     )
@@ -282,9 +338,20 @@ _OG_LOCALE: dict[Locale, str] = {"es": "es_ES", "en": "en_US"}
 _OG_IMAGE_PATH = "/static/og.png"
 
 
-def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url: str) -> list[Any]:
+def _social_meta(
+    locale: Locale,
+    *,
+    full_title: str,
+    base_url: str,
+    current_url: str,
+    brand: TenantBrandingRead | None = None,
+) -> list[Any]:
     """Open Graph + Twitter Card ``<meta>`` tags (A7) — every url is absolute (``base_url``-
     prefixed) so a social unfurler (WhatsApp/email/Slack) fetched out-of-band still resolves them.
+
+    ``og:site_name`` follows the header (:func:`site_name`): when a guest pastes their booking link
+    into WhatsApp, the unfurl must name the BUSINESS. Naming the product there — while the page
+    itself is branded — is the same half-shipped feature, in the one place the guest sees first.
     """
     description = t(locale, "meta_description")
     image_url = f"{base_url}{_OG_IMAGE_PATH}"
@@ -292,7 +359,7 @@ def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url:
         Meta(property="og:title", content=full_title),
         Meta(property="og:description", content=description),
         Meta(property="og:type", content="website"),
-        Meta(property="og:site_name", content=t(locale, "app_name")),
+        Meta(property="og:site_name", content=site_name(locale, brand)),
         Meta(property="og:url", content=current_url),
         Meta(property="og:image", content=image_url),
         Meta(property="og:locale", content=_OG_LOCALE.get(locale, _OG_LOCALE[DEFAULT_LOCALE])),
@@ -310,8 +377,23 @@ def page(
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
+
+    ==``brand`` is where per-business identity enters the page, and it enters ONCE.== The shell is
+    the one thing every route renders, so putting the name, the mark and the colour here is what
+    makes them appear on the landing page, the slot picker, the confirmation, the cancel link a
+    guest opens from their inbox three weeks later, and the 404 — without any of those routes
+    knowing that branding exists.
+
+    ``None`` (the default) is the product's own chrome: an unbranded business, and also the
+    fallback when the API cannot say whose page this is. Every existing caller therefore keeps the
+    behaviour it had.
+
+    In the ``embed`` shell the header is absent by design (B1: the embedder brings its own chrome),
+    so the name and the mark are not rendered there — but the ACCENT still is, because the guest is
+    looking at the business's colours inside the business's own site.
 
     ``base_url`` mints the ABSOLUTE urls Open Graph/Twitter Card tags require (A7); callers that
     don't thread a real ``BookingSettings.base_url`` through still get the production default
@@ -323,12 +405,12 @@ def page(
     size the iframe to the guest's content. The skip-link is also omitted — with no header there
     is nothing before ``<main>`` to skip past.
     """
-    full_title = f"{title} · {t(locale, 'app_name')}"
+    full_title = f"{title} · {site_name(locale, brand)}"
     current_url = f"{base_url}{lang_urls.get(locale, '')}"
     body_children: list[Any] = []
     if not embed:
         body_children.append(A(t(locale, "skip_to_content"), href="#main", cls="skip-link"))
-        body_children.append(_header(locale, lang_urls))
+        body_children.append(_header(locale, lang_urls, brand))
     body_children.append(Main(*content, id="main"))
     if embed:
         body_children.append(_embed_resize_script())
@@ -341,12 +423,19 @@ def page(
             Meta(name="color-scheme", content="dark light"),
             Meta(name="description", content=t(locale, "meta_description")),
             *_social_meta(
-                locale, full_title=full_title, base_url=base_url, current_url=current_url
+                locale,
+                full_title=full_title,
+                base_url=base_url,
+                current_url=current_url,
+                brand=brand,
             ),
             Title(full_title),
             *_hreflang_links(lang_urls),
             Link(rel="icon", type="image/svg+xml", href="/static/favicon.svg"),
             Style(_CSS),
+            # AFTER the base stylesheet, so the business's accent wins on specificity-equal
+            # `:root` — and only ever those two variables.
+            *_brand_style(brand),
             Script(src=_HTMX_SRC, defer=True),
         ),
         Body(*body_children, cls="embed" if embed else None),
@@ -370,6 +459,7 @@ def index_page(
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     event_base: str = "/e",
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Landing page: the tenant's bookable meeting types, each linking into the booking flow.
 
@@ -403,6 +493,7 @@ def index_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 
@@ -492,6 +583,7 @@ def event_page(
     notice: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
 
@@ -522,6 +614,7 @@ def event_page(
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
@@ -811,6 +904,7 @@ def booking_form_page(
     turnstile_site_key: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Step 2: name, email, notes, and questions — re-renders inline errors on failure.
 
@@ -907,6 +1001,7 @@ def booking_form_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
@@ -1000,6 +1095,7 @@ def confirmation_page(
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Step 3: the confirmation (when, e-mail note) plus the add-to-calendar links (M-F3).
 
@@ -1028,6 +1124,7 @@ def confirmation_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
@@ -1048,6 +1145,7 @@ def message_page(
     is_error: bool = False,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """A minimal, friendly single-message page (errors, not-found, done states) — never leaks.
     ``embed`` (B1) renders the compact, chrome-less shell so a backend hiccup or a 404 inside an
@@ -1056,7 +1154,13 @@ def message_page(
     if back_url and back_label:
         body.append(A(back_label, href=back_url, cls="btn secondary"))
     return page(
-        locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url, embed=embed
+        locale,
+        title,
+        Div(*body, cls="stack"),
+        lang_urls=lang_urls,
+        base_url=base_url,
+        embed=embed,
+        brand=brand,
     )
 
 
@@ -1068,6 +1172,7 @@ def cancel_confirm_page(
     action: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The cancel confirmation: a POST form carrying the booking id + guest token."""
     form = Form(
@@ -1090,6 +1195,7 @@ def cancel_confirm_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 
@@ -1149,6 +1255,7 @@ def reschedule_page(
     section: Any,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The reschedule flow: a timezone control plus the slot section (times POST ``new_start``)."""
     return page(
@@ -1164,6 +1271,7 @@ def reschedule_page(
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 

@@ -23,7 +23,12 @@ if TYPE_CHECKING:
     # its "pure, no reflex/db dependency" property. ``aethercal.ui`` would otherwise trigger the
     # component's ``rx.asset`` side effect, and ``admin.service`` would drag SQLAlchemy and the ORM
     # models into what is meant to be a leaf of pure functions.
-    from aethercal.server.admin.service import AdminMetrics, ConnectionRead, HostRead
+    from aethercal.server.admin.service import (
+        AdminMetrics,
+        BrandingRead,
+        ConnectionRead,
+        HostRead,
+    )
     from aethercal.server.services.memberships import MemberRead
     from aethercal.ui import CalendarEvent, CalendarResource
 
@@ -345,12 +350,29 @@ def weekly_rules(weekdays: list[int], start: str, end: str) -> Rules:
     return {day: [TimeRangeSchema(start=start, end=end)] for day in weekdays}
 
 
+def branding_row(view: BrandingRead) -> dict[str, str]:
+    """The branding form's five strings, flattened for a Reflex state var (B-07).
+
+    ``registered_name`` rides along so the panel can SHOW the fallback ("currently shown as: Sol
+    Holdings LLC") without pre-filling the ``public_name`` box with it — which would quietly turn a
+    fallback into a value the operator then saved.
+    """
+    return {
+        "public_name": view.public_name,
+        "logo_url": view.logo_url,
+        "accent_color": view.accent_color,
+        "timezone": view.timezone,
+        "registered_name": view.registered_name,
+    }
+
+
 __all__ = [
     "ALL_EVENT_TYPES",
     "DEFAULT_CALENDAR",
     "SHARED_SCHEDULE",
     "booking_event",
     "booking_row",
+    "branding_row",
     "connection_row",
     "event_type_row",
     "host_resource",

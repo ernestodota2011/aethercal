@@ -15,6 +15,7 @@ from fastapi import APIRouter
 
 from aethercal.server.api import (
     bookings,
+    branding,
     event_types,
     health,
     schedules,
@@ -36,6 +37,9 @@ would mount the same routes onto it again, and again.
 
 api_router = APIRouter(prefix=API_V1_PREFIX)
 api_router.include_router(health.router)
+# The authenticated business's public name / logo / accent colour / timezone (B-07). The booking
+# page reads it to render ITS business's brand — the business is the key's, never a parameter.
+api_router.include_router(branding.router)
 api_router.include_router(event_types.router)
 api_router.include_router(schedules.router)
 api_router.include_router(slots.router)

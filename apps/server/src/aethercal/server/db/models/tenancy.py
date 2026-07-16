@@ -28,12 +28,56 @@ _MEMBER_ROLE = sa.Enum(
 
 
 class Tenant(UUIDPrimaryKey, Timestamps, Base):
-    """An isolated organization. Every other row is scoped to a tenant via ``tenant_id``."""
+    """An isolated organization. Every other row is scoped to a tenant via ``tenant_id``.
+
+    .. rubric:: The four branding columns (B-07 / RF-27), and why they live HERE
+
+    ``slug`` and ``name`` are the operator's handles on the business: one routes, the other is what
+    an invoice is made out to. Neither is a thing a GUEST should be shown, and until 0014 there was
+    nothing else — so every business on a shared instance served a booking page headed "AetherCal",
+    in AetherCal's colours, in UTC. The page was the product's, not theirs.
+
+    * ``public_name`` — the name the guest reads. Nullable, and
+      :func:`~aethercal.schemas.branding.resolve_display_name` falls back to ``name``: a business
+      that has not chosen a trading name still has a name.
+    * ``logo_url`` — an ``https`` URL, validated in ``schemas.branding``. The server never fetches
+      it; the guest's browser does (that validator's docstring explains why that is a different
+      threat model from the webhook allowlist, and why copying the allowlist here would be cargo
+      cult).
+    * ``accent_color`` — a hex triplet, and only a hex triplet: the value is interpolated into a
+      ``<style>`` block, so the FORMAT is the injection belt.
+    * ``timezone`` — ==NOT NULL, defaulted to UTC==, alone among the four. The others degrade to
+      "the page shows a little less"; an absent timezone degrades to "the page shows the wrong
+      TIME", and every slot on the page needs one. It is not a new fact — the booking page has been
+      hard-coding ``DEFAULT_TZ = "UTC"`` all along — it is that fact moved somewhere the operator
+      can reach. Existing rows therefore default to exactly the zone they were already displayed in.
+
+    .. warning::
+       ==``tenants`` carries NO row-level-security policy, by design== (migration 0008: the admin
+       reads it by slug at boot, before any GUC can exist, and the public router makes slugs
+       semi-public anyway). So the ``app`` role **can read every business's branding** — RLS is not
+       what keeps one business's mark off another's page. ==The belt is the ``WHERE tenants.id =
+       :tenant_id`` in :mod:`aethercal.server.services.branding`, and it is load-bearing.== It is
+       asserted from both ends in ``tests/rls/test_branding_isolation.py``: that the policy really
+       is absent (so nobody mistakes RLS for the guard), and that the service is exact regardless.
+    """
 
     __tablename__ = "tenants"
 
     slug: Mapped[str] = mapped_column(sa.String(63), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+
+    # -- branding (migration 0014) ---------------------------------------------------------
+    public_name: Mapped[str | None] = mapped_column(sa.String(255))
+    logo_url: Mapped[str | None] = mapped_column(sa.String(2048))
+    accent_color: Mapped[str | None] = mapped_column(sa.String(7))
+    # Both defaults, deliberately: the ``server_default`` is what backfills the rows that already
+    # exist (and what a raw INSERT from psql gets); the Python-side ``default`` is what keeps a
+    # freshly constructed, not-yet-flushed ``Tenant`` from reading back ``None`` — the CLI's
+    # ``create-tenant`` holds exactly that object.
+    timezone: Mapped[str] = mapped_column(
+        sa.String(64), nullable=False, default="UTC", server_default=sa.text("'UTC'")
+    )
 
 
 class User(UUIDPrimaryKey, TenantScoped, Timestamps, Base):

@@ -38,6 +38,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.public import (
     PublicBookingCreate,
     PublicBookingRead,
@@ -60,6 +61,7 @@ from aethercal.server.services.bookings import (
     EventTypeNotFoundError,
     create_booking,
 )
+from aethercal.server.services.branding import get_branding, public_branding
 from aethercal.server.services.event_types import (
     get_bookable_event_type_by_slug,
     list_bookable_event_types,
@@ -169,6 +171,27 @@ async def list_public_event_types(
         )
         for row in rows
     ]
+
+
+@router.get("/{tenant_slug}/branding", response_model=TenantBrandingRead)
+async def get_public_branding(tenant_slug: TenantSlug, session: SessionDep) -> TenantBrandingRead:
+    """The business's public brand — display name, logo, accent colour, timezone — with NO key.
+
+    ==The keyless twin of ``GET /api/v1/branding``.== That endpoint answers the business the API
+    KEY authenticated as; the booking page holds no key any more, so it asks HERE, naming the
+    business in the ROUTE — the same ``tenant_slug`` every other public endpoint resolves through
+    ``_bind_business``, failing closed the same way: an unknown slug is the shared 404, and
+    indistinguishable from every other public miss.
+
+    The four columns are public by construction — the only fields of ``tenants`` a guest was ever
+    meant to see (``schemas.branding``) — and ``public_branding`` is the projection: the registered
+    ``name``, the ``slug`` and the id are not on the wire model at all, so nothing internal leaks
+    from here. There is no PII on this endpoint because there is no booking on it — it answers
+    "whose page is this?", and nothing more.
+    """
+    tenant_id = await _bind_business(session, tenant_slug)
+    tenant = await get_branding(session, tenant_id=tenant_id)
+    return public_branding(tenant)
 
 
 @router.get("/{tenant_slug}/{event_slug}/slots", response_model=PublicSlotsResponse)

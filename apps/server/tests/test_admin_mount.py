@@ -95,6 +95,7 @@ def test_build_admin_app_registers_every_page() -> None:
         "event-types",
         "schedules",
         "workflows",
+        "branding",
     }
 
 

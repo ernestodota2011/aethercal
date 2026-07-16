@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, MemberRole
 from aethercal.schemas.bookings import BookingRead
+from aethercal.schemas.branding import TenantBrandingUpdate
 from aethercal.schemas.event_types import EventTypeCreate, EventTypeRead, EventTypeUpdate
 from aethercal.schemas.schedules import ScheduleCreate, ScheduleRead, ScheduleUpdate
 from aethercal.schemas.workflows import (
@@ -70,6 +71,7 @@ from aethercal.server.db.models import (
 from aethercal.server.db.models.booking import held_filter
 from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.services import bookings as bookings_service
+from aethercal.server.services import branding as branding_service
 from aethercal.server.services import calendars as calendars_service
 from aethercal.server.services import event_types as event_types_service
 from aethercal.server.services import memberships as memberships_service
@@ -1510,6 +1512,113 @@ async def _member_read(
     raise AdminActionError("that member is no longer in this business")  # pragma: no cover
 
 
+# --------------------------------------------------------------------------------------
+# Branding (B-07 / RF-27) — the four columns a GUEST sees, and the only place they are written.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BrandingForm:
+    """What the operator typed. ==Four boxes, all four sent, every time.==
+
+    Plain strings, blanks included, because that is literally what an HTML form submits — and it is
+    the shape that lets an emptied box MEAN something. A partial model here would collapse "I
+    removed the logo" and "I did not mention the logo" into one request, and the panel would then be
+    unable to remove a logo at all.
+
+    Nothing is validated on this object. The rules live in ``schemas.branding``
+    (:class:`TenantBrandingUpdate`), which is the same object the API answers with, so the panel and
+    the wire cannot come to disagree about what a colour is.
+    """
+
+    public_name: str
+    logo_url: str
+    accent_color: str
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class BrandingRead:
+    """What the panel shows back: the form's four values, plus the name it falls back to.
+
+    ==The values here are RAW, and that is deliberate.== The API hands the booking page a
+    ``display_name`` already resolved (``public_name or name``) because a page needs a name to
+    print. An operator needs the opposite: they must see an EMPTY box when they have set no trading
+    name, and their registered ``name`` shown separately as the fallback currently in use. Filling
+    the box with the fallback would invite them to save it — silently promoting a default into a
+    stored value they never chose.
+    """
+
+    public_name: str
+    logo_url: str
+    accent_color: str
+    timezone: str
+    registered_name: str
+
+
+def _branding_read(tenant: Tenant) -> BrandingRead:
+    return BrandingRead(
+        public_name=tenant.public_name or "",
+        logo_url=tenant.logo_url or "",
+        accent_color=tenant.accent_color or "",
+        timezone=tenant.timezone,
+        registered_name=tenant.name,
+    )
+
+
+async def branding_view(
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None
+) -> BrandingRead:
+    """The business's current branding, as the form's four boxes plus its registered name.
+
+    Reads sit behind ``VIEW`` (every member has it) — the brand is what a guest already sees, so
+    seeing it in the panel is not the reconnaissance ``MANAGE_MEMBERS`` guards. Writing it is
+    another matter (:func:`update_branding_action`, behind ``MANAGE_SCHEDULING``).
+    """
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.VIEW)
+        tenant = await branding_service.get_branding(session, tenant_id=ctx.tenant_id)
+        return _branding_read(tenant)
+
+
+async def update_branding_action(
+    admin: AdminSessions, *, principal: Principal, tenant_slug: str | None, form: BrandingForm
+) -> BrandingRead:
+    """Save the business's branding — or refuse it, with a sentence the operator can act on.
+
+    Behind ``MANAGE_SCHEDULING``: branding is business configuration, like the schedules and event
+    types that capability already governs — an ``admin`` runs the business and may change its public
+    face; a ``member`` may not. (Not ``MANAGE_MEMBERS``/``MANAGE_BILLING``, which are the owner-only
+    powers to hand the business away or move its money.)
+
+    ==The validation is the schema's, and it is not re-implemented here.== Every one of these four
+    values is rendered into HTML on a public page: the colour goes into a ``<style>`` block, the
+    logo into an ``<img src>``. A second, laxer copy of "what a colour is" living in the admin is
+    exactly how the strict one at the edge would come to be bypassed — and it would be bypassed by
+    the one surface that can actually write the row.
+
+    A ``ValidationError`` therefore becomes an :class:`AdminActionError` and **nothing is written**:
+    the model is constructed before the session is opened, so a refused save cannot half-land.
+    """
+    try:
+        data = TenantBrandingUpdate(
+            public_name=form.public_name,
+            logo_url=form.logo_url,
+            accent_color=form.accent_color,
+            timezone=form.timezone,
+        )
+    except ValidationError as exc:
+        raise AdminActionError(_validation_message(exc)) from exc
+
+    async with admin.admin_session(tenant_slug) as (session, ctx):
+        principal = await _live_principal(session, principal, ctx)
+        _authorize(principal, ctx, Capability.MANAGE_SCHEDULING)
+        tenant = await branding_service.update_branding(session, tenant_id=ctx.tenant_id, data=data)
+        await session.flush()
+        return _branding_read(tenant)
+
+
 __all__ = [
     "AdminActionError",
     "AdminContext",
@@ -1519,11 +1628,14 @@ __all__ = [
     "AdminSessions",
     "AdminSetupError",
     "BookingForm",
+    "BrandingForm",
+    "BrandingRead",
     "ConnectionRead",
     "EventTypeForm",
     "HostForm",
     "HostRead",
     "MemberForm",
+    "branding_view",
     "cancel_booking_action",
     "create_booking_action",
     "create_event_type_action",
@@ -1552,6 +1664,7 @@ __all__ = [
     "resolve_admin_context",
     "set_member_password_action",
     "set_workflow_active_action",
+    "update_branding_action",
     "update_event_type_action",
     "update_host_action",
     "update_member_role_action",

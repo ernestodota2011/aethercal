@@ -52,6 +52,7 @@ from aethercal.server.admin.format import (
     SHARED_SCHEDULE,
     booking_event,
     booking_row,
+    branding_row,
     connection_row,
     event_type_row,
     host_resource,
@@ -751,6 +752,10 @@ class AdminState(rx.State):
     hosts: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     # -- the health panel (RF-25 / R9) ------------------------------------------------
     metrics: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- branding (B-07 / RF-27) ------------------------------------------------------
+    # The four columns a GUEST sees, plus the registered name the public name falls back to. A flat
+    # dict rather than five vars: it is one form, loaded and saved as one thing.
+    branding: dict[str, str] = {}  # noqa: RUF012 (reflex state var)
     # The connections of the host the operator is currently inspecting (they are per-host, so they
     # are loaded on demand rather than for everybody).
     connections: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
@@ -1671,6 +1676,64 @@ class AdminState(rx.State):
         except service.AdminError as exc:
             self.error = _error_text(exc)
 
+    # -- branding (B-07 / RF-27) -----------------------------------------------------
+
+    @rx.event
+    async def load_branding(self) -> None:
+        """Load the business's public name / logo / accent colour / timezone."""
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            caller = self._caller
+            view = await service.branding_view(
+                caller.runtime, principal=caller.principal, tenant_slug=caller.business
+            )
+            self.branding = branding_row(view)
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def save_branding(self, form_data: dict[str, str]) -> None:
+        """Save the branding — all four boxes, every time.
+
+        ==A blank box is "remove it", not "leave it".== The form has one control per field, so an
+        emptied one is a decision the operator made; treating it as "unchanged" would make removing
+        a logo impossible from the only surface that can set one.
+
+        A refused value (a colour that is not a hex triplet, a logo that is not https, a timezone
+        that is not an IANA zone) comes back as a readable error and NOTHING is written — the panel
+        then re-loads, so the boxes show what is actually stored rather than what was rejected.
+        """
+        if not self._authenticated:
+            return
+        caller = self._caller
+        try:
+            view = await service.update_branding_action(
+                caller.runtime,
+                principal=caller.principal,
+                tenant_slug=caller.business,
+                form=service.BrandingForm(
+                    public_name=_clean(form_data, "public_name"),
+                    logo_url=_clean(form_data, "logo_url"),
+                    accent_color=_clean(form_data, "accent_color"),
+                    # NO "or UTC": a blank box is the operator's decision, not consent to a
+                    # default. Coercing it here skips validation and writes UTC in silence; let the
+                    # empty reach the schema, which refuses it (the column's server_default still
+                    # backfills existing rows — that is the migration's job, not the form's).
+                    timezone=_clean(form_data, "timezone"),
+                ),
+            )
+            self.branding = branding_row(view)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            # Re-load the boxes so they show what is actually stored — then set the error, because
+            # the reload clears self.error the way every on_load does. Setting it first let the
+            # reload swallow it, and the panel redrew with no word of why nothing saved (:1288
+            # promised the refusal "comes back as a readable error").
+            await self.load_branding()
+            self.error = _error_text(exc)
+
     # -- hosts + their connected calendars (RF-30) -----------------------------------
 
     @rx.event
@@ -2022,6 +2085,7 @@ def _reset_business_scoped_state(state: AdminState) -> None:
     state.new_booking_start = ""
     state.show_new_booking = False
     state.members = []
+    state.branding = {}
 
 
 __all__ = ["HOME_ROUTE", "LOGIN_ROUTE", "AdminState"]

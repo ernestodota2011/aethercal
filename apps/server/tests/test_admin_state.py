@@ -52,6 +52,8 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
     (AdminState.load_metrics.fn, ()),
+    (AdminState.load_branding.fn, ()),
+    (AdminState.save_branding.fn, ({},)),
     (AdminState.load_hosts.fn, ()),
     (AdminState.create_host.fn, ({},)),
     (AdminState.update_host.fn, ({},)),
@@ -933,3 +935,78 @@ async def test_select_business_clears_the_previous_businesss_panels(
         {"slug": "globex", "name": "Globex"},
     ]
     assert state.calendar_view == "week"
+
+
+# --------------------------------------------------------------------------------------
+# Branding panel (B-07 / RF-27) — at the STATE handler, not just the service.
+# --------------------------------------------------------------------------------------
+
+
+async def test_save_branding_keeps_the_validation_error_visible(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A refused save must leave the operator the sentence they can act on.==
+
+    The handler re-loads the form boxes on refusal so they show what is actually stored — but that
+    reload clears ``self.error`` the way every ``on_load`` does. Setting the error and THEN
+    reloading let the reload swallow it: the panel silently redrew and the operator never learned
+    why nothing saved. The error must survive the reload.
+    """
+    state = await _authenticated_state(seeded_maker)
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "Mars/Phobos",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # ...and the boxes show what is stored (the seed's UTC), not the rejected submission.
+    assert state.branding["timezone"] == "UTC"
+    assert state.branding["public_name"] == ""
+
+
+async def test_save_branding_refuses_a_blank_timezone_instead_of_silently_choosing_utc(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A cleared timezone box is not consent to UTC — it is refused, and nothing is written.==
+
+    The handler used to coerce a blank with ``or "UTC"`` before the schema ever saw it, so the
+    operator's empty field was silently decided for them (a no-op the docstring's "NOTHING is
+    written" contract forbids). A blank must reach the validator and come back as an error, leaving
+    the stored zone untouched.
+    """
+    state = await _authenticated_state(seeded_maker)
+    # A known, non-UTC starting point, so "kept" and "silently set to UTC" cannot look the same.
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "America/New_York",
+        },
+    )
+    assert state.error == ""
+    assert state.branding["timezone"] == "America/New_York"
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # Nothing was written: a fresh read still finds the zone from the successful save.
+    await AdminState.load_branding.fn(state)
+    assert state.branding["timezone"] == "America/New_York"

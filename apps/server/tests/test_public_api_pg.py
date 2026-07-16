@@ -376,6 +376,41 @@ async def test_the_public_booking_response_is_NOT_the_pii_dump(
 
 
 # --------------------------------------------------------------------------------------
+# Branding — the keyless "whose page is this?", four public columns and not one more.
+# --------------------------------------------------------------------------------------
+
+
+async def test_branding_is_readable_with_NO_api_key(
+    public_client: AsyncClient, acme: dict[str, Any]
+) -> None:
+    """The booking page reads its business's brand with no key, naming the business in the ROUTE —
+    the keyless twin of ``GET /api/v1/branding``. Four public columns cross the wire and not one
+    more: the registered ``name``, the ``slug`` and the id are the operator's handles, never a
+    guest's to see."""
+    response = await public_client.get(f"/api/v1/public/{acme['tenant_slug']}/branding")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"display_name", "logo_url", "accent_color", "timezone"}
+    # No public_name is set on the seeded business, so a guest reads the registered name; the logo
+    # and colour are absent, and the zone is the NOT-NULL default every existing row backfilled to.
+    assert body["display_name"] == acme["tenant_slug"]
+    assert body["logo_url"] is None
+    assert body["accent_color"] is None
+    assert body["timezone"] == "UTC"
+
+
+async def test_branding_for_an_unknown_business_fails_CLOSED(
+    public_client: AsyncClient,
+) -> None:
+    """An unknown slug is the shared public 404 — the same answer every other public miss gives, so
+    the endpoint that asked for no credentials is not an oracle for which businesses exist."""
+    response = await public_client.get("/api/v1/public/no-such-business/branding")
+
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------------------
 # ==Criterion 15== — the same event slug lives in two businesses. It must land in the right one.
 # --------------------------------------------------------------------------------------
 

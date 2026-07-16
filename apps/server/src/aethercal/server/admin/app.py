@@ -69,6 +69,12 @@ def build_admin_app(runtime: AdminRuntime) -> rx.App:
         title="Schedules · AetherCal admin",
     )
     app.add_page(
+        pages.branding_page,
+        route="/branding",
+        on_load=[AdminState.require_auth, AdminState.load_branding],
+        title="Branding · AetherCal admin",
+    )
+    app.add_page(
         pages.workflows_page,
         route="/workflows",
         # ``load_workflows`` also loads the templates and the event types: a rule cannot be authored

@@ -99,6 +99,7 @@ with `rescheduled_from_id` pointing at the predecessor.
 |---|---|---|
 | `health()` | `GET /api/v1/health` | `dict` |
 | `ping()` | `GET /api/v1/health` | `bool` — never raises |
+| `get_branding()` | `GET /api/v1/branding` | `TenantBrandingRead` |
 | `list_event_types()` | `GET /api/v1/event-types/` | `list[EventTypeRead]` |
 | `get_slots(event_type, *, window_from, window_to, tz)` | `GET /api/v1/slots/` | `SlotsResponse` |
 | `create_booking(booking)` | `POST /api/v1/bookings/` | `BookingRead` |
@@ -109,6 +110,13 @@ with `rescheduled_from_id` pointing at the predecessor.
 and `availability` — which is `"ok"` only when the external busy set was known and complete for the
 whole window. Anything else means a connected calendar could not be established, and AetherCal
 withholds that host's slots rather than risk a double-booking. Check it before you offer a time.
+
+`TenantBrandingRead` carries `display_name`, `logo_url`, `accent_color` and `timezone` — the four
+things a business's own booking page shows. `get_branding()` takes **no argument**: the business is
+the one your API key belongs to, resolved server-side, so there is nothing to pass and nothing that
+could point at another business's brand. `display_name` arrives already resolved (the business's
+public name, or its registered name when it has not set one), and `timezone` is the zone to show
+times in before a visitor picks their own.
 
 ### `AsyncAetherCalClient` — asynchronous
 
