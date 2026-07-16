@@ -163,7 +163,7 @@ class StripeGateway:
             transport=self._transport,
         )
 
-    async def create_checkout_session(
+    async def create_checkout_session(  # noqa: PLR0913 - the checkout's fields ARE the contract
         self,
         *,
         idempotency_key: str,

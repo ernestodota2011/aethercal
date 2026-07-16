@@ -50,11 +50,7 @@ from aethercal.server.services.outbox import (
     drain_outbox,
     make_booking_effect_executor,
 )
-from aethercal.server.services.payments import (
-    make_expire_hold_runner,
-    make_refund_runner,
-    run_parked_payment_tick,
-)
+from aethercal.server.services.payments import build_money_runners, run_parked_payment_tick
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
 
@@ -444,18 +440,15 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
         # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
         fernet = _decryption_fernet(app)
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        # ==The money runners (B-05b).== The REFUND handler needs the BYOK gateway + the rotation
-        # keys; EXPIRE_HOLD needs neither (one conditional UPDATE, no external I/O). Both run on
-        # the exec pool under RLS, bound per item like every other effect. With no gateway wired a
-        # REFUND intent raises loudly rather than silently stranding a guest's money.
-        fernet_keys = app.state.fernet_keys
+        # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateway + rotation keys
+        # DEFENSIVELY off app state (a missing one must not AttributeError), and let
+        # ``build_money_runners`` decide: the REFUND runner needs BOTH, EXPIRE_HOLD needs neither.
+        # With either missing the refund runner is None and a REFUND intent raises loudly, not
+        # silently stranding a guest's money.
+        fernet_keys = getattr(app.state, "fernet_keys", None)
         gateway = getattr(app.state, "payment_gateway", None)
-        refund_runner = (
-            make_refund_runner(
-                sessionmaker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
-            )
-            if gateway is not None
-            else None
+        refund_runner, expire_hold_runner = build_money_runners(
+            exec_maker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
         )
         execute = make_booking_effect_executor(
             sessionmaker=pools.exec_maker,
@@ -469,7 +462,7 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
             # .ics invite that a plain-body ChannelSender cannot.
             channels=getattr(app.state, "channel_senders", None),
             refund_runner=refund_runner,
-            expire_hold_runner=make_expire_hold_runner(sessionmaker=pools.exec_maker),
+            expire_hold_runner=expire_hold_runner,
         )
         await run_outbox_drain_once(pools=pools, execute=execute)
 

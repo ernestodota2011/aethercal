@@ -68,7 +68,7 @@ class _FakeGateway:
     def __init__(self) -> None:
         self.sessions: list[dict[str, Any]] = []
 
-    async def create_checkout_session(
+    async def create_checkout_session(  # noqa: PLR0913 - mirrors the gateway contract
         self,
         *,
         idempotency_key: str,

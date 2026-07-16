@@ -20,7 +20,11 @@ from aethercal.core.model import BookingStatus
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Booking, Payment, PaymentStatus, Schedule, Tenant, User
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork, refund_dedupe_key
-from aethercal.server.services.payments import make_expire_hold_runner, make_refund_runner
+from aethercal.server.services.payments import (
+    build_money_runners,
+    make_expire_hold_runner,
+    make_refund_runner,
+)
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     MissingCredentialError,
@@ -317,3 +321,39 @@ async def test_the_expire_hold_runner_is_a_no_op_once_the_payment_won(
         refreshed = await s.get(Booking, booking_id)
         assert refreshed is not None
         assert refreshed.status is BookingStatus.CONFIRMED, "a confirmed booking is not expired"
+
+
+def test_the_money_runners_are_fail_closed_without_keys_or_gateway(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Finding 2.== The drain's money-runner wiring reads ``fernet_keys``/``payment_gateway`` off
+    app state; a missing one must FAIL-CLOSED, not crash. The REFUND runner needs BOTH the BYOK
+    gateway and the rotation keys — without either it is ``None`` (a REFUND intent then raises
+    at dispatch, never a None-key decrypt or an AttributeError). EXPIRE_HOLD needs neither, so it is
+    always built."""
+    gateway = _GatewaySpy()
+
+    # Both present → the refund runner is wired.
+    refund, expire = build_money_runners(
+        exec_maker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY]
+    )
+    assert refund is not None
+    assert expire is not None
+
+    # No rotation keys → no refund runner (fail-closed), but EXPIRE_HOLD still runs.
+    refund_no_keys, expire_no_keys = build_money_runners(
+        exec_maker=sqlite_maker, gateway=gateway, fernet_keys=None
+    )
+    assert refund_no_keys is None
+    assert expire_no_keys is not None
+
+    # Empty key tuple is also fail-closed.
+    refund_empty, _ = build_money_runners(exec_maker=sqlite_maker, gateway=gateway, fernet_keys=[])
+    assert refund_empty is None
+
+    # No gateway → no refund runner.
+    refund_no_gw, expire_no_gw = build_money_runners(
+        exec_maker=sqlite_maker, gateway=None, fernet_keys=[_KEY]
+    )
+    assert refund_no_gw is None
+    assert expire_no_gw is not None

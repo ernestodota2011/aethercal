@@ -492,7 +492,7 @@ class PaymentGateway(Protocol):
     """The provider side of the money — ==injected==, so every provider call is a seam, not a
     hard-wired Stripe import. A test passes a spy; production passes the real BYOK adapter."""
 
-    async def create_checkout_session(
+    async def create_checkout_session(  # noqa: PLR0913 - the checkout's fields ARE the contract
         self,
         *,
         idempotency_key: str,
@@ -640,6 +640,40 @@ def make_expire_hold_runner(*, sessionmaker: _Sessionmaker) -> OutboxExecutor:
                 )
 
     return _run
+
+
+def build_money_runners(
+    *,
+    exec_maker: _Sessionmaker,
+    gateway: PaymentGateway | None,
+    fernet_keys: Sequence[bytes] | None,
+) -> tuple[OutboxExecutor | None, OutboxExecutor]:
+    """The drain's two money runners, ==FAIL-CLOSED (finding 2)==.
+
+    Returns ``(refund_runner, expire_hold_runner)``. The REFUND runner needs BOTH the BYOK gateway
+    (to move the money) and the rotation keys (to decrypt the credential) — so if EITHER is missing
+    it is ``None``, and a REFUND intent then raises loudly at dispatch (the executor
+    turns a ``None`` refund runner into a hard error) rather than crashing on a missing app-state
+    attribute or decrypting with a ``None`` key. ==EXPIRE_HOLD needs neither== (one conditional
+    UPDATE, no external I/O), so it is always built.
+
+    This exists so the wiring the worker's drain tick does — reading ``fernet_keys`` and
+    ``payment_gateway`` off app state — is a TESTED, defensive function instead of a bare
+    attribute read inside a ``# pragma: no cover`` closure.
+    """
+    expire_hold_runner = make_expire_hold_runner(sessionmaker=exec_maker)
+    if gateway is None or not fernet_keys:
+        _logger.warning(
+            "money runners: REFUND runner NOT built (gateway=%s, fernet_keys=%s) — a REFUND intent "
+            "will fail loudly rather than run without a provider or a decryption key",
+            "present" if gateway is not None else "MISSING",
+            "present" if fernet_keys else "MISSING",
+        )
+        return None, expire_hold_runner
+    refund_runner = make_refund_runner(
+        sessionmaker=exec_maker, gateway=gateway, fernet_keys=fernet_keys
+    )
+    return refund_runner, expire_hold_runner
 
 
 # --------------------------------------------------------------------------------------
@@ -801,6 +835,7 @@ __all__ = [
     "apply_dispute_event",
     "apply_paid_event",
     "apply_refunded_event",
+    "build_money_runners",
     "enqueue_cancellation_refunds",
     "enqueue_expire_hold",
     "enqueue_refund",
