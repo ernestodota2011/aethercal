@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeCreate
 from aethercal.schemas.webhooks import WEBHOOK_EVENTS
+from aethercal.schemas.workflows import WorkflowCreate, WorkflowStepIn
 from aethercal.server.db.models import (
     Booking,
     EventType,
@@ -64,6 +65,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.webhooks import WebhookSubject, enqueue_event, event_subject
+from aethercal.server.services.workflow_rules import create_workflow
 
 _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)}
 
@@ -375,6 +377,53 @@ def test_every_webhook_event_declares_whose_it_is() -> None:
 
     # Every event today is about ONE appointment, and that is why the funnel can take a Booking.
     assert {event_subject(event) for event in WEBHOOK_EVENTS} == {WebhookSubject.BOOKING}
+
+
+# --------------------------------------------------------------------------------------
+# A rule edit does not arm a hold — criterion 22.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_editing_a_workflow_rule_does_not_materialise_steps_for_a_hold(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 22.== Writing a rule arms the CONFIRMED bookings on the books — never the holds.
+
+    A new rule reconciles onto the bookings that already exist (a tenant who writes "remind 1 h
+    before" this morning means it for the meeting already in the diary). ``_LIVE_STATUSES`` used to
+    include ``PENDING``, so a hold was one of those governed bookings — and editing an unrelated
+    reminder would materialise its steps, sending the guest who never paid a reminder for an
+    appointment nobody ever confirmed to them.
+
+    Both bookings sit in the same tenant so this is one reconcile pass making two different
+    decisions: the confirmed booking gets its NOTIFY step, the hold gets nothing.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    hold = await _hold(sqlite_session, tenant, event_type)
+    confirmed = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_11), now=_BEFORE
+    )
+
+    # A reminder one hour before the start — both bookings start at a future instant relative to
+    # ``_BEFORE``, so a governed booking WOULD get a queued step.
+    await create_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        data=WorkflowCreate(
+            name="1h reminder",
+            trigger="before_start",
+            offset_minutes=-60,
+            event_type_id=event_type.id,
+            steps=[WorkflowStepIn(channel="email", kind="reminder")],
+        ),
+        now=_BEFORE,
+    )
+
+    # The confirmed booking was armed; the hold was not touched.
+    confirmed_steps = await _outbox_of(sqlite_session, confirmed)
+    assert [row.effect for row in confirmed_steps] == [OutboxEffect.NOTIFY.value]
+    assert await _outbox_of(sqlite_session, hold) == []
 
 
 # --------------------------------------------------------------------------------------
