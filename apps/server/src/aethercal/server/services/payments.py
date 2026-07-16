@@ -69,11 +69,13 @@ from aethercal.server.db.models import (
     RefundKind,
 )
 from aethercal.server.db.pools import BypassReason, WorkerPools
+from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
     OutboxWork,
     as_utc,
+    email_dedupe_key,
     enqueue_effect,
     refund_dedupe_key,
 )
@@ -108,6 +110,15 @@ class ArbiterOutcome(StrEnum):
     """The amount or currency did not match the price: refund and alert, never confirm."""
     PARKED = "parked"
     """The payment/booking does not exist yet (the webhook beat the commit): retry later."""
+    OUT_OF_BAND_REFUND = "out_of_band_refund"
+    """A ``charge.refunded`` we did NOT emit (the operator refunded from the dashboard): the booking
+    is cancelled so the slot frees — never money returned AND the service still delivered."""
+    REFUND_ECHO = "refund_echo"
+    """A ``charge.refunded`` echoing our OWN refund (the payment is already ``refunded``): no-op,
+    and above all it does not cancel the booking a second time."""
+    DISPUTE_MARKED = "dispute_marked"
+    """A ``charge.dispute.created``: marked and alerted, but NOT cancelled — a dispute is not a
+    resolution, and one later won would be worse than the problem."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +363,105 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
         booking.confirmed_by_payment_id,
     )
     return ArbiterResult(ArbiterOutcome.REFUNDED_DOUBLE, booking.id, payment.id)
+
+
+async def apply_refunded_event(
+    session: AsyncSession, *, tenant_id: uuid.UUID, provider: str, provider_ref: str, now: datetime
+) -> ArbiterResult:
+    """Apply a ``charge.refunded`` event (B-05b, criterion 35). ==Out-of-band vs our own echo.==
+
+    The discriminator is ``payment.status``. Our refund runner sets it to ``refunded`` BEFORE the
+    provider echoes ``charge.refunded`` back — so an event on an already-``refunded`` payment
+    is that echo, and a NO-OP. An event on a still-``paid`` payment is a refund the OPERATOR issued
+    from the provider's dashboard, which we did not cause: leaving the booking confirmed would be
+    money returned AND the service still delivered, so the booking is CANCELLED (freeing the slot),
+    the guest is told, and the host is alerted.
+
+    ==No second refund is queued== on the out-of-band path: the money already went back, and the
+    booking is cancelled INLINE (not through ``cancel_booking``, which would re-enqueue one), so the
+    dedupe never even matters here.
+    """
+    payment = await resolve_payment(
+        session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
+    )
+    if payment is None:
+        _logger.warning(
+            "arbiter: charge.refunded for a payment we never saw (%s, tenant %s); nothing to do",
+            provider_ref,
+            tenant_id,
+        )
+        return ArbiterResult(ArbiterOutcome.REFUND_ECHO)
+
+    if payment.status is PaymentStatus.REFUNDED:
+        # Our OWN refund, echoed back by the provider. The booking is already cancelled; do NOT
+        # cancel it again.
+        _logger.info(
+            "arbiter: charge.refunded echoes our own refund of payment %s; no-op", payment.id
+        )
+        return ArbiterResult(ArbiterOutcome.REFUND_ECHO, payment.booking_id, payment.id)
+
+    # ==OUT OF BAND.== The operator refunded outside our flow. Record it, cancel the booking so the
+    # slot frees, and alert — never money back AND service delivered.
+    payment.status = PaymentStatus.REFUNDED
+    booking = await session.get(Booking, payment.booking_id)
+    if booking is not None and booking.status is not BookingStatus.CANCELLED:
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = now
+        # Bump the iCal sequence so the cancellation .ics supersedes the confirmation (RFC 5545).
+        booking.sequence += 1
+        # Tell the guest it is cancelled. ``confirmed_at`` is set, so the B-05a silence
+        # gate lets it out. Enqueued directly (not via ``cancel_booking``) so no refund is queued.
+        await enqueue_effect(
+            session,
+            booking=booking,
+            effect=OutboxEffect.EMAIL,
+            dedupe_key=email_dedupe_key(NotificationKind.CANCELLATION),
+            payload={
+                "kind": NotificationKind.CANCELLATION.value,
+                "cancel_url": None,
+                "reschedule_url": None,
+                "locale": "es",
+                "sequence": booking.sequence,
+            },
+        )
+    _logger.error(
+        "ALERT: OUT-OF-BAND refund for payment %s — booking %s CANCELLED and its slot freed. "
+        "Notify the host: money was returned outside our flow",
+        payment.id,
+        payment.booking_id,
+    )
+    return ArbiterResult(ArbiterOutcome.OUT_OF_BAND_REFUND, payment.booking_id, payment.id)
+
+
+async def apply_dispute_event(
+    session: AsyncSession, *, tenant_id: uuid.UUID, provider: str, provider_ref: str, now: datetime
+) -> ArbiterResult:
+    """Apply a ``charge.dispute.created`` event (B-05b, criterion 36). ==Mark and alert; NEVER
+    cancel.==
+
+    A dispute is not a resolution. Cancelling on a dispute that is later WON would be worse than the
+    problem — the guest keeps the appointment they paid for AND we tore it up. So it touches neither
+    the booking nor the payment: the persistent MARK is the ``payment_events`` row the webhook
+    wrote, and the ALERT is what puts a human on it. ``now`` is part of the arbiter contract (every
+    apply takes it) even though this branch does not need a clock.
+    """
+    _ = now
+    payment = await resolve_payment(
+        session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
+    )
+    booking_id = payment.booking_id if payment is not None else None
+    _logger.error(
+        "ALERT: DISPUTE created for provider_ref %s (payment %s, booking %s) — marked, host to be "
+        "notified. NOT auto-cancelled: a dispute is not a resolution",
+        provider_ref,
+        payment.id if payment is not None else None,
+        booking_id,
+    )
+    return ArbiterResult(
+        ArbiterOutcome.DISPUTE_MARKED,
+        booking_id,
+        payment.id if payment is not None else None,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -615,7 +725,9 @@ __all__ = [
     "ConfirmEffects",
     "ParkedPaymentReport",
     "PaymentGateway",
+    "apply_dispute_event",
     "apply_paid_event",
+    "apply_refunded_event",
     "enqueue_cancellation_refunds",
     "enqueue_refund",
     "is_refund_eligible",
