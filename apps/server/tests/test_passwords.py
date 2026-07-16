@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from aethercal.server.admin.passwords import hash_password, verify_password
+from aethercal.server.passwords import hash_password, verify_password
 
 
 def test_hash_has_the_self_describing_pbkdf2_format() -> None:

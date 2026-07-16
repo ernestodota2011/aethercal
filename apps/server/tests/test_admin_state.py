@@ -24,12 +24,13 @@ from sqlalchemy.pool import StaticPool
 from aethercal.server.admin import runtime as runtime_mod
 from aethercal.server.admin.config import AdminConfig
 from aethercal.server.admin.format import SHARED_SCHEDULE
-from aethercal.server.admin.passwords import hash_password
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER
 from aethercal.server.admin.runtime import AdminRuntime, configure_runtime
 from aethercal.server.admin.state import AdminState
 from aethercal.server.db import Base
 from aethercal.server.db.models import Tenant, User
+from aethercal.server.passwords import hash_password
+from aethercal.server.services.rbac import PrincipalKind
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -62,6 +63,18 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.create_template.fn, ({},)),
     (AdminState.update_template.fn, ({},)),
     (AdminState.delete_template.fn, ("00000000-0000-0000-0000-000000000000",)),
+    # -- members + the business selector (B-02) -------------------------------------
+    # Each reads or writes tenant data, so each must refuse an unauthenticated caller. The runtime
+    # unconfigured in the sweep above, so a handler that skipped its guard would hit
+    # ``current_runtime()`` and RAISE — which is what proves the guard, not a mock that would
+    # prove only the mock.
+    (AdminState.load_members.fn, ()),
+    (AdminState.create_member.fn, ({},)),
+    (AdminState.update_member_role.fn, ({},)),
+    (AdminState.set_member_password.fn, ({},)),
+    (AdminState.delete_member.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_businesses.fn, ()),
+    (AdminState.select_business.fn, ("acme",)),
 ]
 
 
@@ -121,8 +134,11 @@ def test_authenticated_is_a_server_only_backend_var() -> None:
     assert "set__authenticated" not in dir(AdminState)
 
 
-#: Handlers that are PUBLIC by design: they are the auth surface itself.
-_PUBLIC_HANDLERS = frozenset({"login", "logout", "require_auth", "setvar"})
+#: Handlers that are PUBLIC by design: they are the auth surface itself. ``member_login`` (B-02) is
+#: one of them — it is a login, so an unauthenticated caller is the whole point; its own refusals
+#: (an unknown business/address/password, all one message) are proven in ``test_admin_rbac.py`` and
+#: against a real PostgreSQL in ``tests/rls/test_rbac_isolation.py``.
+_PUBLIC_HANDLERS = frozenset({"login", "member_login", "logout", "require_auth", "setvar"})
 
 #: Handlers that read and write NO tenant data — they only close a panel in the operator's own
 #: browser. They need no guard because there is nothing behind them to guard.
@@ -247,6 +263,7 @@ async def test_authenticated_load_reaches_the_service(seeded_maker: Sessionmaker
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     await AdminState.load_bookings.fn(state)
     # The (empty) tenant resolves cleanly: the query ran, no setup error surfaced.
@@ -263,6 +280,7 @@ async def test_reschedule_stamps_a_naive_datetime_local_as_utc(
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     captured: dict[str, datetime] = {}
 
@@ -320,6 +338,7 @@ async def test_deactivating_an_unknown_event_type_reports_not_found(
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     await AdminState.deactivate_event_type.fn(state, str(uuid.uuid4()))
     assert state.error == "Event type not found"
@@ -345,6 +364,7 @@ async def _authenticated_state(seeded_maker: Sessionmaker) -> AdminState:
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     return state
 
 
@@ -620,6 +640,7 @@ async def _authed(maker: Sessionmaker) -> AdminState:
     )
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     return state
 
 
@@ -726,6 +747,7 @@ async def test_a_schedule_cannot_be_given_to_another_businesss_host(
     )
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
     schedule_id = await _schedule_id_of(state, "Weekly")
 

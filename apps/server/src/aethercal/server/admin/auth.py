@@ -12,7 +12,7 @@ from __future__ import annotations
 import hmac
 
 from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.passwords import verify_password
+from aethercal.server.passwords import verify_password
 
 
 def authenticate(config: AdminConfig, username: str, password: str) -> bool:

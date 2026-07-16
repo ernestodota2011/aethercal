@@ -34,13 +34,21 @@ from aethercal.server.admin import service
 from aethercal.server.admin import state as state_mod
 from aethercal.server.admin.config import AdminConfig
 from aethercal.server.admin.format import booking_event
-from aethercal.server.admin.passwords import hash_password
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER
 from aethercal.server.admin.runtime import AdminRuntime, configure_runtime
 from aethercal.server.admin.state import AdminState
 from aethercal.server.db import Base
 from aethercal.server.db.models import Booking, Tenant, User
+from aethercal.server.passwords import hash_password
 from aethercal.server.services.bookings import BookingParams, create_booking
+from aethercal.server.services.rbac import Principal, PrincipalKind
+
+# ==The instance's OPERATOR.== These tests drive the panels as the person whose credential is in the
+# environment — who drove them before B-02, when they were the only person who could sign in at
+# at all. WHO may do WHAT (and what a `member` is refused) is proven in `test_admin_rbac.py`; this
+# module is about the panels themselves, so it runs them as the principal that holds everything.
+_OPERATOR = Principal.bootstrap_operator()
+
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -144,6 +152,7 @@ async def _authed_state(maker: Sessionmaker) -> AdminState:
     configure_runtime(AdminRuntime(sessionmaker=maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     return state
 
 
@@ -283,7 +292,7 @@ async def test_load_bookings_excludes_cancelled_bookings_from_the_calendar(
     event_type_id = uuid.UUID(state.event_types[0]["id"])
     booking_id = await _book_at(seeded_maker, event_type_id=event_type_id, start=SLOT_A)
     await service.cancel_booking_action(
-        _admin(seeded_maker), tenant_slug=None, booking_id=booking_id
+        _admin(seeded_maker), principal=_OPERATOR, tenant_slug=None, booking_id=booking_id
     )
 
     await AdminState.load_bookings.fn(state)
@@ -840,6 +849,7 @@ async def test_create_booking_action_reuses_the_domain_service(seeded_maker: Ses
 
     read = await service.create_booking_action(
         _admin(seeded_maker),
+        principal=_OPERATOR,
         tenant_slug=None,
         form=service.BookingForm(
             event_type_id=event_type_id,
@@ -861,6 +871,7 @@ async def test_create_booking_action_maps_an_off_hours_slot_to_an_action_error(
     with pytest.raises(service.AdminActionError):
         await service.create_booking_action(
             _admin(seeded_maker),
+            principal=_OPERATOR,
             tenant_slug=None,
             form=service.BookingForm(
                 event_type_id=event_type_id,
