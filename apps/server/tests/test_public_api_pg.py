@@ -310,7 +310,8 @@ async def test_the_public_event_type_projection_leaks_no_internals(
     ``host_id``
     and ``schedule_id`` — internal identifiers of a business, handed to anonymous callers, for
     nothing. What a guest needs in order to choose a time is a slug, a title, a description, a
-    duration and the questions they will be asked."""
+    duration and the questions they will be asked — plus the price they will pay (B-05b), but NEVER
+    the internal refund policy (``refund_window_minutes``/``refund_kind`` stay off it)."""
     response = await public_client.get(f"/api/v1/public/{acme['tenant_slug']}/event-types")
 
     assert set(response.json()[0]) == {
@@ -322,6 +323,8 @@ async def test_the_public_event_type_projection_leaks_no_internals(
         "location",
         "duration_seconds",
         "questions",
+        "price_cents",
+        "currency",
         "collects_phone",
     }
 

@@ -59,6 +59,13 @@ class PublicEventTypeRead(BaseModel):
     location: str | None
     duration_seconds: int
     questions: list[Any]
+    #: The price a guest pays for this appointment (B-05b). ``price_cents`` NULL = FREE (no payment,
+    #: confirms on the spot); a set price means the guest is sent to checkout. ``currency`` is the
+    #: 3-letter ISO code. Read straight off the ORM row — the guest is told the price BEFORE
+    #: booking, never surprised at checkout. The refund policy is internal and deliberately NOT on
+    #: this guest projection.
+    price_cents: int | None = None
+    currency: str | None = None
     collects_phone: bool = False
 
 
