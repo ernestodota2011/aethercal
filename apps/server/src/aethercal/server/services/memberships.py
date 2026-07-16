@@ -334,6 +334,25 @@ async def authenticate_member(
     return await get_membership_for_user(session, tenant_id=tenant_id, user_id=user.id)
 
 
+def spend_absent_kdf(password: str) -> None:
+    """Pay the KDF's constant cost against nothing — ==for a refusal that never reaches
+    :func:`authenticate_member`.==
+
+    :func:`authenticate_member` runs the derivation even when the address is unknown, so a wrong
+    address and a wrong password cost the same and the TIMING answers nothing. But a member login
+    fails one step EARLIER when the BUSINESS is unknown: the slug does not resolve, and the caller
+    returns before a business is ever bound and this function could run. A refusal that skipped the
+    derivation there would answer, in microseconds, the question the whole login refuses to answer
+    in words — *does this business exist?* — and the response time becomes an oracle for which slugs
+    are real.
+
+    So the caller that bails out early spends the same budget here first, against the same reference
+    hash (:data:`_ABSENT_PASSWORD_HASH`), and "no such business" costs exactly what "wrong password"
+    does. The answer is discarded: the point is the TIME, not the boolean.
+    """
+    verify_password(_ABSENT_PASSWORD_HASH, password)
+
+
 async def _host_by_email(session: AsyncSession, *, tenant_id: uuid.UUID, email: str) -> User | None:
     """The business's host at this address (case-insensitive) — or ``None``, never a raise.
 
@@ -418,4 +437,5 @@ __all__ = [
     "list_members",
     "revoke_membership",
     "set_role",
+    "spend_absent_kdf",
 ]
