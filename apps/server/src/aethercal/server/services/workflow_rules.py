@@ -44,7 +44,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -93,6 +93,18 @@ _POSITION_PARKING = 1000
 """Positions are unique per workflow, so a straight swap (0↔1) collides with the row that has not
 moved yet. Surviving steps are parked above every real position first, then written to their final
 ones."""
+
+
+def _workflow_covers(workflow: Workflow, event_type_id: uuid.UUID) -> bool:
+    """Whether this rule governs a booking of ``event_type_id`` — the scope, applied per booking.
+
+    A rule with ``event_type_id = NULL`` is tenant-wide and covers every event type; otherwise it
+    covers exactly the one it names. It is the SAME predicate the scope query encodes, and it has to
+    be re-asked per booking because :func:`_governed_bookings` deliberately hands back bookings the
+    rule NO LONGER covers — rescued only by a still-queued row so their steps can be RETIRED. For
+    those, this returns ``False``, the wanted-set is empty, and the reconcile voids them rather than
+    re-arming a scope the rule has abandoned."""
+    return workflow.event_type_id is None or workflow.event_type_id == event_type_id
 
 
 class WorkflowRuleError(Exception):
@@ -578,21 +590,30 @@ async def _reconcile(
 
     for booking in bookings:
         locale = locales.get(booking.id, DEFAULT_LOCALE)
-        wanted = [
-            StepSchedule(
-                dedupe_key=workflow_step_dedupe_key(workflow.id, step.id, Channel(step.channel)),
-                payload=notify_payload(
-                    workflow_id=workflow.id,
-                    step_id=step.id,
-                    trigger=trigger,
-                    channel=Channel(step.channel),
-                    kind=step.kind,
-                    locale=locale,
-                ),
-                send_at=step_send_time(trigger, booking=booking, offset=offset),
-            )
-            for step in steps
-        ]
+        # A booking the rule STILL covers gets its full step list; one it no longer
+        # covers — rescued by its queued row after the scope moved off it — gets an
+        # EMPTY wanted-set, so the reconcile VOIDS its steps instead of re-arming them.
+        # A uniform ``wanted`` for every booking would re-materialise a reminder for a
+        # scope the rule has abandoned: the very leak this guards.
+        wanted: list[StepSchedule] = []
+        if _workflow_covers(workflow, booking.event_type_id):
+            wanted = [
+                StepSchedule(
+                    dedupe_key=workflow_step_dedupe_key(
+                        workflow.id, step.id, Channel(step.channel)
+                    ),
+                    payload=notify_payload(
+                        workflow_id=workflow.id,
+                        step_id=step.id,
+                        trigger=trigger,
+                        channel=Channel(step.channel),
+                        kind=step.kind,
+                        locale=locale,
+                    ),
+                    send_at=step_send_time(trigger, booking=booking, offset=offset),
+                )
+                for step in steps
+            ]
         await reconcile_workflow_steps(
             session,
             tenant_id=workflow.tenant_id,
@@ -607,11 +628,24 @@ async def _reconcile(
 async def _governed_bookings(
     session: AsyncSession, *, workflow: Workflow, now: datetime
 ) -> Sequence[Booking]:
-    """The tenant's LIVE bookings this rule speaks for.
+    """The tenant's LIVE bookings this rule must reconcile.
 
-    Two shapes qualify. The obvious one is anything that has not ended yet. The other is a booking
-    that IS over and still has a row queued for this workflow — an ``after_end`` follow-up due in an
-    hour. Leave that out and editing the rule would strand exactly the step the edit was about."""
+    Two shapes qualify, OR-ed — a booking need only match one:
+
+    * still IN the rule's scope and not ended yet — armed or re-timed;
+    * has a row STILL QUEUED for this workflow, **in scope or not**. That second arm is
+      scope-blind on purpose, and covers two cases the first would strand:
+
+      - an ``after_end`` follow-up on a booking that is already over — leave it out and editing
+        the rule strands exactly the step the edit was about;
+      - a booking the rule NO LONGER covers because its ``event_type_id`` was just re-pointed —
+        its only remaining tie to the rule IS that queued row. It is handed back so
+        :func:`_reconcile` can RETIRE its steps (:func:`_workflow_covers` is ``False`` for it, so
+        its wanted-set is empty). Gate this arm behind the scope and the re-point would hide the
+        very rows it needs to void — the queue keeps firing for a scope the rule has abandoned.
+
+    So the scope filter guards ONLY the "not ended yet" arm; the queued arm is deliberately
+    outside it."""
     scope = (
         [Booking.event_type_id == workflow.event_type_id]
         if workflow.event_type_id is not None
@@ -628,8 +662,10 @@ async def _governed_bookings(
             .where(
                 Booking.tenant_id == workflow.tenant_id,
                 Booking.status.in_(_LIVE_STATUSES),
-                *scope,
-                or_(Booking.end_at >= now, Booking.id.in_(queued)),
+                or_(
+                    and_(*scope, Booking.end_at >= now),
+                    Booking.id.in_(queued),
+                ),
             )
             .order_by(Booking.start_at, Booking.id)
         )

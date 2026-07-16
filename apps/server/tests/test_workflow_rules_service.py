@@ -41,6 +41,7 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateCreate,
     WorkflowTemplateUpdate,
     WorkflowUpdate,
+    check_offset,
 )
 from aethercal.server.channels import Channel
 from aethercal.server.db.models import (
@@ -238,6 +239,21 @@ def test_before_start_refuses_a_positive_offset_and_after_end_a_negative_one() -
             offset_minutes=-60,
             steps=[WorkflowStepIn(channel="email", kind="reminder")],
         )
+
+
+def test_a_zero_offset_fires_AT_the_moment_and_is_refused_on_both_delayed_triggers() -> None:
+    """The boundary is STRICT, both ways. ``step_send_time`` adds the offset to the anchor, so a
+    ``before_start`` at ``0`` sends ``start_at`` EXACTLY — "your meeting begins in 0 minutes",
+    neither a reminder nor true — and an ``after_end`` at ``0`` fires the instant the meeting ends,
+    the mirror of the same nonsense. So ``before_start`` needs a strictly NEGATIVE offset and
+    ``after_end`` a strictly POSITIVE one; ``0`` is refused on both, and the strictly-signed offsets
+    still pass (the fix tightens the boundary, it does not move it)."""
+    with pytest.raises(ValueError, match="before_start"):
+        check_offset("before_start", 0)
+    with pytest.raises(ValueError, match="after_end"):
+        check_offset("after_end", 0)
+    check_offset("before_start", -30)  # strictly negative — still fine
+    check_offset("after_end", 30)  # strictly positive — still fine
 
 
 def test_two_steps_on_the_same_channel_are_refused() -> None:
@@ -501,6 +517,89 @@ async def test_a_rule_scoped_to_one_event_type_does_not_touch_the_others(
 
     assert len(await _live_steps_of(sqlite_session, booked_mine)) == 1
     assert await _live_steps_of(sqlite_session, booked_theirs) == []
+
+
+async def test_repointing_the_event_type_retires_the_old_scopes_queued_steps(
+    sqlite_session: AsyncSession, tenant: Tenant, reminder: WorkflowCreate
+) -> None:
+    """Move a rule from event type A to B and the reminders already queued for A's guests must be
+    RETIRED, not left to fire. Changing the scope is a symmetric difference: the queued row is the
+    send, so a rule that no longer governs A while still messaging A's guests is the silent no-op,
+    one scope over. The rescue query has to reach a booking that no longer matches the new scope
+    (its only tie to the rule is the queued row), and the reconcile has to give an out-of-scope
+    booking an EMPTY wanted-set so its steps are voided rather than re-armed."""
+    a = await _event_type(sqlite_session, tenant, slug="a")
+    b = await _event_type(sqlite_session, tenant, slug="b")
+    booked_a = await _book(sqlite_session, tenant, a)
+    booked_b = await _book(sqlite_session, tenant, b)
+    created = await create_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        now=_NOW,
+        data=reminder.model_copy(update={"event_type_id": a.id}),
+    )
+    assert len(await _live_steps_of(sqlite_session, booked_a)) == 1
+    assert await _live_steps_of(sqlite_session, booked_b) == []
+
+    await update_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        workflow_id=created.workflow.id,
+        now=_NOW,
+        data=WorkflowUpdate(event_type_id=b.id),
+    )
+
+    # A is no longer governed: its queued reminder is voided, not left ticking toward a send.
+    assert await _live_steps_of(sqlite_session, booked_a) == []
+    voided_a = [row for row in await _steps_of(sqlite_session, booked_a) if row.status == "voided"]
+    assert len(voided_a) == 1
+    # B is now governed: it gets its own reminder.
+    assert len(await _live_steps_of(sqlite_session, booked_b)) == 1
+
+
+async def test_widening_to_tenant_wide_then_narrowing_arms_and_retires_the_right_bookings(
+    sqlite_session: AsyncSession, tenant: Tenant, reminder: WorkflowCreate
+) -> None:
+    """A NULL scope covers every event type. Widening "only A" → tenant-wide ARMS the others (it
+    adds; nothing is retired); narrowing tenant-wide → "only A" RETIRES every booking but A's. The
+    same symmetric-difference rule, at the boundary where the scope becomes (or stops being)
+    everything."""
+    a = await _event_type(sqlite_session, tenant, slug="a")
+    b = await _event_type(sqlite_session, tenant, slug="b")
+    booked_a = await _book(sqlite_session, tenant, a)
+    booked_b = await _book(sqlite_session, tenant, b)
+    created = await create_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        now=_NOW,
+        data=reminder.model_copy(update={"event_type_id": a.id}),
+    )
+    assert len(await _live_steps_of(sqlite_session, booked_a)) == 1
+    assert await _live_steps_of(sqlite_session, booked_b) == []
+
+    # Widen: A → tenant-wide (NULL). B's booking must now be armed; A's survives.
+    await update_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        workflow_id=created.workflow.id,
+        now=_NOW,
+        data=WorkflowUpdate(event_type_id=None),
+    )
+    assert len(await _live_steps_of(sqlite_session, booked_a)) == 1
+    assert len(await _live_steps_of(sqlite_session, booked_b)) == 1
+
+    # Narrow back: tenant-wide → only A. B's booking must be retired again; A's survives.
+    await update_workflow(
+        sqlite_session,
+        tenant_id=tenant.id,
+        workflow_id=created.workflow.id,
+        now=_NOW,
+        data=WorkflowUpdate(event_type_id=a.id),
+    )
+    assert len(await _live_steps_of(sqlite_session, booked_a)) == 1
+    assert await _live_steps_of(sqlite_session, booked_b) == []
+    voided_b = [row for row in await _steps_of(sqlite_session, booked_b) if row.status == "voided"]
+    assert len(voided_b) == 1
 
 
 async def test_moving_the_offset_MOVES_the_already_queued_reminder(
