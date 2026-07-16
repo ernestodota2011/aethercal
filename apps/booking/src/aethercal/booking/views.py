@@ -73,8 +73,8 @@ from aethercal.booking.forms import (
 from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
-from aethercal.schemas.bookings import BookingRead
-from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
+from aethercal.schemas.event_types import resolve_description, resolve_title
+from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 from aethercal.schemas.slots import Availability
 
 # Self-hosted (vendored at `static/htmx-2.0.4.min.js`, served by the app itself via `/static`) —
@@ -359,14 +359,14 @@ def page(
 # --------------------------------------------------------------------------------------
 
 
-def _duration_label(locale: Locale, event: EventTypeRead) -> str:
+def _duration_label(locale: Locale, event: PublicEventTypeRead) -> str:
     return t(locale, "duration_minutes", minutes=event.duration_seconds // 60)
 
 
 def index_page(
     locale: Locale,
     *,
-    event_types: Sequence[EventTypeRead],
+    event_types: Sequence[PublicEventTypeRead],
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
 ) -> Any:
@@ -397,7 +397,7 @@ def index_page(
     )
 
 
-def _event_intro(locale: Locale, event: EventTypeRead) -> Any:
+def _event_intro(locale: Locale, event: PublicEventTypeRead) -> Any:
     meta_parts = [_duration_label(locale, event)]
     if event.location:
         meta_parts.append(event.location)
@@ -471,7 +471,7 @@ def _detect_script(tz_explicit: bool) -> Any:
 def event_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     tz: str,
     tz_options: Sequence[str],
     tz_explicit: bool,
@@ -563,7 +563,7 @@ def slots_unavailable_fragment(locale: Locale) -> Any:
 def slots_section(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     groups: Sequence[DayGroup],
     availability: Availability,
     tz: str,
@@ -765,10 +765,32 @@ def _phone_fields(locale: Locale, *, values: Mapping[str, str], error: str | Non
     ]
 
 
+TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+"""Cloudflare's widget loader. It is the ONE third-party script this page loads, and the CSP is
+widened for exactly this origin (``app.security_headers``) — never for scripts in general."""
+
+
+def _turnstile_widget(site_key: str | None) -> list[Any]:
+    """The captcha, or nothing at all.
+
+    ``None`` renders NOTHING — which is not a bypass, and cannot be turned into one. The check that
+    matters is the SERVER's: with the public API enabled the process refuses to boot without a
+    Turnstile secret, and every booking POST is verified against Cloudflare. A page with no site key
+    configured therefore submits no token, and the API refuses the booking. ==The page can fail to
+    ASK the question; it can never answer it.==
+    """
+    if not site_key:
+        return []
+    return [
+        Script(src=TURNSTILE_SCRIPT_URL, defer=True),
+        Div(cls="cf-turnstile field", data_sitekey=site_key),
+    ]
+
+
 def booking_form_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     start_iso: str,
     tz: str,
     when_label: str,
@@ -777,6 +799,7 @@ def booking_form_page(
     errors: Sequence[FieldError],
     action: str,
     lang_urls: Mapping[Locale, str],
+    turnstile_site_key: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
 ) -> Any:
@@ -850,6 +873,9 @@ def booking_form_page(
         Input(type="hidden", name="lang", value=locale),
         _honeypot_field(),
         *fields,
+        # The honeypot stays, and the captcha joins it. The honeypot costs a bot nothing to defeat
+        # once it has been read; the captcha is the control that makes each attempt COST something.
+        *_turnstile_widget(turnstile_site_key),
         Button(t(locale, "confirm_booking"), type="submit", cls="btn"),
         method="post",
         action=action,
@@ -876,20 +902,22 @@ def booking_form_page(
     )
 
 
-def _calendar_details(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
-    """A short plain-text body for the add-to-calendar links: the event description (if any),
-    plus the meeting link (if any) on its own line so it stays clickable in the guest's calendar
-    app."""
-    parts: list[str] = []
-    description = resolve_description(event, locale)
-    if description:
-        parts.append(description)
-    if booking.meeting_url:
-        parts.append(booking.meeting_url)
-    return "\n".join(parts)
+def _calendar_details(locale: Locale, event: PublicEventTypeRead) -> str:
+    """The plain-text body of the add-to-calendar links: the event's description, if it has one.
+
+    ==The meeting link is no longer in here, and that is a real cost, paid deliberately.== The
+    public
+    booking response is ``{id, start, end, status}`` and nothing else: an endpoint with no
+    authentication that hands out a meeting URL keyed by a booking id is an endpoint that hands out
+    meeting URLs. The link reaches the guest in the confirmation e-mail instead — the channel that
+    proves they own the address they typed into the form.
+    """
+    return resolve_description(event, locale) or ""
 
 
-def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+def _google_calendar_url(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> str:
     """A Google Calendar "quick add" deep link pre-filled with the confirmed booking (M-F3)."""
 
     def google_dt(instant: datetime) -> str:
@@ -899,14 +927,16 @@ def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingR
         "action": "TEMPLATE",
         "text": resolve_title(event, locale),
         "dates": f"{google_dt(booking.start)}/{google_dt(booking.end)}",
-        "details": _calendar_details(locale, event, booking),
+        "details": _calendar_details(locale, event),
     }
     if event.location:
         params["location"] = event.location
     return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
 
 
-def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+def _outlook_calendar_url(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> str:
     """An Outlook Web "compose event" deep link pre-filled with the confirmed booking (M-F3)."""
 
     def outlook_dt(instant: datetime) -> str:
@@ -916,7 +946,7 @@ def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: Booking
         "subject": resolve_title(event, locale),
         "startdt": outlook_dt(booking.start),
         "enddt": outlook_dt(booking.end),
-        "body": _calendar_details(locale, event, booking),
+        "body": _calendar_details(locale, event),
         "path": "/calendar/action/compose",
         "rru": "addevent",
     }
@@ -925,7 +955,9 @@ def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: Booking
     return f"https://outlook.live.com/calendar/0/deeplink/compose?{urlencode(params)}"
 
 
-def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: BookingRead) -> Any:
+def _add_to_calendar_section(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> Any:
     """The "add to calendar" links (M-F3): Google + Outlook deep links, no server round-trip."""
     return Div(
         H2(t(locale, "add_to_calendar_heading")),
@@ -952,28 +984,36 @@ def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: Book
 def confirmation_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
-    booking: BookingRead,
+    event: PublicEventTypeRead,
+    booking: PublicBookingRead,
+    guest_email: str,
     when_label: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
 ) -> Any:
-    """Step 3: a clear confirmation with the essentials (when, meeting link, email note) plus
-    add-to-calendar links (M-F3). ``embed`` (B1) renders the compact, chrome-less shell."""
+    """Step 3: the confirmation (when, e-mail note) plus the add-to-calendar links (M-F3).
+
+    ``guest_email`` is passed IN, and it used to be read off the booking. The public API answers
+    with
+    four fields and no personal data at all — the guest's own address included — because a response
+    that echoed it back would make a booking id an oracle for a stranger's e-mail on an endpoint
+    that
+    asked for no credentials. The page does not need the API to tell it: the guest typed the address
+    into the form it is currently rendering the answer to.
+
+    The meeting link is gone from this page for the same reason, and reaches the guest by e-mail.
+    """
     summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
     if event.location:
         summary.append(Dd(event.location, cls="meta"))
-    if booking.meeting_url:
-        summary.append(Dt(t(locale, "confirmed_meeting_link")))
-        summary.append(Dd(A(booking.meeting_url, href=booking.meeting_url)))
     return page(
         locale,
         resolve_title(event, locale),
         Div(
             H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
             Dl(*summary, cls="summary"),
-            P(t(locale, "confirmed_email_note", email=booking.guest_email), cls="lead"),
+            P(t(locale, "confirmed_email_note", email=guest_email), cls="lead"),
             _add_to_calendar_section(locale, event, booking),
             cls="stack",
         ),

@@ -1,10 +1,14 @@
 """The FastHTML application: stateless, SSR + HTMX, wired to the API only through the SDK.
 
-The app never touches the database — it calls the AetherCal API on the guest's behalf with a
-**server-side** API key (the D4 rule), so a guest never sees a key. ``create_app`` builds a
-:class:`_BookingApp` (which holds the settings and a ``client_factory`` returning a fresh
-:class:`AetherCalClient`) and wires its handlers as routes; tests inject an
-``httpx.MockTransport``-backed client to run the whole app offline.
+The app never touches the database — it calls the AetherCal API on the guest's behalf. ==It holds
+no API key at all any more:== it used to carry one with the tenant's full permissions, in the most
+exposed process in the system, which is also what made it serve exactly one business (a key names
+one). It is now an ANONYMOUS client of the PUBLIC API, and the business travels in the route
+(``/t/{tenant_slug}/…``, falling back to ``AETHERCAL_TENANT_SLUG`` for the single-business
+self-hoster's unprefixed URLs) — so one deployment serves N businesses. ``create_app`` builds a
+:class:`_BookingApp` (settings + a ``client_factory`` returning a fresh :class:`AetherCalClient`)
+and wires its handlers as routes; tests inject an ``httpx.MockTransport``-backed client to run the
+whole app offline.
 
 The routes deliver the ≤3-step flow (RF-07): an event landing with a slot picker → a details form →
 a confirmation, plus token-authorized ``/cancel`` and ``/reschedule`` pages (RF-09). Blocking SDK
@@ -56,7 +60,8 @@ from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
 from aethercal.client import AetherCalAPIError, AetherCalClient
 from aethercal.core.tz import require_iana_zone
-from aethercal.schemas.event_types import EventTypeRead, resolve_title
+from aethercal.schemas.event_types import resolve_title
+from aethercal.schemas.public import PublicEventTypeRead
 
 T = TypeVar("T")
 
@@ -116,18 +121,40 @@ EMBED_JS_CACHE_CONTROL = "public, max-age=31536000, immutable"
 # --------------------------------------------------------------------------------------
 
 
-def _content_security_policy(*, frame_ancestors: str, script_src_extra: str = "") -> str:
-    """Build the CSP string shared by the baseline and the ``/embed/*`` variant — only
-    ``frame_ancestors`` and (for embed) one extra ``script-src`` source ever differ."""
-    script_src = f"'self' {script_src_extra}" if script_src_extra else "'self'"
+#: Cloudflare's origin for the Turnstile widget. ==The ONE third-party origin this page will ever
+#: talk to==, and it is named explicitly rather than loosening `script-src` to something like
+#: `https:` — a CSP that admits "any HTTPS script" admits every HTTPS script.
+TURNSTILE_ORIGIN = "https://challenges.cloudflare.com"
+
+
+def _content_security_policy(
+    *, frame_ancestors: str, script_src_extra: str = "", turnstile: bool = False
+) -> str:
+    """Build the CSP shared by the baseline and the ``/embed/*`` variant.
+
+    ``turnstile`` widens the policy for the captcha, and for the captcha ONLY: its loader is a
+    script
+    from Cloudflare's origin, and the challenge itself renders in an iframe from that same origin
+    (hence ``frame-src``, which ``default-src 'self'`` would otherwise refuse — silently, leaving a
+    widget that never appears and a booking flow every guest fails).
+
+    It is added only where it is needed. A captcha the operator has not configured does not buy a
+    third-party script source on every page of the site.
+    """
+    sources = ["'self'"]
+    if script_src_extra:
+        sources.append(script_src_extra)
+    if turnstile:
+        sources.append(TURNSTILE_ORIGIN)
+    frame_src = f" frame-src {TURNSTILE_ORIGIN}; " if turnstile else " "
     return (
         "default-src 'self'; "
-        f"script-src {script_src}; "
+        f"script-src {' '.join(sources)}; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "font-src 'self'; "
         "connect-src 'self'; "
-        f"frame-ancestors {frame_ancestors}; "
+        f"frame-ancestors {frame_ancestors};{frame_src}"
         "base-uri 'self'; "
         "form-action 'self'"
     )
@@ -153,18 +180,51 @@ _EMBED_PATH_PREFIX = "/embed/"
 _NORMAL_PATH_PREFIX = "/e"
 
 
+#: The route prefix that names a BUSINESS explicitly — ``/t/{tenant_slug}/e/{event_slug}``. It is
+#: what makes one deployment able to serve N businesses: the old page could serve exactly one,
+#: because its identity was an API key, and a key names exactly one.
+_TENANT_PATH_PREFIX = "/t/"
+
+
 def _is_embed_path(path: str) -> bool:
-    """True for any path under the frameable ``/embed/*`` space (B0/B1)."""
-    return path.startswith(_EMBED_PATH_PREFIX)
+    """True for any path in the frameable embed space (B0/B1) — ==including its tenant twin.==
+
+    Decided on SEGMENTS, not on a prefix, and both halves of that matter:
+
+    * a prefix test (``startswith("/embed/")``) would have missed ``/t/{tenant}/embed/{slug}``
+      entirely. That path is framed by design, and it would have been served with
+      ``frame-ancestors 'self'`` + ``X-Frame-Options: SAMEORIGIN`` — so the multi-business embed,
+      the
+      whole point of the tenant twins, would simply have refused to render inside its embedder;
+    * a substring test (``"/embed/" in path``) fixes that and quietly breaks a business whose event
+      type is called ``embed``: ``/e/embed/slots`` would suddenly be "framable", chrome-less, and
+      relaxed. The segment is the unit of a route, so the segment is what is compared.
+    """
+    parts = [segment for segment in path.split("/") if segment]
+    if not parts:
+        return False
+    if parts[0] == "embed":
+        return True
+    return len(parts) > 2 and parts[0] == "t" and parts[2] == "embed"
 
 
 def _is_embed_request(request: Request) -> bool:
     return _is_embed_path(request.url.path)
 
 
-def _booking_prefix(embed: bool) -> str:
-    """The routing base ("/e" or "/embed") a handler builds this request's links/actions from."""
-    return "/embed" if embed else _NORMAL_PATH_PREFIX
+def _booking_prefix(embed: bool, tenant: str | None = None) -> str:
+    """The base path every link, action and redirect of a request must stay inside.
+
+    Four spaces, and a response must never leak between them: the plain flow (``/e``), the frameable
+    embed (``/embed``), and the business-scoped twins of both (``/t/{slug}/e``,
+    ``/t/{slug}/embed``).
+    ``tenant`` is the slug when the ROUTE named one, and ``None`` when the request is being served
+    by
+    the deployment's own default business — in which case the links carry no slug either, and the
+    single-business deployment's URLs are exactly what they always were.
+    """
+    base = f"{_TENANT_PATH_PREFIX}{tenant}" if tenant else ""
+    return f"{base}{_EMBED_PATH_PREFIX.rstrip('/')}" if embed else f"{base}{_NORMAL_PATH_PREFIX}"
 
 
 def _embed_frame_ancestors(embed_allowed_origins: Sequence[str]) -> str:
@@ -176,7 +236,9 @@ def _embed_frame_ancestors(embed_allowed_origins: Sequence[str]) -> str:
     return " ".join(origins) if origins else "*"
 
 
-def _embed_security_headers(embed_allowed_origins: Sequence[str]) -> dict[str, str]:
+def _embed_security_headers(
+    embed_allowed_origins: Sequence[str], *, turnstile: bool = False
+) -> dict[str, str]:
     """Headers for a frameable ``/embed/*`` response (B0) — see the module-level note above."""
     headers = {
         key: value for key, value in _BASE_SECURITY_HEADERS.items() if key != "X-Frame-Options"
@@ -184,33 +246,57 @@ def _embed_security_headers(embed_allowed_origins: Sequence[str]) -> dict[str, s
     headers["Content-Security-Policy"] = _content_security_policy(
         frame_ancestors=_embed_frame_ancestors(embed_allowed_origins),
         script_src_extra=views.EMBED_RESIZE_SCRIPT_CSP_SOURCE,
+        turnstile=turnstile,
     )
     return headers
 
 
-def security_headers(path: str, *, embed_allowed_origins: Sequence[str] = ()) -> dict[str, str]:
+def security_headers(
+    path: str, *, embed_allowed_origins: Sequence[str] = (), turnstile: bool = False
+) -> dict[str, str]:
     """The security headers for a response to ``path``: the strict baseline (``frame-ancestors
     'self'`` + ``X-Frame-Options: SAMEORIGIN``) for every route EXCEPT ``/embed/*`` (B0), which is
     deliberately frameable — see ``_embed_security_headers``.
+
+    ``turnstile`` is on when the operator has configured a captcha site key. It widens
+    ``script-src``
+    and ``frame-src`` for Cloudflare's origin and NOTHING else — and if it were forgotten, the
+    widget
+    would be blocked by the browser, no token would be submitted, and every public booking would be
+    refused. A CSP that quietly breaks the only gate in front of an unauthenticated write is worth a
+    parameter.
     """
     if _is_embed_path(path):
-        return _embed_security_headers(embed_allowed_origins)
-    return dict(_BASE_SECURITY_HEADERS)
+        return _embed_security_headers(embed_allowed_origins, turnstile=turnstile)
+    if not turnstile:
+        return dict(_BASE_SECURITY_HEADERS)
+    headers = dict(_BASE_SECURITY_HEADERS)
+    headers["Content-Security-Policy"] = _content_security_policy(
+        frame_ancestors="'self'", turnstile=True
+    )
+    return headers
 
 
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Sets the app-owned security headers (``security_headers``) on every response."""
 
     def __init__(
-        self, app: Callable[..., object], *, embed_allowed_origins: Sequence[str] = ()
+        self,
+        app: Callable[..., object],
+        *,
+        turnstile: bool = False,
+        embed_allowed_origins: Sequence[str] = (),
     ) -> None:
         super().__init__(app)  # pyright: ignore[reportArgumentType]
+        self._turnstile = turnstile
         self._embed_allowed_origins = tuple(embed_allowed_origins)
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         headers = security_headers(
-            request.url.path, embed_allowed_origins=self._embed_allowed_origins
+            request.url.path,
+            embed_allowed_origins=self._embed_allowed_origins,
+            turnstile=self._turnstile,
         )
         for name, value in headers.items():
             response.headers[name] = value
@@ -376,8 +462,15 @@ def _is_rate_limited_post(request: Request) -> bool:
     if request.method != "POST":
         return False
     path = request.url.path
-    return path in ("/cancel", "/reschedule") or (
-        (path.startswith("/e/") or path.startswith(_EMBED_PATH_PREFIX)) and path.endswith("/book")
+    if path in ("/cancel", "/reschedule"):
+        return True
+    # ==The business-scoped twins are POSTs too.== `/t/{slug}/e/{event}/book` writes exactly what
+    # `/e/{event}/book` writes, and a limiter that only knew the old shape would have left the new
+    # one — the multi-business one, the reason this cut exists — completely unguarded.
+    return path.endswith("/book") and (
+        path.startswith("/e/")
+        or path.startswith(_EMBED_PATH_PREFIX)
+        or path.startswith(_TENANT_PATH_PREFIX)
     )
 
 
@@ -524,8 +617,17 @@ def _when_label(instant: datetime, tz: str, locale: Locale) -> str:
     return f"{day}{joiner}{clock}"
 
 
-def _find_event(events: Sequence[EventTypeRead], slug: str) -> EventTypeRead | None:
-    return next((e for e in events if e.slug == slug and e.active), None)
+def _find_event(events: Sequence[PublicEventTypeRead], slug: str) -> PublicEventTypeRead | None:
+    """The event type by slug. ==No ``active`` filter any more, and its absence is the fix.==
+
+    The page used to receive every event type — withdrawn ones included — and filter them here, in
+    the CLIENT. A server must never lean on its client to enforce what the business decided, and
+    with
+    the API now answering anonymous callers, "the page filters it" would have BEEN the enforcement.
+    The public listing contains only what is on sale (``services/event_types.list_bookable_*``), so
+    there is nothing left here to filter.
+    """
+    return next((e for e in events if e.slug == slug), None)
 
 
 def _shifted_url(
@@ -603,6 +705,44 @@ class _BookingApp:
 
         return await run_in_threadpool(invoke)
 
+    def _route_tenant(self, request: Request) -> str | None:
+        """The business named in the PATH, or ``None``. ==This is what the LINK SPACE follows.==
+
+        It drives ``_booking_prefix``, and it must NOT fall back to the default: a guest who arrived
+        on the unprefixed ``/e/intro`` (the single-business self-hoster's URL) must be answered with
+        links that stay on ``/e/intro`` — never bounced onto ``/t/acme/e/intro``. Prepending the
+        default slug to a request that did not carry one is exactly the break this cut promised the
+        self-hoster it would not cause, and their guests' bookmarks along with it.
+        """
+        from_route = request.path_params.get("tenant")
+        return from_route if isinstance(from_route, str) and from_route else None
+
+    def _tenant(self, request: Request) -> str | None:
+        """Which business to actually TALK TO — the ROUTE first, then the deployment's default.
+
+        This drives the API calls and the "is there any business at all?" 404. It DOES fall back to
+        the default, which is what lets the single-business deployment serve ``/e/intro`` (no slug
+        in the path) against its one configured business. ``None`` means neither a route slug nor
+        ``AETHERCAL_TENANT_SLUG`` — nothing to serve, and the page says so rather than guessing.
+
+        The split from :meth:`_route_tenant` is the whole fix: which business we serve, and which
+        URL space we keep the guest in, are two different questions — and conflating them is what
+        put a plain-route guest onto a ``/t/…`` link.
+        """
+        return self._route_tenant(request) or self._settings.tenant_slug
+
+    def _guest_ip(self, request: Request) -> str:
+        """The guest's real address, resolved through this page's OWN trusted-proxy contract.
+
+        It is then FORWARDED to the API, which believes it only because this page's address is
+        inside
+        the API's ``AETHERCAL_TRUSTED_PROXIES``. Without that hop, the API would see this page's
+        address for every guest on earth: one rate-limit bucket for all of them, one address stamped
+        onto every booking, and the per-IP cap exhausted by the page itself — denying service to
+        everybody, in silence. It is the same value this page's own limiter already keys on.
+        """
+        return _client_ip(request, self._trusted_proxies)
+
     def _locale(self, request: Request, form_lang: str | None = None) -> Locale:
         return select_locale(
             query_lang=form_lang or request.query_params.get("lang"),
@@ -611,20 +751,24 @@ class _BookingApp:
         )
 
     async def _slots_section(  # noqa: PLR0913 - each is a distinct query/render input; `event_path`
-        # is the routing base (B1: "/e/{slug}" or "/embed/{slug}") — not derivable from `event`.
+        # is the routing base (B1: "/e/{slug}", "/embed/{slug}", or their /t/{tenant} twins) — not
+        # derivable from `event`.
         self,
-        event: EventTypeRead,
+        event: PublicEventTypeRead,
         tz: str,
         window_from: date,
         today: date,
         locale: Locale,
         *,
         event_path: str,
+        tenant: str,
     ) -> object:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
             result = await self._call(
-                lambda c: c.get_slots(event.id, window_from=window_from, window_to=window_to, tz=tz)
+                lambda c: c.get_public_slots(
+                    tenant, event.slug, window_from=window_from, window_to=window_to, tz=tz
+                )
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability
@@ -648,7 +792,7 @@ class _BookingApp:
             prev_disabled=(window_from <= today),
         )
 
-    async def _events(self) -> list[EventTypeRead] | None:
+    async def _events(self, tenant: str) -> list[PublicEventTypeRead] | None:
         """Load the tenant's event types, or ``None`` if the backend can't be reached (RF-16).
 
         A public-page trust boundary: an API error, a dropped connection, or a malformed response
@@ -656,9 +800,9 @@ class _BookingApp:
         ``None`` here, and the caller renders the service-unavailable page.
         """
         try:
-            return await self._call(lambda c: c.list_event_types())
+            return await self._call(lambda c: c.list_public_event_types(tenant))
         except Exception:
-            logger.exception("booking page: failed to load event types")
+            logger.exception("booking page: failed to load event types for %s", tenant)
             return None
 
     def _service_error(
@@ -728,15 +872,19 @@ class _BookingApp:
 
     async def index(self, request: Request) -> object:
         locale = self._locale(request)
-        events = await self._events()
+        tenant = self._tenant(request)
+        if tenant is None:
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        events = await self._events(tenant)
         if events is None:
             return self._service_error(
                 locale, lang_urls=_lang_links_here(request), retry_url=str(request.url)
             )
-        active = [event for event in events if event.active]
+        # No `active` filter here any more: the PUBLIC listing only ever contains what is on sale.
+        # Filtering in the client was never a defence — it was the server trusting its client.
         return views.index_page(
             locale,
-            event_types=active,
+            event_types=events,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
         )
@@ -747,12 +895,15 @@ class _BookingApp:
         # this response emits stays inside whichever space the guest is already in.
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
+        tenant = self._tenant(request)
         embed = _is_embed_request(request)
-        event_path = f"{_booking_prefix(embed)}/{slug}"
+        event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
         tz, tz_explicit = _tz_of(request)
         today = _today_in(tz)
         window_from = _window_of(request, today)
-        events = await self._events()
+        if tenant is None:
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        events = await self._events(tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -764,7 +915,7 @@ class _BookingApp:
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
         section = await self._slots_section(
-            found, tz, window_from, today, locale, event_path=event_path
+            found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
         # I4 (PRG): a 409 slot-conflict redirect from book_submit lands back here carrying
         # `?err=slot_unavailable` — render it as an inline notice, never re-post on a refresh.
@@ -792,8 +943,9 @@ class _BookingApp:
     async def slots_partial(self, request: Request) -> object:
         # Same handler for "/e/{slug}/slots" and "/embed/{slug}/slots" (B1) — see `event()`.
         slug = str(request.path_params["slug"])
+        tenant = self._tenant(request)
         embed = _is_embed_request(request)
-        event_path = f"{_booking_prefix(embed)}/{slug}"
+        event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
         if request.headers.get("HX-Request") is None:
             query = request.url.query
             return RedirectResponse(
@@ -803,7 +955,9 @@ class _BookingApp:
         tz, _ = _tz_of(request)
         today = _today_in(tz)
         window_from = _window_of(request, today)
-        events = await self._events()
+        if tenant is None:
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        events = await self._events(tenant)
         if events is None:
             # HTMX swaps only on 2xx: degrade the fragment in place, not with a non-swapping 5xx.
             return views.slots_unavailable_fragment(locale)
@@ -811,18 +965,21 @@ class _BookingApp:
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
         return await self._slots_section(
-            found, tz, window_from, today, locale, event_path=event_path
+            found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
 
     async def book_form(self, request: Request) -> object:
         # Same handler for "/e/{slug}/book" (GET) and "/embed/{slug}/book" (GET) — see `event()`.
         locale = self._locale(request)
         slug = str(request.path_params["slug"])
+        tenant = self._tenant(request)
         embed = _is_embed_request(request)
-        event_path = f"{_booking_prefix(embed)}/{slug}"
+        event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
         tz, _ = _tz_of(request)
         start = request.query_params.get("start", "")
-        events = await self._events()
+        if tenant is None:
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        events = await self._events(tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -849,6 +1006,7 @@ class _BookingApp:
             errors=[],
             action=f"{event_path}/book",
             lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
+            turnstile_site_key=self._settings.turnstile_site_key,
             base_url=self._settings.base_url,
             embed=embed,
         )
@@ -866,7 +1024,7 @@ class _BookingApp:
             # entirely and return a plausible "received" 200 — the bot sees success and doesn't
             # retry — never creating a booking, never leaking that it was caught.
             embed = _is_embed_request(request)
-            event_path = f"{_booking_prefix(embed)}/{slug}"
+            event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
             locale = self._locale(request, form.get("lang"))
             return views.message_page(
                 locale,
@@ -878,14 +1036,15 @@ class _BookingApp:
             )
         return None
 
-    async def _complete_booking(
+    async def _complete_booking(  # noqa: PLR0913 - each kwarg is a distinct input of one flow
         self,
         request: Request,
         *,
         form: Mapping[str, str],
-        event: EventTypeRead,
+        event: PublicEventTypeRead,
         locale: Locale,
         tz: str,
+        tenant: str,
     ) -> object:
         """Validate the submitted form and either create the booking or return the outcome page:
         inline validation errors, a 409-conflict PRG redirect (I4), a friendly backend-failure
@@ -895,15 +1054,18 @@ class _BookingApp:
         """
         slug = event.slug
         embed = _is_embed_request(request)
-        event_path = f"{_booking_prefix(embed)}/{slug}"
+        event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
         start = form.get("start", "")
         questions = parse_questions(event.questions)
         instant = _parse_instant(start)
         label = _when_label(instant, tz, locale) if instant is not None else ""
         lang_urls = _lang_links(f"{event_path}/book", {"start": start, "tz": tz})
-        booking_request = BookingRequest(
-            event_type_id=event.id, start_iso=start, guest_timezone=tz, locale=locale
-        )
+        # No `event_type_id`: the appointment is named by the ROUTE the SDK posts to
+        # (/public/{tenant}/{event_slug}/bookings). A body field naming it beside a path that
+        # already
+        # names it is two sources of truth for one fact — and the one that won would decide whose
+        # diary a guest's booking landed in.
+        booking_request = BookingRequest(start_iso=start, guest_timezone=tz, locale=locale)
         # `collects_phone` is the server's answer to "will anything actually message this number?"
         # It gates BOTH the rendering of the field (views) and the reading of it here — so a phone
         # POSTed against an event type no active rule messages is dropped, never stored (RNF-8).
@@ -926,11 +1088,17 @@ class _BookingApp:
                 errors=result.errors,
                 action=f"{event_path}/book",
                 lang_urls=lang_urls,
+                turnstile_site_key=self._settings.turnstile_site_key,
                 base_url=self._settings.base_url,
                 embed=embed,
             )
+        guest_ip = self._guest_ip(request)
         try:
-            booking = await self._call(lambda c: c.create_booking(booking_create))
+            booking = await self._call(
+                lambda c: c.create_public_booking(
+                    tenant, slug, booking_create, forwarded_for=guest_ip
+                )
+            )
         except Exception as exc:
             if isinstance(exc, AetherCalAPIError) and exc.status_code == HTTP_409_CONFLICT:
                 # I4 (PRG): redirect back to the picker instead of re-rendering the POST response
@@ -950,6 +1118,10 @@ class _BookingApp:
             locale,
             event=event,
             booking=booking,
+            # The API answers with {id, start, end, status} and no personal data at all — see
+            # PublicBookingRead. The page does not need it to: the guest typed this address into the
+            # very form we are now rendering the answer to.
+            guest_email=booking_create.guest_email,
             when_label=label,
             lang_urls=_lang_links_here(request),
             base_url=self._settings.base_url,
@@ -962,15 +1134,18 @@ class _BookingApp:
         # Same handler for "/e/{slug}/book" (POST) and "/embed/{slug}/book" (POST) — see `event()`.
         form = _form_dict(await request.form())
         slug = str(request.path_params["slug"])
+        tenant = self._tenant(request)
         embed = _is_embed_request(request)
-        event_path = f"{_booking_prefix(embed)}/{slug}"
+        event_path = f"{_booking_prefix(embed, self._route_tenant(request))}/{slug}"
         tz = _valid_tz(form.get("tz")) or DEFAULT_TZ
         start = form.get("start", "")
         honeypot = self._honeypot_response(request, form=form, slug=slug, start=start, tz=tz)
         if honeypot is not None:
             return honeypot
         locale = self._locale(request, form.get("lang"))
-        events = await self._events()
+        if tenant is None:
+            return _not_found(request, locale, base_url=self._settings.base_url)
+        events = await self._events(tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -981,7 +1156,9 @@ class _BookingApp:
         found = _find_event(events, slug)
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        return await self._complete_booking(request, form=form, event=found, locale=locale, tz=tz)
+        return await self._complete_booking(
+            request, form=form, event=found, locale=locale, tz=tz, tenant=tenant
+        )
 
     async def cancel_form(self, request: Request) -> object:
         locale = self._locale(request)
@@ -1058,7 +1235,16 @@ class _BookingApp:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
             result = await self._call(
-                lambda c: c.get_slots(event_id, window_from=window_from, window_to=window_to, tz=tz)
+                # ==The token, and this is what keeps RF-09 alive.== The page holds no API key any
+                # more, and the reschedule link in a guest's inbox carries a token, a booking id and
+                # an event-type ID — no business, no slug — so the picker cannot be rendered through
+                # the public, slug-keyed route. `/api/v1/slots` therefore takes the guest's signed
+                # RESCHEDULE token as a second door. Verified, never consumed: a token spent on a
+                # page render is a guest who may look at the times once and never move their
+                # booking.
+                lambda c: c.get_slots(
+                    event_id, window_from=window_from, window_to=window_to, tz=tz, token=token
+                )
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability
@@ -1196,7 +1382,13 @@ def create_app(
     app = FastHTML(
         middleware=[
             Middleware(
-                _SecurityHeadersMiddleware, embed_allowed_origins=settings.embed_allowed_origins
+                _SecurityHeadersMiddleware,
+                embed_allowed_origins=settings.embed_allowed_origins,
+                # The captcha's script and its challenge iframe both come from Cloudflare's origin.
+                # Forget this and the browser BLOCKS the widget: no token is submitted, and the API
+                # — correctly — refuses every booking. A CSP that silently breaks the only gate in
+                # front of an unauthenticated write is not a detail.
+                turnstile=settings.turnstile_site_key is not None,
             ),
             booking.rate_limit_middleware(),
         ]
@@ -1223,6 +1415,26 @@ def create_app(
     _register(app, "/embed/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/embed/{slug}/book", booking.book_form, ["GET"])
     _register(app, "/embed/{slug}/book", booking.book_submit, ["POST"])
+    # ==THE BUSINESS-SCOPED TWINS — this is what makes ONE page serve N businesses.==
+    #
+    # The SAME handlers, again, under `/t/{tenant}`. Not a second implementation: each handler asks
+    # `self._tenant(request)`, which reads the slug from the path when the route carries one and
+    # falls back to `AETHERCAL_TENANT_SLUG` when it does not — so `_booking_prefix` keeps every
+    # link,
+    # action and redirect a response emits inside whichever space the guest is already in.
+    #
+    # The unprefixed routes above are NOT legacy: they are the single-business self-hoster, whose
+    # URLs (and whose guests' bookmarks and e-mailed links) must not break on the day the page
+    # learned to serve more than one.
+    _register(app, "/t/{tenant}", booking.index, ["GET"])
+    _register(app, "/t/{tenant}/e/{slug}", booking.event, ["GET"])
+    _register(app, "/t/{tenant}/e/{slug}/slots", booking.slots_partial, ["GET"])
+    _register(app, "/t/{tenant}/e/{slug}/book", booking.book_form, ["GET"])
+    _register(app, "/t/{tenant}/e/{slug}/book", booking.book_submit, ["POST"])
+    _register(app, "/t/{tenant}/embed/{slug}", booking.event, ["GET"])
+    _register(app, "/t/{tenant}/embed/{slug}/slots", booking.slots_partial, ["GET"])
+    _register(app, "/t/{tenant}/embed/{slug}/book", booking.book_form, ["GET"])
+    _register(app, "/t/{tenant}/embed/{slug}/book", booking.book_submit, ["POST"])
     # Catch-all MUST be registered last: Starlette matches routes in registration order, so every
     # specific path above still wins; only a truly unmatched path falls through to here.
     _register(app, "/{path:path}", booking.catch_all, ["GET"])

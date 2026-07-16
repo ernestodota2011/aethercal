@@ -19,18 +19,18 @@ from aethercal.booking.app import STATIC_DIR, create_app
 from aethercal.booking.settings import BookingSettings
 from aethercal.client import AetherCalClient
 
-API_KEY = "ack_server_side_secret"
-
 #: The loader must stay small — this is the budget the task set (B2.1), not an arbitrary number.
 _MAX_EMBED_JS_BYTES = 5 * 1024
 
 
 def _make_client() -> TestClient:
-    settings = BookingSettings(api_url="http://api.test", api_key=API_KEY, default_locale="es")
+    settings = BookingSettings(
+        api_url="http://api.test", tenant_slug="acme", turnstile_site_key=None, default_locale="es"
+    )
     transport = httpx.MockTransport(lambda request: httpx.Response(404))
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory)
     return TestClient(app)
@@ -125,11 +125,13 @@ def test_embed_js_route_never_touches_the_backend() -> None:
         calls.append(request)
         return httpx.Response(404)
 
-    settings = BookingSettings(api_url="http://api.test", api_key=API_KEY, default_locale="es")
+    settings = BookingSettings(
+        api_url="http://api.test", tenant_slug="acme", turnstile_site_key=None, default_locale="es"
+    )
     transport = httpx.MockTransport(handler)
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory)
     client = TestClient(app)

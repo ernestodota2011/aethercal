@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import math
 import re
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,11 +21,17 @@ from urllib.parse import urlparse
 from pydantic import ValidationError
 
 from aethercal.booking.i18n import Locale, t
-from aethercal.schemas.bookings import BookingCreate, normalize_phone
+from aethercal.schemas.bookings import normalize_phone
+from aethercal.schemas.public import PublicBookingCreate
 
 #: The guest's phone input, and the consent checkbox beside it (RF-24).
 PHONE_FIELD_NAME = "phone"
 PHONE_CONSENT_FIELD_NAME = "phone_consent"
+
+#: The field the Turnstile widget writes its response into. ==The name is Cloudflare's, not ours==:
+#: the script injects a hidden input called exactly this. It must match, or the token is never
+#: submitted and every public booking is refused with a captcha error that names no cause.
+TURNSTILE_FIELD_NAME = "cf-turnstile-response"
 
 #: The ``value`` the consent checkbox carries, and therefore what a TICKED box submits. An unticked
 #: box submits nothing at all — the key is simply absent from the payload.
@@ -78,9 +83,16 @@ class FieldError:
 
 @dataclass(frozen=True, slots=True)
 class BookingRequest:
-    """The request context a submitted form is validated against (which event, when, whose zone)."""
+    """The request context a submitted form is validated against (when, whose zone, which language).
 
-    event_type_id: uuid.UUID
+    ==No ``event_type_id`` any more, and its absence is the point.== The booking now goes to the
+    PUBLIC route, which names the appointment in its PATH — ``/public/{tenant_slug}/{event_slug}/
+    bookings``. A body field naming the event type beside a path that already names it would be two
+    sources of truth for one fact, and the one that eventually won would decide whose diary a
+    guest's
+    booking landed in.
+    """
+
     start_iso: str
     guest_timezone: str
     locale: Locale
@@ -90,7 +102,7 @@ class BookingRequest:
 class BookingFormResult:
     """The outcome of validating a booking form: a ``booking`` XOR a list of ``errors``."""
 
-    booking: BookingCreate | None
+    booking: PublicBookingCreate | None
     errors: list[FieldError]
     values: dict[str, str] = field(default_factory=dict)
 
@@ -301,12 +313,18 @@ def build_booking(
     form: Mapping[str, str],
     collects_phone: bool = False,
 ) -> BookingFormResult:
-    """Validate a submitted booking form into a :class:`BookingCreate` or localized field errors.
+    """Validate a submitted form into a :class:`PublicBookingCreate` or localized field errors.
 
-    ``collects_phone`` mirrors ``EventTypeRead.collects_phone``: the phone + consent are read from
-    the payload ONLY when an active WhatsApp/SMS rule governs this event type. It defaults to
-    ``False`` — the safe direction — so a caller that forgets to pass it collects no personal data
-    rather than harvesting numbers nothing will send to.
+    ``collects_phone`` mirrors the event type's own flag: the phone + consent are read from the
+    payload ONLY when an active WhatsApp/SMS rule governs this event type. It defaults to ``False``
+    — the safe direction — so a caller that forgets to pass it collects no personal data rather than
+    harvesting numbers nothing will ever send to.
+
+    The captcha's response is carried through UNVALIDATED, and deliberately: it is opaque to us, and
+    the only thing entitled to judge it is Cloudflare, server-side. An absent one is not a field
+    error either — the API answers that with its own ``403 captcha_required``, which is the same
+    answer a token that FAILED gets. Telling a bot which field to start guessing at is not a
+    kindness we owe it.
     """
     locale = request.locale
     values = _collect_values(form, questions)
@@ -352,8 +370,7 @@ def build_booking(
         return BookingFormResult(booking=None, errors=errors, values=values)
 
     try:
-        booking = BookingCreate(
-            event_type_id=request.event_type_id,
+        booking = PublicBookingCreate(
             start=start,
             guest_name=name,
             guest_email=email,
@@ -365,6 +382,7 @@ def build_booking(
             # be decorative and the guest could never prove — nor we evidence — that they agreed.
             guest_phone=phone,
             guest_phone_consent=phone_consent,
+            turnstile_token=form.get(TURNSTILE_FIELD_NAME, "").strip() or None,
         )
     except ValidationError:
         # Defensive: our own checks precede this, so a residual failure (e.g. an unexpected
@@ -379,6 +397,7 @@ __all__ = [
     "CONSENT_SUBMITTED_VALUE",
     "PHONE_CONSENT_FIELD_NAME",
     "PHONE_FIELD_NAME",
+    "TURNSTILE_FIELD_NAME",
     "BookingFormResult",
     "BookingRequest",
     "FieldError",
