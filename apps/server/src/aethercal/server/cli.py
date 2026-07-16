@@ -1120,6 +1120,35 @@ def guest_purge_command(
         f"{report.sent_notifications} ledger row(s) deleted, "
         f"{report.webhook_deliveries} webhook payload(s) redacted"
     )
+    if report.outbox_retained:
+        # Said out loud, never left to the log. An erasure is a thing an operator may have to PROVE
+        # they performed, and a row this purge deliberately KEPT is exactly what they will be asked
+        # about. It names nobody — it is money owed, or a slot to free — and they should hear that
+        # from the command rather than discover it in the table.
+        typer.echo(
+            f"  kept {report.outbox_retained} queued intent(s) that are not messages (a refund "
+            "owed, a hold to expire): they name nobody, and deleting them would have kept this "
+            "guest's money"
+        )
+    if report.purge_anomalies:
+        # ==Only when there IS one.== An ordinary purge prints nothing here, because a line that
+        # appears every time is a line that stops being read — and this is the one that must not be.
+        # A retained row carrying an undeclared key means something reached the table without
+        # passing enqueue_effect's guard: the erasure is complete (the key was dropped), but the
+        # write path that produced it is still out there, and a human has to go and look.
+        #
+        # Each line names the ROW, and quotes a key only when it is one of our own declared words —
+        # an unrecognised key can BE the address just erased, and this terminal's scrollback is not
+        # the place to put it back. The row is retained: that is what the operator goes and reads.
+        typer.echo(
+            f"  ANOMALY: {len(report.purge_anomalies)} retained intent(s) carried undeclared "
+            "payload key(s). The keys were dropped, so the erasure IS complete — but a row got "
+            "past the enqueue guard. Read each intent's created_at/dedupe_key to find the write "
+            "path that produced it:",
+            err=True,
+        )
+        for anomaly in report.purge_anomalies:
+            typer.echo(f"    - {anomaly}", err=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

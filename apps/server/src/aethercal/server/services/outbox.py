@@ -384,6 +384,84 @@ literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE 
 in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
 
 
+class Purgeability(StrEnum):
+    """Whether the GUEST ERASURE (``services/privacy.py``) may delete a queued intent."""
+
+    PURGEABLE = "purgeable"
+    """It exists ONLY in order to message this person. After the erasure there is nobody to message,
+    and the payload would still carry their address to a provider, so the row goes."""
+    RETAINED = "retained"
+    """==It is not a message.== It moves MONEY or frees a SLOT, it names nobody, and deleting it
+    would take something from the very person the erasure is supposed to serve."""
+
+
+def purge_policy(effect: OutboxEffect) -> Purgeability:
+    """Whether :func:`purge_guest` may delete a queued ``effect`` when erasing its guest.
+
+    ==EXHAUSTIVE, with ``assert_never``, exactly like the staleness, confirmation and voidability
+    tables.== The purge used to delete every outbox row of a booking on one sentence of
+    justification — *"each of these exists ONLY in order to message this person"* — which was true
+    of every effect that existed when it was written, and false of the two that arrived with B-05b.
+
+    * ``EMAIL`` / ``GOOGLE`` / ``NOTIFY`` → **PURGEABLE**. The original argument, and it still
+      holds: each exists to message the guest, and its payload carries their address to a provider.
+      After an erasure there is nobody left to send them to.
+    * ==``REFUND`` → **RETAINED**, the load-bearing one.== It is not a message; it is money the
+      guest is OWED, and its payload (``{provider, provider_ref}``) names no person. Deleted before
+      the drain reaches it, the intent vanishes and the refund never executes: the guest is erased
+      **and** out of pocket — silently, with the purge reporting success. That is "keeping a paying
+      guest's money", the other half of what the payments header says cannot be got wrong. It is
+      also the discriminator :func:`we_queued_this_refund` reads, so deleting it re-opens r8 too.
+    * ``EXPIRE_HOLD`` → **RETAINED**. It carries ``{booking_id}`` and no person. It is slot state,
+      not a message: delete it and the hold never lapses, so the slot stays blocked for ever — a
+      loss inflicted on the HOST by a guest's erasure.
+
+    .. rubric:: This is NOT the question :func:`voidability_policy` answers
+
+    That one asks *"may a booking transition retire this?"*; this asks *"may an ERASURE delete
+    this?"*. The two tables agree today by coincidence and must never be collapsed: ``EMAIL`` and
+    ``GOOGLE`` are ``NON_VOIDABLE`` (a cancellation notice must survive the cancellation it
+    reports) and PURGEABLE all the same (an erased guest is told nothing at all). Collapse them and
+    the first effect whose two answers differ gets one of them wrong, in silence.
+    """
+    match effect:
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Purgeability.PURGEABLE
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            return Purgeability.RETAINED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+PURGEABLE_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if purge_policy(effect) is Purgeability.PURGEABLE
+)
+"""The effect values the guest erasure DELETES — derived from the table above, never a literal.
+
+``services/privacy.py`` filters its outbox delete on this, so the declaration and the mechanism are
+one object: classify an effect ``PURGEABLE`` and the purge sweeps it for free; classify it
+``RETAINED`` and there is no hand-written ``WHERE`` anywhere that somebody has to remember."""
+
+RETAINED_PAYLOAD_KEYS: Mapping[OutboxEffect, frozenset[str]] = {
+    # `enqueue_refund` (services/payments.py): which provider to call, and the charge reference to
+    # refund. No name, no address, no notes, no answers.
+    OutboxEffect.REFUND: frozenset({"provider", "provider_ref"}),
+    # `enqueue_expire_hold` (services/payments.py): the booking whose hold lapses — an id of OURS,
+    # pointing at a row the erasure redacts in place rather than deletes.
+    OutboxEffect.EXPIRE_HOLD: frozenset({"booking_id"}),
+}
+"""What a RETAINED effect's payload may contain — the OTHER half of retaining a row.
+
+==An effect is RETAINED because its payload names nobody, and that is a claim about the PAYLOAD.==
+A claim nobody checks decays: add ``guest_email`` to the refund payload tomorrow and the purge
+would faithfully retain it — erasure reported complete, the address still sitting in the table. So
+the keys are declared, the suite asserts the declaration holds no PII key, and
+:func:`enqueue_effect` — the one place an ``Outbox`` row is constructed — refuses an undeclared one.
+
+Exhaustiveness is asserted against :func:`purge_policy` (``test_privacy``): a newly RETAINED effect
+has to say what it carries before anything will keep it."""
+
+
 @dataclass(frozen=True, slots=True)
 class Suppressed:
     """The intent was REFUSED rather than queued: its booking has never been ``CONFIRMED``.
@@ -563,6 +641,18 @@ class OutboxReport:
     Kept out of :attr:`lost` deliberately: that counter exists to alert on a broken timing
     assumption, and an alarm that also fires on every ordinary cancellation is one nobody reads.
     """
+    purged_midflight: list[uuid.UUID] = field(default_factory=list)
+    """DELETED by a guest erasure WHILE we were sending them. Routine, expected, and NOT lost.
+
+    ==The third cause of a vanished row, and it earns its own bucket for the same reason
+    :attr:`voided_midflight` did.== ``purge_guest`` filters on effect, never on status, so a message
+    intent a worker is mid-send on is as deletable as an idle one — and at settle time that looks
+    EXACTLY like a lost lease: the row is not ours any more. Filed as :attr:`lost` it would fire the
+    duplicate-send alarm on every erasure that happened to land during a drain, and send an operator
+    off to re-tune lease timings that are working perfectly.
+
+    Nothing was sent twice and nothing timed out: somebody exercised their right to be forgotten.
+    """
     lost: list[uuid.UUID] = field(default_factory=list)
     """Rows whose LEASE EXPIRED mid-send, so this worker's result was DISCARDED at settle time.
 
@@ -617,6 +707,37 @@ def expire_hold_dedupe_key(booking_id: uuid.UUID) -> str:
     return f"{OutboxEffect.EXPIRE_HOLD.value}:{booking_id}"
 
 
+RETAINED_DEDUPE_KEY: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], str]] = {
+    # `enqueue_refund` keys on the charge, and puts that same charge in the payload.
+    OutboxEffect.REFUND: lambda payload: refund_dedupe_key(str(payload["provider_ref"])),
+    # `enqueue_expire_hold` keys on the booking, and puts that same booking in the payload.
+    OutboxEffect.EXPIRE_HOLD: lambda payload: expire_hold_dedupe_key(
+        uuid.UUID(str(payload["booking_id"]))
+    ),
+}
+"""How to rebuild a RETAINED effect's ``dedupe_key`` from its own payload.
+
+==The other half of retaining a row: ``payload`` was never the only column.== Three rounds hardened
+the payload — an allowlist, a shape, a vocabulary — while ``dedupe_key``, a free-form
+``VARCHAR(128)``, rode along untouched on every retained row and nothing had ever looked at it.
+
+It cannot be redacted the way a payload can. :func:`we_queued_this_refund` matches on
+``(tenant_id, dedupe_key)``, so this column IS the r8 discriminator — the committed fact that tells
+our own refund from an operator's — and rewriting it would stop the money already on the wire from
+being recognised as ours, re-opening the bug this cut opened with. It survives verbatim, or the
+refund breaks.
+
+Something that survives verbatim has to be PII-free BY CONSTRUCTION, and that is what this makes
+checkable rather than hoped for: ==a retained row's dedupe_key must be REBUILDABLE from its own
+retained payload.== The payload is already proven to name nobody (:data:`RETAINED_PAYLOAD_KEYS` plus
+the funnel guard), so a key derived from nothing else can carry nothing else — and one that does not
+rebuild came from somewhere nothing can vouch for. ``refund:ada@example.com`` is not a hypothetical
+shape: it is what :func:`refund_dedupe_key` yields the day a ``provider_ref`` is an address, or a
+future caller keys a retained intent on "the person this is about".
+
+Exhaustive over the RETAINED effects (asserted in ``test_privacy``), and enforced at the funnel."""
+
+
 def workflow_step_dedupe_key(workflow_id: uuid.UUID, step_id: uuid.UUID, channel: Channel) -> str:
     """The idempotency key for one workflow step on one channel (RF-24's exactly-once guarantee).
 
@@ -637,6 +758,70 @@ def as_utc(moment: datetime) -> datetime:
     (``services/workflows.py``) and the deadline arithmetic (:func:`message_deadline`) need it — and
     two copies of "what does a naive timestamp from the database mean" is how two answers appear."""
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _refuse_underivable_retained_dedupe_key(
+    effect: OutboxEffect, dedupe_key: str, payload: Mapping[str, object]
+) -> None:
+    """Refuse a RETAINED intent whose ``dedupe_key`` cannot be rebuilt from its own payload.
+
+    ==The column the payload guard never looked at.== See :data:`RETAINED_DEDUPE_KEY` for why this
+    one cannot be redacted after the fact (it is the r8 discriminator) and therefore has to be
+    PII-free at the door instead.
+
+    Same funnel, same reasoning as the payload keys beside it: the rule lands on the enqueue path
+    nobody has written yet. It raises for the same reason too — a dedupe_key that does not rebuild
+    is a programming error, met by the suite long before a guest meets it.
+    """
+    rebuild = RETAINED_DEDUPE_KEY.get(effect)
+    if rebuild is None:  # PURGEABLE: the whole row goes on a purge, so its key outlives nothing.
+        return
+    try:
+        expected = rebuild(payload)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            f"and must be rebuildable from its (PII-free) payload — and it cannot be rebuilt at "
+            f"all: {exc!r}. Its payload must carry what its key is derived from."
+        ) from exc
+    if dedupe_key != expected:
+        # The KEY itself is never echoed: if it carries the guest, this message would too.
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            "verbatim — and this one is not the key its own payload rebuilds. It was derived from "
+            "something nothing has vouched for, which may be the person. Key it on the payload "
+            "(see RETAINED_DEDUPE_KEY), or this effect cannot be retained as it stands."
+        )
+
+
+def _refuse_undeclared_retained_keys(effect: OutboxEffect, payload: Mapping[str, object]) -> None:
+    """Refuse a RETAINED effect carrying a payload key nobody classified (B-05c).
+
+    ==Gate the FUNNEL, not the callers.== :func:`enqueue_effect` is the only place an ``Outbox`` row
+    is constructed in the source tree, so the rule lands on the enqueue path nobody has written yet,
+    without its author ever learning this rule exists. A list of the call sites that matter today is
+    a photograph; this is the door they all come through.
+
+    A RETAINED intent OUTLIVES a guest erasure. Whether it may is decided entirely by what is inside
+    it — so a key nobody classified cannot ride along on the assumption that it is harmless, because
+    the erasure would keep it, faithfully, address and all.
+
+    Raises rather than warns, and that is deliberate: an undeclared key is a PROGRAMMING error, not
+    a runtime condition, and it is one the suite meets long before a guest does — every test that
+    queues a refund runs this. The alternative is a log line nobody reads, on the one path where
+    being wrong means an erasure that did not erase.
+    """
+    allowed = RETAINED_PAYLOAD_KEYS.get(effect)
+    if allowed is None:  # PURGEABLE: the whole row goes on a purge, so its keys need no vetting.
+        return
+    undeclared = set(payload) - allowed
+    if undeclared:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge (services/privacy.py), so its payload "
+            f"outlives an erasure — and it carries undeclared payload key(s) {sorted(undeclared)}. "
+            "Either add them to RETAINED_PAYLOAD_KEYS (having checked they name nobody), or, if "
+            "they do name somebody, this effect cannot be retained as it stands."
+        )
 
 
 async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are the keyword contract
@@ -711,6 +896,11 @@ async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are
             booking.id,
         )
         return Suppressed(booking_id=booking.id, effect=effect)
+
+    # Everything a RETAINED row will still be carrying after an erasure, vetted at the one door it
+    # comes through: the payload's keys, and the dedupe_key those keys must rebuild.
+    _refuse_undeclared_retained_keys(effect, payload)
+    _refuse_underivable_retained_dedupe_key(effect, dedupe_key, payload)
 
     row = Outbox(
         tenant_id=booking.tenant_id,
@@ -1372,12 +1562,17 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         if row is None:
             # WHY we lost it decides which bucket it lands in, and that matters: `lost` is the
             # metric that proves in production whether the timeout assumption holds. Fill it with
-            # routine cancellations and a real duplicate-send signal drowns in noise — and an alarm
-            # that always fires is an alarm nobody reads.
-            if await _lost_because_voided(session, work):
-                report.voided_midflight.append(work.id)
-            else:
-                report.lost.append(work.id)
+            # routine cancellations — or with routine ERASURES — and a real duplicate-send signal
+            # drowns in noise, and an alarm that always fires is an alarm nobody reads.
+            match await _why_it_vanished(session, work):
+                case Vanished.VOIDED:
+                    report.voided_midflight.append(work.id)
+                case Vanished.PURGED:
+                    report.purged_midflight.append(work.id)
+                case Vanished.LEASE_LOST:
+                    report.lost.append(work.id)
+                case _ as unreachable:
+                    assert_never(unreachable)
             return
         row.claimed_by = None
         row.lease_expires_at = None
@@ -1435,21 +1630,54 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
         assert_never(outcome)
 
 
-async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
-    """Log why our result is being discarded; return whether it was a VOID rather than a lost lease.
+class Vanished(StrEnum):
+    """Why a row we held is no longer ours at settle time. Three causes, three buckets."""
 
-    Both end in "we do not write", but they are different facts. One is the system working as
-    designed: a cancellation retired the step under us — routine, expected, harmless. The other is a
-    real failure of our own timing assumption: our send outran its lease, the row was recovered, and
-    somebody else owns it now — which means the effect may have been executed TWICE.
+    VOIDED = "voided"
+    """A booking transition retired the step under us. Routine."""
+    PURGED = "purged"
+    """A guest erasure DELETED it under us. Routine."""
+    LEASE_LOST = "lease_lost"
+    """Our send outran its lease and somebody else owns the row. ==The one to alarm on.=="""
 
-    Collapsing them into one bucket would file routine cancellations into the very counter that is
-    supposed to alert on duplicate sends.
+
+async def _why_it_vanished(session: AsyncSession, work: OutboxWork) -> Vanished:
+    """Log why our result is being discarded, and say which of the three causes it was.
+
+    All three end in "we do not write", and they are three different facts. Two are the system
+    working as designed — a cancellation retired the step; a guest exercised their right to be
+    forgotten — and are routine, expected and harmless. The third is a real failure of our own
+    timing assumption: our send outran its lease, the row was recovered, and somebody else owns it
+    now — which means the effect may have been executed TWICE.
+
+    Collapsing any of them together files a routine event into the very counter that is supposed to
+    alert on duplicate sends. ``voided`` was split out for exactly that reason; ==``purged`` is the
+    third cause, and it was landing in the alarm bucket== — with an error line telling an operator
+    to re-tune lease timings that were working perfectly.
+
+    .. rubric:: ==Why "gone" means PURGED, and what keeps that true==
+
+    A deleted row leaves no marker to read — it is gone — so the cause has to be INFERRED, and the
+    inference is only sound because ``services/privacy.py`` holds the only ``DELETE`` against this
+    table in the whole source tree (nothing deletes ``bookings`` either, so the ``ON DELETE
+    CASCADE`` never fires). That is not a comment anybody has to keep true by remembering:
+    ``test_purge_drain_concurrency_pg`` walks the AST of every shipped module and fails the day a
+    second deleter appears — which is the day this classification would start lying.
     """
     current = await session.get(Outbox, work.id)
-    status = current.status if current is not None else "gone"
 
-    if status == _VOIDED:
+    if current is None:
+        _logger.info(
+            "outbox intent %s (%s) for booking %s: PURGED mid-flight by a guest erasure (RNF-8). "
+            "Our result is discarded and the intent is gone for good — which is the point: it was "
+            "a message to somebody who asked to be forgotten. Routine, and NOT a lost lease",
+            work.id,
+            work.effect,
+            work.booking_id,
+        )
+        return Vanished.PURGED
+
+    if current.status == _VOIDED:
         _logger.warning(
             "outbox intent %s (%s) for booking %s: VOIDED mid-flight by a booking transition "
             "(cancel / reschedule / no-show). Our result is discarded and the step will not be "
@@ -1458,7 +1686,7 @@ async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
             work.effect,
             work.booking_id,
         )
-        return True
+        return Vanished.VOIDED
 
     _logger.error(
         "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (we held it as %s; it is now "
@@ -1469,9 +1697,9 @@ async def _lost_because_voided(session: AsyncSession, work: OutboxWork) -> bool:
         work.effect,
         work.booking_id,
         work.claimed_by,
-        status,
+        current.status,
     )
-    return False
+    return Vanished.LEASE_LOST
 
 
 async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
@@ -2608,6 +2836,9 @@ __all__ = [
     "PAUSED_RULE_RECHECK",
     "PROVIDER_CALL_MARKER",
     "PROVIDER_TIMEOUT_CEILING",
+    "PURGEABLE_EFFECTS",
+    "RETAINED_DEDUPE_KEY",
+    "RETAINED_PAYLOAD_KEYS",
     "TERMINAL_MESSAGE_GRACE",
     "Clock",
     "Confirmation",
@@ -2619,10 +2850,12 @@ __all__ = [
     "OutboxSkipped",
     "OutboxUnknownOutcome",
     "OutboxWork",
+    "Purgeability",
     "ReconcileReport",
     "Staleness",
     "StepSchedule",
     "Suppressed",
+    "Vanished",
     "Voidability",
     "as_utc",
     "backoff_delay",
@@ -2636,6 +2869,7 @@ __all__ = [
     "make_booking_effect_executor",
     "message_deadline",
     "new_worker_id",
+    "purge_policy",
     "reconcile_workflow_steps",
     "recover_expired_leases",
     "refund_dedupe_key",

@@ -26,8 +26,13 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
-from aethercal.server.services.outbox import OutboxEffect
-from aethercal.server.services.payments import ArbiterOutcome, apply_paid_event
+from aethercal.server.services.outbox import Confirmation, OutboxEffect, confirmation_policy
+from aethercal.server.services.payments import (
+    ArbiterOutcome,
+    apply_paid_event,
+    apply_refunded_event,
+    we_queued_this_refund,
+)
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 _SLOT = datetime(2026, 7, 20, 15, 0, tzinfo=UTC)
@@ -309,3 +314,88 @@ async def test_the_arbiter_resolves_the_booking_by_provider_ref_only(
     await sqlite_session.refresh(decoy)
     assert real.status is BookingStatus.CONFIRMED
     assert decoy.status is BookingStatus.PENDING, "the decoy is untouched — no metadata was trusted"
+
+
+# --- B-05c: the REFUNDED_MISMATCH branch, end to end -------------------------------------------
+#
+# B-05b left this one declared but unverified: on this branch the booking is a PENDING hold, so the
+# B-05a silence gate is live — and the r8 discriminator is an outbox row that gate could have
+# refused to write. Nobody had run the round trip. These two tests are that round trip.
+
+
+async def _refunded(
+    session: AsyncSession, tenant_id: uuid.UUID, provider_ref: str
+) -> tuple[object, list[uuid.UUID]]:
+    """The provider telling us the charge came back — the event r8 is about."""
+    cancelled: list[uuid.UUID] = []
+
+    async def _cancel_effects(s: AsyncSession, booking: Booking, now: datetime) -> None:
+        cancelled.append(booking.id)
+
+    result = await apply_refunded_event(
+        session,
+        tenant_id=tenant_id,
+        provider=_PROVIDER,
+        provider_ref=provider_ref,
+        now=NOW,
+        cancel_effects=_cancel_effects,
+    )
+    return result, cancelled
+
+
+async def test_a_mismatched_payment_queues_its_refund_even_though_the_hold_is_unconfirmed(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The silence gate must NOT swallow the refund of a wrong-amount payment.==
+
+    The booking here is a PENDING hold: ``confirmed_at`` is NULL, so the B-05a gate suppresses every
+    intent that would ANNOUNCE it. A refund is not an announcement — it is money going back — and
+    ``confirmation_policy`` says so by marking REFUND ``EXEMPT``. If it did not, this branch would
+    take a guest's money for a booking it also refuses to confirm, and say nothing at all.
+
+    Asserted on the EXEMPTION as well as the row: the exemption is the property that could rot, and
+    a test that only counted rows would not say WHY they were there.
+    """
+    tenant_id, booking, _ = await _seed(sqlite_session)
+    await _pay(sqlite_session, tenant_id, booking, provider_ref="pi_A", amount_cents=100)
+
+    result = await _apply(sqlite_session, tenant_id, "pi_A", _Spy(), amount_cents=100)
+
+    assert result.outcome is ArbiterOutcome.REFUNDED_MISMATCH
+    await sqlite_session.refresh(booking)
+    assert booking.confirmed_at is None, "the hold is unconfirmed — the silence gate is live"
+    assert confirmation_policy(OutboxEffect.REFUND) is Confirmation.EXEMPT
+    assert len(await _refund_rows(sqlite_session, booking.id)) == 1, (
+        "the silence gate swallowed the refund of a payment we refused to honour: the guest's "
+        "money stays ours and nobody is told"
+    )
+
+
+async def test_the_echo_of_a_mismatch_refund_is_not_read_as_an_out_of_band_refund(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The r8 round trip on the branch nobody had walked (B-05b's own open question).==
+
+    ``we_queued_this_refund`` reads the REFUND INTENT, and on this branch that intent is written
+    while the booking is unconfirmed — through the one gate that can refuse to write it. Had the
+    gate suppressed it, the discriminator would silently answer "not ours", and the
+    ``charge.refunded`` the provider fires seconds later would be classified OUT OF BAND: the
+    arbiter would cancel and page a human on every ordinary mismatch refund.
+
+    The verdict: the gate lets it through (REFUND is confirmation-EXEMPT), so the echo reads as
+    ours. This test is what keeps that true — it fails the day somebody makes REFUND gated.
+    """
+    tenant_id, booking, _ = await _seed(sqlite_session)
+    await _pay(sqlite_session, tenant_id, booking, provider_ref="pi_A", amount_cents=100)
+    await _apply(sqlite_session, tenant_id, "pi_A", _Spy(), amount_cents=100)
+
+    # The payment is still `paid`: the refund runner has not committed yet. This is exactly the r8
+    # window — the status alone cannot tell our own refund from an operator's.
+    assert await we_queued_this_refund(sqlite_session, tenant_id=tenant_id, provider_ref="pi_A")
+
+    result, cancelled = await _refunded(sqlite_session, tenant_id, "pi_A")
+
+    assert result.outcome is ArbiterOutcome.REFUND_ECHO, (
+        "our own mismatch refund was read as an operator's out-of-band refund"
+    )
+    assert cancelled == [], "the arbiter cancelled a booking over the echo of its own refund"
