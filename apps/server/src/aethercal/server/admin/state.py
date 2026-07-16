@@ -806,6 +806,13 @@ class AdminState(rx.State):
         this raise is unreachable through the UI — which is exactly why it must stay a raise. The
         day
         a new handler forgets that guard, this is what stops it, instead of it acting as somebody.
+
+        ==The ``role`` here is the LOGIN SNAPSHOT, and it is NOT what authorises.== It is the role
+        the member held when they signed in; an owner may have revoked or demoted them since. The
+        service layer re-reads the CURRENT role from ``memberships`` on every action
+        (``service._live_principal``) and decides on that, so a stale snapshot role grants nothing —
+        the day a member is demoted, their very next action is judged on the new role, not this one.
+        This snapshot only seeds who is asking and which business they belong to.
         """
         if self._principal_kind == PrincipalKind.BOOTSTRAP_OPERATOR.value:
             return Principal.bootstrap_operator()

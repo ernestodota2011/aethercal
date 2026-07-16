@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import MemberRole
-from aethercal.server.admin import bootstrap
+from aethercal.server.admin import bootstrap, service
 from aethercal.server.admin.config import AdminConfig
 from aethercal.server.admin.runtime import AdminRuntime
 from aethercal.server.db.guc import reset_tenant_binding
@@ -250,3 +250,120 @@ class TestCriterion38OperatorSwitchesBusiness:
         operator = Principal.bootstrap_operator()
         assert operator.tenant_id is None
         assert operator.is_operator
+
+
+# ==========================================================================================
+# ==A role is re-read from `memberships` per action, under the belt== — not the login snapshot.
+# ==========================================================================================
+
+
+class TestStaleRoleIsRevalidatedUnderRls:
+    """The critical B-02 defect, proven where it lives: a role change must reach an OPEN session on
+    its very next action, and the re-read that makes it so runs under row-level security — bound to
+    the business being administered, on the app role, with no ``BYPASSRLS``.
+    """
+
+    async def test_a_demoted_admins_next_action_is_refused_under_rls(
+        self,
+        app_maker: async_sessionmaker[AsyncSession],
+        owner_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """==Persistence of privilege, closed.== An ``admin`` signs in for real (the login writes
+        ``admin`` onto the session), an owner demotes them to ``member`` in the database, and their
+        next write is refused — because ``create_host_action`` re-reads the live role from
+        ``memberships`` under RLS before it authorises, rather than trusting the snapshot the login
+        took. A second owner is seeded so the demotion is not itself the last-owner refusal."""
+        password = "correct horse battery staple"
+        async with owner_maker() as session, session.begin():
+            tenant = Tenant(slug="acme", name="Acme")
+            session.add(tenant)
+            await session.flush()
+            owner = User(
+                tenant_id=tenant.id,
+                email="owner@acme.example",
+                name="Owner",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            adm = User(
+                tenant_id=tenant.id,
+                email="adm@acme.example",
+                name="Adm",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            session.add_all([owner, adm])
+            await session.flush()
+            session.add(Membership(tenant_id=tenant.id, user_id=owner.id, role=MemberRole.OWNER))
+            adm_membership = Membership(tenant_id=tenant.id, user_id=adm.id, role=MemberRole.ADMIN)
+            session.add(adm_membership)
+            await session.flush()
+            adm_membership_id = adm_membership.id
+
+        admin = _runtime(app_maker)
+
+        # The admin signs in — through the REAL login seam, under RLS. Snapshot role: admin.
+        principal = await bootstrap.member_login(
+            admin, tenant_slug="acme", email="adm@acme.example", password=password
+        )
+        assert principal is not None
+        assert principal.role is MemberRole.ADMIN
+
+        # An owner demotes them to a plain member (seeded on the BYPASSRLS owner engine).
+        async with owner_maker() as session, session.begin():
+            membership = await session.get(Membership, adm_membership_id)
+            assert membership is not None
+            membership.role = MemberRole.MEMBER
+
+        # The stale ADMIN principal's next scheduling write is refused — the role is re-read per
+        # action, under the belt, and a member does not hold MANAGE_SCHEDULING.
+        with pytest.raises(service.AdminPermissionError):
+            await service.create_host_action(
+                admin,
+                principal=principal,
+                tenant_slug="acme",
+                form=service.HostForm(name="New Host", email="new@acme.example", timezone="UTC"),
+            )
+
+    async def test_a_revoked_members_open_session_is_refused_under_rls(
+        self,
+        app_maker: async_sessionmaker[AsyncSession],
+        owner_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A member with their ``memberships`` row deleted is refused even a READ on their next
+        action: no row under the belt means no session, not a member who may still look around."""
+        password = "correct horse battery staple"
+        async with owner_maker() as session, session.begin():
+            tenant = Tenant(slug="globex", name="Globex")
+            session.add(tenant)
+            await session.flush()
+            member = User(
+                tenant_id=tenant.id,
+                email="mem@globex.example",
+                name="Mem",
+                timezone="UTC",
+                hashed_password=hash_password(password),
+            )
+            session.add(member)
+            await session.flush()
+            member_membership = Membership(
+                tenant_id=tenant.id, user_id=member.id, role=MemberRole.MEMBER
+            )
+            session.add(member_membership)
+            await session.flush()
+            member_membership_id = member_membership.id
+
+        admin = _runtime(app_maker)
+        principal = await bootstrap.member_login(
+            admin, tenant_slug="globex", email="mem@globex.example", password=password
+        )
+        assert principal is not None
+        assert principal.role is MemberRole.MEMBER
+
+        async with owner_maker() as session, session.begin():
+            membership = await session.get(Membership, member_membership_id)
+            assert membership is not None
+            await session.delete(membership)
+
+        with pytest.raises(service.SessionRevokedError):
+            await service.list_bookings_view(admin, principal=principal, tenant_slug="globex")

@@ -369,6 +369,103 @@ async def test_the_instance_operator_administers_any_business(sessionmaker: Sess
 
 
 # ======================================================================================
+# ==A role is not a fact learned once at login.== It is re-read from `memberships`, per action.
+# ======================================================================================
+
+
+async def _membership_id_of(
+    sessionmaker: Sessionmaker, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> uuid.UUID:
+    async with sessionmaker() as session, session.begin():
+        membership = await memberships_service.get_membership_for_user(
+            session, tenant_id=tenant_id, user_id=user_id
+        )
+        assert membership is not None
+        return membership.id
+
+
+async def test_a_degraded_members_action_uses_their_CURRENT_role_not_the_login_snapshot(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """==Persistence of privilege is the bug.== An ``admin`` signs in — the login writes ``admin``
+    onto the session — and an owner then DEMOTES them to ``member``. The session's next action that
+    needs the old role must be refused, because the role it authorises on is re-read from
+    ``memberships`` on every action, never the snapshot the login took.
+
+    Until now, the demoted admin kept ``MANAGE_SCHEDULING`` until they logged out and back
+    in: a scope they no longer hold, held open by a session nobody had closed.
+    """
+    business = await _seed(sessionmaker)
+    admin = _runtime(sessionmaker)
+    membership_id = await _membership_id_of(
+        sessionmaker, tenant_id=business.tenant_id, user_id=business.admin.user_id
+    )
+
+    # The owner demotes the admin to a plain member — in the database, mid-session.
+    async with sessionmaker() as session, session.begin():
+        await memberships_service.set_role(
+            session,
+            tenant_id=business.tenant_id,
+            membership_id=membership_id,
+            role=MemberRole.MEMBER,
+        )
+
+    # The STALE principal still says "admin". Its next scheduling write must be refused.
+    with pytest.raises(service.AdminPermissionError):
+        await service.create_host_action(
+            admin,
+            principal=business.admin,
+            tenant_slug=business.slug,
+            form=service.HostForm(name="Nope", email="nope@acme.example", timezone="UTC"),
+        )
+
+
+async def test_a_revoked_members_session_is_denied_even_a_read(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """==No membership ⇒ no session.== An owner REVOKES a member; the member's open session is then
+    refused every action — including the reads it did a moment ago — because a principal with no
+    ``memberships`` row is a login that no longer exists, not a member who may still look around."""
+    business = await _seed(sessionmaker)
+    admin = _runtime(sessionmaker)
+    membership_id = await _membership_id_of(
+        sessionmaker, tenant_id=business.tenant_id, user_id=business.member.user_id
+    )
+
+    async with sessionmaker() as session, session.begin():
+        await memberships_service.revoke_membership(
+            session, tenant_id=business.tenant_id, membership_id=membership_id
+        )
+
+    with pytest.raises(service.AdminPermissionError):
+        await service.list_bookings_view(
+            admin, principal=business.member, tenant_slug=business.slug
+        )
+
+
+async def test_re_reading_the_role_does_not_lock_a_still_current_member_out(
+    sessionmaker: Sessionmaker,
+) -> None:
+    """The other half: the per-action re-read must NOT refuse somebody whose role is unchanged. A
+    guard that also stops the still-valid member is an outage, not a fix."""
+    business = await _seed(sessionmaker)
+    admin = _runtime(sessionmaker)
+
+    # Unchanged member: still reads the agenda, still refused the scheduling writes — exactly as
+    # before, because the role re-read finds the SAME role the login did.
+    assert await service.list_bookings_view(
+        admin, principal=business.member, tenant_slug=business.slug
+    )
+    with pytest.raises(service.AdminPermissionError):
+        await service.create_host_action(
+            admin,
+            principal=business.member,
+            tenant_slug=business.slug,
+            form=service.HostForm(name="Nope", email="nope2@acme.example", timezone="UTC"),
+        )
+
+
+# ======================================================================================
 # ==The lock: no panel reaches the data without asking.==
 # ======================================================================================
 
@@ -415,6 +512,26 @@ def test_every_panel_that_opens_a_session_authorises_first() -> None:
             }
             & _AUTHORIZERS
         )
+    )
+    assert offenders == []
+
+
+def test_every_panel_reresolves_the_live_role_before_it_authorises() -> None:
+    """==The lock on the snapshot hole.== Authorising is only safe if the role authorised on is the
+    CURRENT one. A panel that opens a session and calls ``_authorize`` with the login-snapshot
+    principal re-grants whatever role that person held when they signed in — long after an owner
+    revoked or demoted them. So the fact is asserted about the TREE: every session-owning panel
+    re-reads the live role (``_live_principal``) before it serves, or this goes red.
+    """
+    offenders = sorted(
+        node.name
+        for node in _session_owning_panels()
+        if "_live_principal"
+        not in {
+            call.func.id
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
     )
     assert offenders == []
 
