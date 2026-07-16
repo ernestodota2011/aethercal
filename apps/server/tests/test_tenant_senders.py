@@ -58,6 +58,7 @@ from aethercal.server.services.tenant_senders import (
     InstanceSenderDefaults,
     SenderClients,
     TenantSenders,
+    UncappedChannelError,
     UnusableCredentialError,
     _assert_smtp_host_reachable,
     _open_pinned_socket,
@@ -434,6 +435,15 @@ class TestACredentialWithNoCeilingIsNotACeilingAtAll:
             senders = await _senders(sqlite_session, business, defaults=capless, client=client)
 
         assert Channel.WHATSAPP not in senders.channels
+        # ==And RETRYABLE, not discarded.== The business HAS a credential, so this is a FAULT, not
+        # "the channel is off". It used to be silently absent — which the drain reads as terminal —
+        # so a guest's reminder was destroyed for ever over a variable the operator sets in a
+        # minute, and setting it afterwards brought nothing back.
+        assert isinstance(senders.channel_errors[Channel.WHATSAPP], UncappedChannelError), (
+            "a credential with no caps was treated as 'the channel is off'. Off is terminal; this "
+            "is undone by one line in an env file, so it cannot be."
+        )
+        assert "DAILY_CAP_PER_PHONE" in str(senders.channel_errors[Channel.WHATSAPP])
 
     async def test_a_businesss_own_sender_is_capped_by_the_operators_declared_ceiling(
         self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
@@ -1281,6 +1291,52 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             service_factory=None,
         )
         with pytest.raises(UnusableCredentialError, match="inward"):
+            await execute(_email_work(uuid.uuid4()), _NOW)
+
+
+class TestTheExecutorRefusesSendersThatAreNotTheItems:
+    """==A tripwire against the leak the obvious optimisation would cause.==
+
+    The resolver cannot be called without a business and always stamps back the id it was handed, so
+    nothing today can produce a mismatch — verified below rather than assumed. It is armed for what
+    comes next: the natural way to speed this loop up is to MEMOISE the resolve, and a cache keyed
+    even slightly wrong hands one business's sender to another's item. The drain would never notice
+    — a sender is a sender — and the result is a guest messaged from the wrong company's number,
+    which nobody can take back.
+    """
+
+    async def test_the_live_resolver_cannot_produce_a_mismatch_today(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Closed with proof, not opinion.== The tripwire guards a future, not a present."""
+        business = await _business(sqlite_session, tenant_factory, "identity-ok")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.tenant_id == business.id, (
+            "the real resolver already stamps a business other than the one it was asked for — "
+            "then this is not a future risk, it is a live bug"
+        )
+
+    async def test_senders_belonging_to_another_business_are_refused(self) -> None:
+        """==The cache-keyed-wrong scenario, made unrepresentable rather than unlikely.==
+
+        A resolver that ignores the id it is given is exactly what a memoisation bug looks like from
+        the outside. The item must not send.
+        """
+        theirs = uuid.uuid4()
+
+        async def _confused_cache(tenant_id: uuid.UUID) -> TenantSenders:
+            # Hands back the FIRST business's senders to whoever asks — one wrong cache key.
+            return TenantSenders(tenant_id=theirs, email=None, channels={})
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # the refusal precedes any use
+            resolve_senders=_confused_cache,
+            service_factory=None,
+        )
+        with pytest.raises(RuntimeError, match="Refusing to send"):
             await execute(_email_work(uuid.uuid4()), _NOW)
 
 

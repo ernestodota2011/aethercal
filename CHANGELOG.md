@@ -63,6 +63,11 @@ credentials; nothing sent with them.
   nobody has enumerated. A channel that is configured and fails to resolve FAILS and retries,
   carrying its own reason; one that was never configured is still skipped. A cancellation or
   shutdown is not a channel failure and still rises.
+- **A phone credential with no declared caps is a fault, not a switched-off channel.** It made the
+  channel merely absent, which the drain reads as terminal — so a guest's reminder was discarded for
+  ever because an operator had not set `AETHERCAL_<CHANNEL>_DAILY_CAP_*`, and setting it afterwards
+  brought nothing back. The channel still cannot come up uncapped; it now fails and retries, so the
+  message outlives the fix.
 - **A tenant's SMTP relay host is guarded too, and pinned at connect.** `host: 127.0.0.1, port: 25`
   relayed a business's mail through the operator's own local MTA — an open relay on the operator's
   IP reputation. It is the same trust-boundary bug without the HTTP, and scoping it out was

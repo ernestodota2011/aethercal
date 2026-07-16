@@ -331,6 +331,62 @@ class TestATenantsUrlCannotBeDialedWithoutTheEgressGuard:
             )
 
 
+class TestOffAndBrokenAreDecidedInExactlyOnePlace:
+    """==The rule that keeps being right while its application keeps falling short.==
+
+    *Off* (never configured) is terminal; *broken* (configured and failing) is retryable, because a
+    human undoes it and terminal "may only carry a condition that cannot be undone". That rule was
+    stated correctly and then applied wrongly three times — per business instead of per channel, per
+    taxonomy instead of per scope, and terminal-instead-of-retryable for a credential with no caps.
+    Each time the rule was fine and the SITE was new.
+
+    So the sites stop deciding. ``_resolve_phone_channel`` consults the credential ONCE: no
+    credential returns (off), and everything after it raises (broken). This asserts the shape holds
+    — because a second ``return`` added below that line reads like ordinary defensive code and
+    silently discards a guest's message for ever.
+    """
+
+    def _resolver(self) -> ast.AsyncFunctionDef:
+        return next(
+            node
+            for node in ast.walk(_tree(_FUNNEL))
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_resolve_phone_channel"
+        )
+
+    def test_the_phone_resolver_has_exactly_one_return_and_it_means_OFF(self) -> None:
+        returns = [node for node in ast.walk(self._resolver()) if isinstance(node, ast.Return)]
+        assert len(returns) == 1, (
+            f"`_resolve_phone_channel` has {len(returns)} returns. Exactly one may exist, and it "
+            "means THE BUSINESS NEVER CONFIGURED THIS CHANNEL (off → terminal). Every other exit "
+            "must raise, because once a credential exists the channel IS configured and any "
+            "failure is a fault a human can undo — and a terminal outcome destroys the message the "
+            "fix would have delivered. A second `return` is that bug, and it looks like tidy "
+            "defensive code."
+        )
+        assert returns[0].value is None, "the one return says 'off'; it carries nothing"
+
+    def test_that_one_return_is_guarded_by_the_absence_of_a_credential(self) -> None:
+        """==The return must MEAN 'off', not merely be alone.==
+
+        A single ``return`` moved somewhere else would pass the count above while restoring the
+        exact bug. So the guard is checked too: it fires only when there is no credential.
+        """
+        guarded = [
+            node
+            for node in ast.walk(self._resolver())
+            if isinstance(node, ast.If)
+            and any(isinstance(body, ast.Return) for body in node.body)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "credential"
+        ]
+        assert len(guarded) == 1, (
+            "the only `return` in `_resolve_phone_channel` is not the `credential is None` branch. "
+            "Off is the absence of a credential and nothing else; a return under any other "
+            "condition is a channel silently discarded."
+        )
+
+
 class TestTheOfflineEscapeHatchIsNailedShut:
     def test_the_product_never_uses_the_offline_resolver(self) -> None:
         """``TenantSenders.for_offline_tests`` hands the SAME senders to every business.

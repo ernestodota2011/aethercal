@@ -207,6 +207,21 @@ class UnusableCredentialError(CredentialError):
     """
 
 
+class UncappedChannelError(CredentialError):
+    """This business configured a phone channel and the instance declares no ceilings for it.
+
+    ==Not the same as "the channel is off", and that difference cost a message.== No credential at
+    all means the business never asked for the channel: terminal, and correctly so. A credential
+    WITH no caps means they did ask, and the instance is missing a knob — which an operator sets in
+    a minute, so it ==is undone==, so it must not be terminal. It used to be: the step was skipped,
+    the reminder was discarded for ever, and setting the variable afterwards brought nothing back.
+
+    Not an :class:`UnusableCredentialError`: the credential is fine. What is missing is the
+    OPERATOR's abuse ceiling over their own public booking form. Different fault, different owner,
+    same retryable outcome.
+    """
+
+
 def _unusable_message(provider: CredentialProvider, *, field: str, expected: str) -> str:
     """The refusal, naming the provider and the FIELD — and ==never the value==.
 
@@ -1304,6 +1319,29 @@ async def _resolve_phone_channel(  # noqa: PLR0913 - one keyword per injected se
     scope instead of an indented block. The caller does not need to know what this can raise — only
     that whatever it raises is this channel's fault. ==That is what makes the guard a rule rather
     than a list of the failures somebody happened to think of.==
+
+    .. rubric:: ==OFF or BROKEN is answered ONCE, and the answer is the credential==
+
+    Those two are not failures of the same kind, and the drain treats them oppositely: *off* is
+    terminal (:class:`~aethercal.server.services.outbox.OutboxSkipped` — nothing is wrong, so
+    retrying is noise) and *broken* is retryable (a human undoes it, and terminal "may only carry a
+    condition that cannot be undone"). Deciding that per failure site is how it goes wrong: it was
+    decided correctly for a missing credential, correctly for a refused endpoint, and ==wrongly for
+    a credential with no caps== — which discarded a guest's reminder for ever over a variable an
+    operator sets in a minute.
+
+    So it is not decided per site. ==**The presence of a credential IS the answer**==, and this
+    function consults it exactly once:
+
+    * **no credential** → the business never configured this channel. It is OFF, and returning is
+      how that gets said. ==The ONLY ``return`` in this function==;
+    * **a credential** → the business configured it, so anything that goes wrong from here is a
+      FAULT, and faults ``raise``. There is no path back to "off": the code below cannot express it,
+      so nobody has to remember not to.
+
+    ``tests/test_sender_belt.py`` walks this function's AST and fails CI on a second ``return`` —
+    because a silent early exit added below that line IS this bug, and it would read like perfectly
+    ordinary defensive code.
     """
     credential = await _resolve_one(
         session,
@@ -1313,25 +1351,28 @@ async def _resolve_phone_channel(  # noqa: PLR0913 - one keyword per injected se
         defaults=defaults,
     )
     if credential is None:
+        # OFF: never configured. The one place this function may say "nothing is wrong here".
         return
+    # ==CONFIGURED from here on. Every failure below is a fault, and faults raise.==
     caps = defaults.phone_caps.get(provider)
     if caps is None:
-        # ==Fail-closed, loudly.== The business HAS a credential; the operator has not declared
-        # the ceilings for the public form it sits behind. Building an uncapped sender is the one
-        # state `PhoneChannelSender` exists to make unrepresentable, so the channel stays off — and
-        # says exactly which variables would turn it on, because a channel that is silently absent
-        # is indistinguishable from one nobody wanted.
-        _logger.warning(
-            "business %s has a %s credential but this instance declares no daily caps for that "
-            "channel, so it stays OFF: set AETHERCAL_%s_DAILY_CAP_PER_PHONE and "
-            "AETHERCAL_%s_DAILY_CAP_PER_IP. The recipient comes from a PUBLIC form, so an "
-            "uncapped channel can be made to message strangers on that business's account.",
-            tenant_id,
-            provider.value,
-            provider.value.upper(),
-            provider.value.upper(),
+        # ==Fail-closed — and RETRYABLE, which is the correction.== The business HAS a credential;
+        # the operator has not declared the ceilings for the public form it sits behind. Building an
+        # uncapped sender is the one state `PhoneChannelSender` exists to make unrepresentable, so
+        # the channel cannot come up.
+        #
+        # This used to `return`, which made the channel merely ABSENT — and absent is TERMINAL. So a
+        # guest's reminder was discarded for ever because a variable was unset, and setting it
+        # afterwards brought nothing back. It is undone by one line in an env file, so it cannot be
+        # terminal: it raises, the drain fails the step, and the message outlives the fix.
+        raise UncappedChannelError(
+            f"the {provider.value} channel is configured for this business and this instance "
+            f"declares no daily caps for it, so no sender can be built. Set "
+            f"AETHERCAL_{provider.value.upper()}_DAILY_CAP_PER_PHONE and "
+            f"AETHERCAL_{provider.value.upper()}_DAILY_CAP_PER_IP. The recipient comes from a "
+            "PUBLIC form, so an uncapped channel can be made to message strangers on this "
+            "business's account — which is why the ceiling is not optional."
         )
-        return
     # ==THE EGRESS GUARD, and it runs BEFORE the sender exists.== A `_EgressTarget` cannot be
     # fabricated, and `_build_phone_sender` requires one — so a tenant's URL is never dialed without
     # having been through it. See `_assert_target_reachable`: this is the bill B-03bis incurred by
@@ -1367,6 +1408,7 @@ __all__ = [
     "InstanceSenderDefaults",
     "SenderClients",
     "TenantSenders",
+    "UncappedChannelError",
     "UnusableCredentialError",
     "channel_for",
     "instance_fallback",

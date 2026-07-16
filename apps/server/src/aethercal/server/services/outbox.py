@@ -2503,10 +2503,35 @@ def make_booking_effect_executor(
 
     An absent channel is not a gap: its steps SKIP with a reason, never fail."""
 
+    async def _resolve_for(work: OutboxWork) -> TenantSenders:
+        """This item's senders — and ==proof they are THIS item's==.
+
+        The resolver cannot be called without a business, and today it always stamps back the
+        ``tenant_id`` it was handed, so this check cannot currently fire. It is here for what comes
+        next rather than for what is here now: the obvious optimisation of this loop is to MEMOISE
+        the resolve (a batch is often several items of one business, each paying for its own read
+        and decrypt), and a cache keyed even slightly wrong hands business A's sender to business
+        B's item.
+
+        That failure is externally visible and cannot be taken back: a guest messaged from the wrong
+        company's number. The drain would never notice — a sender is a sender — so the item carries
+        its business, the senders carry theirs, and they are compared before either is used. ==One
+        comparison, against a leak nobody could undo.==
+        """
+        senders = await resolve_senders(work.tenant_id)
+        if senders.tenant_id != work.tenant_id:
+            raise RuntimeError(
+                f"the resolver returned senders for business {senders.tenant_id} while draining an "
+                f"intent belonging to {work.tenant_id}. Refusing to send: this business's guest "
+                "would be messaged from another business's account. If a cache was added to the "
+                "resolver, its key is wrong."
+            )
+        return senders
+
     async def _execute(work: OutboxWork, now: datetime) -> None:
         effect = work.effect
         if effect is OutboxEffect.EMAIL:
-            senders = await resolve_senders(work.tenant_id)
+            senders = await _resolve_for(work)
             # Configured and REFUSED is not the same as never configured. A relay whose host points
             # inside our network is a fault a human fixes with one `credentials set`, so it fails
             # and retries carrying its own reason — and, crucially, it took no other channel down
@@ -2527,7 +2552,7 @@ def make_booking_effect_executor(
                 raise RuntimeError("outbox Google intent has no configured service factory")
             await run_google_effect(sessionmaker, work, now, service_factory=service_factory)
         elif effect is OutboxEffect.NOTIFY:
-            senders = await resolve_senders(work.tenant_id)
+            senders = await _resolve_for(work)
             await run_notify_effect(
                 sessionmaker,
                 work,
