@@ -170,9 +170,15 @@ class StripeGateway:
         amount_cents: int,
         currency: str,
         expires_at: datetime,
+        return_url: str,
         secrets: Mapping[str, str],
-    ) -> CheckoutSession:  # pragma: no cover - live Stripe call, not verified in this cut
+    ) -> CheckoutSession:
         secret_key = secrets["secret_key"]
+        # ==Finding 3.== The guest returns to the business's REAL booking page, not a dead
+        # ``example.invalid``. ``return_url`` is the booking base the public router computes;
+        # a query flag tells the page which way it went, and Stripe expands the session id token
+        # so the page can confirm the session.
+        base = return_url.rstrip("/")
         # Stripe wants a Unix expiry; the hold's TTL, to the second.
         data = {
             "mode": "payment",
@@ -181,10 +187,8 @@ class StripeGateway:
             "line_items[0][price_data][currency]": currency,
             "line_items[0][price_data][unit_amount]": str(amount_cents),
             "line_items[0][price_data][product_data][name]": "Appointment",
-            # A Checkout Session in payment mode has success/cancel URLs; the booking page supplies
-            # them, but a placeholder keeps the call well-formed until that wiring lands (B-08).
-            "success_url": "https://example.invalid/success",
-            "cancel_url": "https://example.invalid/cancel",
+            "success_url": f"{base}?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{base}?checkout=cancelled",
         }
         async with self._client(secret_key) as client:
             response = await client.post(

@@ -75,16 +75,20 @@ class _FakeGateway:
         amount_cents: int,
         currency: str,
         expires_at: datetime,
+        return_url: str,
         secrets: Any,
     ) -> CheckoutSession:
         # The BYOK secret must be the BUSINESS's own.
         assert secrets.get("secret_key", "").startswith("sk_test_")
+        # ==Finding 3.== The return URL must be a real base, never a dead placeholder.
+        assert return_url and "example.invalid" not in return_url
         self.sessions.append(
             {
                 "idempotency_key": idempotency_key,
                 "amount_cents": amount_cents,
                 "currency": currency,
                 "expires_at": expires_at,
+                "return_url": return_url,
             }
         )
         return CheckoutSession(checkout_url=_CHECKOUT_URL, provider_ref=_PROVIDER_REF)

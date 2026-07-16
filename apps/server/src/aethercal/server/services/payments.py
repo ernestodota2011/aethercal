@@ -499,11 +499,13 @@ class PaymentGateway(Protocol):
         amount_cents: int,
         currency: str,
         expires_at: datetime,
+        return_url: str,
         secrets: Mapping[str, str],
     ) -> CheckoutSession:
         """Open a hosted checkout on the business's OWN account. ==``idempotency_key`` is derived
         from the ``booking_id``, so a retry returns the SAME session, never a second charge.==
-        ``expires_at`` is the hold's TTL, to the minute."""
+        ``expires_at`` is the hold's TTL, to the minute. ==``return_url`` is where the guest lands
+        after paying/cancelling — the business's real booking page, never a dead placeholder.=="""
         ...
 
     async def refund(

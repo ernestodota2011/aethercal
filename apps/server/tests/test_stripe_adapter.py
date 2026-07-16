@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from datetime import UTC, datetime
 
 import httpx
 
@@ -114,6 +115,37 @@ def test_charge_refunded_and_dispute_parse_to_their_kinds() -> None:
         ).encode("utf-8")
     )
     assert dispute is not None and dispute.kind is WebhookEventKind.DISPUTE
+
+
+async def test_the_checkout_session_returns_to_the_configured_base_not_a_dead_url() -> None:
+    """==Finding 3.== The success/cancel URLs derive from the booking page's real base, never the
+    hardcoded ``example.invalid`` a guest would land on after paying."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["idempotency_key"] = request.headers.get("Idempotency-Key", "")
+        captured["body"] = request.content.decode()
+        return httpx.Response(
+            200, json={"url": "https://checkout.stripe/cs_x", "payment_intent": "pi_x"}
+        )
+
+    gateway = StripeGateway(transport=httpx.MockTransport(handler))
+    result = await gateway.create_checkout_session(
+        idempotency_key="booking:abc",
+        amount_cents=5000,
+        currency="usd",
+        expires_at=datetime(2026, 7, 20, 15, 0, tzinfo=UTC),
+        return_url="https://book.example.com/t/acme",
+        secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x"},
+    )
+
+    assert result.checkout_url == "https://checkout.stripe/cs_x"
+    assert result.provider_ref == "pi_x"
+    assert captured["idempotency_key"] == "booking:abc"
+    body = captured["body"]
+    assert "example.invalid" not in body, "the guest must not land on a dead URL after paying"
+    assert "book.example.com" in body, "success/cancel derive from the configured booking base"
 
 
 async def test_the_refund_call_sends_a_deterministic_idempotency_key() -> None:

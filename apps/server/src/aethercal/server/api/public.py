@@ -403,6 +403,9 @@ async def _start_paid_booking(
         amount_cents=price_cents,
         currency=currency,
         expires_at=booking.hold_expires_at,
+        # ==Finding 3.== The guest returns to the REAL booking page (the same base the guest
+        # cancel/reschedule links are minted against), never a dead ``example.invalid``.
+        return_url=_booking_base_url(request, _settings(request)),
         secrets=credential.secrets,
     )
     session.add(
