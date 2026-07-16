@@ -363,7 +363,7 @@ async def run_busy_refresh_once(
 # --------------------------------------------------------------------------------------
 
 
-def _decryption_fernet(app: FastAPI) -> MultiFernet:  # pragma: no cover - live
+def _decryption_fernet(app: FastAPI) -> MultiFernet:
     """The MultiFernet a live tick decrypts with: the current key first, and the retiring one during
     a rotation. ``app.state.fernet_keys`` is ``Settings.decryption_fernet_keys()`` — so a row the
     rotation has not reached yet, still on the old key, is readable throughout the window."""
@@ -422,48 +422,57 @@ def _payment_confirm_effects(app: FastAPI):
     return _run
 
 
-def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to the worker's state (pools + SMTP sender + a Fernet-built Google
-    factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+def build_drain_executor(app: FastAPI) -> OutboxExecutor:
+    """The live outbox ``execute``, built from the worker's app state — ==and TESTED (finding 1).==
 
-    ==The executor is built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers
-    read the booking, decrypt the business's credential and write the ledger, and every one of those
-    is a tenant-scoped table. They run inside the drain's per-item ``tenant_scope``, so under RLS
-    they see exactly that item's business — which is the whole point of splitting the pools: the one
-    place a cross-business leak would be *externally visible* is precisely here, in the process that
-    sends the guest's name and address to somebody's webhook.
+    Extracted out of the ``# pragma: no cover`` tick so the money-path wiring is verifiable: that
+    the REFUND runner really is armed with the worker's gateway + rotation keys, and is invocable. A
+    path nobody exercises is not acceptable, whatever a static read of the wiring concludes.
+
+    ==Built over ``pools.exec_maker``, the APP-role pool.== The handlers read the booking,
+    decrypt the business's credential and write the ledger — all tenant-scoped tables — inside the
+    drain's per-item ``tenant_scope``, so under RLS they see exactly that item's business.
+    """
+    pools: WorkerPools = app.state.pools
+    # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key during a
+    # rotation, so the drain never fails to decrypt a row the rotation has not reached.
+    fernet = _decryption_fernet(app)
+    service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+    # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateway + rotation keys
+    # DEFENSIVELY off app state (a missing one must not AttributeError), and let
+    # ``build_money_runners`` decide: the REFUND runner needs BOTH, EXPIRE_HOLD needs neither. With
+    # either missing the refund runner is None and a REFUND intent raises loudly, not silently
+    # stranding a guest's money.
+    fernet_keys = getattr(app.state, "fernet_keys", None)
+    gateway = getattr(app.state, "payment_gateway", None)
+    refund_runner, expire_hold_runner = build_money_runners(
+        exec_maker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
+    )
+    return make_booking_effect_executor(
+        sessionmaker=pools.exec_maker,
+        sender=app.state.email_sender,
+        service_factory=service_factory,
+        # The non-email channel registry. A step on a channel nobody registered is SKIPPED with its
+        # reason, never failed — a channel without credentials is a disabled feature, not an error.
+        # Email is deliberately NOT here: it goes through the full composer, which carries the .ics
+        # invite that a plain-body ChannelSender cannot.
+        channels=getattr(app.state, "channel_senders", None),
+        refund_runner=refund_runner,
+        expire_hold_runner=expire_hold_runner,
+    )
+
+
+def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
+    """Bind an outbox-drain tick to the worker's state.
+
+    The live ``execute`` (:func:`build_drain_executor`) dispatches each intent to its handler (email
+    / Google / refund / hold-expiry); then the parked-payment tick re-runs the arbiter for events
+    that beat their checkout.
     """
 
     async def _tick() -> None:
         pools: WorkerPools = app.state.pools
-        # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key
-        # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
-        fernet = _decryption_fernet(app)
-        service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateway + rotation keys
-        # DEFENSIVELY off app state (a missing one must not AttributeError), and let
-        # ``build_money_runners`` decide: the REFUND runner needs BOTH, EXPIRE_HOLD needs neither.
-        # With either missing the refund runner is None and a REFUND intent raises loudly, not
-        # silently stranding a guest's money.
-        fernet_keys = getattr(app.state, "fernet_keys", None)
-        gateway = getattr(app.state, "payment_gateway", None)
-        refund_runner, expire_hold_runner = build_money_runners(
-            exec_maker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
-        )
-        execute = make_booking_effect_executor(
-            sessionmaker=pools.exec_maker,
-            sender=app.state.email_sender,
-            service_factory=service_factory,
-            # The non-email channel registry. A step on a channel nobody registered is SKIPPED with
-            # its reason, never failed — a channel without credentials is a disabled feature, not an
-            # error.
-            #
-            # Email is deliberately NOT here: it goes through the full composer, which carries the
-            # .ics invite that a plain-body ChannelSender cannot.
-            channels=getattr(app.state, "channel_senders", None),
-            refund_runner=refund_runner,
-            expire_hold_runner=expire_hold_runner,
-        )
+        execute = build_drain_executor(app)
         await run_outbox_drain_once(pools=pools, execute=execute)
 
         # ==The parked-payment tick (criterion 29).== Runs on the same interval as the drain: re-run
