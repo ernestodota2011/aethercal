@@ -8,7 +8,9 @@ So the places the guest's data actually lives are ENUMERATED, and each is dealt 
 
 ======================  =========================================================================
 ``bookings``            ``guest_name``, ``guest_email``, ``guest_phone``, ``guest_notes``,
-                        ``answers``, ``guest_phone_consent_at``, ``guest_timezone``
+                        ``answers``, ``guest_phone_consent_at``, ``guest_timezone``, and
+                        ==``source_ip``== — the address the booking was made from, which is
+                        personal data and is the ONE column here without a ``guest_`` prefix
 ``outbox``              the ``payload`` JSON carries ``guest_email`` (``services/bookings.py``)
 ``guest_tokens``        rows hanging off the booking
 ``sent_notifications``  the ledger of every message they were sent
@@ -91,6 +93,19 @@ BOOKING_PII_COLUMNS: dict[str, Any] = {
     # needs it: the booking's own instants are UTC, and the only thing this ever fed was rendering a
     # local time into a message to a guest who is now gone. NOT NULL, so it is reset, not emptied.
     "guest_timezone": "UTC",
+    # ==The address the booking was made from — PERSONAL DATA, and the only column here that does
+    # not
+    # wear the ``guest_`` prefix.== Roughly "where this person was". It is theirs, not the host's,
+    # and nothing needs it after an erasure: the per-IP cap it feeds counts a ROLLING 24 hours, and
+    # nobody purges the traffic of the last day.
+    #
+    # The prefix is exactly why this is argued in prose rather than left to the loop. The coverage
+    # lock derives its expectation from ``guest_*``, so a test would never have DEMANDED this column
+    # of the purge — a person had to decide it. That is precisely the shape of the defect the lock
+    # exists to catch, arriving through the one door the lock does not watch. So the lock grew a
+    # second half (``test_privacy``): every guest-prefixed column must be classified, AND everything
+    # classified must be a column that really exists.
+    "source_ip": None,
 }
 """Every guest-bearing column on ``bookings``, and the value it is erased to.
 

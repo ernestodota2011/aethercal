@@ -37,7 +37,6 @@ from aethercal.server.integrations.messaging.guard import (
     DailyCaps,
     PermanentSendError,
     SendOutcomeUnknown,
-    warn_if_ip_cap_unenforceable,
 )
 from aethercal.server.integrations.messaging.status import (
     is_definitely_undelivered,
@@ -59,8 +58,9 @@ class TwilioSmsSender:
     def __init__(self, config: TwilioConfig, http_client: httpx.AsyncClient) -> None:
         self._config = config
         self._http = http_client
+        # Both ceilings are now REAL — see the note in the WhatsApp sender. The boot warning that
+        # used to stand here (the per-IP cap counts nothing) is retired with the gap it described.
         self.caps: DailyCaps = config.caps
-        warn_if_ip_cap_unenforceable(channel=self.channel, caps=config.caps)
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
         """Send ``body`` to the E.164 number ``to``. ``subject`` is ignored — SMS has none."""

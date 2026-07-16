@@ -85,6 +85,7 @@ from aethercal.server.integrations.messaging.guard import (
     PhoneChannelSender,
     SendOutcomeUnknown,
     SendRefused,
+    enforce_ip_cap,
     enforce_phone_cap,
 )
 from aethercal.server.integrations.smtp.compose import NotificationKind
@@ -2159,12 +2160,28 @@ async def _prepare_notify(
             "(a channel without credentials is a disabled feature, not an error)"
         )
 
-    # THE CAP, before the render and long before the network call: an over-cap message is never
+    # THE CAPS, before the render and long before the network call: an over-cap message is never
     # built and never handed to a provider. The sender carries its own ceilings — a phone sender
     # WITHOUT caps is unrepresentable (see PhoneChannelSender) — so there is no path through here
     # that reaches a provider with no ceiling in force.
+    #
+    # ==BOTH of them, and the second is new.== `per_ip` has been required at boot since RF-24 and
+    # enforced NOTHING: no client address ever reached this line, because a booking did not record
+    # the one it came from. `bookings.source_ip` (migration 0011) + `enforce_ip_cap` close that —
+    # and
+    # the call belongs HERE, in the read phase, because this IS the send path. The column without
+    # this line would leave the cap *looking* applied while still denying nothing, which is worse
+    # than the gap it replaces.
+    #
+    # The two are asymmetric on a missing value, deliberately: no phone REFUSES the send (the
+    # missing
+    # value is the recipient), no address ALLOWS it (the missing value means this booking never came
+    # from the public form — it is the host's own, and a host must not be throttled by a stranger).
     try:
         await enforce_phone_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+        await enforce_ip_cap(
             session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
         )
     except SendRefused as refused:

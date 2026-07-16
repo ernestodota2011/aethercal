@@ -34,19 +34,41 @@ Two consequences worth stating, because they are deliberate:
 * it is scoped per **tenant** and per **channel** — one business never spends another's budget, and
   each channel has its own account, its own bill, and its own reputation to lose.
 
-.. rubric:: The per-IP cap, honestly
+.. rubric:: The per-IP cap — ==the no-op, closed==
 
-:attr:`DailyCaps.per_ip` is **required configuration** (the design mandates it, and this module
-enforces that it is set). It is NOT yet enforced at send time, and that is not an oversight left to
-be discovered later: **no client IP reaches the send path**. A booking does not record the address
-it was created from — ``bookings`` has no such column — so at drain time there is nothing to key an
-IP cap on. The public booking page has its own per-IP rate limiter on its POST handlers, which is
-the flood control that exists today.
+:attr:`DailyCaps.per_ip` has always been REQUIRED configuration: a phone channel refuses to boot
+without it. And until this cut it enforced **nothing whatsoever**, for the reason this module used
+to
+confess in its own docstring — no client address reached the send path, because ``bookings`` had
+nowhere to record one. A ceiling with nothing to count is not a ceiling: it is a knob that everybody
+downstream (the operator who set it, the reviewer who saw it, the next author who trusted it)
+believes in.
 
-Rather than ship a knob that reads as protection and quietly enforces nothing,
-:func:`warn_if_ip_cap_unenforceable` says so out loud at channel construction. Closing it for real
-needs a ``bookings.source_ip`` column carried into the workflow step's payload — a schema change,
-and this batch is deliberately limited to one migration with one owner.
+Closing it took THREE pieces, and any two of them would have been worse than none:
+
+1. **the column** — ``bookings.source_ip`` (migration ``0011``);
+2. **the value**, written on the one path a stranger can reach: the public router. ``api/public.py``
+   stamps it from the declared proxy contract, while the admin's own bookings and the API key's
+   carry
+   ``None`` — and are therefore not capped by an address they never had;
+3. **the enforcement** — :func:`enforce_ip_cap`, called in the NOTIFY handler's READ phase, right
+   beside :func:`enforce_phone_cap`, before a provider is ever reached.
+
+==Stopping at (1) would have been the worst outcome available==: a cap that *looks* applied, with a
+schema behind it to prove it, and denies nothing. So the criterion this is signed off against is not
+"the column exists" — it is "the cap DENIES A REAL SEND".
+
+.. rubric:: Where it reads the address from, and why not from the step's payload
+
+:func:`enforce_ip_cap` reads ``booking.source_ip`` off the row. The obvious alternative — copying
+the
+address into the NOTIFY step's payload at enqueue time — was rejected: the send path already HOLDS
+the booking (``services/outbox._prepare_notify`` loads it to check the consent, the phone and the
+staleness), so a payload copy buys nothing and costs a second source of truth for one fact,
+snapshotted at a different moment. This codebase has a name for that, and a scar from it: it is why
+the guest token was never given a ``tenant_id``. One fact, one home. ==The requirement is that the
+address REACH the send path — not that it travel by any particular vehicle — and the row is the
+vehicle that cannot drift.==
 """
 
 from __future__ import annotations
@@ -195,25 +217,6 @@ def _require_int(environ: Mapping[str, str], key: str) -> int:
         raise RuntimeError(f"{key} must be an integer, got {raw!r}.") from exc
 
 
-def warn_if_ip_cap_unenforceable(*, channel: Channel, caps: DailyCaps) -> None:
-    """Say, out loud and at boot, that the configured per-IP cap has nothing to count yet.
-
-    An operator who sets ``DAILY_CAP_PER_IP=50`` believes they bought a protection. Today they did
-    not: no client IP reaches the send path, because a booking never records the address it was made
-    from. Letting them keep that belief is precisely the silent no-op this project exists to kill —
-    so the gap is stated at boot, with its fix, instead of being discovered from an invoice."""
-    _logger.warning(
-        "%s: DAILY_CAP_PER_IP is configured (%d) but is NOT enforced at send time — a booking does "
-        "not record the IP it was created from, so the drain has nothing to count. The per-PHONE "
-        "cap (%d) IS enforced. Closing this needs a bookings.source_ip column carried into the "
-        "workflow step's payload; until then the public booking page's own per-IP rate limit is "
-        "the flood control in place.",
-        channel.value,
-        caps.per_ip,
-        caps.per_phone,
-    )
-
-
 async def phone_sends_in_window(
     session: AsyncSession,
     *,
@@ -302,6 +305,97 @@ async def enforce_phone_cap(
         )
 
 
+async def sends_from_ip_in_window(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    source_ip: str,
+    channel: Channel,
+    since: datetime,
+) -> int:
+    """How many messages this tenant has really sent on ``channel`` because of ``source_ip``.
+
+    Read from the ``sent_notifications`` ledger, joined to the address on the booking — the same
+    EFFECTIVE-state discipline as :func:`phone_sends_in_window`, and for the same reason: an
+    in-process counter is zeroed by every restart and kept privately by every second worker, so it
+    would hold perfectly in a test and mean nothing in production.
+
+    ==There is NO status filter, and that is criterion 17.== A free event type confirms DIRECTLY —
+    ``create_booking`` writes ``CONFIRMED``, and no unpaid hold exists anywhere on this path — so a
+    cap that only counted holds would cover exactly nothing. Every booking carrying this address
+    counts, whatever state it is in.
+
+    Counting ACROSS bookings is the whole point: the cheap way to defeat a per-booking ceiling is to
+    make more bookings, and an address is the one thing an attacker cannot mint on demand.
+    """
+    total = await session.scalar(
+        select(func.count())
+        .select_from(SentNotification)
+        .join(Booking, Booking.id == SentNotification.booking_id)
+        .where(
+            SentNotification.tenant_id == tenant_id,
+            SentNotification.channel == channel.value,
+            SentNotification.sent_at >= since,
+            Booking.source_ip == source_ip,
+        )
+    )
+    return int(total or 0)
+
+
+async def enforce_ip_cap(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    channel: Channel,
+    caps: DailyCaps,
+    now: datetime,
+) -> None:
+    """Raise :class:`QuotaExceeded` unless the address behind this booking is under the daily cap.
+
+    Called in the outbox handler's READ phase, beside :func:`enforce_phone_cap` and BEFORE the
+    network call — so an over-cap message is never handed to a provider at all.
+
+    .. rubric:: A booking with NO address is NOT capped — the deliberate asymmetry
+
+    :func:`enforce_phone_cap` REFUSES a booking with no phone: there, the missing value IS the thing
+    being messaged, and "the count came back zero, so it is under the cap" is the hole every
+    unbounded send walks straight through.
+
+    Here the missing value means something else entirely: ==this booking did not come through the
+    public form.== The host booked it by hand in the admin, or the business's own integration
+    created
+    it with its API key. Refusing those would silence a host's own appointments because a stranger,
+    somewhere, was abusing the public page. So ``None`` means "not capped", never "capped at zero" —
+    and an attacker cannot reach that branch, because they cannot make the public router forget to
+    stamp the address it has just resolved.
+
+    .. rubric:: The residual, stated rather than left to be discovered
+
+    Like the per-phone cap, the check is not atomic with the send: two workers could each read
+    ``already == cap - 1`` and both send, overshooting by one per racing worker. It is bounded, and
+    it is not reachable in the deployed shape (the scheduler runs in exactly ONE process —
+    ``deploy/README.md``). This is an abuse ceiling, not a legal limit.
+    """
+    source_ip = booking.source_ip
+    if not source_ip:
+        return
+
+    already = await sends_from_ip_in_window(
+        session,
+        tenant_id=booking.tenant_id,
+        source_ip=source_ip,
+        channel=channel,
+        since=now - CAP_WINDOW,
+    )
+    if already >= caps.per_ip:
+        raise QuotaExceeded(
+            f"daily-cap: this source address has already caused {already} {channel.value} "
+            f"message(s) in the last {CAP_WINDOW}, at or over the per-ip cap of {caps.per_ip}. The "
+            "booking form is PUBLIC: this cap is what stops one caller turning a business's own "
+            "messaging account into a spam cannon."
+        )
+
+
 __all__ = [
     "CAP_WINDOW",
     "ChannelUnavailable",
@@ -311,7 +405,8 @@ __all__ = [
     "QuotaExceeded",
     "SendOutcomeUnknown",
     "SendRefused",
+    "enforce_ip_cap",
     "enforce_phone_cap",
     "phone_sends_in_window",
-    "warn_if_ip_cap_unenforceable",
+    "sends_from_ip_in_window",
 ]

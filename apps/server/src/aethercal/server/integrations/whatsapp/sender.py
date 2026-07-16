@@ -39,7 +39,6 @@ from aethercal.server.integrations.messaging.guard import (
     DailyCaps,
     PermanentSendError,
     SendOutcomeUnknown,
-    warn_if_ip_cap_unenforceable,
 )
 from aethercal.server.integrations.messaging.status import (
     is_definitely_undelivered,
@@ -64,10 +63,12 @@ class EvolutionWhatsAppSender:
     def __init__(self, config: EvolutionConfig, http_client: httpx.AsyncClient) -> None:
         self._config = config
         self._http = http_client
+        # Both ceilings are now REAL. The boot warning that used to stand here said the per-IP cap
+        # counted nothing, because no client address reached the send path; `bookings.source_ip` and
+        # `guard.enforce_ip_cap` closed that, so the warning is gone rather than left to go stale
+        # into a lie. (A retired confession that keeps being printed is how a fixed bug gets
+        # re-reported for a year.)
         self.caps: DailyCaps = config.caps
-        # The channel is coming up. Say plainly what the per-IP cap does and does not do, once,
-        # here — rather than letting an operator infer a protection they do not have.
-        warn_if_ip_cap_unenforceable(channel=self.channel, caps=config.caps)
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
         """Send ``body`` to the E.164 number ``to``. ``subject`` is ignored — WhatsApp has none."""
