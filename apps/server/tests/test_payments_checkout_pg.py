@@ -222,10 +222,12 @@ async def test_a_paid_booking_holds_and_returns_a_checkout_url(
     owner_maker: Sessionmaker,
 ) -> None:
     """A priced type: PENDING hold + INTENT payment + EXPIRE_HOLD queued + checkout_url; the
-    idempotency key is the booking id and the checkout expires with the hold (30 min)."""
+    idempotency key is the booking id, and the Stripe expiry is ≥ 30 min with buffer while the hold
+    OUTLIVES the session (finding 2)."""
     seeded = await _seed(owner_maker)
     _app, gateway = paid_app
 
+    before = datetime.now(UTC)
     response = await paid_client.post(
         f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
     )
@@ -247,10 +249,19 @@ async def test_a_paid_booking_holds_and_returns_a_checkout_url(
         assert booking is not None
         assert booking.status is BookingStatus.PENDING
         assert booking.hold_expires_at is not None
+        hold_expires_at = booking.hold_expires_at
 
-    # The checkout was opened with the booking id as the idempotency key + a 30-minute expiry.
+    # The checkout was opened with the booking id as the idempotency key.
     assert len(gateway.sessions) == 1
     assert gateway.sessions[0]["idempotency_key"] == str(booking_id)
+
+    # ==Finding 2.== The Stripe expiry is ≥ 30 min out even measured from BEFORE the request (so it
+    # survives network latency), and the hold OUTLIVES the session (no pay-against-freed-slot gap).
+    stripe_expires_at = gateway.sessions[0]["expires_at"]
+    assert stripe_expires_at >= before + timedelta(minutes=30), (
+        "Stripe's 30-min minimum, with buffer"
+    )
+    assert hold_expires_at > stripe_expires_at, "the hold must outlive the checkout session"
     assert gateway.sessions[0]["amount_cents"] == _PRICE
 
 

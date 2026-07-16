@@ -470,13 +470,23 @@ async def apply_dispute_event(
 # --------------------------------------------------------------------------------------
 
 
-HOLD_TTL = timedelta(minutes=30)
-"""How long an unpaid hold lives — and the checkout session's ``expires_at``, to the minute.
+CHECKOUT_SESSION_TTL = timedelta(minutes=31)
+"""The Checkout Session's ``expires_at``. ==Stripe's 30-min MINIMUM + a 1-min BUFFER (finding 2).==
 
-==30 minutes, because Stripe imposes a ~30-minute MINIMUM on a Checkout Session's ``expires_at``.==
-If the hold TTL were shorter than the session's, there would always be a window in which the guest
-could pay against a hold that had already lapsed — a charge to capture and immediately refund (a bad
-experience and a lost fee). Tying the two to the same instant closes that window."""
+Stripe rejects a session whose ``expires_at`` is under 30 minutes in the future. Sending exactly
+``now + 30 min`` is a coin-flip: by the time the request reaches Stripe (network + our own compute
+latency), ``now`` is already in the past and the value can dip below the floor. The buffer absorbs
+that latency, so what Stripe receives is comfortably ≥ 30 minutes."""
+
+HOLD_TTL = timedelta(minutes=33)
+"""How long an unpaid hold lives before ``EXPIRE_HOLD`` cancels it and frees its slot.
+
+==Deliberately LONGER than :data:`CHECKOUT_SESSION_TTL` (finding 2).== The hold must OUTLIVE the
+checkout session: if it lapsed first, ``EXPIRE_HOLD`` would free the slot while the session was
+still payable, and the guest could pay against a slot already given away — a charge to capture and
+immediately refund (a bad experience and a lost fee). With the hold outliving the session, once the
+session expires the guest can no longer pay, and only then does the hold lapse. They are no longer
+tied to the same instant precisely so this ordering is guaranteed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,6 +834,7 @@ async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's
 
 
 __all__ = [
+    "CHECKOUT_SESSION_TTL",
     "DEFAULT_PARKED_MAX_ATTEMPTS",
     "HOLD_TTL",
     "ArbiterOutcome",

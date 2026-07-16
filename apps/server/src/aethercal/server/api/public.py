@@ -68,6 +68,7 @@ from aethercal.server.services.event_types import (
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.payments import (
+    CHECKOUT_SESSION_TTL,
     HOLD_TTL,
     PaymentGateway,
     enqueue_expire_hold,
@@ -380,12 +381,16 @@ async def _start_paid_booking(
             },
         ) from exc
 
+    # ONE clock for the whole flow: the hold's TTL and the checkout's expiry are both measured from
+    # this instant, so their ordering (hold OUTLIVES session — finding 2) is guaranteed by the
+    # constants, not by two clocks read a few statements apart.
+    now = _now()
     try:
         booking = await create_booking(
             session,
             tenant_id=event_type.tenant_id,
             params=params,
-            now=_now(),
+            now=now,
             effects=None,
             hold_ttl=HOLD_TTL,
         )
@@ -402,7 +407,10 @@ async def _start_paid_booking(
         idempotency_key=str(booking.id),
         amount_cents=price_cents,
         currency=currency,
-        expires_at=booking.hold_expires_at,
+        # ==Finding 2.== The Stripe session expires at ``now + CHECKOUT_SESSION_TTL`` (30-min min
+        # + a buffer for latency), NOT the hold's TTL. The hold (``HOLD_TTL``, longer) outlives the
+        # session, so ``EXPIRE_HOLD`` never frees the slot while the checkout is still payable.
+        expires_at=now + CHECKOUT_SESSION_TTL,
         # ==Finding 3.== The guest returns to the REAL booking page (the same base the guest
         # cancel/reschedule links are minted against), never a dead ``example.invalid``.
         return_url=_booking_base_url(request, _settings(request)),
