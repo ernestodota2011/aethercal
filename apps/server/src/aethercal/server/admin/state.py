@@ -1305,8 +1305,12 @@ class AdminState(rx.State):
             self.branding = branding_row(view)
             self.error = ""
         except (ValueError, service.AdminError) as exc:
-            self.error = _error_text(exc)
+            # Re-load the boxes so they show what is actually stored — then set the error, because
+            # the reload clears self.error the way every on_load does. Setting it first let the
+            # reload swallow it, and the panel redrew with no word of why nothing saved (:1288
+            # promised the refusal "comes back as a readable error").
             await self.load_branding()
+            self.error = _error_text(exc)
 
     # -- hosts + their connected calendars (RF-30) -----------------------------------
 

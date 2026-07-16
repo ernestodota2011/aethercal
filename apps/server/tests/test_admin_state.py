@@ -735,3 +735,37 @@ async def test_a_schedule_cannot_be_given_to_another_businesss_host(
 
     assert state.error != ""
     assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE  # untouched
+
+
+# --------------------------------------------------------------------------------------
+# Branding panel (B-07 / RF-27) — at the STATE handler, not just the service.
+# --------------------------------------------------------------------------------------
+
+
+async def test_save_branding_keeps_the_validation_error_visible(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A refused save must leave the operator the sentence they can act on.==
+
+    The handler re-loads the form boxes on refusal so they show what is actually stored — but that
+    reload clears ``self.error`` the way every ``on_load`` does. Setting the error and THEN
+    reloading let the reload swallow it: the panel silently redrew and the operator never learned
+    why nothing saved. The error must survive the reload.
+    """
+    state = await _authenticated_state(seeded_maker)
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "Mars/Phobos",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # ...and the boxes show what is stored (the seed's UTC), not the rejected submission.
+    assert state.branding["timezone"] == "UTC"
+    assert state.branding["public_name"] == ""
