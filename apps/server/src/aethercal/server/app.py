@@ -38,8 +38,9 @@ from starlette.responses import JSONResponse
 
 from aethercal.schemas import ErrorResponse
 from aethercal.server.admin.mount import mount_admin
-from aethercal.server.api import api_router
+from aethercal.server.api import API_V1_PREFIX, api_router, public
 from aethercal.server.api.auth import AuthenticationError
+from aethercal.server.api.ratelimit import PublicRateLimitMiddleware, SlidingWindowLimiter
 from aethercal.server.channels import Channel
 from aethercal.server.db.config import DATABASE_URL_ENV
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
@@ -50,6 +51,7 @@ from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
+from aethercal.server.integrations.turnstile import CloudflareTurnstile
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import WEBHOOK_HTTP_TIMEOUT_SECONDS
@@ -184,6 +186,42 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.include_router(api_router)
     app.add_exception_handler(AuthenticationError, _handle_authentication_error)
+
+    # WHO a request is, when it has no credentials. Built eagerly (like the sessionmaker) because
+    # the
+    # public router reads it off `app.state` on every request, and an app that never runs its
+    # lifespan — every test client — must still resolve addresses exactly as production does. A
+    # malformed CIDR has already failed the boot, inside Settings.
+    app.state.trusted_proxies = settings.trusted_proxy_networks()
+
+    # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
+    #
+    # It is mounted only where the operator asked for it. An instance that serves nobody but its own
+    # integrations, over API keys, must not acquire an anonymous booking endpoint merely by
+    # upgrading — and must not be made to obtain a captcha key in order to start.
+    #
+    # Where it IS on, three things come with it, and not one of them is optional:
+    #
+    #   * the Turnstile verifier. Its secret is REQUIRED — `Settings` refuses to build without it,
+    # so
+    #     this branch cannot be reached in a shape where `turnstile_secret` is None. The captcha is
+    #     the only control here that makes an attempt COST an attacker something;
+    #   * the per-address rate limit, over this prefix and no other. The API had none. Anywhere;
+    #   * the proxy contract (above), so the address the limiter counts — and the booking records —
+    #     is the GUEST's, not the reverse proxy's. Counting the proxy's would exhaust one bucket
+    # with
+    #     everybody in it and deny service to all of them, in silence.
+    if settings.public_api_enabled:
+        secret = settings.turnstile_secret
+        if secret is None:  # pragma: no cover - Settings has already refused this combination
+            raise RuntimeError("the public API is enabled without a Turnstile secret")
+        app.state.turnstile = CloudflareTurnstile(secret=secret)
+        app.include_router(public.router, prefix=API_V1_PREFIX)
+        app.add_middleware(
+            PublicRateLimitMiddleware,
+            limiter=SlidingWindowLimiter(max_requests=settings.public_rate_limit_per_minute),
+            trusted_proxies=app.state.trusted_proxies,
+        )
 
     # Additive, off-by-default: mounts the single-user Reflex admin at /admin only when the operator
     # has configured credentials AND set AETHERCAL_ADMIN_ENABLED (F1-11). A no-op otherwise, so the

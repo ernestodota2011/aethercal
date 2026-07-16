@@ -23,7 +23,18 @@ from aethercal.server.api import (
     workflows,
 )
 
-api_router = APIRouter(prefix="/api/v1")
+API_V1_PREFIX = "/api/v1"
+"""The one place the version prefix is spelled.
+
+``create_app`` mounts the PUBLIC router separately — it is conditional, because an unauthenticated
+write endpoint is opt-in — and it must land under the same prefix as everything else. Including it
+INTO ``api_router`` instead would be worse than untidy: that object is a module-level SINGLETON, so
+a
+second ``create_app`` in the same process (which is what the test suite does, many times per run)
+would mount the same routes onto it again, and again.
+"""
+
+api_router = APIRouter(prefix=API_V1_PREFIX)
 api_router.include_router(health.router)
 api_router.include_router(event_types.router)
 api_router.include_router(schedules.router)
@@ -46,4 +57,4 @@ api_router.include_router(workflows.templates_router)
 # BYPASSRLS scan pool that makes those numbers true, and which is also where the process-local
 # DRAIN_COUNTERS are actually accumulated. See `aethercal.server.worker`.
 
-__all__ = ["api_router"]
+__all__ = ["API_V1_PREFIX", "api_router"]

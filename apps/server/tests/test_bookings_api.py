@@ -220,7 +220,14 @@ async def test_get_and_list(wired_client: AsyncClient, seeded: dict[str, Any]) -
 
     listed = await wired_client.get(BOOKINGS, headers=seeded["headers"])
     assert listed.status_code == 200
-    assert booking_id in [b["id"] for b in listed.json()]
+    # ==A PAGE envelope now, not a bare array (criterion 16).== The authenticated list of a whole
+    # diary is the PII dump; unbounded it was an availability risk for its own owner, and a default
+    # limit returned as a plain list would silently truncate a large diary — ``total`` is the honest
+    # signal that more exists.
+    body = listed.json()
+    assert booking_id in [b["id"] for b in body["items"]]
+    assert body["total"] >= 1
+    assert body["limit"] == 100 and body["offset"] == 0
 
     missing = await wired_client.get(f"{BOOKINGS}{uuid.uuid4()}", headers=seeded["headers"])
     assert missing.status_code == 404
