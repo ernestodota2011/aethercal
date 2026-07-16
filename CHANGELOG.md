@@ -9,6 +9,24 @@ Every package in the repository shares one version number.
 
 ## [Unreleased]
 
+### Added
+
+**Per-business branding** — a business's booking page is now *theirs*, not the product's.
+
+- `tenants` gains `public_name`, `logo_url`, `accent_color` and `timezone` (migration
+  `0014_tenant_branding`). Existing rows keep behaving exactly as before: no logo, no colour, and
+  `UTC` — the zone the booking page was already hard-coding for everybody.
+- The booking page renders the business's name and logo in its header, its accent colour as the
+  page's accent, and its timezone as the display zone a visitor sees before choosing their own. A
+  visitor's explicit `?tz=` still wins.
+- `GET /api/v1/branding` returns the branding of the business the API key belongs to. It takes no
+  parameters — the business is never an input — and the SDK exposes it as `client.get_branding()`.
+- The admin gains a **Branding** page. A colour must be a hex triplet, a logo URL must be `https`,
+  and a timezone must be a real IANA zone; anything else is refused with a readable message and
+  nothing is written.
+- The booking page's `img-src` content-security policy now permits `https:` so an operator's logo
+  can actually load. Without it the feature would have failed silently in the visitor's browser.
+
 ## [0.1.0] — 2026-07-13
 
 The first published release. The booking stack is in production for its first operator; the API

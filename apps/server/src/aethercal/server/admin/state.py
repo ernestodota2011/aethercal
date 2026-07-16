@@ -51,6 +51,7 @@ from aethercal.server.admin.format import (
     SHARED_SCHEDULE,
     booking_event,
     booking_row,
+    branding_row,
     connection_row,
     event_type_row,
     host_resource,
@@ -668,6 +669,10 @@ class AdminState(rx.State):
     hosts: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
     # -- the health panel (RF-25 / R9) ------------------------------------------------
     metrics: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
+    # -- branding (B-07 / RF-27) ------------------------------------------------------
+    # The four columns a GUEST sees, plus the registered name the public name falls back to. A flat
+    # dict rather than five vars: it is one form, loaded and saved as one thing.
+    branding: dict[str, str] = {}  # noqa: RUF012 (reflex state var)
     # The connections of the host the operator is currently inspecting (they are per-host, so they
     # are loaded on demand rather than for everybody).
     connections: list[dict[str, str]] = []  # noqa: RUF012 (reflex state var)
@@ -1255,6 +1260,53 @@ class AdminState(rx.State):
             self.metrics = metrics_rows(snapshot)
         except service.AdminError as exc:
             self.error = _error_text(exc)
+
+    # -- branding (B-07 / RF-27) -----------------------------------------------------
+
+    @rx.event
+    async def load_branding(self) -> None:
+        """Load the business's public name / logo / accent colour / timezone."""
+        if not self._authenticated:
+            return
+        self.error = ""
+        try:
+            runtime = current_runtime()
+            view = await service.branding_view(runtime, tenant_slug=runtime.config.tenant_slug)
+            self.branding = branding_row(view)
+        except service.AdminError as exc:
+            self.error = _error_text(exc)
+
+    @rx.event
+    async def save_branding(self, form_data: dict[str, str]) -> None:
+        """Save the branding — all four boxes, every time.
+
+        ==A blank box is "remove it", not "leave it".== The form has one control per field, so an
+        emptied one is a decision the operator made; treating it as "unchanged" would make removing
+        a logo impossible from the only surface that can set one.
+
+        A refused value (a colour that is not a hex triplet, a logo that is not https, a timezone
+        that is not an IANA zone) comes back as a readable error and NOTHING is written — the panel
+        then re-loads, so the boxes show what is actually stored rather than what was rejected.
+        """
+        if not self._authenticated:
+            return
+        runtime = current_runtime()
+        try:
+            view = await service.update_branding_action(
+                runtime,
+                tenant_slug=runtime.config.tenant_slug,
+                form=service.BrandingForm(
+                    public_name=_clean(form_data, "public_name"),
+                    logo_url=_clean(form_data, "logo_url"),
+                    accent_color=_clean(form_data, "accent_color"),
+                    timezone=_clean(form_data, "timezone") or "UTC",
+                ),
+            )
+            self.branding = branding_row(view)
+            self.error = ""
+        except (ValueError, service.AdminError) as exc:
+            self.error = _error_text(exc)
+            await self.load_branding()
 
     # -- hosts + their connected calendars (RF-30) -----------------------------------
 

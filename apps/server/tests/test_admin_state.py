@@ -48,6 +48,8 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
     (AdminState.load_metrics.fn, ()),
+    (AdminState.load_branding.fn, ()),
+    (AdminState.save_branding.fn, ({},)),
     (AdminState.load_hosts.fn, ()),
     (AdminState.create_host.fn, ({},)),
     (AdminState.update_host.fn, ({},)),

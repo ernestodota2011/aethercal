@@ -31,6 +31,7 @@ _NAV = (
     ("Event types", "/event-types"),
     ("Schedules", "/schedules"),
     ("Rules", "/workflows"),
+    ("Branding", "/branding"),
 )
 
 
@@ -511,6 +512,89 @@ def hosts_page() -> rx.Component:
             ),
             on_submit=AdminState.update_host,
             reset_on_submit=True,
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Branding (B-07 / RF-27) — the only surface that writes what a GUEST sees.
+# --------------------------------------------------------------------------------------
+
+
+def branding_page() -> rx.Component:
+    """The business's public identity: the name, the mark, the colour, the timezone.
+
+    Every field on this form is rendered into the PUBLIC booking page, which is why each one is
+    refused rather than coerced when it is wrong — a colour that is not a hex triplet, a logo that
+    is not ``https``, a timezone that is not a real IANA zone. The hints say so in the operator's
+    own terms, so the refusal is never a surprise.
+
+    ``public_name`` is deliberately left EMPTY when unset, with the registered name shown beside it
+    as the fallback in use. Pre-filling the box with that fallback would invite the operator to save
+    it — turning a default they never chose into a value they now own.
+    """
+    return _shell(
+        "Branding",
+        _error(AdminState.error),
+        rx.text(
+            "What your customers see on your booking page. Leave a field empty to remove it.",
+            size="1",
+            color_scheme="gray",
+        ),
+        rx.form(
+            rx.vstack(
+                rx.text("Public name", size="2", weight="bold"),
+                rx.input(
+                    name="public_name",
+                    placeholder="The name your customers know you by",
+                    default_value=AdminState.branding["public_name"],
+                ),
+                rx.text(
+                    "Empty: your booking page shows "
+                    + AdminState.branding["registered_name"]
+                    + ".",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                rx.text("Logo URL", size="2", weight="bold"),
+                rx.input(
+                    name="logo_url",
+                    placeholder="https://.../logo.png",
+                    default_value=AdminState.branding["logo_url"],
+                ),
+                rx.text(
+                    "Must start with https:// — browsers block anything else on a secure page.",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                rx.text("Accent colour", size="2", weight="bold"),
+                rx.input(
+                    name="accent_color",
+                    placeholder="#e0894b",
+                    default_value=AdminState.branding["accent_color"],
+                ),
+                rx.text(
+                    "A hex colour, e.g. #e0894b or #abc.",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                rx.text("Timezone", size="2", weight="bold"),
+                rx.input(
+                    name="timezone",
+                    placeholder="America/New_York",
+                    default_value=AdminState.branding["timezone"],
+                ),
+                rx.text(
+                    "The zone your times are shown in before a visitor picks their own.",
+                    size="1",
+                    color_scheme="gray",
+                ),
+                rx.button("Save", type="submit"),
+                spacing="2",
+                width="100%",
+                max_width="30em",
+            ),
+            on_submit=AdminState.save_branding,
         ),
     )
 

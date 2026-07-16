@@ -193,6 +193,40 @@ def test_anti_double_booking_partial_unique_index_exists() -> None:
     assert index.dialect_kwargs.get("postgresql_where") is not None
 
 
+def test_the_tenant_carries_its_branding(tmp_path: Path) -> None:
+    """B-07 / RF-27: a business has a public name, a logo, an accent colour and a timezone.
+
+    The three optional ones are NULLABLE (a business that has set no logo has none, and ``""`` is
+    not a logo — the resolver in ``schemas.branding`` treats blank as absent, so a NOT NULL column
+    with an empty default would be a second, disagreeing, way to say "unset").
+
+    ``timezone`` is the one that is **NOT NULL, defaulted to UTC**, and that asymmetry is the whole
+    point of it. Every other field degrades to "the page shows a little less"; a missing timezone
+    degrades to "the page shows the wrong TIME", and there is no rendering of a slot that does not
+    need a zone. The booking page's hard-coded ``DEFAULT_TZ = "UTC"`` was exactly that absent value,
+    spelled somewhere the operator could not reach — so existing rows land on the zone they were
+    already being displayed in, and the column can never be the thing that is missing.
+    """
+    table = Base.metadata.tables["tenants"]
+
+    for name in ("public_name", "logo_url", "accent_color"):
+        assert name in table.c, f"tenants is missing {name}"
+        assert table.c[name].nullable, f"tenants.{name} must be nullable (unset is a real state)"
+
+    timezone = table.c["timezone"]
+    assert not timezone.nullable, "tenants.timezone must be NOT NULL"
+    assert timezone.server_default is not None, "tenants.timezone needs a server-side default"
+
+    # Migration parity, offline: the migration must create exactly the columns the model declares.
+    # A model column with no migration behind it passes every SQLite test and dies in production.
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'tenant_branding.sqlite'}")
+    run_migrations(engine)
+    inspector = sa.inspect(engine)
+    actual = {col["name"] for col in inspector.get_columns("tenants")}
+    assert {"public_name", "logo_url", "accent_color", "timezone"} <= actual
+    engine.dispose()
+
+
 def test_naming_convention_yields_deterministic_constraint_names() -> None:
     # Deterministic names keep Alembic autogenerate drift-free across machines.
     fk = next(iter(Base.metadata.tables["users"].foreign_key_constraints))

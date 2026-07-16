@@ -18,11 +18,13 @@ from pydantic import ValidationError
 
 from aethercal.schemas import ErrorResponse
 from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.event_types import EventTypeRead
 from aethercal.schemas.slots import SlotsResponse
 
 DEFAULT_TIMEOUT = 10.0
 _HEALTH_PATH = "/api/v1/health"
+_BRANDING_PATH = "/api/v1/branding"
 _EVENT_TYPES_PATH = "/api/v1/event-types/"
 _SLOTS_PATH = "/api/v1/slots/"
 _BOOKINGS_PATH = "/api/v1/bookings/"
@@ -149,6 +151,17 @@ class AetherCalClient:
         return True
 
     # -- v1 resource methods (public booking page + admin) ---------------------------------
+
+    def get_branding(self) -> TenantBrandingRead:
+        """The authenticated business's branding (``GET /api/v1/branding``) — B-07 / RF-27.
+
+        It takes no argument, and that is the contract: the business is the one the API key belongs
+        to, resolved server-side. There is nothing to pass, so there is nothing to point at somebody
+        else's brand.
+        """
+        response = self._send("GET", _BRANDING_PATH)
+        _raise_for_status(response)
+        return TenantBrandingRead.model_validate(response.json())
 
     def list_event_types(self) -> list[EventTypeRead]:
         """List the authenticated tenant's bookable event types (``GET /api/v1/event-types``)."""
