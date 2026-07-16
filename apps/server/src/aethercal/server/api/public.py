@@ -31,13 +31,17 @@ prefix, and never will be.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.core.model import BookingStatus
 from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.public import (
     PublicBookingCreate,
@@ -50,7 +54,7 @@ from aethercal.server.api.bookings import map_booking_error
 from aethercal.server.api.slots import require_iana_zone_or_422, require_window_is_sane
 from aethercal.server.client_ip import TrustedProxies, resolve_client_ip
 from aethercal.server.db.guc import bind_tenant
-from aethercal.server.db.models import EventType, Payment, PaymentStatus
+from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus
 from aethercal.server.deps import get_session
 from aethercal.server.integrations.turnstile import TurnstileVerifier
 from aethercal.server.services.bookings import (
@@ -67,9 +71,11 @@ from aethercal.server.services.event_types import (
     list_bookable_event_types,
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.outbox import as_utc
 from aethercal.server.services.payments import (
     CHECKOUT_SESSION_TTL,
     HOLD_TTL,
+    CheckoutSession,
     PaymentGateway,
     enqueue_expire_hold,
 )
@@ -82,6 +88,8 @@ from aethercal.server.services.tenant_credentials import (
 from aethercal.server.services.tenant_resolution import tenant_by_slug
 from aethercal.server.services.workflow_rules import PhoneChannelScope, phone_channel_scope
 from aethercal.server.settings import Settings
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public", tags=["public"])
 
@@ -109,6 +117,35 @@ def _not_found() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail={"error": _NOT_FOUND, "message": "Not found"},
+    )
+
+
+def _conflict(message: str) -> HTTPException:
+    """A 409 for a hold that can no longer be paid — already confirmed, cancelled, or lapsed.
+
+    The resume endpoint (finding 2) returns this instead of minting a SECOND checkout session: a
+    confirmed booking is already paid, and a cancelled/expired one no longer holds its slot, so a
+    fresh session would either double-charge or take a slot that has been given away."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error": "hold_not_resumable", "message": message},
+    )
+
+
+def _checkout_unavailable(booking_id: uuid.UUID) -> HTTPException:
+    """A 502 that carries the ``booking_id`` (finding 2).
+
+    The hold is already committed when the provider call is made, so a failed checkout must not
+    strand the guest on an opaque error with the slot locked for the hold's whole TTL. The
+    ``booking_id`` lets the page retry via ``POST /{tenant_slug}/bookings/{id}/checkout``, which
+    resumes the SAME session (the booking-id Idempotency-Key) rather than opening a second one."""
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail={
+            "error": "checkout_unavailable",
+            "message": "Could not start payment right now; please retry",
+            "booking_id": str(booking_id),
+        },
     )
 
 
@@ -333,6 +370,63 @@ async def create_public_booking(
     return PublicBookingRead.model_validate(booking)
 
 
+@router.post(
+    "/{tenant_slug}/bookings/{booking_id}/checkout",
+    response_model=PublicBookingRead,
+)
+async def resume_paid_checkout(
+    tenant_slug: TenantSlug,
+    booking_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+) -> PublicBookingRead:
+    """==Resume a paid checkout for a live unpaid hold (finding 2).== Idempotent.
+
+    When the first checkout call fails, ``create_public_booking`` answers 502 with the
+    ``booking_id`` and leaves the hold PENDING (§4.4 designed this endpoint for that). This re-opens
+    checkout for that hold: by the booking-id Idempotency-Key the provider returns the SAME session
+    (never a second charge), and the INTENT Payment row is written if the failed first attempt never
+    got that far. A hold that has since confirmed, cancelled, or lapsed is a clear 409 — a fresh
+    session would double-charge or take a freed slot. An unknown/other-business booking, or a free
+    type (nothing to pay), is the shared 404 — the same non-answer every public miss gives.
+
+    The route carries ``tenant_slug`` like every other public endpoint: it BINDS the business so the
+    booking is read under row-level security (without a bound tenant the lookup sees nothing), which
+    is also what keeps one business from resuming another's hold.
+    """
+    tenant_id = await _bind_business(session, tenant_slug)
+    booking = await session.get(Booking, booking_id)
+    if booking is None or booking.tenant_id != tenant_id:
+        raise _not_found()
+    event_type = await session.get(EventType, booking.event_type_id)
+    price_cents = None if event_type is None else event_type.price_cents
+    currency = None if event_type is None else event_type.currency
+    if price_cents is None or currency is None:
+        # A free type has no checkout to resume — indistinguishable from any other public miss.
+        raise _not_found()
+
+    now = _now()
+    _require_resumable_hold(booking, now=now)
+
+    gateway = _resolve_gateway(request)
+    secrets = await _resolve_business_secrets(session, request, tenant_id=tenant_id)
+    checkout_url = await _open_checkout_and_record(
+        session,
+        request=request,
+        gateway=gateway,
+        booking=booking,
+        tenant_id=tenant_id,
+        price_cents=price_cents,
+        currency=currency,
+        secrets=secrets,
+        now=now,
+    )
+    await session.refresh(booking)
+    return PublicBookingRead.model_validate(booking).model_copy(
+        update={"checkout_url": checkout_url}
+    )
+
+
 async def _start_paid_booking(
     session: AsyncSession,
     *,
@@ -345,8 +439,9 @@ async def _start_paid_booking(
     ==The order is the design (§4.4).== The credential is resolved FIRST, so a business that cannot
     charge never even opens a hold (fail-closed, no orphan). The hold and its self-cancel are
     committed BEFORE the provider I/O — *persist the intent before the call* — so a failed checkout
-    leaves a hold that lapses in 30 minutes, never a charge. The checkout session's idempotency key
-    is the ``booking_id``, so a retry returns the same session, never a second charge.
+    leaves a hold that lapses at its TTL, never a charge. ==If the provider call fails the guest
+    gets a 502 carrying the ``booking_id`` (finding 2)==, so they resume the SAME session instead of
+    being stranded with the slot locked; the checkout's idempotency key is the ``booking_id``.
     """
     price_cents = event_type.price_cents
     currency = event_type.currency
@@ -357,29 +452,10 @@ async def _start_paid_booking(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error": "misconfigured", "message": "This service is not configured for pay"},
         )
-    gateway: PaymentGateway | None = getattr(request.app.state, "payment_gateway", None)
-    if gateway is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": "payments_unavailable", "message": "Payments are not configured"},
-        )
-    fernet_keys = request.app.state.fernet_keys
-    try:
-        credential = await resolve_money_credential(
-            session,
-            tenant_id=event_type.tenant_id,
-            provider=CredentialProvider.STRIPE,
-            fernet_key=fernet_keys,
-        )
-    except MissingCredentialError as exc:
-        # ==Fail-closed: no BYOK account, no charge.== Never fall back to the instance's account.
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "error": "payment_unavailable",
-                "message": "This service cannot take payment right now",
-            },
-        ) from exc
+    # Resolve the gateway + the BYOK secret BEFORE the hold: a business that cannot charge (no
+    # provider, or no credential) never opens a hold at all (fail-closed, no orphan).
+    gateway = _resolve_gateway(request)
+    secrets = await _resolve_business_secrets(session, request, tenant_id=event_type.tenant_id)
 
     # ONE clock for the whole flow: the hold's TTL and the checkout's expiry are both measured from
     # this instant, so their ordering (hold OUTLIVES session — finding 2) is guaranteed by the
@@ -403,39 +479,128 @@ async def _start_paid_booking(
     # transaction (the listener + ContextVar), so the writes below stay bound to this business.
     await session.commit()
 
-    checkout = await gateway.create_checkout_session(
-        idempotency_key=str(booking.id),
-        amount_cents=price_cents,
+    checkout_url = await _open_checkout_and_record(
+        session,
+        request=request,
+        gateway=gateway,
+        booking=booking,
+        tenant_id=event_type.tenant_id,
+        price_cents=price_cents,
         currency=currency,
-        # ==Finding 2.== The Stripe session expires at ``now + CHECKOUT_SESSION_TTL`` (30-min min
-        # + a buffer for latency), NOT the hold's TTL. The hold (``HOLD_TTL``, longer) outlives the
-        # session, so ``EXPIRE_HOLD`` never frees the slot while the checkout is still payable.
-        expires_at=now + CHECKOUT_SESSION_TTL,
-        # ==Finding 3.== The guest returns to the REAL booking page (the same base the guest
-        # cancel/reschedule links are minted against), never a dead ``example.invalid``.
-        return_url=_booking_base_url(request, _settings(request)),
-        secrets=credential.secrets,
+        secrets=secrets,
+        now=now,
     )
-    session.add(
-        Payment(
-            tenant_id=event_type.tenant_id,
-            booking_id=booking.id,
-            provider=CredentialProvider.STRIPE.value,
-            # ==Finding 1.== Anchor the row on the Checkout Session id (it exists now); the intent
-            # does not exist yet, so ``provider_ref`` stays NULL until the confirming webhook
-            # backfills it. Storing ``str(payment_intent)`` here is what once persisted "None".
-            checkout_session_id=checkout.checkout_session_id,
-            provider_ref=None,
-            status=PaymentStatus.INTENT,
-            amount_cents=price_cents,
-            currency=currency,
-        )
-    )
-    await session.flush()
     await session.refresh(booking)
     return PublicBookingRead.model_validate(booking).model_copy(
-        update={"checkout_url": checkout.checkout_url}
+        update={"checkout_url": checkout_url}
     )
+
+
+def _resolve_gateway(request: Request) -> PaymentGateway:
+    """The configured payment gateway, or a 503. Shared by the create and resume paths."""
+    gateway: PaymentGateway | None = getattr(request.app.state, "payment_gateway", None)
+    if gateway is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "payments_unavailable", "message": "Payments are not configured"},
+        )
+    return gateway
+
+
+async def _resolve_business_secrets(
+    session: AsyncSession, request: Request, *, tenant_id: uuid.UUID
+) -> Mapping[str, str]:
+    """The business's OWN Stripe secrets (BYOK), or a 402. ==Fail-closed== — a business with no
+    credential can never fall back to the instance operator's account (criterion 41)."""
+    fernet_keys = request.app.state.fernet_keys
+    try:
+        credential = await resolve_money_credential(
+            session,
+            tenant_id=tenant_id,
+            provider=CredentialProvider.STRIPE,
+            fernet_key=fernet_keys,
+        )
+    except MissingCredentialError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "payment_unavailable",
+                "message": "This service cannot take payment right now",
+            },
+        ) from exc
+    return credential.secrets
+
+
+async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs ARE the contract
+    session: AsyncSession,
+    *,
+    request: Request,
+    gateway: PaymentGateway,
+    booking: Booking,
+    tenant_id: uuid.UUID,
+    price_cents: int,
+    currency: str,
+    secrets: Mapping[str, str],
+    now: datetime,
+) -> str:
+    """Open (or, by the booking-id Idempotency-Key, RE-open the SAME) checkout and ensure the INTENT
+    Payment row, returning the ``checkout_url``. ==Shared by the create path and the resume endpoint
+    (finding 2)==, so both derive the SAME session for one booking and neither can double-charge.
+
+    A failure of the provider call becomes a 502 carrying the ``booking_id`` — the hold is already
+    persisted, so the guest resumes rather than losing the slot. The Payment row is inserted only if
+    this booking has none yet: a resume after the row was written (or a double resume) re-derives
+    the SAME session via the idempotency key and must not insert a second (the
+    ``checkout_session_id`` UNIQUE would reject it in any case)."""
+    try:
+        checkout: CheckoutSession = await gateway.create_checkout_session(
+            idempotency_key=str(booking.id),
+            amount_cents=price_cents,
+            currency=currency,
+            # ==Finding 2.== The Stripe session expires at ``now + CHECKOUT_SESSION_TTL`` (30-min
+            # minimum + a latency buffer), NOT the hold's TTL. The hold (``HOLD_TTL``, longer)
+            # outlives the session, so ``EXPIRE_HOLD`` never frees the slot while it is payable.
+            expires_at=now + CHECKOUT_SESSION_TTL,
+            # ==Finding 3.== The guest returns to the REAL booking page, never a dead placeholder.
+            return_url=_booking_base_url(request, _settings(request)),
+            secrets=secrets,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # ==Finding 2.== is resumeable — the hold is committed, so answer 502 with the booking id
+        # rather than an opaque 500 that strands the slot for its whole TTL.
+        _logger.exception("checkout: provider call failed for booking %s", booking.id)
+        raise _checkout_unavailable(booking.id) from exc
+
+    existing = await session.scalar(select(Payment).where(Payment.booking_id == booking.id))
+    if existing is None:
+        session.add(
+            Payment(
+                tenant_id=tenant_id,
+                booking_id=booking.id,
+                provider=CredentialProvider.STRIPE.value,
+                # ==Finding 1.== Anchor on the Checkout Session id; ``provider_ref`` stays NULL
+                # until the confirming webhook backfills the real intent.
+                checkout_session_id=checkout.checkout_session_id,
+                provider_ref=None,
+                status=PaymentStatus.INTENT,
+                amount_cents=price_cents,
+                currency=currency,
+            )
+        )
+        await session.flush()
+    return checkout.checkout_url
+
+
+def _require_resumable_hold(booking: Booking, *, now: datetime) -> None:
+    """A checkout may be resumed ONLY for a still-live PENDING hold (finding 2). A confirmed or
+    cancelled booking, or a hold past its TTL, is a 409 — resuming would double-charge a paid
+    booking or take a slot that has already been freed."""
+    if booking.status is not BookingStatus.PENDING:
+        raise _conflict("This booking is no longer awaiting payment")
+    if booking.hold_expires_at is None or as_utc(booking.hold_expires_at) <= as_utc(now):
+        raise _conflict("This hold has expired; please book again")
 
 
 def _booking_base_url(request: Request, settings: Settings) -> str:

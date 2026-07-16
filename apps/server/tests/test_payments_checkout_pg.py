@@ -65,10 +65,14 @@ class _StubTurnstile:
 
 
 class _FakeGateway:
-    """Records the checkout it was asked to open. NO real Stripe — the money call is a seam."""
+    """Records the checkout it was asked to open. NO real Stripe — the money call is a seam.
+
+    ``fail`` makes the provider call RAISE (finding 2), to exercise the 502-with-booking-id path and
+    the resume endpoint that recovers from it."""
 
     def __init__(self) -> None:
         self.sessions: list[dict[str, Any]] = []
+        self.fail = False
 
     async def create_checkout_session(  # noqa: PLR0913 - mirrors the gateway contract
         self,
@@ -80,6 +84,9 @@ class _FakeGateway:
         return_url: str,
         secrets: Any,
     ) -> CheckoutSession:
+        if self.fail:
+            # A provider I/O failure — raised BEFORE recording, so a failed attempt opens nothing.
+            raise RuntimeError("stripe is unreachable")
         # The BYOK secret must be the BUSINESS's own.
         assert secrets.get("secret_key", "").startswith("sk_test_")
         # ==Finding 3.== The return URL must be a real base, never a dead placeholder.
@@ -303,3 +310,113 @@ async def test_a_free_booking_confirms_directly_with_no_checkout(
     body = response.json()
     assert body["status"] == "confirmed"
     assert body["checkout_url"] is None
+
+
+async def _payments_for(owner_maker: Sessionmaker, booking_id: uuid.UUID) -> list[Payment]:
+    async with owner_maker() as session:
+        return list(
+            (await session.scalars(select(Payment).where(Payment.booking_id == booking_id))).all()
+        )
+
+
+async def test_a_failed_checkout_returns_502_with_booking_id_and_keeps_the_hold(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==Finding 2.== When the provider call fails, the guest gets a 502 carrying the ``booking_id``
+    (to resume) and the hold stays PENDING with its EXPIRE_HOLD queued — never an opaque 500 that
+    locks the slot for the whole TTL. No Payment row is written: the checkout never opened."""
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+    gateway.fail = True
+
+    response = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+
+    assert response.status_code == 502, response.text
+    detail = response.json()["detail"]
+    assert detail["error"] == "checkout_unavailable"
+    booking_id = uuid.UUID(detail["booking_id"])
+
+    async with owner_maker() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.PENDING
+    assert await _has_expire_hold(owner_maker, booking_id)
+    assert await _payments_for(owner_maker, booking_id) == [], "the checkout never opened"
+
+
+async def test_a_resumed_checkout_reopens_the_same_session_and_records_the_payment(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==Finding 2.== After a failed create leaves a PENDING hold, ``POST
+    .../bookings/{id}/checkout`` re-opens the checkout (SAME booking-id Idempotency-Key) and returns
+    the checkout_url; the INTENT Payment row is written. A SECOND resume is idempotent — same
+    session, still ONE Payment row."""
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+    gateway.fail = True
+    failed = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    booking_id = uuid.UUID(failed.json()["detail"]["booking_id"])
+    assert gateway.sessions == [], "the failed attempt opened nothing"
+
+    gateway.fail = False
+    resumed = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+    )
+
+    assert resumed.status_code == 200, resumed.text
+    body = resumed.json()
+    assert body["checkout_url"] == _CHECKOUT_URL
+    assert body["status"] == "pending"
+    # The resume used the booking id as the idempotency key → the SAME session, never a 2nd charge.
+    assert gateway.sessions[-1]["idempotency_key"] == str(booking_id)
+    payments = await _payments_for(owner_maker, booking_id)
+    assert len(payments) == 1
+    assert payments[0].status is PaymentStatus.INTENT
+    assert payments[0].checkout_session_id is not None
+    assert payments[0].provider_ref is None
+
+    # A second resume is idempotent: same session returned, no duplicate Payment row.
+    again = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["checkout_url"] == _CHECKOUT_URL
+    assert len(await _payments_for(owner_maker, booking_id)) == 1, "resume must not double-insert"
+
+
+async def test_resume_is_refused_for_a_non_live_hold(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """A hold that is no longer live cannot be resumed: a CONFIRMED booking is 409 (no second
+    charge), an unknown booking is the shared 404 — and neither opens a checkout."""
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+
+    # A confirmed booking: create the hold, then mark it CONFIRMED out of band.
+    created = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    booking_id = uuid.UUID(created.json()["id"])
+    async with owner_maker() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.CONFIRMED
+    opened_before = len(gateway.sessions)
+
+    confirmed_resume = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+    )
+    assert confirmed_resume.status_code == 409, confirmed_resume.text
+    assert confirmed_resume.json()["detail"]["error"] == "hold_not_resumable"
+
+    # An unknown booking id → the shared 404.
+    unknown = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{uuid.uuid4()}/checkout"
+    )
+    assert unknown.status_code == 404
+
+    assert len(gateway.sessions) == opened_before, "a refused resume opens no checkout"
