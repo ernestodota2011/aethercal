@@ -11,10 +11,13 @@ job (:mod:`aethercal.server.webhooks.delivery`).
 
 from __future__ import annotations
 
+import logging
 import secrets
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
+from enum import StrEnum
+from typing import assert_never
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +30,9 @@ from aethercal.schemas.webhooks import (
     WebhookUpdate,
 )
 from aethercal.server.crypto import decrypt_secret, encrypt_secret
-from aethercal.server.db.models import Webhook, WebhookDelivery
+from aethercal.server.db.models import Booking, Webhook, WebhookDelivery
+
+_logger = logging.getLogger(__name__)
 
 _SECRET_NBYTES = 32  # secrets.token_urlsafe(32) → 43 url-safe chars of entropy.
 
@@ -128,21 +133,92 @@ async def delete_webhook(
     return True
 
 
+class WebhookSubject(StrEnum):
+    """WHO an outbound event is about. The funnel cannot judge an event without knowing this."""
+
+    BOOKING = "booking"
+    """It reports something that happened to ONE appointment."""
+
+
+def event_subject(event: WebhookEventName) -> WebhookSubject:
+    """What ``event`` is ABOUT — exhaustively, so a new event cannot arrive without deciding.
+
+    :func:`enqueue_event` has to answer one question before it fans anything out: *was this
+    appointment ever confirmed?* (B-05a — a hold nobody paid for must reach no subscriber, and this
+    is the payload that carries the guest's name, email and answers out of the building.)
+
+    Its signature never carried a booking: only a ``tenant_id`` and a free-form ``data`` dict. Both
+    obvious ways out of that were wrong, and are worth naming so nobody re-discovers them:
+
+    * dig ``data["id"]`` out of the payload → the gate is then tied to a dict whose shape is
+      VARIABLE BY DESIGN. Change the payload, and the gate opens **in silence**.
+    * hand the guard back to the four callers → that is the exact mistake this wave exists to
+      correct. A belt lives in the funnel, or it is not a belt.
+
+    So the funnel takes the ``Booking``, and this table is what keeps that honest. Every event today
+    is about one appointment. The day one arrives that is NOT — a tenant-level event, say —
+    ``assert_never`` stops the build until somebody decides what the silence rule means for it,
+    instead of letting it inherit a booking-shaped guard that makes no sense for it.
+    """
+    match event:
+        case "booking.created" | "booking.cancelled" | "booking.rescheduled" | "booking.no_show":
+            return WebhookSubject.BOOKING
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 async def enqueue_event(
     session: AsyncSession,
     *,
-    tenant_id: uuid.UUID,
+    booking: Booking,
     event: WebhookEventName,
     data: dict[str, object],
     now: datetime,
 ) -> list[WebhookDelivery]:
-    """Fan ``event`` out to matching active subscribers of ``tenant_id``.
+    """Fan ``event`` out to every matching active subscriber of the booking's tenant.
+
+    ==THE FUNNEL.== ``WebhookDelivery(...)`` is constructed here and **nowhere else in the source
+    tree**, so every outbound webhook this product will ever send passes through this one function.
 
     For every active subscription whose ``events`` includes ``event``, insert one ``pending``
     :class:`WebhookDelivery` carrying the full signed envelope in ``payload``. ``data`` must be
     JSON-serializable (it lands in a JSON column and is later canonicalized for signing). Returns
     the created deliveries (empty when nothing matches). Flushes; does not commit.
+
+    .. rubric:: The guard
+
+    ==A booking that has never been ``CONFIRMED`` reaches no subscriber.== A hold awaiting payment
+    is not an appointment anybody has been told about. Fan its ``booking.created`` out and a
+    subscriber's CRM files a lead — carrying the guest's name, email and answers — for something
+    that does not exist, and no cancellation event will ever follow to retract it (the expired hold
+    is not announced either, precisely because its creation never was).
+
+    ``confirmed_at`` is the switch, never ``status``, and the funnel takes the BOOKING rather than
+    an id or a payload key so that switch cannot be read off something that is free to change shape.
+    See :func:`event_subject`.
+
+    Returning ``[]`` on a refusal is honest rather than lossy: it says *zero deliveries were
+    created*, which is exactly true, and it is the same answer the caller already had to handle for
+    "nobody is subscribed". (Contrast :func:`~aethercal.server.services.outbox.enqueue_effect`,
+    where ``None`` was ALREADY taken to mean *a terminal row owns this key*, so a suppression there
+    needed an answer of its own.) No caller in the source reads this value; the log line is what
+    makes the refusal visible.
     """
+    subject = event_subject(event)
+    match subject:
+        case WebhookSubject.BOOKING:
+            if booking.confirmed_at is None:
+                _logger.info(
+                    "webhook %s for booking %s SUPPRESSED: the booking has never been confirmed "
+                    "(confirmed_at is NULL), so no subscriber may be told that it exists",
+                    event,
+                    booking.id,
+                )
+                return []
+        case _ as unreachable:  # pragma: no cover - assert_never makes this a type error first
+            assert_never(unreachable)
+
+    tenant_id = booking.tenant_id
     subscribers = (
         await session.scalars(
             select(Webhook).where(Webhook.tenant_id == tenant_id, Webhook.active.is_(True))
@@ -173,10 +249,12 @@ async def enqueue_event(
 
 
 __all__ = [
+    "WebhookSubject",
     "create_webhook",
     "decrypt_webhook_secret",
     "delete_webhook",
     "enqueue_event",
+    "event_subject",
     "generate_secret",
     "get_webhook",
     "list_webhooks",

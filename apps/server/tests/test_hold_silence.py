@@ -30,7 +30,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeCreate
-from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
+from aethercal.schemas.webhooks import WEBHOOK_EVENTS
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    Schedule,
+    Tenant,
+    User,
+    Webhook,
+    WebhookDelivery,
+)
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.bookings import (
     BookingParams,
@@ -51,6 +60,7 @@ from aethercal.server.services.outbox import (
     enqueue_effect,
     google_dedupe_key,
 )
+from aethercal.server.services.webhooks import WebhookSubject, enqueue_event, event_subject
 
 _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)}
 
@@ -261,6 +271,102 @@ async def test_suppressed_by_a_hold_is_not_the_same_answer_as_already_queued(
     assert duplicate is None  # "a terminal row already owns this key" — the dedupe conflict
     assert isinstance(suppressed, Suppressed)  # "we refused to speak for an unpaid hold"
     assert suppressed is not None  # ...and the two are NOT the same answer
+
+
+# --------------------------------------------------------------------------------------
+# The EVENT funnel — criterion 20 (the webhook half, which carries PII).
+# --------------------------------------------------------------------------------------
+
+
+async def _subscribe_to_everything(session: AsyncSession, tenant: Tenant) -> Webhook:
+    row = Webhook(
+        tenant_id=tenant.id,
+        url="https://example.com/hook",
+        secret=b"test-secret",
+        events=list(WEBHOOK_EVENTS),
+        active=True,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_an_unpaid_hold_fans_out_no_webhook(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 20, the webhook half.== A hold nobody paid for reaches no subscriber.
+
+    This one leaves the building with the guest's NAME, EMAIL and ANSWERS in the payload — a
+    subscriber's CRM would file a lead for an appointment that does not exist, and no cancellation
+    event would ever follow to retract it (criterion 21).
+
+    The subscriber here is subscribed to EVERY event, so a silence in the assertion below cannot be
+    an accident of what it happens to listen for.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    await _subscribe_to_everything(sqlite_session, tenant)
+    hold = await _hold(sqlite_session, tenant, event_type)
+
+    deliveries = await enqueue_event(
+        sqlite_session,
+        booking=hold,
+        event="booking.created",
+        data={"id": str(hold.id), "guest_email": hold.guest_email},
+        now=_BEFORE,
+    )
+
+    assert deliveries == []
+    rows = (
+        await sqlite_session.scalars(
+            select(WebhookDelivery).where(WebhookDelivery.tenant_id == tenant.id)
+        )
+    ).all()
+    assert list(rows) == []
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_booking_still_fans_its_webhook_out(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 23, the webhook half.== The subscriber of a REAL booking still hears about it."""
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    subscriber = await _subscribe_to_everything(sqlite_session, tenant)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_11), now=_BEFORE
+    )
+
+    deliveries = await enqueue_event(
+        sqlite_session,
+        booking=booking,
+        event="booking.created",
+        data={"id": str(booking.id)},
+        now=_BEFORE,
+    )
+
+    assert len(deliveries) == 1
+    assert deliveries[0].webhook_id == subscriber.id
+    assert deliveries[0].tenant_id == tenant.id
+
+
+def test_every_webhook_event_declares_whose_it_is() -> None:
+    """The event funnel cannot evaluate the guard without knowing WHO the event is about.
+
+    Its signature never carried a booking — only ``tenant_id`` and a free-form ``data`` dict — and
+    the two obvious ways out were both wrong. Digging ``data["id"]`` out of the payload ties the
+    gate to a dict whose shape is variable BY DESIGN: change the payload, and the gate opens in
+    silence. Handing the guard back to the four callers is the mistake this wave exists to correct.
+
+    So the funnel takes the ``Booking``, and this table is what keeps that honest: an event is
+    declared to be ABOUT something, exhaustively (``assert_never``). The day one arrives that is
+    NOT about a booking — a tenant-level event, say — it will not COMPILE until somebody decides
+    what the silence rule means for it.
+    """
+    for event in WEBHOOK_EVENTS:
+        assert event_subject(event) in tuple(WebhookSubject)
+
+    # Every event today is about ONE appointment, and that is why the funnel can take a Booking.
+    assert {event_subject(event) for event in WEBHOOK_EVENTS} == {WebhookSubject.BOOKING}
 
 
 def test_every_effect_declares_whether_it_needs_a_confirmation() -> None:

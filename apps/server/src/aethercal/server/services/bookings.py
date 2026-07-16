@@ -487,7 +487,7 @@ async def create_booking(
     await _insert_active(session, booking, start=start)
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.created",
         data=_serialize_booking(booking),
         now=now,
@@ -566,7 +566,7 @@ async def cancel_booking(
     await session.flush()
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.cancelled",
         data=_serialize_booking(booking),
         now=now,
@@ -714,7 +714,7 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     await _swap_booking(session, old=old, new=new, now=now, start=start)
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=new,
         event="booking.rescheduled",
         data=_serialize_booking(new),
         now=now,
@@ -807,7 +807,7 @@ async def mark_no_show(
     # appointment — nor inflate the host's no-show rate with a duplicate.
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.no_show",
         data=_serialize_booking(booking),
         now=now,
