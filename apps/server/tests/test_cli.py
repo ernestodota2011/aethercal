@@ -51,6 +51,7 @@ from aethercal.server.services.calendars import GoogleCredential, load_credentia
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
+    required_fields,
     resolve_money_credential,
 )
 
@@ -635,10 +636,15 @@ async def test_rotate_key_moves_every_business_onto_the_new_key(
 CLI_RUNNER = CliRunner()
 
 
+# The provider's fixed field set — the ONLY names the refusal is allowed to echo (any other key
+# could itself be a secret). ``credentials_set_command`` passes exactly this to _credential_fields.
+STRIPE_EXPECTED = required_fields(CredentialProvider.STRIPE)
+
+
 def test_credential_fields_accepts_an_object_of_non_empty_strings() -> None:
     """The happy path: a scalar object is returned unchanged, ready for the service."""
     scalar = {"secret_key": "sk_test_x", "webhook_secret": "whsec_x"}
-    assert _credential_fields(scalar) == scalar
+    assert _credential_fields(scalar, expected=STRIPE_EXPECTED) == scalar
 
 
 @pytest.mark.parametrize(
@@ -657,17 +663,30 @@ def test_credential_fields_refuses_anything_that_is_not_a_non_empty_string(
     bad: dict[str, object],
 ) -> None:
     """A dict/list/null/number/boolean or a blank string is not a credential value — it is refused,
-    and the message names the FIELD (not a secret) but never the value."""
+    and the message names an EXPECTED field (a provider literal, not a secret) but never the
+    value."""
     with pytest.raises(ValueError, match="secret_key"):
-        _credential_fields(bad)
+        _credential_fields(bad, expected=STRIPE_EXPECTED)
 
 
 def test_credential_fields_never_echoes_the_rejected_value() -> None:
-    """==The value is a secret, even when it is the wrong shape.== The refusal names the field and
-    the JSON type, and nothing that was piped in."""
+    """==The value is a secret, even when it is the wrong shape.== The refusal names the (expected)
+    field and the JSON type, and nothing that was piped in."""
     with pytest.raises(ValueError) as raised:
-        _credential_fields({"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}})
+        _credential_fields(
+            {"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}, expected=STRIPE_EXPECTED
+        )
     assert "sk_live_MUST_NOT_APPEAR" not in str(raised.value)
+
+
+def test_credential_fields_does_not_echo_an_unexpected_field_name() -> None:
+    """==A field name outside the provider's set may be a secret, so it is never printed.== The
+    operator still learns a field is the wrong shape (and its JSON type), enough to fix their
+    input, without the caller-supplied key reaching the terminal or a log."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields({"whsec_A_SECRET_IN_THE_KEY": {"inner": 1}}, expected=STRIPE_EXPECTED)
+    assert "whsec_A_SECRET_IN_THE_KEY" not in str(raised.value)
+    assert "credential field" in str(raised.value)  # it still says SOMETHING legible
 
 
 @pytest.mark.parametrize(
@@ -699,3 +718,18 @@ def test_credentials_set_command_refusal_does_not_leak_the_value() -> None:
     )
     assert result.exit_code == 2
     assert "sk_live_MUST_NOT_APPEAR" not in result.output
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_field_name() -> None:
+    """==A field NAME is caller-supplied, so it can be a secret too.== Someone can paste the secret
+    into the key as easily as the value (a mislabelled export, a copy-paste slip). Only a field name
+    the PROVIDER declares — a fixed literal we control — is safe to echo; an unexpected key is named
+    only as "a field", so the refusal names the JSON type but never the piped-in key itself."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"sk_live_A_SECRET_IN_THE_KEY": {"inner": 1}}',
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+    assert "sk_live_A_SECRET_IN_THE_KEY" not in result.output

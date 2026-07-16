@@ -57,6 +57,7 @@ from aethercal.server.services.tenant_credentials import (
     credential_class,
     delete_credential,
     list_credential_providers,
+    required_fields,
     store_credential,
 )
 from aethercal.server.services.users import (
@@ -440,7 +441,7 @@ def _json_type(value: object) -> str:
             return type(value).__name__
 
 
-def _credential_fields(parsed: Mapping[str, Any]) -> dict[str, str]:
+def _credential_fields(parsed: Mapping[str, Any], *, expected: frozenset[str]) -> dict[str, str]:
     """Marshal parsed JSON into the service's ``Mapping[str, str]`` contract, or REFUSE at the door.
 
     ``json.loads`` yields values of any JSON type; a credential field is a string. Coercing with
@@ -449,9 +450,18 @@ def _credential_fields(parsed: Mapping[str, Any]) -> dict[str, str]:
     when a guest's money has already left their card. So every value must ALREADY be a non-empty
     string; a nested object, an array, a number, a boolean, ``null`` or a blank string is refused.
 
-    ==The refusal never echoes the value — it is a secret, wrong shape or not.== It names the field
-    (a field name is not a secret; :class:`ResolvedCredential`'s repr already exposes them) and the
-    JSON type, which is enough for the operator to fix the input and safe to write to a log.
+    ==The refusal never echoes the value NOR a caller-supplied field NAME.== The value is a secret,
+    wrong shape or not — but so is a field NAME, because it is piped in exactly the same way: a
+    mislabelled export or a copy-paste slip can put the secret in the KEY as easily as the value,
+    and that key would then reach the terminal, the scrollback and the CI log. So a name is echoed
+    ONLY when it is one the provider itself declares (``expected`` = ``required_fields(provider)``,
+    a fixed set THIS code controls); any other key is referred to as "a credential field" and never
+    printed. The JSON type is always safe to name and is kept, which is enough for the operator to
+    fix their own input.
+
+    ``expected`` gates only what the refusal may NAME — it does not reject unknown fields (an
+    unexpected but well-formed field flows on to the service's ``_validate``, which reports the
+    provider's own missing required fields, never the input's keys).
 
     This is the ONE place untyped JSON becomes a credential: ``store_credential`` is typed
     ``Mapping[str, str]``, so no other (typed, Python) caller can reach it with a non-string, and
@@ -461,16 +471,19 @@ def _credential_fields(parsed: Mapping[str, Any]) -> dict[str, str]:
     fields: dict[str, str] = {}
     for field, value in parsed.items():
         name = str(field)
+        # Only a name the PROVIDER declares is a literal we control and safe to echo; a
+        # caller-supplied key may itself be a secret, so it is named generically and never printed.
+        shown = f"the credential field {name!r}" if name in expected else "a credential field"
         if not isinstance(value, str):
             raise _CredentialInputError(
-                f"the credential field {name!r} must be a JSON string, but it is a "
+                f"{shown} must be a JSON string, but it is a "
                 f"{_json_type(value)}. Every field is a single string value; a nested object, an "
-                "array, a number, a boolean or null is not a credential. (The value is not shown — "
-                "it is a secret.)"
+                "array, a number, a boolean or null is not a credential. (Neither the value nor an "
+                "unexpected field name is shown — either may be a secret.)"
             )
         if not value.strip():
             raise _CredentialInputError(
-                f"the credential field {name!r} is empty. A blank value looks configured and fails "
+                f"{shown} is empty. A blank value looks configured and fails "
                 "at the moment it is used — which, for a payment provider, is after the guest's "
                 "money has already left their card."
             )
@@ -527,9 +540,12 @@ def credentials_set_command(
         raise typer.Exit(code=2)
 
     try:
-        secrets = _credential_fields(cast(dict[Any, Any], parsed))
+        secrets = _credential_fields(
+            cast(dict[Any, Any], parsed), expected=required_fields(provider)
+        )
     except _CredentialInputError as exc:
-        # Names the field and the JSON type; never the value — it is a secret, wrong shape or not.
+        # Names the JSON type (and a provider field name); never the value nor a caller-supplied
+        # key — either can be a secret. See _credential_fields.
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
 
