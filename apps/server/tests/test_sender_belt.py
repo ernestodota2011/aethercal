@@ -331,6 +331,68 @@ class TestATenantsUrlCannotBeDialedWithoutTheEgressGuard:
             )
 
 
+class TestAChannelsFaultIsConsultedInExactlyOnePlace:
+    """==The rule was applied by hand in three places, and by the third the hand slipped.==
+
+    "There is no sender for this channel — what now?" has two answers that are opposites: OFF is
+    terminal, BROKEN is retryable. Two of the three sites consulted ``channel_errors`` to tell them
+    apart. The email branch of a workflow step did not, so a business with a refused SMTP relay had
+    its reminders retired as "off" while the reason sat unread — ==emails failing silently, in a
+    product whose job is sending reminders.==
+
+    So the hand stops. ``_refuse_channel`` is the one door; these assert nobody re-rolls the
+    decision beside it, and that every sender-less path goes through it. The unit test of the
+    decision itself lives in ``test_tenant_senders``; ==this half is the one that would have caught
+    the bug==, because the decision was never wrong — a site just did not ask.
+    """
+
+    def test_channel_errors_is_read_by_the_one_door_and_nothing_else(self) -> None:
+        readers: dict[str, list[int]] = {}
+        for path in _modules():
+            for node in ast.walk(_tree(path)):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "channel_errors"
+                ):
+                    continue
+                readers.setdefault(_rel(path), []).append(node.lineno)
+
+        assert list(readers) == ["services/outbox.py"], (
+            f"`channel_errors` is consulted in {readers}. It is read by `_refuse_channel` and "
+            "nowhere else: every other reader is a second place to decide OFF vs BROKEN, and the "
+            "third one already got it wrong."
+        )
+        assert len(readers["services/outbox.py"]) == 1, (
+            f"`channel_errors` is consulted {len(readers['services/outbox.py'])} times in "
+            "outbox.py. Exactly one — the door. A hand-rolled check beside it is the divergence "
+            "this lock exists to catch."
+        )
+
+    def test_every_sender_less_path_goes_through_that_door(self) -> None:
+        """==Anti-vacuity.== One reader proves nothing if nobody calls it.
+
+        Three call sites, and each is a place that can find itself without a sender: the booking's
+        confirmation email, a workflow step's email branch, and a workflow step's phone branch.
+        Fewer means a path found no sender and decided for itself — which is the bug.
+        """
+        callers = {
+            node.lineno
+            for node in ast.walk(_tree(_SRC / "services" / "outbox.py"))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_refuse_channel"
+        }
+        assert len(callers) == 3, (
+            f"`_refuse_channel` is called from {len(callers)} places, expected 3 (the confirmation "
+            "email, the workflow step's email branch, the phone branch). A sender-less path that "
+            "does not come through the door decides OFF vs BROKEN on its own — and the email "
+            "branch already proved how that ends."
+        )
+
+
 class TestOffAndBrokenAreDecidedInExactlyOnePlace:
     """==The rule that keeps being right while its application keeps falling short.==
 

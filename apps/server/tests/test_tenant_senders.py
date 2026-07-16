@@ -38,6 +38,7 @@ from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxSkipped,
     OutboxWork,
+    _refuse_channel,
     make_booking_effect_executor,
 )
 from aethercal.server.services.tenant_credentials import (
@@ -1292,6 +1293,58 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
         )
         with pytest.raises(UnusableCredentialError, match="inward"):
             await execute(_email_work(uuid.uuid4()), _NOW)
+
+
+class TestAChannelWithNoSenderIsRefusedByOneRule:
+    """==Emails failing silently, in a product whose job is sending reminders.==
+
+    Three sites had to answer "there is no sender for this channel — what now?". Two consulted
+    ``channel_errors``; the email branch of a workflow step did not. So a business whose SMTP relay
+    was REFUSED had its reminders retired as *"the channel is off"* — terminal — while the recorded
+    reason sat unread two frames up. The business believes its guest was told. The guest was not.
+
+    Nobody wrote that on purpose: the rule was applied by hand three times and by the third the hand
+    slipped. This pins the DECISION; ``test_sender_belt`` pins that every site consults it.
+    """
+
+    def test_a_refused_channel_raises_ITS_OWN_fault_and_not_the_off_outcome(self) -> None:
+        """==The finding.== The fault is raised, so the step retries and the fix can still land."""
+        broken = UnusableCredentialError("the relay host resolves inside this network")
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(UnusableCredentialError) as caught:
+            _refuse_channel(Channel.EMAIL, {Channel.EMAIL: broken}, when_off=off)
+
+        assert caught.value is broken, (
+            "a channel that is CONFIGURED and refused was retired as 'off'. Off is terminal: the "
+            "reminder is destroyed for ever and the recorded reason is never read — the message "
+            "silently never arrives, which is the whole bug."
+        )
+
+    def test_an_unconfigured_channel_still_gets_the_off_outcome(self) -> None:
+        """==Anti-vacuity, and the other half of the rule.==
+
+        Without this, "raise whatever you find" would pass while having destroyed the distinction.
+        A channel nobody configured is a decision, not a fault: terminal, because retrying it would
+        burn the dead-letter over a feature somebody chose not to switch on.
+        """
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(OutboxSkipped) as caught:
+            _refuse_channel(Channel.EMAIL, {}, when_off=off)
+
+        assert caught.value is off
+
+    def test_another_channels_fault_does_not_answer_for_this_one(self) -> None:
+        """The lookup is BY CHANNEL. A broken WhatsApp must not decide what email does."""
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(OutboxSkipped):
+            _refuse_channel(
+                Channel.EMAIL,
+                {Channel.WHATSAPP: UnusableCredentialError("whatsapp is broken")},
+                when_off=off,
+            )
 
 
 class TestTheExecutorRefusesSendersThatAreNotTheItems:

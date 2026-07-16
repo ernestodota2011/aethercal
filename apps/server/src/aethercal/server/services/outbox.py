@@ -66,7 +66,7 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, assert_never, cast
+from typing import TYPE_CHECKING, Any, NoReturn, assert_never, cast
 
 from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -2252,6 +2252,43 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
         )
 
 
+def _refuse_channel(
+    channel: Channel, channel_errors: Mapping[Channel, Exception], *, when_off: Exception
+) -> NoReturn:
+    """There is no sender for ``channel``. ==The ONE place that decides what that costs.==
+
+    Two states arrive here and they are opposites. Collapsing them is a bug in either direction:
+
+    * a channel the business never configured is **OFF** — a disabled feature. Terminal, and right:
+      nothing is broken, so retrying is noise the dead-letter has to carry;
+    * a channel that IS configured and could not be built (a relay host pointing inside our network,
+      DNS down, a field that will not parse) is **BROKEN**. A human undoes it with one
+      ``credentials set``, and terminal "may only carry a condition that cannot be undone" — so it
+      fails, retries, and the message outlives the fix.
+
+    .. rubric:: ==Why a function and not three ``if``s==
+
+    It WAS three. Two of them consulted ``channel_errors`` and the third — the email branch of a
+    workflow step — did not, so a business whose SMTP relay was refused had its reminders retired as
+    "the channel is off" while the recorded reason sat unread two frames up. ==Emails failing
+    silently, in a product whose job is sending reminders.== The business believes its guest was
+    told. The guest was not.
+
+    Nobody wrote that on purpose: the rule was applied by hand in three places, and by the third the
+    hand slipped. So the hand stops. Every path with no sender comes through here, and
+    ``channel_errors`` is read in this function and nowhere else — ``tests/test_sender_belt.py``
+    walks the source and fails CI on a second reader.
+
+    ``when_off`` is the caller's, and that asymmetry is deliberate and narrow: what "off" COSTS
+    genuinely differs (see the two call sites). What "broken" costs does not, and that is the half
+    that was getting it wrong.
+    """
+    refused = channel_errors.get(channel)
+    if refused is not None:
+        raise refused
+    raise when_off
+
+
 async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending seam
     session: AsyncSession,
     work: OutboxWork,
@@ -2306,7 +2343,13 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
 
     if channel is Channel.EMAIL:
         return await _prepare_notify_email(
-            session, booking=booking, kind=kind, step_id=step_id, locale=locale, sender=sender
+            session,
+            booking=booking,
+            kind=kind,
+            step_id=step_id,
+            locale=locale,
+            sender=sender,
+            channel_errors=channel_errors,
         )
 
     # ==THE CRASH WE CANNOT SEE FROM ANYWHERE ELSE.== The marker was committed before the previous
@@ -2334,18 +2377,13 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
 
     phone_sender = channels.get(channel)
     if phone_sender is None:
-        # ==Absent and REFUSED are not the same state, and collapsing them loses a real fault.==
-        # No credential at all is a disabled feature: terminal, nothing to fix, retrying is noise.
-        # A credential that IS configured and was refused (an endpoint pointing inside our network,
-        # a field that cannot be parsed) is a misconfiguration a human undoes with one
-        # `credentials set` — so it FAILS and retries, carrying its own reason, and its message
-        # survives long enough for the fix to land.
-        refused = channel_errors.get(channel)
-        if refused is not None:
-            raise refused
-        raise OutboxSkipped(
-            f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this instance "
-            "(a channel without credentials is a disabled feature, not an error)"
+        _refuse_channel(
+            channel,
+            channel_errors,
+            when_off=OutboxSkipped(
+                f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this "
+                "instance (a channel without credentials is a disabled feature, not an error)"
+            ),
         )
 
     # THE CAPS, before the render and long before the network call: an over-cap message is never
@@ -2422,6 +2460,7 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
     step_id: uuid.UUID,
     locale: str,
     sender: EmailSender | None,
+    channel_errors: Mapping[Channel, Exception],
 ) -> _NotifyPlan | None:
     """The EMAIL branch: the built-in composer, which is what carries the ``.ics`` invite.
 
@@ -2433,7 +2472,13 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
     So an email step's ``kind`` must be one of the four built-in ones. A tenant's own kind has no
     composer here, and is retired with that reason rather than mailing something empty."""
     if sender is None:
-        raise OutboxSkipped("the email channel has no configured SMTP sender")
+        _refuse_channel(
+            Channel.EMAIL,
+            channel_errors,
+            when_off=OutboxSkipped(
+                f"{_CHANNEL_UNCONFIGURED}: the email channel has no configured SMTP sender"
+            ),
+        )
     try:
         composer_kind = NotificationKind(kind)
     except ValueError as exc:
@@ -2532,20 +2577,22 @@ def make_booking_effect_executor(
         effect = work.effect
         if effect is OutboxEffect.EMAIL:
             senders = await _resolve_for(work)
-            # Configured and REFUSED is not the same as never configured. A relay whose host points
-            # inside our network is a fault a human fixes with one `credentials set`, so it fails
-            # and retries carrying its own reason — and, crucially, it took no other channel down
-            # with it on the way here.
-            refused = senders.channel_errors.get(Channel.EMAIL)
-            if refused is not None:
-                raise refused
-            if senders.email is None:  # pragma: no cover - live misconfiguration guard
-                # RETRYABLE, and deliberately NOT an OutboxSkipped. Email is the one channel with a
-                # legitimate instance-wide default (a relay is a lent transport, not an identity —
-                # see `services/tenant_senders`), so "no email sender for this business" means the
-                # operator has configured no SMTP at all. That is a misconfiguration they will fix,
-                # and the confirmation should still go out when they do.
-                raise RuntimeError("outbox email intent has no configured SMTP sender")
+            if senders.email is None:
+                # ==Through the same door as every other sender-less channel.== It used to consult
+                # `channel_errors` by hand right here — correctly — while the workflow-step branch
+                # forgot to, which is precisely the divergence a hand-applied rule earns on its
+                # third copy.
+                #
+                # `when_off` differs from the workflow step's, and that is a real difference rather
+                # than an oversight: this is the booking's CONFIRMATION. An instance with no SMTP at
+                # all has not switched a feature off — it is misconfigured, and the receipt should
+                # still reach the guest once somebody fixes it. A workflow reminder is a feature,
+                # and a feature nobody configured is off.
+                _refuse_channel(
+                    Channel.EMAIL,
+                    senders.channel_errors,
+                    when_off=RuntimeError("outbox email intent has no configured SMTP sender"),
+                )
             await run_email_effect(sessionmaker, work, now, sender=senders.email)
         elif effect is OutboxEffect.GOOGLE:
             if service_factory is None:  # pragma: no cover - live misconfiguration guard

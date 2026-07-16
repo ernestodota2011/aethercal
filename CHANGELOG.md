@@ -63,6 +63,10 @@ credentials; nothing sent with them.
   nobody has enumerated. A channel that is configured and fails to resolve FAILS and retries,
   carrying its own reason; one that was never configured is still skipped. A cancellation or
   shutdown is not a channel failure and still rises.
+- **A workflow step on email sees its channel's fault.** A business whose SMTP relay was refused
+  had its email reminders retired as "the channel is off" — terminal — while the recorded reason
+  went unread: emails failing silently, in a product whose job is sending reminders. Every
+  sender-less path now goes through one door that tells OFF (terminal) from BROKEN (retryable).
 - **A phone credential with no declared caps is a fault, not a switched-off channel.** It made the
   channel merely absent, which the drain reads as terminal — so a guest's reminder was discarded for
   ever because an operator had not set `AETHERCAL_<CHANNEL>_DAILY_CAP_*`, and setting it afterwards
