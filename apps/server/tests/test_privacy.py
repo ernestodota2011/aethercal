@@ -573,3 +573,59 @@ async def test_the_payment_record_survives_but_its_event_payload_is_redacted(
     assert event.payload == {"redacted": True}
     assert _EMAIL not in str(event.payload)
     assert report.payment_events == 1
+
+
+async def test_a_purge_never_orphans_a_charged_payment_by_redacting_a_parked_event(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==r6 finding 2 — the invariant that outranks the erasure.== A PARKED event has NOT been
+    applied yet: the parked tick re-runs the arbiter from ITS payload to confirm or refund the
+    charge. Redacting it would destroy the amount + currency the arbiter needs and leave a payment
+    that was CHARGED but never confirmed nor refunded — the worst outcome this system can produce.
+
+    So the purge redacts only TERMINAL events (``applied``/``dead``) and leaves an in-flight one
+    applyable. Retaining it costs no privacy: it holds financial identifiers, not guest PII, and a
+    later purge pass redacts it once the tick has driven it terminal.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "biz")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _pay(sqlite_session, booking)  # the payment + one APPLIED (terminal) event
+
+    # A second event for the SAME charge that the arbiter has NOT applied yet — it is waiting for
+    # the tick. Its payload is exactly what the arbiter needs to re-run.
+    parked_payload: dict[str, object] = {
+        "kind": "paid",
+        "provider_ref": "pi_test_123",
+        "amount_cents": 5000,
+        "currency": "usd",
+    }
+    sqlite_session.add(
+        PaymentEvent(
+            tenant_id=tenant.id,
+            provider="stripe",
+            event_id=f"evt_parked_{uuid.uuid4().hex}",
+            provider_ref="pi_test_123",
+            payload=dict(parked_payload),
+            status=PaymentEventStatus.PARKED,
+        )
+    )
+    await sqlite_session.flush()
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    events = (
+        await sqlite_session.scalars(
+            sa.select(PaymentEvent).where(PaymentEvent.provider_ref == "pi_test_123")
+        )
+    ).all()
+    by_status = {row.status: row for row in events}
+
+    # ==The parked event is still APPLYABLE== — the arbiter can still confirm or refund the charge.
+    parked = by_status[PaymentEventStatus.PARKED]
+    assert parked.payload == parked_payload, "a parked event must stay applyable after a purge"
+
+    # And the purge is still COMPLETE for what is done with: the terminal event is redacted.
+    applied = by_status[PaymentEventStatus.APPLIED]
+    assert applied.payload == {"redacted": True}
+    assert _EMAIL not in str(applied.payload)
+    assert report.payment_events == 1, "only the terminal event is redacted"

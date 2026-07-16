@@ -61,9 +61,16 @@ from aethercal.server.db.models import (
     Outbox,
     Payment,
     PaymentEvent,
+    PaymentEventStatus,
     SentNotification,
     WebhookDelivery,
 )
+
+# ==A payment event is redactable ONLY once it is TERMINAL (r6 finding 2).== ``received``/``parked``
+# events are still ACTIONABLE — the parked tick re-runs the arbiter from their payload — so
+# redacting one would destroy the amount/currency it needs and strand a CHARGED payment that never
+# confirms nor refunds — the worst outcome the system can produce. Only ``applied``/``dead`` are.
+_TERMINAL_PAYMENT_EVENT_STATUSES = frozenset({PaymentEventStatus.APPLIED, PaymentEventStatus.DEAD})
 
 _logger = logging.getLogger(__name__)
 
@@ -398,6 +405,16 @@ async def _purge_payment_events(
     The events are reached through the guest's PAYMENTS (``payment_events`` has no ``booking_id``
     — it links to a payment by ``provider_ref``), so a purge that walked foreign keys from the
     booking would miss it, which is the whole reason it is handled here by name.
+
+    .. rubric:: Only TERMINAL events are redacted (r6 finding 2)
+
+    ==A charged payment is NEVER orphaned by a purge.== A ``received``/``parked`` event has not been
+    applied yet — the parked tick re-runs the arbiter from its payload to CONFIRM or REFUND the
+    charge — so redacting it would destroy the amount/currency the arbiter needs and leave a payment
+    that was taken but never confirmed nor refunded, the worst outcome this system can produce
+    (§4.4). So only ``applied``/``dead`` events are redacted here; an in-flight one is retained (it
+    holds financial identifiers, not guest PII) and becomes redactable on a later purge pass once
+    the tick has driven it terminal. The count returned is the redactions done, not the retentions.
     """
     if not booking_ids:
         return 0
@@ -421,14 +438,31 @@ async def _purge_payment_events(
         )
     ).all()
     touched = 0
+    retained = 0
     for row in rows:
         if row.payload == _REDACTED_PAYMENT_PAYLOAD:
+            continue
+        if row.status not in _TERMINAL_PAYMENT_EVENT_STATUSES:
+            # ==Still actionable (r6 finding 2): DO NOT redact.== A ``received``/``parked`` event
+            # has not been applied yet; the parked tick re-runs the arbiter from THIS payload (the
+            # amount + currency it needs live here, not in a ledger row that does not exist yet).
+            # Redacting it would strand a CHARGED payment that never confirms nor refunds. It holds
+            # no guest PII — it is a financial record in flight — so retaining it is safe, and a
+            # later purge pass redacts it once the tick has driven it to ``applied``/``dead``.
+            retained += 1
             continue
         # REASSIGNED, never mutated in place — SQLAlchemy does not track mutation in a plain JSON
         # column, so an in-place edit would look clean and never be written (a purge that reports
         # success and changes nothing).
         row.payload = dict(_REDACTED_PAYMENT_PAYLOAD)
         touched += 1
+    if retained:
+        _logger.info(
+            "purge: retained %d still-actionable payment event(s) for tenant %s (redacted once the "
+            "parked tick resolves them); a charged payment is never orphaned by a purge",
+            retained,
+            tenant_id,
+        )
     await session.flush()
     return touched
 
