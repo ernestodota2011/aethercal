@@ -1120,6 +1120,16 @@ def guest_purge_command(
         f"{report.sent_notifications} ledger row(s) deleted, "
         f"{report.webhook_deliveries} webhook payload(s) redacted"
     )
+    if report.outbox_retained:
+        # Said out loud, never left to the log. An erasure is a thing an operator may have to PROVE
+        # they performed, and a row this purge deliberately KEPT is exactly what they will be asked
+        # about. It names nobody — it is money owed, or a slot to free — and they should hear that
+        # from the command rather than discover it in the table.
+        typer.echo(
+            f"  kept {report.outbox_retained} queued intent(s) that are not messages (a refund "
+            "owed, a hold to expire): they name nobody, and deleting them would have kept this "
+            "guest's money"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

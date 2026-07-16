@@ -49,12 +49,21 @@ from aethercal.server.db.models import (
     Webhook,
     WebhookDelivery,
 )
-from aethercal.server.services.outbox import OutboxEffect
+from aethercal.server.services.outbox import (
+    RETAINED_PAYLOAD_KEYS,
+    OutboxEffect,
+    Purgeability,
+    enqueue_effect,
+    purge_policy,
+    select_due,
+)
+from aethercal.server.services.payments import enqueue_refund, we_queued_this_refund
 from aethercal.server.services.privacy import (
     BOOKING_PII_COLUMNS,
     BOOKING_RETAINED_GUEST_COLUMNS,
     ERASED_EMAIL,
     ERASED_NAME,
+    JSON_PII_KEYS,
     TABLES_PURGED_BY_BOOKING,
     TABLES_RETAINED_OFF_BOOKING,
     purge_guest,
@@ -629,3 +638,233 @@ async def test_a_purge_never_orphans_a_charged_payment_by_redacting_a_parked_eve
     assert applied.payload == {"redacted": True}
     assert _EMAIL not in str(applied.payload)
     assert report.payment_events == 1, "only the terminal event is redacted"
+
+
+# --- B-05c: the erasure must not keep the guest's money -----------------------------------------
+#
+# The purge deleted EVERY outbox row of the booking, with no filter on effect. That is right for the
+# three effects that exist only to message the person — and wrong for the one that exists to give
+# them their money back. See `test_a_queued_refund_survives_the_purge...` for the full argument.
+
+
+async def _owe_them_a_refund(
+    session: AsyncSession, booking: Booking, *, provider_ref: str = "pi_owed_777"
+) -> None:
+    """A charge of theirs, and the REFUND we owe on it — queued through the REAL path.
+
+    Through ``enqueue_refund`` rather than a hand-built ``Outbox(...)``: the payload this must
+    survive with is the one the product actually writes, not one a test author imagined.
+    """
+    session.add(
+        Payment(
+            tenant_id=booking.tenant_id,
+            booking_id=booking.id,
+            provider="stripe",
+            provider_ref=provider_ref,
+            status=PaymentStatus.PAID,
+            amount_cents=5000,
+            currency="usd",
+        )
+    )
+    await session.flush()
+    await enqueue_refund(session, booking=booking, provider="stripe", provider_ref=provider_ref)
+
+
+async def test_a_queued_refund_survives_the_purge_and_the_drain_still_runs_it(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The erasure gives them their money back; it does not keep it.==
+
+    The guest cancels a paid booking (a REFUND intent is queued) and, before the drain reaches it,
+    asks to be forgotten. The purge used to delete every outbox row of the booking — so the intent
+    vanished, the drain never saw it, and the guest was left erased AND out of pocket. Silently:
+    the purge reported success, and every test passed.
+
+    A REFUND is not a message. It carries ``{provider, provider_ref}`` and names nobody.
+
+    The assertion is on the EFFECTIVE state, not on the row: what matters is not that a row is still
+    there, it is that ``select_due`` — the drain's own planner — still hands it to a worker.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _owe_them_a_refund(sqlite_session, booking)
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    survivors = (
+        await sqlite_session.scalars(sa.select(Outbox).where(Outbox.booking_id == booking.id))
+    ).all()
+    assert [row.effect for row in survivors] == [OutboxEffect.REFUND.value], (
+        "the GOOGLE intent must go (it exists only to message them) and the REFUND must stay"
+    )
+    refund = survivors[0]
+    # The payload the runner needs is intact — a surviving row that lost it is the same bug.
+    assert refund.payload == {"provider": "stripe", "provider_ref": "pi_owed_777"}
+    # ==The effective state.== The drain's planner still plans it, so the money still moves.
+    assert refund.id in await select_due(sqlite_session, now=_START + timedelta(days=2))
+
+
+async def test_the_purge_leaves_the_discriminator_of_our_own_refund_standing(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The r8 discriminator is the refund intent, so the purge deleting it re-opened r8.==
+
+    ``we_queued_this_refund`` answers "is the refund the provider is telling us about OURS?" by the
+    existence of the intent — deliberately, because it is the only fact committed before the
+    provider is called. Purge the intent and the answer silently flips to "no": the next
+    ``charge.refunded`` reads as an operator's out-of-band refund and CANCELS the booking.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _owe_them_a_refund(sqlite_session, booking)
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    assert await we_queued_this_refund(
+        sqlite_session, tenant_id=tenant.id, provider_ref="pi_owed_777"
+    ), "the erasure destroyed the fact that the refund in flight is ours"
+
+
+@pytest.mark.parametrize("effect", list(OutboxEffect))
+async def test_the_purge_deletes_exactly_what_the_policy_calls_purgeable(
+    sqlite_session: AsyncSession, effect: OutboxEffect
+) -> None:
+    """==The anti-drift lock on the EFFECTS, and the reason it is parametrised over the enum.==
+
+    Not a list of the effects that exist today — a sweep of ``OutboxEffect`` itself. The effect
+    somebody adds next is covered by this test the moment they add it, and it fails until
+    ``purge_policy`` classifies it. That is the whole difference between a lock and a photograph.
+
+    The assertion is the EFFECTIVE state (did the row actually go?), never the declaration read back
+    to itself.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    probe = f"probe:{effect.value}"
+    sqlite_session.add(
+        Outbox(
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            effect=effect.value,
+            dedupe_key=probe,
+            payload={
+                "provider": "stripe",
+                "provider_ref": "pi_probe",
+                "booking_id": str(booking.id),
+            },
+            status=OutboxStatus.PENDING.value,
+            attempts=0,
+        )
+    )
+    await sqlite_session.flush()
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    survived = (
+        await sqlite_session.scalars(
+            sa.select(Outbox).where(Outbox.booking_id == booking.id, Outbox.dedupe_key == probe)
+        )
+    ).all()
+    was_deleted = list(survived) == []
+    assert was_deleted is (purge_policy(effect) is Purgeability.PURGEABLE), (
+        f"{effect.value} is classified {purge_policy(effect).value} but the purge "
+        f"{'deleted' if was_deleted else 'kept'} it — the declaration and the mechanism disagree"
+    )
+
+
+def test_every_outbox_effect_declares_whether_the_purge_deletes_it() -> None:
+    """The exhaustiveness lock: ``purge_policy`` must answer for EVERY effect, not raise.
+
+    ``assert_never`` already makes this a type error, but pyright is not the only reader — this
+    fails the suite too, in the same run as the behaviour it guards.
+    """
+    for effect in OutboxEffect:
+        assert isinstance(purge_policy(effect), Purgeability), (
+            f"{effect.value} has no purge classification"
+        )
+
+
+def test_a_retained_effect_declares_the_payload_keys_it_may_carry() -> None:
+    """==The second half of retaining a row: proving it holds no PII.==
+
+    An effect is RETAINED because its payload names nobody. That is a claim about the payload, and a
+    claim nobody checks is a claim that decays: add ``guest_email`` to the refund payload tomorrow
+    and the purge would faithfully RETAIN it — erasure reported complete, address still in the
+    table.
+
+    So a RETAINED effect must declare its keys, and the declaration must be PII-free. Both halves
+    are derived: the set of retained effects comes from ``purge_policy``, and the PII vocabulary
+    from ``JSON_PII_KEYS`` — the same one the redactor uses.
+    """
+    retained = {effect for effect in OutboxEffect if purge_policy(effect) is Purgeability.RETAINED}
+    undeclared = retained ^ set(RETAINED_PAYLOAD_KEYS)
+    assert retained == set(RETAINED_PAYLOAD_KEYS), (
+        "a RETAINED effect must declare the payload keys it may carry, or it is a row the purge "
+        f"keeps without anybody having checked what is in it: {undeclared}"
+    )
+    for effect, keys in RETAINED_PAYLOAD_KEYS.items():
+        leaks = keys & set(JSON_PII_KEYS)
+        assert not leaks, (
+            f"{effect.value} is RETAINED by the purge but declares PII key(s) {leaks}. A row the "
+            "erasure keeps cannot carry the person it erased — either the key goes, or the effect "
+            "is not retainable."
+        )
+
+
+async def test_the_funnel_refuses_a_retained_effect_carrying_an_undeclared_key(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Gate the FUNNEL, not the callers.== ``enqueue_effect`` is where every Outbox row in the
+    source tree is built, so guarding it there catches the enqueue path nobody has written yet —
+    without its author ever learning this rule exists.
+
+    A RETAINED row outlives an erasure. Whether it may is decided by what is IN it, so a key nobody
+    classified cannot ride along on the assumption that it is harmless.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+
+    with pytest.raises(ValueError, match="undeclared payload key"):
+        await enqueue_effect(
+            sqlite_session,
+            booking=booking,
+            effect=OutboxEffect.REFUND,
+            dedupe_key="refund:sneaky",
+            payload={"provider": "stripe", "provider_ref": "pi_x", "guest_email": _EMAIL},
+        )
+
+
+async def test_a_retained_row_written_before_the_guard_is_still_redacted(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The rows already in the database.== The funnel guard binds what is enqueued from now on; it
+    says nothing about a row committed last year, when nothing stopped a payload growing a key.
+
+    So the purge does not merely trust the classification — it REDACTS what it retains. The row
+    survives (the money still moves) and the person does not (the erasure is complete). Same shape
+    as ``payment_events``: keep the row, clear the person out of it.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    # Written straight to the table, exactly as a legacy row would sit there.
+    sqlite_session.add(
+        Outbox(
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            effect=OutboxEffect.REFUND.value,
+            dedupe_key="refund:legacy",
+            payload={"provider": "stripe", "provider_ref": "pi_legacy", "guest_email": _EMAIL},
+            status=OutboxStatus.PENDING.value,
+            attempts=0,
+        )
+    )
+    await sqlite_session.flush()
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    row = (
+        await sqlite_session.scalars(sa.select(Outbox).where(Outbox.dedupe_key == "refund:legacy"))
+    ).one()
+    assert row.payload["provider_ref"] == "pi_legacy", "the money must still move"
+    assert row.payload["guest_email"] == ERASED_EMAIL, "the person must be gone"
+    assert report.outbox_payloads_redacted == 1

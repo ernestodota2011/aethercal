@@ -11,7 +11,8 @@ So the places the guest's data actually lives are ENUMERATED, and each is dealt 
                         ``answers``, ``guest_phone_consent_at``, ``guest_timezone``, and
                         ==``source_ip``== — the address the booking was made from, which is
                         personal data and is the ONE column here without a ``guest_`` prefix
-``outbox``              the ``payload`` JSON carries ``guest_email`` (``services/bookings.py``)
+``outbox``              the ``payload`` JSON carries ``guest_email`` (``services/bookings.py``) —
+                        but ==only for the effects that are MESSAGES==; see :func:`purge_policy`
 ``guest_tokens``        rows hanging off the booking
 ``sent_notifications``  the ledger of every message they were sent
 ``webhook_deliveries``  the ``payload`` JSON carries the WHOLE serialised booking — name, email,
@@ -31,16 +32,38 @@ DELETED outright is everything that exists ONLY in order to message this person:
 intents (which would otherwise carry their address to a provider *after* the erasure), their guest
 tokens, and the send ledger.
 
-.. rubric:: The two structural locks
+.. rubric:: ==The erasure does not keep their money== (B-05c)
 
-A purge is written once, against the schema of that day, and then rots in silence. Two module-level
-declarations are asserted against the live metadata by the suite:
+"Everything that exists only in order to message this person" was a true description of the outbox
+when it was written, and B-05b made it false. A ``REFUND`` intent is not a message: it is money the
+guest is OWED, its payload is ``{provider, provider_ref}``, and it names nobody. Deleted before the
+drain reaches it, the refund never runs — and the guest ends up erased AND out of pocket, silently,
+with the purge reporting success. An ``EXPIRE_HOLD`` is the same story told about a slot: delete it
+and the hold never lapses, so a guest's erasure blocks the HOST's calendar for ever.
+
+So WHICH intents go is decided one row at a time by :func:`purge_policy`, and the survivors are
+redacted rather than trusted (:func:`_redact_retained_outbox`). ==The tension with the erasure is
+real and is resolved, not dodged==: ``provider_ref`` is a pseudonymous identifier — it resolves, at
+Stripe, to a person — and it is retained on exactly the footing ``payments`` already is (a financial
+record, kept for the obligation it discharges and for the very refund the subject is owed). The
+intent introduces no identifier the purge does not already keep one table over, and it is transient
+besides: the drain runs it and it goes ``delivered``. What is NOT exempt is anything more than that,
+which is why the retained payload's keys are declared and the funnel refuses an undeclared one.
+
+.. rubric:: The three structural locks
+
+A purge is written once, against the schema of that day, and then rots in silence. Three
+module-level declarations are asserted against the live code by the suite:
 
 * :data:`BOOKING_PII_COLUMNS` + :data:`BOOKING_RETAINED_GUEST_COLUMNS` must together cover every
   ``guest_*`` column on ``bookings``. A new one has to be CLASSIFIED — erased, or explicitly kept.
 * :data:`TABLES_PURGED_BY_BOOKING` must cover every table carrying a ``booking_id``. The channels
   cut is about to add rendered message bodies hanging off a booking; the day it lands, the suite
   fails until this module accounts for them.
+* :func:`purge_policy` must classify every ``OutboxEffect``, and the suite proves the EFFECTIVE
+  state per effect — it seeds a row of each and checks it went (or stayed) as classified. So the
+  thirteenth effect somebody adds is covered by that test on the day they add it, and both
+  ``assert_never`` and the suite refuse it until they have decided whether an erasure deletes it.
 """
 
 from __future__ import annotations
@@ -65,6 +88,7 @@ from aethercal.server.db.models import (
     SentNotification,
     WebhookDelivery,
 )
+from aethercal.server.services.outbox import PURGEABLE_EFFECTS
 
 # ==A payment event is redactable ONLY once it is TERMINAL (r6 finding 2).== ``received``/``parked``
 # events are still ACTIONABLE — the parked tick re-runs the arbiter from their payload — so
@@ -127,21 +151,45 @@ BOOKING_RETAINED_GUEST_COLUMNS: frozenset[str] = frozenset()
 It exists so that "keep this one" has to be a decision somebody wrote down, rather than an omission
 that looks exactly like a bug."""
 
-_PURGED_BY_BOOKING: dict[str, Any] = {
-    "outbox": Outbox,
-    "guest_tokens": GuestToken,
-    "sent_notifications": SentNotification,
+
+@dataclass(frozen=True, slots=True)
+class _PurgedTable:
+    """A table the purge deletes from, and (optionally) WHICH of its rows."""
+
+    model: Any
+    only: Any = None
+    """An extra row predicate, or ``None`` for "every row of this booking".
+
+    It exists for ``outbox``, where "delete the lot" is wrong for one effect — see below."""
+
+
+_PURGED_BY_BOOKING: dict[str, _PurgedTable] = {
+    # ==NOT every row: only the effects that are MESSAGES (B-05c).== The predicate is derived from
+    # `purge_policy`, so this line never has to be revisited when an effect is added — the table in
+    # `services/outbox.py` is where that decision is made, and it is made or the build fails.
+    "outbox": _PurgedTable(Outbox, only=Outbox.effect.in_(PURGEABLE_EFFECTS)),
+    "guest_tokens": _PurgedTable(GuestToken),
+    "sent_notifications": _PurgedTable(SentNotification),
 }
-"""Table name → model, for every table hanging off a booking. ==This IS the purge, not a list.==
+"""Table name → what to delete, for every table hanging off a booking. ==This IS the purge.==
 
 The purge iterates this mapping, so the declaration and the mechanism are the same object. Kept as a
 decorative set instead, the anti-drift lock below could be satisfied by *adding a name to it* — the
 test would go green while the rows stayed exactly where they were. A lock you can pick by writing
 down that you did the work, without doing it, is not a lock.
 
-Deleted outright rather than redacted, because each of these exists ONLY in order to message this
-person: an outbox intent would carry their address to a provider after the erasure; a guest token is
-a live capability over their booking; the ledger is the record of everything they were sent."""
+Deleted rather than redacted, because these exist ONLY in order to message this person: a guest
+token is a live capability over their booking; the ledger is the record of everything they were
+sent; and an outbox intent would carry their address to a provider after the erasure.
+
+.. rubric:: ==Except the intent that is not a message (B-05c)==
+
+That last clause was written when every effect WAS a message, and B-05b made it false. A ``REFUND``
+intent is money the guest is owed and an ``EXPIRE_HOLD`` is a slot waiting to be freed; neither
+names anybody, and deleting either takes something from the person the erasure exists to serve — the
+refund silently never runs, and the guest ends up erased AND out of pocket. So which rows go is
+decided by :func:`purge_policy`, one row at a time, and what stays is redacted by
+:func:`_redact_retained_outbox` rather than trusted."""
 
 TABLES_PURGED_BY_BOOKING: frozenset[str] = frozenset(_PURGED_BY_BOOKING)
 """The anti-drift lock: asserted against every ``booking_id``-bearing table in ``Base.metadata``.
@@ -175,7 +223,7 @@ reaches it; its payload is redacted by :func:`_purge_payment_events`, the same w
 # The keys that carry the guest INSIDE a JSON payload, and what they become. Applied recursively, at
 # any depth: the outbox keeps `guest_email` at the top level, while a webhook delivery buries the
 # whole serialised booking under `data`, with `answers` a level below that again.
-_JSON_PII_KEYS: dict[str, Any] = {
+JSON_PII_KEYS: dict[str, Any] = {
     "guest_name": ERASED_NAME,
     "guest_email": ERASED_EMAIL,
     "guest_phone": None,
@@ -192,6 +240,18 @@ class PurgeReport:
     webhook_deliveries: int = 0
     payment_events: int = 0
     """Payment-event rows whose raw provider payload was redacted (the row itself stands)."""
+    outbox_retained: int = 0
+    """Queued intents KEPT because they are not messages: a refund owed, a hold expiry.
+
+    Reported rather than left silent — an erasure is a thing an operator may have to PROVE they
+    performed, and "we kept two rows about this person" is exactly the sort of fact they must be
+    able to explain. The answer is that those rows name nobody (see :func:`purge_policy`)."""
+    outbox_payloads_redacted: int = 0
+    """RETAINED intents whose payload nonetheless carried a guest key, now erased.
+
+    Normally ``0``, and that is the point: :data:`RETAINED_PAYLOAD_KEYS` plus the funnel guard mean
+    a retained payload should never hold PII in the first place. This counts rows written BEFORE
+    that guard existed, so a non-zero here is worth an operator's attention rather than a shrug."""
     deleted_by_table: Mapping[str, int] = field(default_factory=dict)
     """Rows deleted, per table — keyed by :data:`_PURGED_BY_BOOKING`, so a table added there is
     counted here without anybody having to remember to add a field for it."""
@@ -220,9 +280,9 @@ def _redact_json(value: Any) -> tuple[Any, bool]:
         redacted: dict[str, Any] = {}
         changed = False
         for key, item in source.items():
-            if key in _JSON_PII_KEYS:
-                redacted[key] = _JSON_PII_KEYS[key]
-                changed = changed or item != _JSON_PII_KEYS[key]
+            if key in JSON_PII_KEYS:
+                redacted[key] = JSON_PII_KEYS[key]
+                changed = changed or item != JSON_PII_KEYS[key]
                 continue
             new_item, item_changed = _redact_json(item)
             redacted[key] = new_item
@@ -293,15 +353,19 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
     # Driven BY the declaration, not alongside it: a table added to `_PURGED_BY_BOOKING` to satisfy
     # the anti-drift lock is a table whose rows this loop then actually deletes.
     deleted = {
-        table: await _delete_by_booking(session, model, booking_ids)
-        for table, model in _PURGED_BY_BOOKING.items()
+        name: await _delete_by_booking(session, table, booking_ids)
+        for name, table in _PURGED_BY_BOOKING.items()
     }
+    # What the outbox KEPT (a refund owed, a hold to expire) loses the guest but not its job.
+    retained, redacted_payloads = await _redact_retained_outbox(session, booking_ids)
     await session.flush()
 
     report = PurgeReport(
         bookings=len(bookings),
         webhook_deliveries=deliveries,
         payment_events=payment_events,
+        outbox_retained=retained,
+        outbox_payloads_redacted=redacted_payloads,
         deleted_by_table=deleted,
     )
     # Loud, and with the counts: an erasure is a thing an operator may one day have to PROVE they
@@ -309,31 +373,85 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
     # erasure must not do.
     _logger.warning(
         "guest purge (tenant %s): %d booking(s) redacted; deleted %s; %d webhook delivery "
-        "payload(s) redacted",
+        "payload(s) redacted; %d outbox intent(s) RETAINED (money/slot, naming nobody)",
         tenant_id,
         report.bookings,
         ", ".join(f"{count} row(s) from {table}" for table, count in sorted(deleted.items())),
         report.webhook_deliveries,
+        report.outbox_retained,
     )
     return report
 
 
-async def _delete_by_booking(session: AsyncSession, model: Any, booking_ids: set[uuid.UUID]) -> int:
-    """Delete a table's rows for these bookings. Returns how many went."""
+async def _delete_by_booking(
+    session: AsyncSession, table: _PurgedTable, booking_ids: set[uuid.UUID]
+) -> int:
+    """Delete a table's rows for these bookings. Returns how many went.
+
+    ``table.only`` narrows WHICH rows — the outbox keeps the intents that are not messages."""
     if not booking_ids:
         return 0
+    where = [table.model.booking_id.in_(booking_ids)]
+    if table.only is not None:
+        where.append(table.only)
     # A CursorResult, because only that carries `rowcount` — and the count is what the purge
     # REPORTS. An erasure an operator may one day have to prove they performed cannot shrug about
     # how much it actually removed.
     result = cast(
         "CursorResult[Any]",
         await session.execute(
-            sa.delete(model)
-            .where(model.booking_id.in_(booking_ids))
-            .execution_options(synchronize_session=False)
+            sa.delete(table.model).where(*where).execution_options(synchronize_session=False)
         ),
     )
     return result.rowcount or 0
+
+
+async def _redact_retained_outbox(
+    session: AsyncSession, booking_ids: set[uuid.UUID]
+) -> tuple[int, int]:
+    """Strip the guest out of the intents the purge KEEPS. Returns ``(retained, redacted)``.
+
+    ==The purge does not merely trust the classification.== A ``REFUND`` is retained because its
+    payload is ``{provider, provider_ref}`` and names nobody; :data:`RETAINED_PAYLOAD_KEYS` and the
+    guard in ``enqueue_effect`` are what keep that true going forward. But neither binds a row
+    committed a year ago, before either existed — and an erasure cannot be conditional on the
+    history of the codebase. So what survives is redacted, the same way ``webhook_deliveries`` and
+    ``payment_events`` are: ==keep the row, remove the person==.
+
+    Ordinarily this changes nothing and reports ``0``. It is the belt, not the mechanism.
+
+    Selected by the COMPLEMENT of :data:`PURGEABLE_EFFECTS` rather than by naming the retained
+    effects: a row whose effect nothing recognises (legacy data, a hand-written row) is then
+    retained and redacted rather than deleted — the purge does not destroy what it cannot classify,
+    but it does take the person out of it.
+    """
+    if not booking_ids:
+        return 0, 0
+    rows = (
+        await session.scalars(
+            sa.select(Outbox).where(
+                Outbox.booking_id.in_(booking_ids),
+                Outbox.effect.not_in(PURGEABLE_EFFECTS),
+            )
+        )
+    ).all()
+    redacted_count = 0
+    for row in rows:
+        redacted, changed = _redact_json(row.payload)
+        if not changed:
+            continue
+        # REASSIGNED, never mutated in place: SQLAlchemy does not track mutation inside a plain JSON
+        # column, so an in-place edit would leave the object looking clean and would never be
+        # written — a purge that runs, reports success, and changes nothing at all.
+        row.payload = redacted
+        redacted_count += 1
+        _logger.warning(
+            "purge: a RETAINED outbox intent (%s) carried a guest key; redacted. It predates the "
+            "payload guard in enqueue_effect — the intent still runs, the person is gone",
+            row.effect,
+        )
+    await session.flush()
+    return len(rows), redacted_count
 
 
 async def _purge_webhook_deliveries(
@@ -476,6 +594,7 @@ __all__ = [
     "BOOKING_RETAINED_GUEST_COLUMNS",
     "ERASED_EMAIL",
     "ERASED_NAME",
+    "JSON_PII_KEYS",
     "TABLES_PURGED_BY_BOOKING",
     "TABLES_RETAINED_OFF_BOOKING",
     "PurgeReport",

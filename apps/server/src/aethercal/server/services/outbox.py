@@ -384,6 +384,84 @@ literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE 
 in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
 
 
+class Purgeability(StrEnum):
+    """Whether the GUEST ERASURE (``services/privacy.py``) may delete a queued intent."""
+
+    PURGEABLE = "purgeable"
+    """It exists ONLY in order to message this person. After the erasure there is nobody to message,
+    and the payload would still carry their address to a provider, so the row goes."""
+    RETAINED = "retained"
+    """==It is not a message.== It moves MONEY or frees a SLOT, it names nobody, and deleting it
+    would take something from the very person the erasure is supposed to serve."""
+
+
+def purge_policy(effect: OutboxEffect) -> Purgeability:
+    """Whether :func:`purge_guest` may delete a queued ``effect`` when erasing its guest.
+
+    ==EXHAUSTIVE, with ``assert_never``, exactly like the staleness, confirmation and voidability
+    tables.== The purge used to delete every outbox row of a booking on one sentence of
+    justification — *"each of these exists ONLY in order to message this person"* — which was true
+    of every effect that existed when it was written, and false of the two that arrived with B-05b.
+
+    * ``EMAIL`` / ``GOOGLE`` / ``NOTIFY`` → **PURGEABLE**. The original argument, and it still
+      holds: each exists to message the guest, and its payload carries their address to a provider.
+      After an erasure there is nobody left to send them to.
+    * ==``REFUND`` → **RETAINED**, the load-bearing one.== It is not a message; it is money the
+      guest is OWED, and its payload (``{provider, provider_ref}``) names no person. Deleted before
+      the drain reaches it, the intent vanishes and the refund never executes: the guest is erased
+      **and** out of pocket — silently, with the purge reporting success. That is "keeping a paying
+      guest's money", the other half of what the payments header says cannot be got wrong. It is
+      also the discriminator :func:`we_queued_this_refund` reads, so deleting it re-opens r8 too.
+    * ``EXPIRE_HOLD`` → **RETAINED**. It carries ``{booking_id}`` and no person. It is slot state,
+      not a message: delete it and the hold never lapses, so the slot stays blocked for ever — a
+      loss inflicted on the HOST by a guest's erasure.
+
+    .. rubric:: This is NOT the question :func:`voidability_policy` answers
+
+    That one asks *"may a booking transition retire this?"*; this asks *"may an ERASURE delete
+    this?"*. The two tables agree today by coincidence and must never be collapsed: ``EMAIL`` and
+    ``GOOGLE`` are ``NON_VOIDABLE`` (a cancellation notice must survive the cancellation it
+    reports) and PURGEABLE all the same (an erased guest is told nothing at all). Collapse them and
+    the first effect whose two answers differ gets one of them wrong, in silence.
+    """
+    match effect:
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Purgeability.PURGEABLE
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            return Purgeability.RETAINED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+PURGEABLE_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if purge_policy(effect) is Purgeability.PURGEABLE
+)
+"""The effect values the guest erasure DELETES — derived from the table above, never a literal.
+
+``services/privacy.py`` filters its outbox delete on this, so the declaration and the mechanism are
+one object: classify an effect ``PURGEABLE`` and the purge sweeps it for free; classify it
+``RETAINED`` and there is no hand-written ``WHERE`` anywhere that somebody has to remember."""
+
+RETAINED_PAYLOAD_KEYS: Mapping[OutboxEffect, frozenset[str]] = {
+    # `enqueue_refund` (services/payments.py): which provider to call, and the charge reference to
+    # refund. No name, no address, no notes, no answers.
+    OutboxEffect.REFUND: frozenset({"provider", "provider_ref"}),
+    # `enqueue_expire_hold` (services/payments.py): the booking whose hold lapses — an id of OURS,
+    # pointing at a row the erasure redacts in place rather than deletes.
+    OutboxEffect.EXPIRE_HOLD: frozenset({"booking_id"}),
+}
+"""What a RETAINED effect's payload may contain — the OTHER half of retaining a row.
+
+==An effect is RETAINED because its payload names nobody, and that is a claim about the PAYLOAD.==
+A claim nobody checks decays: add ``guest_email`` to the refund payload tomorrow and the purge
+would faithfully retain it — erasure reported complete, the address still sitting in the table. So
+the keys are declared, the suite asserts the declaration holds no PII key, and
+:func:`enqueue_effect` — the one place an ``Outbox`` row is constructed — refuses an undeclared one.
+
+Exhaustiveness is asserted against :func:`purge_policy` (``test_privacy``): a newly RETAINED effect
+has to say what it carries before anything will keep it."""
+
+
 @dataclass(frozen=True, slots=True)
 class Suppressed:
     """The intent was REFUSED rather than queued: its booking has never been ``CONFIRMED``.
@@ -639,6 +717,36 @@ def as_utc(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
+def _refuse_undeclared_retained_keys(effect: OutboxEffect, payload: Mapping[str, object]) -> None:
+    """Refuse a RETAINED effect carrying a payload key nobody classified (B-05c).
+
+    ==Gate the FUNNEL, not the callers.== :func:`enqueue_effect` is the only place an ``Outbox`` row
+    is constructed in the source tree, so the rule lands on the enqueue path nobody has written yet,
+    without its author ever learning this rule exists. A list of the call sites that matter today is
+    a photograph; this is the door they all come through.
+
+    A RETAINED intent OUTLIVES a guest erasure. Whether it may is decided entirely by what is inside
+    it — so a key nobody classified cannot ride along on the assumption that it is harmless, because
+    the erasure would keep it, faithfully, address and all.
+
+    Raises rather than warns, and that is deliberate: an undeclared key is a PROGRAMMING error, not
+    a runtime condition, and it is one the suite meets long before a guest does — every test that
+    queues a refund runs this. The alternative is a log line nobody reads, on the one path where
+    being wrong means an erasure that did not erase.
+    """
+    allowed = RETAINED_PAYLOAD_KEYS.get(effect)
+    if allowed is None:  # PURGEABLE: the whole row goes on a purge, so its keys need no vetting.
+        return
+    undeclared = set(payload) - allowed
+    if undeclared:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge (services/privacy.py), so its payload "
+            f"outlives an erasure — and it carries undeclared payload key(s) {sorted(undeclared)}. "
+            "Either add them to RETAINED_PAYLOAD_KEYS (having checked they name nobody), or, if "
+            "they do name somebody, this effect cannot be retained as it stands."
+        )
+
+
 async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are the keyword contract
     session: AsyncSession,
     *,
@@ -711,6 +819,8 @@ async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are
             booking.id,
         )
         return Suppressed(booking_id=booking.id, effect=effect)
+
+    _refuse_undeclared_retained_keys(effect, payload)
 
     row = Outbox(
         tenant_id=booking.tenant_id,
@@ -2608,6 +2718,8 @@ __all__ = [
     "PAUSED_RULE_RECHECK",
     "PROVIDER_CALL_MARKER",
     "PROVIDER_TIMEOUT_CEILING",
+    "PURGEABLE_EFFECTS",
+    "RETAINED_PAYLOAD_KEYS",
     "TERMINAL_MESSAGE_GRACE",
     "Clock",
     "Confirmation",
@@ -2619,6 +2731,7 @@ __all__ = [
     "OutboxSkipped",
     "OutboxUnknownOutcome",
     "OutboxWork",
+    "Purgeability",
     "ReconcileReport",
     "Staleness",
     "StepSchedule",
@@ -2636,6 +2749,7 @@ __all__ = [
     "make_booking_effect_executor",
     "message_deadline",
     "new_worker_id",
+    "purge_policy",
     "reconcile_workflow_steps",
     "recover_expired_leases",
     "refund_dedupe_key",
