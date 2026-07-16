@@ -55,7 +55,14 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.db.models import Booking, Outbox, OutboxStatus, WebhookDelivery
+from aethercal.server.db.models import (
+    Booking,
+    Outbox,
+    OutboxStatus,
+    PaymentEvent,
+    PaymentEventStatus,
+    WebhookDelivery,
+)
 from aethercal.server.db.models.booking import held_filter
 from aethercal.server.db.models.outbox import due_filter
 from aethercal.server.db.pools import require_bypass
@@ -181,6 +188,13 @@ class MetricsSnapshot:
     ``blocked-*`` is worth an alarm; ``http-error`` mostly is not (a consumer having a bad day is
     ordinary). Keeping them in one series with a bounded ``reason`` label — never a URL, never a
     tenant — is what lets a dashboard tell those apart on a public, scrapeable endpoint."""
+    payment_events_parked: int = 0
+    """Inbound payment events whose booking does not exist yet, awaiting a retry (B-05b). A backlog
+    that grows and never drains means the parked-payment tick is not running."""
+    payment_events_dead: int = 0
+    """==THE money dead-man switch.== Parked payment events retried to exhaustion: each is a charge
+    that neither confirmed nor refunded — by this spec, the worst outcome the system can produce.
+    Any non-zero value is a human task, never routine."""
 
 
 async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSnapshot:
@@ -291,6 +305,26 @@ async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSna
             .where(held, Booking.status == BookingStatus.NO_SHOW.value)
         )
     ) or 0
+
+    # The money dead-man switch (B-05b): parked events awaiting retry, and the dead-lettered ones —
+    # a charge that neither confirmed nor refunded. Cross-tenant, like everything else here.
+    def _payment_events_in(status: PaymentEventStatus) -> sa.ScalarSelect[int]:
+        return (
+            sa.select(sa.func.count())
+            .select_from(PaymentEvent)
+            .where(PaymentEvent.status == status.value)
+            .scalar_subquery()
+        )
+
+    parked_dead = (
+        await session.execute(
+            sa.select(
+                _payment_events_in(PaymentEventStatus.PARKED),
+                _payment_events_in(PaymentEventStatus.DEAD),
+            )
+        )
+    ).one()
+
     return MetricsSnapshot(
         outbox_by_status=by_status,
         outbox_due=outbox_due,
@@ -300,6 +334,8 @@ async def collect_metrics(session: AsyncSession, *, now: datetime) -> MetricsSna
         no_show_ratio=(absent / expected) if expected else 0.0,
         webhook_deliveries_by_status=webhooks_by_status,
         webhook_deliveries_by_reason=webhooks_by_reason,
+        payment_events_parked=parked_dead[0] or 0,
+        payment_events_dead=parked_dead[1] or 0,
     )
 
 
@@ -469,6 +505,22 @@ def render_prometheus(snapshot: MetricsSnapshot, *, counters: DrainCounters) -> 
             (f'{{reason="{_escape(reason)}"}}', count)
             for reason, count in sorted(snapshot.webhook_deliveries_by_reason.items())
         ],
+    )
+    _series(
+        lines,
+        "aethercal_payment_events_parked",
+        "Inbound payment events awaiting a booking that does not exist yet (B-05b). A backlog that "
+        "grows and never drains means the parked-payment tick is not running.",
+        "gauge",
+        [("", snapshot.payment_events_parked)],
+    )
+    _series(
+        lines,
+        "aethercal_payment_events_dead",
+        "Parked payment events retried to exhaustion: each is a charge that neither confirmed nor "
+        "refunded — the worst outcome the system can produce. ANY non-zero value is a human task.",
+        "gauge",
+        [("", snapshot.payment_events_dead)],
     )
     return "\n".join(lines) + "\n"
 

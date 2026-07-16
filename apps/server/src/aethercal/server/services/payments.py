@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, cast
@@ -58,7 +58,17 @@ from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model.booking import BookingStatus
-from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus, RefundKind
+from aethercal.server.db.guc import tenant_scope
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    Payment,
+    PaymentEvent,
+    PaymentEventStatus,
+    PaymentStatus,
+    RefundKind,
+)
+from aethercal.server.db.pools import BypassReason, WorkerPools
 from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
@@ -451,10 +461,159 @@ def make_expire_hold_runner(*, sessionmaker: _Sessionmaker) -> OutboxExecutor:
     return _run
 
 
+# --------------------------------------------------------------------------------------
+# The parked-payment TICK — re-run the arbiter for events that beat the checkout commit.
+# --------------------------------------------------------------------------------------
+
+DEFAULT_PARKED_MAX_ATTEMPTS = 10
+"""How many times a parked event is retried before it is dead-lettered. A payment that neither
+confirms nor refunds is the worst outcome the system can produce, so the ceiling exists to turn
+*"it is never discarded"* into a REAL promise (a loud dead-letter) instead of an infinite silent
+retry — which is the same worst outcome wearing a different mask."""
+
+DEFAULT_PARKED_BATCH_SIZE = 100
+
+
+@dataclass
+class ParkedPaymentReport:
+    """What one :func:`run_parked_payment_tick` pass did to the parked events it scanned."""
+
+    applied: list[uuid.UUID] = field(default_factory=list)
+    """The payment landed in the meantime: the arbiter ran and the event is done."""
+    retried: list[uuid.UUID] = field(default_factory=list)
+    """Still no payment, but under the ceiling: parked again, one attempt spent."""
+    dead: list[uuid.UUID] = field(default_factory=list)
+    """==THE bucket to alarm on.== Attempts exhausted: a charge that neither confirmed nor refunded,
+    dead-lettered with an error-level ALERT so a human goes and looks at the provider."""
+
+
+async def select_parked_payment_events(
+    session: AsyncSession, *, limit: int = DEFAULT_PARKED_BATCH_SIZE
+) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """The ``(id, tenant_id)`` of every parked event — read on the BYPASS pool, cross-tenant.
+
+    ==A parked event cannot travel through the outbox== (``outbox.booking_id`` is NOT NULL and a
+    parked event is, by definition, the one whose booking does not exist yet), so it needs its own
+    instance-wide scan. Returns the tenant id with the event id so the caller can BIND it before
+    re-reading the row under row-level security on the exec pool."""
+    rows = (
+        await session.execute(
+            select(PaymentEvent.id, PaymentEvent.tenant_id)
+            .where(PaymentEvent.status == PaymentEventStatus.PARKED.value)
+            .order_by(PaymentEvent.received_at)
+            .limit(limit)
+        )
+    ).all()
+    return [(row.id, row.tenant_id) for row in rows]
+
+
+async def run_parked_payment_tick(
+    pools: WorkerPools,
+    *,
+    now: datetime,
+    confirm_effects: ConfirmEffects,
+    max_attempts: int = DEFAULT_PARKED_MAX_ATTEMPTS,
+    limit: int = DEFAULT_PARKED_BATCH_SIZE,
+) -> ParkedPaymentReport:
+    """Re-run the arbiter for every parked payment event (B-05b, criterion 29).
+
+    Plan on the ``BYPASSRLS`` scan pool (whose tenant is unknown until the row is read — the same
+    shape as the outbox drain), then bind each event's business and re-run the arbiter on the app
+    pool under RLS, ONE event per :func:`~aethercal.server.db.guc.tenant_scope`. An event whose
+    payment has since committed APPLIES; one that never resolves is retried until the ceiling, then
+    DEAD-lettered with an ALERT.
+    """
+    report = ParkedPaymentReport()
+    async with pools.scan_session(BypassReason.PLAN_PARKED_PAYMENTS) as session:
+        planned = await select_parked_payment_events(session, limit=limit)
+
+    for event_id, tenant_id in planned:
+        with tenant_scope(tenant_id):
+            async with pools.exec_maker() as session, session.begin():
+                await _retry_one_parked(
+                    session,
+                    event_id=event_id,
+                    tenant_id=tenant_id,
+                    now=now,
+                    confirm_effects=confirm_effects,
+                    max_attempts=max_attempts,
+                    report=report,
+                )
+    return report
+
+
+async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's knobs
+    session: AsyncSession,
+    *,
+    event_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    now: datetime,
+    confirm_effects: ConfirmEffects,
+    max_attempts: int,
+    report: ParkedPaymentReport,
+) -> None:
+    """Re-run the arbiter for ONE parked event, inside its own bound transaction."""
+    event = await session.get(PaymentEvent, event_id)
+    if (
+        event is None or event.status is not PaymentEventStatus.PARKED
+    ):  # pragma: no cover - defensive
+        return
+
+    provider_ref = event.provider_ref
+    try:
+        amount_cents = int(event.payload["amount_cents"])
+        currency = str(event.payload["currency"])
+    except (KeyError, TypeError, ValueError):
+        amount_cents, currency = None, None
+
+    if provider_ref is None or amount_cents is None or currency is None:
+        # A parked event we cannot re-run (malformed / non-paid) must not loop for ever either.
+        event.status = PaymentEventStatus.DEAD
+        _logger.error(
+            "ALERT: parked payment event %s (tenant %s) is not re-runnable (missing "
+            "provider_ref/amount/currency); DEAD-lettering it",
+            event.id,
+            tenant_id,
+        )
+        report.dead.append(event.id)
+        return
+
+    result = await apply_paid_event(
+        session,
+        tenant_id=tenant_id,
+        provider=event.provider,
+        provider_ref=provider_ref,
+        amount_cents=amount_cents,
+        currency=currency,
+        now=now,
+        confirm_effects=confirm_effects,
+    )
+    if not result.parked:
+        event.status = PaymentEventStatus.APPLIED
+        report.applied.append(event.id)
+        return
+
+    event.attempts += 1
+    if event.attempts >= max_attempts:
+        event.status = PaymentEventStatus.DEAD
+        _logger.error(
+            "ALERT: parked payment event %s (provider_ref %s) DEAD after %d attempts — a charge "
+            "that neither confirmed nor refunded. Go look at the provider",
+            event.id,
+            provider_ref,
+            event.attempts,
+        )
+        report.dead.append(event.id)
+    else:
+        report.retried.append(event.id)
+
+
 __all__ = [
+    "DEFAULT_PARKED_MAX_ATTEMPTS",
     "ArbiterOutcome",
     "ArbiterResult",
     "ConfirmEffects",
+    "ParkedPaymentReport",
     "PaymentGateway",
     "apply_paid_event",
     "enqueue_cancellation_refunds",
@@ -463,4 +622,6 @@ __all__ = [
     "make_expire_hold_runner",
     "make_refund_runner",
     "resolve_payment",
+    "run_parked_payment_tick",
+    "select_parked_payment_events",
 ]
