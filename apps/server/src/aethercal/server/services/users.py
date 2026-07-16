@@ -44,6 +44,7 @@ Transaction control (commit / rollback) belongs to the caller, as everywhere els
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -360,7 +361,10 @@ async def set_password(
     verifies it) or an owner setting somebody else's (who never needs to know it).
     """
     row = await get_user(session, tenant_id=tenant_id, user_id=user_id)
-    row.hashed_password = hash_password(password)
+    # Off the event loop: PBKDF2 at 600k iterations blocks for tens of milliseconds, and this runs
+    # in a request path (an owner setting a member's password, a member changing their own). The
+    # same reason ``memberships.authenticate_member`` hands its verify off to a worker thread.
+    row.hashed_password = await asyncio.to_thread(hash_password, password)
     await session.flush()
     return row
 

@@ -22,6 +22,7 @@ so a single patch catches every derivation the login performs.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 import pytest
@@ -120,3 +121,60 @@ async def test_it_costs_the_same_kdf_a_wrong_password_does(
 
     assert result is None
     assert kdf_calls() == 1
+
+
+def _record_kdf_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Spy on the login's KDF, recording the THREAD id each derivation runs on.
+
+    A 600k-iteration PBKDF2 grinds for tens of milliseconds. On the event-loop thread that blocks
+    every other request in the process while it runs; off it (``asyncio.to_thread``) it does not.
+    The thread the hasher runs on is the fact that says which — no clock, no jitter.
+    """
+    threads: list[int] = []
+    real = memberships_service.verify_password
+
+    def _spy(stored: str, presented: str) -> bool:
+        threads.append(threading.get_ident())
+        return real(stored, presented)
+
+    monkeypatch.setattr(memberships_service, "verify_password", _spy)
+    return threads
+
+
+async def test_the_absent_business_kdf_runs_off_the_event_loop(
+    sqlite_maker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """==The unknown-business KDF must not block the loop.== It still runs (H2: it is never
+    skipped), but on a worker thread — or a handful of concurrent unknown-slug logins freezes every
+    other request the process is serving. Before the fix it ran inline on the loop thread."""
+    loop_thread = threading.get_ident()  # this coroutine runs on the event-loop thread
+    threads = _record_kdf_threads(monkeypatch)
+    admin = _runtime(sqlite_maker)
+
+    result = await bootstrap.member_login(
+        admin, tenant_slug="no-such-business", email="ana@example.com", password="whatever-it-is"
+    )
+
+    assert result is None
+    assert threads == [t for t in threads if t != loop_thread]  # every derivation ran off the loop
+    assert threads  # ...and at least one DID run (the H2 equivalence is preserved)
+
+
+async def test_the_real_login_kdf_runs_off_the_event_loop(
+    sqlite_maker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same for the REAL login path: an existing business with a wrong password runs its KDF off
+    the loop too. Both paths must, or whichever is still on it becomes the process's chokepoint
+    under concurrent logins."""
+    await _seed_member(sqlite_maker, slug="acme", email="ana@example.com", password="the-real-one")
+    loop_thread = threading.get_ident()
+    threads = _record_kdf_threads(monkeypatch)
+    admin = _runtime(sqlite_maker)
+
+    result = await bootstrap.member_login(
+        admin, tenant_slug="acme", email="ana@example.com", password="not-the-real-one"
+    )
+
+    assert result is None
+    assert threads == [t for t in threads if t != loop_thread]
+    assert threads

@@ -39,6 +39,7 @@ Transaction control (commit / rollback) belongs to the caller, as everywhere els
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -288,7 +289,11 @@ async def change_own_password(
     """
     user = await users_service.get_user(session, tenant_id=tenant_id, user_id=user_id)
     stored = user.hashed_password
-    if stored is None or not verify_password(stored, current_password):
+    # Off the event loop, as everywhere the KDF runs in a request path (``authenticate_member``).
+    verified = stored is not None and await asyncio.to_thread(
+        verify_password, stored, current_password
+    )
+    if not verified:
         raise InvalidCredentialsError("the current password is not correct")
     _require_strong(new_password)
     await users_service.set_password(
@@ -326,15 +331,21 @@ async def authenticate_member(
     user = await _host_by_email(session, tenant_id=tenant_id, email=email)
     stored = user.hashed_password if user is not None else None
 
-    # The KDF runs whichever way this is going (see ``_ABSENT_PASSWORD_HASH``).
-    verified = verify_password(stored or _ABSENT_PASSWORD_HASH, password)
+    # The KDF runs whichever way this is going (see ``_ABSENT_PASSWORD_HASH``) — and it runs OFF the
+    # event loop. PBKDF2 at 600k iterations blocks for tens of milliseconds; on the loop that stalls
+    # every other request in the process, so a handful of concurrent logins freezes the server. The
+    # operator's login is already off-loop at its call site (``admin/state.py`` wraps
+    # ``authenticate`` in ``to_thread``); the member path could not be, because this is buried in an
+    # async DB call, so the hand-off to a worker thread lives HERE instead.
+    reference = stored or _ABSENT_PASSWORD_HASH
+    verified = await asyncio.to_thread(verify_password, reference, password)
 
     if user is None or stored is None or not verified:
         return None
     return await get_membership_for_user(session, tenant_id=tenant_id, user_id=user.id)
 
 
-def spend_absent_kdf(password: str) -> None:
+async def spend_absent_kdf(password: str) -> None:
     """Pay the KDF's constant cost against nothing — ==for a refusal that never reaches
     :func:`authenticate_member`.==
 
@@ -349,8 +360,14 @@ def spend_absent_kdf(password: str) -> None:
     So the caller that bails out early spends the same budget here first, against the same reference
     hash (:data:`_ABSENT_PASSWORD_HASH`), and "no such business" costs exactly what "wrong password"
     does. The answer is discarded: the point is the TIME, not the boolean.
+
+    ==Off the event loop, and identically to :func:`authenticate_member`.== The one derivation runs
+    in a worker thread via ``asyncio.to_thread`` — both because a 600k-iteration PBKDF2 on the loop
+    stalls every other request, and because the two paths MUST spend the KDF the same way: if the
+    real login moved off-loop and this one stayed on it, the ``to_thread`` scheduling difference
+    would reopen the very timing oracle this function exists to close.
     """
-    verify_password(_ABSENT_PASSWORD_HASH, password)
+    await asyncio.to_thread(verify_password, _ABSENT_PASSWORD_HASH, password)
 
 
 async def _host_by_email(session: AsyncSession, *, tenant_id: uuid.UUID, email: str) -> User | None:

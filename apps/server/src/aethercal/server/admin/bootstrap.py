@@ -144,8 +144,10 @@ async def member_login(
             # runs the KDF for an unknown HOST (so a wrong address and a wrong password are
             # indistinguishable in time); this path returns one step earlier, before a business is
             # bound and it could run at all. Skipping the derivation here would make the response
-            # time an oracle for which business slugs exist — so spend the same budget first.
-            memberships_service.spend_absent_kdf(password)
+            # time an oracle for which business slugs exist — so spend the same budget first (and
+            # off the event loop, exactly as the real login does, or the scheduling difference would
+            # itself become the timing tell).
+            await memberships_service.spend_absent_kdf(password)
             return None
 
         # 3. Bind, and only THEN read. The `after_begin` listener has already fired on this
