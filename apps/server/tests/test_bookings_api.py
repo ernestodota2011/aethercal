@@ -303,6 +303,10 @@ async def _book_in_the_past(
             start_at=start,
             end_at=start + timedelta(minutes=30),
             status=BookingStatus.CONFIRMED,
+            # A CONFIRMED booking carries the instant it became so — leaving it NULL would make the
+            # outbound belt (B-05a) treat this real, finished appointment as an unpaid hold and
+            # SILENCE its no-show webhook. It was confirmed when it was booked, before it ended.
+            confirmed_at=start - timedelta(hours=1),
             guest_name="Ada Lovelace",
             guest_email="ada@example.com",
             guest_timezone="UTC",

@@ -71,6 +71,10 @@ async def _seed(
         start_at=_START,
         end_at=_END,
         status=status,
+        # A confirmed booking — and a no-show, which was confirmed once — carries the instant it
+        # became so. Only an unpaid HOLD has no stamp, and the funnel refuses to speak for one
+        # (B-05a). These transitions all begin from a REAL appointment, so it is stamped.
+        confirmed_at=None if status is BookingStatus.PENDING else _START - timedelta(days=1),
         guest_name="Ada Lovelace",
         guest_email="ada@example.com",
         guest_timezone="UTC",

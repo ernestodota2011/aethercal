@@ -270,6 +270,67 @@ _STALENESS: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], Staleness]] = {
 }
 
 
+class Confirmation(StrEnum):
+    """Whether an effect may only ever speak for a booking that was ACTUALLY confirmed."""
+
+    REQUIRES_CONFIRMATION = "requires_confirmation"
+    """It announces an appointment — and an appointment nobody confirmed must not be announced."""
+    EXEMPT = "exempt"
+    """It acts ON an unconfirmed or cancelled booking; that is the whole reason it exists."""
+
+
+def confirmation_policy(effect: OutboxEffect) -> Confirmation:
+    """Whether ``effect`` may be queued for a booking that has never been ``CONFIRMED``.
+
+    EXHAUSTIVE by construction, exactly like :func:`staleness_policy` and the dispatch in
+    :func:`make_booking_effect_executor`: an effect that inherits a default is an effect nobody ever
+    decided about, and the default is always wrong for somebody. ``assert_never`` makes it a TYPE
+    error to add an effect without choosing — the build fails, and nobody has to remember that this
+    function exists.
+
+    * every effect today (``EMAIL`` / ``GOOGLE`` / ``NOTIFY``) **REQUIRES_CONFIRMATION**. Each tells
+      a human being about an appointment: an email, a WhatsApp, an SMS — or a Google Calendar event,
+      which is the one that looks harmless and is not. An event carrying the guest as an attendee
+      makes GOOGLE mail them the invitation, so an unpaid hold that syncs to a calendar
+      ==announces itself==, through a channel we do not even own.
+    * ``REFUND`` and ``EXPIRE_HOLD`` (B-05b) will be **EXEMPT**, and that choice has to be a
+      conscious one: they act on bookings that are unpaid or cancelled BY DEFINITION. A belt that
+      silenced them would be a belt that ==keeps the guest's money== and leaves the slot blocked for
+      ever.
+
+    ==The question here is NOT the one :func:`staleness_policy` answers.== Staleness asks *"did a
+    later transition overtake this booking?"*; this asks *"was this appointment ever REAL?"*. A
+    cancellation notice is staleness-EXEMPT (it has to survive the very cancellation it reports) and
+    still requires confirmation (an expired hold's cancellation must never be announced, because its
+    creation never was). Collapse the two questions into one and one of those two guests gets the
+    wrong message.
+    """
+    match effect:
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Confirmation.REQUIRES_CONFIRMATION
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+@dataclass(frozen=True, slots=True)
+class Suppressed:
+    """The intent was REFUSED rather than queued: its booking has never been ``CONFIRMED``.
+
+    ==A distinct answer from ``None``, and that distinction is the entire point.== ``None`` already
+    means something exact in this funnel — *a TERMINAL row already owns this dedupe key* — and
+    :func:`reconcile_workflow_steps` reads it that way, in writing, to decide it must not re-send a
+    message that has already had its moment.
+
+    Collapse a suppression into ``None`` and the two facts become one: *"we refused to announce an
+    unpaid hold"* would be recorded as *"the guest already got it"*, ``report.materialised`` would
+    lie about both, and a silent no-op would be living **inside the funnel that exists to prevent
+    silent no-ops**.
+    """
+
+    booking_id: uuid.UUID
+    effect: OutboxEffect
+
+
 def staleness_policy(effect: OutboxEffect, payload: Mapping[str, Any]) -> Staleness:
     """Whether ``effect`` is dropped when its booking is no longer the chain's live member.
 
@@ -493,20 +554,48 @@ def as_utc(moment: datetime) -> datetime:
 async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are the keyword contract
     session: AsyncSession,
     *,
-    tenant_id: uuid.UUID,
-    booking_id: uuid.UUID,
+    booking: Booking,
     effect: OutboxEffect,
     dedupe_key: str,
     payload: dict[str, object],
     next_retry_at: datetime | None = None,
-) -> Outbox | None:
+) -> Outbox | Suppressed | None:
     """Persist a ``pending`` effect intent for a booking, INSIDE the caller's transaction (F1-05).
+
+    ==THE FUNNEL.== ``Outbox(...)`` is constructed here and **nowhere else in the source tree**, so
+    every outbound effect the product will ever have — today's confirmation email, WhatsApp reminder
+    and Google sync; tomorrow's refund — passes through this one function. That is what makes the
+    guard below a BELT rather than an etiquette: a new enqueue path nobody foresaw is silenced by
+    it the day it is written, without its author knowing this rule exists.
+
+    .. rubric:: It takes the BOOKING, not a ``booking_id``
+
+    Deliberately, and it is the load-bearing half of the guard. The gate has to ask *"was this
+    appointment ever confirmed?"*, and a funnel handed only an id would have to go and LOAD the row
+    to find out — which under row-level security returns ``None`` for a session whose business is
+    not bound, silently. The gate would then have to choose between failing open (announcing unpaid
+    holds — the bug) and failing closed (silencing everything — an outage), from inside a function
+    that cannot tell the two situations apart. Taking the object the caller already has in hand
+    removes the question: every caller of this function has the booking, because it is enqueueing an
+    effect ABOUT that booking.
+
+    .. rubric:: The guard
+
+    ==A booking that has never been ``CONFIRMED`` produces no outbound at all== — unless the effect
+    is declared EXEMPT by :func:`confirmation_policy` (a refund, a hold expiry: they exist precisely
+    to act on bookings nobody paid for). ``confirmed_at`` is the switch, never ``status``: a
+    cancelled booking that WAS confirmed must still send its cancellation notice, while an expired
+    hold must not — and both read ``cancelled``.
 
     Idempotent on ``(tenant_id, booking_id, dedupe_key)``: the insert runs in a ``SAVEPOINT`` and a
     unique-constraint conflict (the same transition already enqueued this exact intent) returns
     ``None`` without poisoning the transaction. Flushes; the caller owns the commit, so the intent
     commits atomically with the booking, or rolls back with it (and never fires for a booking that
-    never persisted). Returns the created row, or ``None`` when it was already queued.
+    never persisted).
+
+    Three outcomes, and they are three because collapsing any two of them loses a fact somebody
+    needs: the created :class:`Outbox` row · :class:`Suppressed` (*refused: nobody confirmed this
+    appointment*) · ``None`` (*a terminal row already owns this key — it has had its moment*).
 
     ``next_retry_at`` is the intent's earliest send time. ``None`` means "as soon as the next drain
     runs"; a future instant is how the outbox doubles as the durable SCHEDULER — a 24 h reminder is
@@ -520,9 +609,24 @@ async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are
     so
     a message that already went out is never re-sent, and a mid-flight (``claimed``) row is not
     yanked out from under its worker."""
+    if (
+        confirmation_policy(effect) is Confirmation.REQUIRES_CONFIRMATION
+        and booking.confirmed_at is None
+    ):
+        # Never confirmed: nobody has been told this appointment exists, and nobody may be. Loud in
+        # the log, because a message that is silently absent is exactly what nobody ever notices —
+        # and this is the branch that will be doing the most work the day holds start being written.
+        _logger.info(
+            "outbox %s intent for booking %s SUPPRESSED: the booking has never been confirmed "
+            "(confirmed_at is NULL), so nothing may be announced for it",
+            effect.value,
+            booking.id,
+        )
+        return Suppressed(booking_id=booking.id, effect=effect)
+
     row = Outbox(
-        tenant_id=tenant_id,
-        booking_id=booking_id,
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
         effect=effect.value,
         dedupe_key=dedupe_key,
         payload=payload,
@@ -663,13 +767,18 @@ class ReconcileReport:
     voided: list[uuid.UUID] = field(default_factory=list)
     left: list[uuid.UUID] = field(default_factory=list)
     """Mid-flight (``claimed``), or event-shaped: not a rule edit's business to move."""
+    suppressed: list[uuid.UUID] = field(default_factory=list)
+    """Bookings the funnel refused to speak for: never confirmed, so never to be announced.
+
+    Kept OUT of :attr:`materialised` on purpose. ``materialised`` is the count of messages this edit
+    armed, and a suppressed step armed nothing — folding the two together would make the report
+    claim it had queued a reminder for an appointment nobody paid for."""
 
 
 async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the keyword contract
     session: AsyncSession,
     *,
-    tenant_id: uuid.UUID,
-    booking_id: uuid.UUID,
+    booking: Booking,
     workflow_id: uuid.UUID,
     wanted: Collection[StepSchedule],
     now: datetime,
@@ -723,8 +832,8 @@ async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the
         await session.scalars(
             select(Outbox)
             .where(
-                Outbox.tenant_id == tenant_id,
-                Outbox.booking_id == booking_id,
+                Outbox.tenant_id == booking.tenant_id,
+                Outbox.booking_id == booking.id,
                 Outbox.effect == OutboxEffect.NOTIFY.value,
                 Outbox.status.in_(_NON_TERMINAL),
                 Outbox.dedupe_key.startswith(workflow_key_prefix(workflow_id)),
@@ -749,7 +858,7 @@ async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the
                 "outbox intent %s (booking %s): the rule moved its send time to %s, which is "
                 "already past — retiring it rather than firing it late",
                 row.id,
-                booking_id,
+                booking.id,
                 schedule.send_at.isoformat(),
             )
             to_void.append(row)
@@ -772,18 +881,23 @@ async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the
             continue
         created = await enqueue_effect(
             session,
-            tenant_id=tenant_id,
-            booking_id=booking_id,
+            booking=booking,
             effect=OutboxEffect.NOTIFY,
             dedupe_key=schedule.dedupe_key,
             payload=dict(schedule.payload),
             next_retry_at=schedule.send_at,
         )
-        if created is not None:
+        # Three answers, kept three. ``None`` = a TERMINAL row already owns this key (delivered /
+        # skipped / voided): that message has had its moment, and the UNIQUE constraint is what
+        # stops a rule edit re-sending it — deliberately not an error, since reconciling a rule is
+        # not a request to re-send anything. :class:`Suppressed` = the booking was never confirmed,
+        # nothing may be announced for it; unreachable from here today (a rule only governs LIVE
+        # bookings, and a hold is not one), and counted as ``suppressed`` rather than folded into
+        # either of the others precisely so it cannot become a lie if that ever changes.
+        if isinstance(created, Outbox):
             report.materialised.append(created.id)
-        # ``None`` = a TERMINAL row already owns this key (delivered / skipped / voided). That
-        # message has had its moment, and the UNIQUE constraint is what stops a rule edit re-sending
-        # it. Deliberately not an error: reconciling a rule is not a request to re-send anything.
+        elif isinstance(created, Suppressed):
+            report.suppressed.append(booking.id)
     await session.flush()
     return report
 
@@ -1326,6 +1440,31 @@ async def _should_skip_as_stale(session: AsyncSession, booking: Booking, work: O
     return not await _is_chain_current(session, booking)
 
 
+def _should_skip_as_unconfirmed(booking: Booking, work: OutboxWork) -> bool:
+    """==DEFENCE IN DEPTH at the point of EXECUTION.== Whether to drop this intent because its
+    booking was never confirmed.
+
+    :func:`enqueue_effect` already refuses to QUEUE an effect for a booking with no confirmation,
+    so under today's paths nothing that requires confirmation ever reaches here for a hold. This is
+    the second belt, for the path nobody has written yet: a future caller that builds an intent some
+    other way, a bug that flips a status, a manual insert. The drainer re-checks at the last
+    moment — an intent whose booking has no confirmation, for an effect that REQUIRES_CONFIRMATION,
+    DIES here rather than reaching a provider.
+
+    ==It is NOT the same question as :func:`_should_skip_as_stale`.== Staleness asks *"did a later
+    transition overtake this booking?"* and leans on :func:`_is_chain_current`, which is False only
+    for a CANCELLED booking — a ``PENDING`` hold sails straight through it. This asks *"was this
+    appointment ever real?"*, and it is exactly the gap that guard cannot see.
+
+    EXEMPT effects (``REFUND`` / ``EXPIRE_HOLD``, B-05b) are let through: acting on an unpaid or
+    cancelled booking is their entire purpose. Same enum, same policy, same ``assert_never`` as the
+    funnel — one decision, enforced in two places.
+    """
+    if confirmation_policy(work.effect) is Confirmation.EXEMPT:
+        return False
+    return booking.confirmed_at is None
+
+
 async def _chain_awaits_meeting_link(session: AsyncSession, booking: Booking) -> bool:
     """True while a non-terminal Google intent that WOULD write the chain's Meet link is queued.
 
@@ -1400,6 +1539,10 @@ async def _prepare_email(session: AsyncSession, work: OutboxWork) -> _EmailPlan 
     payload = work.payload
     kind = NotificationKind(payload["kind"])
 
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth: an intent for a booking that was never confirmed (a hold) must not be
+        # sent, even if some path the funnel does not guard managed to queue it. It dies here.
+        return None
     if await _should_skip_as_stale(session, booking, work):
         # A later transition superseded this booking: drop the notice (never mail a "confirmed"
         # after a "cancelled", nor a reminder for a slot that was rescheduled away).
@@ -1551,6 +1694,13 @@ async def _prepare_google(
     """
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a booking that was never
+        # confirmed must not sync to a calendar — a Google event with the guest as an attendee makes
+        # Google mail them the invitation, so this is how a hold would announce itself.
+        # Dropped BEFORE the host/target machinery, which is irrelevant for something that will
+        # never be sent.
         return None
     payload = work.payload
     host_id = await _payload_host_id(session, payload)
@@ -2100,6 +2250,12 @@ async def _prepare_notify(
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
         return None
 
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a workflow step — a WhatsApp
+        # or SMS to the guest — must not fire for a booking that was never confirmed, whatever path
+        # queued it. It dies here rather than reaching a provider.
+        return None
+
     payload = work.payload
     channel = Channel(payload["channel"])
     step_id = uuid.UUID(str(payload["step_id"]))
@@ -2332,6 +2488,7 @@ __all__ = [
     "PROVIDER_TIMEOUT_CEILING",
     "TERMINAL_MESSAGE_GRACE",
     "Clock",
+    "Confirmation",
     "GoogleOperation",
     "OutboxDeferred",
     "OutboxEffect",
@@ -2343,9 +2500,11 @@ __all__ = [
     "ReconcileReport",
     "Staleness",
     "StepSchedule",
+    "Suppressed",
     "as_utc",
     "backoff_delay",
     "claim_one",
+    "confirmation_policy",
     "drain_outbox",
     "email_dedupe_key",
     "enqueue_effect",

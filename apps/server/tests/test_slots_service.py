@@ -109,6 +109,8 @@ async def _book(
         start_at=start,
         end_at=start + timedelta(minutes=30),
         status=status,
+        # Confirmed/cancelled ⇒ stamped; only an unpaid hold has no confirmation (B-05a).
+        confirmed_at=None if status is BookingStatus.PENDING else start - timedelta(days=1),
         guest_name="Guest",
         guest_email="guest@example.com",
         guest_timezone="UTC",

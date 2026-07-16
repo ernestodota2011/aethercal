@@ -481,6 +481,15 @@ async def create_booking(
         start_at=start,
         end_at=end,
         status=BookingStatus.CONFIRMED,
+        # The stamp moves WITH the status, in the same statement — never in a later one. It is what
+        # licenses every outbound this booking will ever produce (B-05a), so a confirmed booking
+        # that reached the database without it would be one nothing ever speaks for: no email, no
+        # reminder, no webhook, no calendar event — and no error to say so.
+        #
+        # Today every booking is born confirmed, on every path (the public page, the admin and the
+        # API key alike). When holds arrive (B-05b) this line becomes the ARBITER's: the payment
+        # that wins the conditional UPDATE stamps it, and nothing else may.
+        confirmed_at=now,
         guest_name=params.guest_name,
         guest_email=params.guest_email,
         guest_timezone=params.guest_timezone,
@@ -493,7 +502,7 @@ async def create_booking(
     await _insert_active(session, booking, start=start)
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.created",
         data=_serialize_booking(booking),
         now=now,
@@ -557,12 +566,34 @@ async def cancel_booking(
     sees it already cancelled and is a no-op that queues NO second webhook. Best-effort deletes the
     Google event and sends the cancellation email when ``effects`` is supplied. Raises
     :class:`BookingNotFoundError` (404) if the tenant has no such booking.
+
+    ==A booking that was never confirmed (a hold, ``confirmed_at is None``) is cancelled SILENTLY:==
+    its slot is freed but nothing is announced — no webhook, no ``on_cancel`` workflow, no sequence
+    bump. You do not announce the cancellation of an appointment nobody was ever told existed.
     """
     booking, event_type = await _lock_and_reload_booking(
         session, tenant_id=tenant_id, booking_id=booking_id
     )
     if booking.status == BookingStatus.CANCELLED:
         return booking  # already cancelled under the lock → no-op, no duplicate webhook (RF-04)
+
+    if booking.confirmed_at is None:
+        # ==A hold nobody paid for is being abandoned.== It was never announced, so its cancellation
+        # is not announced either — you cannot retract an appointment nobody was ever told about.
+        # Free the slot (that part of a cancel is real: ``status <> 'cancelled'`` reopens it), and
+        # STOP. No ``booking.cancelled`` webhook, no ``apply_booking_transition(CANCEL)`` (which
+        # would try to materialise the ``on_cancel`` workflow), and no iCal SEQUENCE bump for an
+        # event that never existed.
+        #
+        # The funnels would suppress every one of those effects anyway (``confirmed_at`` is NULL) —
+        # this is the root-cause short-circuit that never builds the announcement at all, rather
+        # rather than building it and relying on the belt to throw it away. The guard keys on
+        # ``confirmed_at``, never on ``status``: a CONFIRMED booking being cancelled reads
+        # ``cancelled`` too and its guest is owed the notice (that path is below, untouched).
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = now
+        await session.flush()
+        return booking
 
     booking.status = BookingStatus.CANCELLED
     booking.cancelled_at = now
@@ -572,7 +603,7 @@ async def cancel_booking(
     await session.flush()
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.cancelled",
         data=_serialize_booking(booking),
         now=now,
@@ -699,6 +730,15 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         # ``answers`` is COPIED, not aliased: one shared dict would let a later edit of either row
         # rewrite the other's history.
         answers=dict(old.answers),
+        # INHERITED, never re-minted. The successor is the SAME appointment, moved — so it carries
+        # the instant that appointment was first confirmed, and a reschedule does not change that
+        # fact. Re-stamping it with ``now`` would forge a new confirmation; leaving it NULL would be
+        # far worse — the belt would treat the moved booking as an unannounced hold and SILENCE it,
+        # so the very email telling the guest their time changed would never be sent.
+        #
+        # A predecessor is always confirmed here (the guard above refuses anything else), so this is
+        # never NULL in practice. It is the same chain B-05b re-points the payment onto.
+        confirmed_at=old.confirmed_at,
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
         # increase (RFC 5545, F1-08); the drained reschedule email snapshots this value.
@@ -726,7 +766,7 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
     await _swap_booking(session, old=old, new=new, now=now, start=start)
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=new,
         event="booking.rescheduled",
         data=_serialize_booking(new),
         now=now,
@@ -819,7 +859,7 @@ async def mark_no_show(
     # appointment — nor inflate the host's no-show rate with a duplicate.
     await enqueue_event(
         session,
-        tenant_id=tenant_id,
+        booking=booking,
         event="booking.no_show",
         data=_serialize_booking(booking),
         now=now,
@@ -1076,8 +1116,7 @@ async def _enqueue_email(  # noqa: PLR0913 - the composer needs the full booking
     minted in-txn, so the links persist atomically with the booking."""
     await enqueue_effect(
         session,
-        tenant_id=booking.tenant_id,
-        booking_id=booking.id,
+        booking=booking,
         effect=OutboxEffect.EMAIL,
         dedupe_key=email_dedupe_key(kind),
         payload={
@@ -1176,8 +1215,7 @@ async def _enqueue_google(
         )
     await enqueue_effect(
         session,
-        tenant_id=booking.tenant_id,
-        booking_id=booking.id,
+        booking=booking,
         effect=OutboxEffect.GOOGLE,
         dedupe_key=google_dedupe_key(operation),
         payload=payload,

@@ -21,17 +21,28 @@ self-hoster could point AetherCal at their own n8n and watch every event vanish 
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.core.model import BookingStatus
+from aethercal.schemas.event_types import EventTypeCreate
 from aethercal.schemas.webhooks import WebhookCreate
 from aethercal.server.crypto import derive_fernet_key
-from aethercal.server.db.models import Tenant, WebhookDelivery
+from aethercal.server.db.models import (
+    Booking,
+    Schedule,
+    Tenant,
+    User,
+    WebhookDelivery,
+)
 from aethercal.server.db.pools import WorkerPools
+from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.webhooks import create_webhook, enqueue_event
 from aethercal.server.webhooks.allowlist import NO_PRIVATE_TARGETS, PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryFailure, backoff_delay, deliver_due
@@ -111,6 +122,47 @@ def _rebinding_resolver(guard_answer: list[str], connect_answer: list[str]) -> R
     return _resolver
 
 
+async def _confirmed_booking(session: AsyncSession, tenant: Tenant) -> Booking:
+    """A REAL appointment for ``tenant``: confirmed, and stamped with when it became so.
+
+    ``enqueue_event`` takes the BOOKING now, not a bare ``tenant_id``, because it has to know
+    whether the appointment was ever confirmed before it tells a subscriber that it exists (B-05a).
+    A fixture that left ``confirmed_at`` NULL would be seeding an unpaid HOLD, the funnel would
+    correctly fan nothing out, and these tests would be asserting on a silence they never meant.
+    """
+    host = (await session.scalars(select(User).where(User.tenant_id == tenant.id))).first()
+    assert host is not None
+    schedule = Schedule(tenant_id=tenant.id, name="Weekly", timezone="UTC", rules={})
+    session.add(schedule)
+    await session.flush()
+    event_type = await create_event_type(
+        session,
+        tenant_id=tenant.id,
+        data=EventTypeCreate(
+            host_id=host.id,
+            schedule_id=schedule.id,
+            slug=f"intro-{uuid.uuid4().hex[:6]}",
+            title="Intro",
+            duration_seconds=1800,
+            max_advance_seconds=60 * 60 * 24 * 30,
+        ),
+    )
+    booking = Booking(
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        start_at=NOW + timedelta(days=1),
+        end_at=NOW + timedelta(days=1, minutes=30),
+        status=BookingStatus.CONFIRMED,
+        confirmed_at=NOW,
+        guest_name="Ada",
+        guest_email="ada@example.com",
+        guest_timezone="UTC",
+    )
+    session.add(booking)
+    await session.flush()
+    return booking
+
+
 async def _seed_one(
     session: AsyncSession,
     tenant_factory: TenantFactory,
@@ -125,9 +177,10 @@ async def _seed_one(
         params=WebhookCreate(url=url, events=["booking.created"], secret=SECRET),
         fernet_key=KEY,
     )
+    booking = await _confirmed_booking(session, tenant)
     deliveries = await enqueue_event(
         session,
-        tenant_id=tenant.id,
+        booking=booking,
         event="booking.created",
         data={"booking_id": "bk_1"},
         now=NOW,

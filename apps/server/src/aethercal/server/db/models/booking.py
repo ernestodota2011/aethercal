@@ -94,6 +94,24 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     rescheduled_from_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("bookings.id", ondelete="SET NULL")
     )
+    # WHEN THIS BOOKING FIRST BECAME ``CONFIRMED`` — and NULL means it never did. This is the switch
+    # the whole outbound belt reads (B-05a): ==a booking that has never been confirmed emits not one
+    # outbound== — no email, no WhatsApp, no SMS, no webhook, and no Google Calendar event (an event
+    # carrying the guest as an attendee makes GOOGLE mail them the invitation, so an unpaid hold
+    # would announce itself).
+    #
+    # ``status`` cannot be that switch, and the reason is exact: a booking cancelled AFTER being
+    # confirmed must still send its cancellation notice, while an expired unpaid HOLD must not — and
+    # both rows read ``cancelled``. Only a stamp of the FIRST confirmation tells them apart. Read it
+    # as a fact about the PAST — "this appointment was announced" — which is the question every
+    # outbound actually has to answer, rather than as a fact about the present.
+    #
+    # Write-once, and never cleared: cancelling does not un-confirm anything. It moves together with
+    # ``status = 'confirmed'``, in the same statement, everywhere — a confirmed booking left without
+    # this stamp is a booking the belt below would SILENCE, with nothing raised anywhere. A
+    # reschedule successor INHERITS its predecessor's stamp (the same appointment, moved), which is
+    # also the chain B-05b hangs the payment on.
+    confirmed_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     cancelled_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     # When the host marked the guest a no-show (RF-25). Only ever set from ``confirmed``, and only
     # after the appointment has ENDED. The booking keeps occupying its slot (see BookingStatus).

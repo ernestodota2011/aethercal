@@ -79,6 +79,8 @@ async def _seed_booking(
             start_at=start,
             end_at=start + timedelta(minutes=30),
             status=BookingStatus.CONFIRMED,
+            # Confirmed ⇒ stamped: after B-05a a confirmed booking always carries when it became so.
+            confirmed_at=start - timedelta(days=1),
             guest_name="Guest",
             guest_email="guest@example.com",
             guest_timezone="UTC",
