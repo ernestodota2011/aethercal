@@ -70,7 +70,7 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.pools import WorkerPools
 from aethercal.server.db.roles import DbRole, assert_engine_role
-from aethercal.server.integrations.stripe import StripeGateway
+from aethercal.server.integrations.money import build_payment_gateways
 from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
@@ -172,9 +172,13 @@ def create_worker_app(settings: Settings) -> FastAPI:
     app = FastAPI(title=f"{settings.app_name} worker", lifespan=lifespan)
     app.state.settings = settings
     app.state.pools = pools
-    # The BYOK payment gateway the REFUND runner calls (B-05b). Eager, so the drain tick built in
-    # lifespan can read it. Its HTTP half is not verified against live Stripe in this cut.
-    app.state.payment_gateway = StripeGateway()
+    # ==The BYOK payment gateways the REFUND runner calls, one PER PROVIDER (B-05b, B-06).== Eager,
+    # so the drain tick built in lifespan can read them. This was a single ``StripeGateway()``, and
+    # the refund runner passed it the intent's provider — which it ignored: a Mercado Pago refund
+    # resolved a Mercado Pago credential, handed it to Stripe's gateway, and died on
+    # ``secrets["secret_key"]`` for ever. The runner now SELECTS by provider. Neither gateway's HTTP
+    # half is verified against a live account in this cut.
+    app.state.payment_gateways = build_payment_gateways()
     app.state.webhook_allowlist = settings.private_target_allowlist()
     warn_if_loopback_is_allowlisted(app.state.webhook_allowlist)
 

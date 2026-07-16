@@ -387,6 +387,77 @@ async def enqueue_cancellation_refunds(
     return count
 
 
+async def _refund_second_charge(  # noqa: PLR0913 - the second charge's identity IS the argument list
+    session: AsyncSession,
+    *,
+    anchor: Payment,
+    tenant_id: uuid.UUID,
+    provider: str,
+    provider_ref: str,
+    amount_cents: int,
+    currency: str,
+) -> ArbiterResult:
+    """Give a SECOND charge under one checkout reference its own row, and refund it (B-06).
+
+    ==The row is not bookkeeping — without it the refund is a silent no-op.== The obvious
+    implementation is to call :func:`enqueue_refund` and stop; it does not work.
+    :func:`make_refund_runner` resolves the payment by ``provider_ref`` and, finding none, logs
+    "nothing to refund" and RETURNS. So a refund queued for a charge that has no row of its own is
+    dutifully drained and never sent, and the guest's money stays with us exactly as if this branch
+    had never been written. Auditing the READER, not just the writer, is what makes that visible.
+
+    The row is created PAID, because the money demonstrably moved (this is a paid event). Its
+    ``checkout_session_id`` is NULL: the anchor belongs to the row that claimed it, and the
+    ``UNIQUE(tenant_id, provider, checkout_session_id)`` would refuse a second row carrying it —
+    while Postgres treats NULLs as distinct, so any number of these may exist. The row's own
+    identity is the ``UNIQUE(tenant_id, provider, provider_ref)``, which is also what makes the
+    INSERT safe to race: a concurrent delivery of the same second charge is absorbed by re-reading,
+    the way :func:`record_checkout_intent` does it.
+
+    The refund is enqueued for THIS charge's reference, so the outbox dedupe keys it apart from any
+    refund of the winning charge — and collapses redeliveries of this one to a single row.
+    """
+    booking = await session.get(Booking, anchor.booking_id)
+    if booking is None:  # pragma: no cover - the FK makes this near-impossible; defensive PARK
+        _logger.info("arbiter: double charge %s points at a missing booking; parking", provider_ref)
+        return ArbiterResult(ArbiterOutcome.PARKED, anchor.booking_id, anchor.id)
+
+    row = Payment(
+        tenant_id=tenant_id,
+        booking_id=anchor.booking_id,
+        provider=provider,
+        provider_ref=provider_ref,
+        checkout_session_id=None,
+        status=PaymentStatus.PAID,
+        amount_cents=amount_cents,
+        currency=currency,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        # A concurrent delivery of this same charge inserted it first. Use THAT row.
+        conflicting = await resolve_payment(
+            session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
+        )
+        if conflicting is None:  # pragma: no cover - the conflict must be re-readable
+            raise
+        row = conflicting
+
+    await enqueue_refund(session, booking=booking, provider=provider, provider_ref=provider_ref)
+    _logger.error(
+        "arbiter ALERT: charge %s is a SECOND payment under checkout reference %s (booking %s is "
+        "confirmed on %s) — recording it and refunding it. Two charges under one checkout "
+        "reference means two provider sessions were minted for one booking",
+        provider_ref,
+        anchor.checkout_session_id,
+        booking.id,
+        anchor.provider_ref,
+    )
+    return ArbiterResult(ArbiterOutcome.REFUNDED_DOUBLE, booking.id, row.id)
+
+
 async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event field; one return per named §4.4 branch
     session: AsyncSession,
     *,
@@ -414,6 +485,7 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
     payment = await resolve_payment(
         session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
     )
+    resolved_by_session = False
     if payment is None and checkout_session_id is not None:
         # ==The creation-time-anchor fallback (finding 1).== The row was created with a NULL intent,
         # so a lookup by ``provider_ref`` misses it — but ``checkout.session.completed`` carries the
@@ -424,6 +496,7 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
             provider=provider,
             checkout_session_id=checkout_session_id,
         )
+        resolved_by_session = payment is not None
     if payment is None:
         # The checkout's commit has not landed (or this is an event for a payment we never created).
         # PARK: the caller keeps the event and a tick retries it. Discarding it would be the worst
@@ -440,6 +513,30 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
         # ==Backfill the intent (finding 1).== We resolved by the session id; record the real charge
         # reference now, so ``payment_intent.succeeded`` (and any refund) then resolves on it.
         payment.provider_ref = provider_ref
+    elif resolved_by_session and payment.provider_ref != provider_ref:
+        # ==A SECOND, DIFFERENT charge under ONE checkout reference (B-06).== Refund it.
+        #
+        # This branch exists because Mercado Pago can produce a shape Stripe cannot. A Stripe
+        # Checkout Session mints exactly one PaymentIntent, so two charges mean two session ids and
+        # two rows, and the ordinary double-payment branch below refunds the loser. Mercado Pago's
+        # payment carries no preference id at all, so the creation-time anchor is an
+        # ``external_reference`` WE choose — and if two preferences are minted for one booking and
+        # both are paid, BOTH payments echo that one reference and resolve HERE, to the same row.
+        #
+        # Without this, the second charge would fall through to the conditional UPDATE, find the
+        # booking already confirmed by THIS row's own payment id, and be read as an idempotent
+        # REPLAY — ==so we would keep a guest's money and log nothing.== It must be checked BEFORE
+        # the REFUNDED guard below, which would swallow it the same way once the first charge had
+        # been refunded.
+        return await _refund_second_charge(
+            session,
+            anchor=payment,
+            tenant_id=tenant_id,
+            provider=provider,
+            provider_ref=provider_ref,
+            amount_cents=amount_cents,
+            currency=currency,
+        )
 
     if payment.status is PaymentStatus.REFUNDED:
         # Already refunded: a paid event arriving now cannot un-refund it. No-op, loudly.
@@ -667,13 +764,27 @@ async def apply_dispute_event(
 # --------------------------------------------------------------------------------------
 
 
-CHECKOUT_SESSION_TTL = timedelta(minutes=31)
-"""The Checkout Session's ``expires_at``. ==Stripe's 30-min MINIMUM + a 1-min BUFFER (finding 2).==
+CHECKOUT_LATENCY_BUFFER = timedelta(minutes=1)
+"""The margin added to a provider's own floor to absorb latency.
 
-Stripe rejects a session whose ``expires_at`` is under 30 minutes in the future. Sending exactly
-``now + 30 min`` is a coin-flip: by the time the request reaches Stripe (network + our own compute
-latency), ``now`` is already in the past and the value can dip below the floor. The buffer absorbs
-that latency, so what Stripe receives is comfortably ≥ 30 minutes."""
+A value computed HERE arrives at the provider a moment later — network plus our own compute — so an
+expiry set to exactly the floor is a coin-flip the provider may reject on arrival. This is the
+absorber, and it is meaningful only ON TOP of a floor: a provider with no floor has nothing to dip
+below, so it needs no room made for it."""
+
+CHECKOUT_SESSION_TTL = timedelta(minutes=31)
+"""How long a guest gets to pay. ==The PRODUCT's window — not any provider's rule (B-06).==
+
+The number was chosen while Stripe was the only provider, and it was chosen to clear Stripe's
+30-minute floor plus :data:`CHECKOUT_LATENCY_BUFFER`. That heritage is why it is 31 and not 45,
+==but it is not a constraint any more: it is a product decision that happens to satisfy Stripe.==
+Mercado Pago documents no minimum at all, and still gets this window, because "how long should a
+guest have to pay?" is a question about guests, not about processors.
+
+==What a provider's own floor DOES constrain is :func:`min_hold_remaining_for_checkout`== — how much
+life a hold must have left before a session can be opened against it. That is where the floor
+belongs, it is declared by the gateway (:attr:`PaymentGateway.checkout_session_floor`), and it is
+the reason a Stripe resume window is minutes wide while a Mercado Pago one is not."""
 
 HOLD_TTL = timedelta(minutes=33)
 """How long an unpaid hold lives before ``EXPIRE_HOLD`` cancels it and frees its slot.
@@ -704,6 +815,20 @@ class PaymentGateway(Protocol):
     """The provider side of the money — ==injected==, so every provider call is a seam, not a
     hard-wired Stripe import. A test passes a spy; production passes the real BYOK adapter."""
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        """The SHORTEST checkout expiry this provider will accept. ==The provider declares it.==
+
+        Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes away. Mercado
+        Pago documents no minimum. That difference used to live in this module as a constant named
+        after Stripe's rule — ==one provider's constraint wearing the shape of the domain==, which
+        is precisely the disease B-06 found in the webhook seam. So the provider states its own
+        floor and the arbiter consumes it.
+
+        ``timedelta(0)`` means "no floor": the session may be as short as the hold has left.
+        """
+        ...
+
     async def create_checkout_session(  # noqa: PLR0913 - the checkout's fields ARE the contract
         self,
         *,
@@ -721,20 +846,54 @@ class PaymentGateway(Protocol):
         ...
 
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
-        """Refund the charge ``provider_ref`` on the business's OWN account (its ``secrets``).
+        """Refund the charge ``provider_ref`` IN FULL, on the business's OWN account (``secrets``).
 
         ==``idempotency_key`` is deterministic (one per charge), so a retry after a crash gets the
         SAME refund, not a second one.== The provider dedupes on it — that is the real guarantee the
-        runner's status re-check cannot give across a lost commit."""
+        runner's status re-check cannot give across a lost commit.
+
+        .. rubric:: ==Two parameters were removed here, and their absence is the fix (B-06)==
+
+        This used to take ``provider`` and ``amount_cents``. Both implementations opened with
+        ``del provider, amount_cents``. ==A parameter that every implementation ignores is a promise
+        the signature makes and the body breaks==, and this one was not harmless:
+
+        * ``provider`` made the signature *look* like the gateway routed on it, so the wiring handed
+          ONE instance-wide ``StripeGateway`` every refund and let it sort them out. It could not:
+          a Mercado Pago refund arrived with a Mercado Pago credential, Stripe's gateway read
+          ``secrets["secret_key"]``, and the runner raised ``KeyError`` and retried for ever — a
+          guest's refund stuck in the outbox with nothing to show for it. The gateway is now
+          SELECTED per provider (``integrations.money.gateway_for``), so the object's identity IS
+          the provider and passing it again would be a chance to disagree with itself;
+        * ``amount_cents`` said "refund this much" while both providers keyed on the charge alone.
+          The product has never issued anything but a FULL refund — ``is_refund_eligible`` returns a
+          boolean, not an amount — and Mercado Pago reads a body carrying an ``amount`` as a PARTIAL
+          refund, so passing it "for completeness" is one careless edit away from silently refunding
+          the wrong sum. When F5 brings partial refunds it can add the parameter back, and it will
+          mean something.
+        """
         ...
+
+
+def min_hold_remaining_for_checkout(gateway: PaymentGateway) -> timedelta:
+    """How much life a hold must have left before a session can be opened against it.
+
+    ==The one place a provider's floor is allowed to matter (B-06).== Two rules must hold at once:
+    the session must never OUTLIVE the hold (else ``EXPIRE_HOLD`` frees a slot that is still
+    payable), and it must clear the provider's own minimum WITH the latency margin (else the
+    provider may reject it on arrival). Below this, no session can satisfy both, and the honest
+    answer is a 409 rather than one the provider refuses or one that strands a slot.
+
+    ==It is per-PROVIDER, and that is the whole point.== For Stripe this is 30 + 1 = 31 minutes, so
+    against a 33-minute hold a checkout can only be resumed in roughly its first two minutes. That
+    window was never a product decision — it is Stripe's floor showing through. Mercado Pago
+    declares no floor, so its answer is one minute (the latency buffer alone) and a Mercado Pago
+    hold stays resumable for nearly its whole life. The narrow window follows the provider that
+    imposes it instead of being charged to every provider alike.
+    """
+    return gateway.checkout_session_floor + CHECKOUT_LATENCY_BUFFER
 
 
 async def enqueue_expire_hold(
@@ -759,7 +918,7 @@ async def enqueue_expire_hold(
 def make_refund_runner(
     *,
     sessionmaker: _Sessionmaker,
-    gateway: PaymentGateway,
+    gateways: Mapping[str, PaymentGateway],
     fernet_keys: Sequence[bytes],
 ) -> OutboxExecutor:
     """Build the REFUND handler the drain dispatches (via ``make_booking_effect_executor``).
@@ -770,6 +929,13 @@ def make_refund_runner(
     re-check==: it re-reads ``payments.status`` and does NOT call the provider if the row is already
     ``refunded``, so the two enqueue paths collapsing to one row (criterion 30) and any re-drain
     both stay effectively-once even if the dedupe ever let two rows through.
+
+    ==Takes a MAP of gateways, not one (B-06).== It used to take a single gateway and pass it the
+    intent's ``provider`` — which the gateway ignored. So a Mercado Pago refund resolved a Mercado
+    Pago credential and handed it to ``StripeGateway``, which read ``secrets["secret_key"]``, raised
+    ``KeyError``, and retried until the attempts ran out: a refund that was queued, drained, and
+    never sent. The provider now SELECTS the gateway, and a provider with no gateway is a loud
+    failure rather than a wrong one.
     """
 
     async def _run(work: OutboxWork, now: datetime) -> None:
@@ -792,6 +958,17 @@ def make_refund_runner(
                 _logger.info("refund runner: payment %s already refunded; no-op", payment.id)
                 return
 
+            # ==The gateway is SELECTED by the intent's provider (B-06).== Refunding a Mercado Pago
+            # charge through Stripe's gateway is not a degraded mode; it is a refund that never
+            # happens. A provider with no gateway raises rather than reaching for whichever one
+            # happens to be at hand.
+            gateway = gateways.get(provider)
+            if gateway is None:
+                raise LookupError(
+                    f"no payment gateway for provider {provider!r}, so the refund of "
+                    f"{provider_ref} cannot be sent. The refund intent stays queued; this is a "
+                    "wiring failure, not a transient one."
+                )
             credential = await resolve_money_credential(
                 session,
                 tenant_id=work.tenant_id,
@@ -802,12 +979,11 @@ def make_refund_runner(
             # FIRST line: it does not survive a crash BETWEEN the provider refund and the
             # ``status = refunded`` commit — the next drain re-runs this with the row still paid.
             # So the refund carries a DETERMINISTIC key (stable across retries, one per charge), and
-            # the provider (Stripe) returns the SAME refund for a repeated key rather than a second
-            # one. The money moves once even if this code runs twice.
+            # the provider returns the SAME refund for a repeated key rather than a second one (both
+            # Stripe and Mercado Pago document this). The money moves once even if this code runs
+            # twice.
             await gateway.refund(
-                provider=provider,
                 provider_ref=provider_ref,
-                amount_cents=payment.amount_cents,
                 idempotency_key=refund_dedupe_key(provider_ref),
                 secrets=credential.secrets,
             )
@@ -857,33 +1033,33 @@ def make_expire_hold_runner(*, sessionmaker: _Sessionmaker) -> OutboxExecutor:
 def build_money_runners(
     *,
     exec_maker: _Sessionmaker,
-    gateway: PaymentGateway | None,
+    gateways: Mapping[str, PaymentGateway] | None,
     fernet_keys: Sequence[bytes] | None,
 ) -> tuple[OutboxExecutor | None, OutboxExecutor]:
     """The drain's two money runners, ==FAIL-CLOSED (finding 2)==.
 
-    Returns ``(refund_runner, expire_hold_runner)``. The REFUND runner needs BOTH the BYOK gateway
+    Returns ``(refund_runner, expire_hold_runner)``. The REFUND runner needs BOTH the BYOK gateways
     (to move the money) and the rotation keys (to decrypt the credential) — so if EITHER is missing
-    it is ``None``, and a REFUND intent then raises loudly at dispatch (the executor
+    or empty it is ``None``, and a REFUND intent then raises loudly at dispatch (the executor
     turns a ``None`` refund runner into a hard error) rather than crashing on a missing app-state
     attribute or decrypting with a ``None`` key. ==EXPIRE_HOLD needs neither== (one conditional
     UPDATE, no external I/O), so it is always built.
 
     This exists so the wiring the worker's drain tick does — reading ``fernet_keys`` and
-    ``payment_gateway`` off app state — is a TESTED, defensive function instead of a bare
+    ``payment_gateways`` off app state — is a TESTED, defensive function instead of a bare
     attribute read inside a ``# pragma: no cover`` closure.
     """
     expire_hold_runner = make_expire_hold_runner(sessionmaker=exec_maker)
-    if gateway is None or not fernet_keys:
+    if not gateways or not fernet_keys:
         _logger.warning(
-            "money runners: REFUND runner NOT built (gateway=%s, fernet_keys=%s) — a REFUND intent "
-            "will fail loudly rather than run without a provider or a decryption key",
-            "present" if gateway is not None else "MISSING",
+            "money runners: REFUND runner NOT built (gateways=%s, fernet_keys=%s) — a REFUND "
+            "intent will fail loudly rather than run without a provider or a decryption key",
+            "present" if gateways else "MISSING",
             "present" if fernet_keys else "MISSING",
         )
         return None, expire_hold_runner
     refund_runner = make_refund_runner(
-        sessionmaker=exec_maker, gateway=gateway, fernet_keys=fernet_keys
+        sessionmaker=exec_maker, gateways=gateways, fernet_keys=fernet_keys
     )
     return refund_runner, expire_hold_runner
 
@@ -1041,6 +1217,7 @@ async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's
 
 
 __all__ = [
+    "CHECKOUT_LATENCY_BUFFER",
     "CHECKOUT_SESSION_TTL",
     "DEFAULT_PARKED_MAX_ATTEMPTS",
     "HOLD_TTL",
@@ -1061,6 +1238,7 @@ __all__ = [
     "is_refund_eligible",
     "make_expire_hold_runner",
     "make_refund_runner",
+    "min_hold_remaining_for_checkout",
     "record_checkout_intent",
     "resolve_payment",
     "resolve_payment_by_checkout_session",

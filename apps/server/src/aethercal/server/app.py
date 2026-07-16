@@ -47,12 +47,11 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.roles import DbRole, assert_engine_role
 from aethercal.server.integrations.messaging.guard import PhoneChannelSender
-from aethercal.server.integrations.money import build_webhook_adapters
+from aethercal.server.integrations.money import build_payment_gateways, build_webhook_adapters
 from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
-from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.integrations.turnstile import CloudflareTurnstile
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
@@ -219,15 +218,14 @@ def create_app(settings: Settings) -> FastAPI:
     # verified a real Mercado Pago notification. ``build_webhook_adapters`` is exhaustive over the
     # enum, so a provider cannot be advertised without an adapter that can actually verify it.
     app.state.webhook_adapters = build_webhook_adapters()
-    # ==ONE gateway for the whole instance, and it is Stripe's.== So is ``api/public.py``'s
-    # hardcoded ``CredentialProvider.STRIPE``. A business whose only money credential is Mercado
-    # Pago therefore cannot be charged, even though its adapter now exists and its webhooks would
-    # verify: WHICH provider a business charges with is a product decision that B-06 deliberately
-    # did not invent. See ``integrations/money.gateway_for`` and the B-06 findings. The gateway's
-    # HTTP half is NOT verified against live Stripe in this cut (see integrations/stripe) — a test
-    # injects a fake; a paid booking on an instance with no gateway answers 503, and a free booking
-    # is unaffected.
-    app.state.payment_gateway = StripeGateway()
+    # ==A gateway PER provider (B-06).== This was one instance-wide ``StripeGateway()``, so a
+    # business whose only money credential was Mercado Pago could not be charged at all. Which
+    # provider a business charges with is now DERIVED from the money credential it configured
+    # (``resolve_tenant_money_provider``), and this map turns that answer into the object that can
+    # talk to it. Neither gateway's HTTP half is verified against a live account in this cut (see
+    # integrations/stripe, integrations/mercadopago) — a test injects a fake; a paid booking on an
+    # instance with no gateway answers 503, and a free booking is unaffected.
+    app.state.payment_gateways = build_payment_gateways()
 
     # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
     #

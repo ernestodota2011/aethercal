@@ -82,13 +82,16 @@ from aethercal.server.services.payments import (
     CheckoutSession,
     PaymentGateway,
     enqueue_expire_hold,
+    min_hold_remaining_for_checkout,
     record_checkout_intent,
 )
 from aethercal.server.services.slots import compute_slots
 from aethercal.server.services.tenant_credentials import (
+    AmbiguousMoneyProviderError,
     CredentialProvider,
     MissingCredentialError,
     resolve_money_credential,
+    resolve_tenant_money_provider,
 )
 from aethercal.server.services.tenant_resolution import tenant_by_slug
 from aethercal.server.services.workflow_rules import PhoneChannelScope, phone_channel_scope
@@ -106,14 +109,6 @@ TokenQuery = Annotated[str | None, Query(description="Signed guest token authori
 # The resume token outlives the hold by a small margin, so the HOLD (not the token) is always what
 # gates a resume — an expired hold is a clean 409, never a confusing token failure (r5).
 _CHECKOUT_TOKEN_TTL = HOLD_TTL + timedelta(minutes=5)
-
-# ==The hold must have room for a FULL-MARGIN session, or there is no session to open (r7).==
-# ``CHECKOUT_SESSION_TTL`` already encodes Stripe's 30-minute floor PLUS the latency buffer that
-# keeps the value Stripe receives comfortably above it. Requiring the hold to have at least that
-# much life left means every session we open carries the whole margin AND expires inside the hold.
-# Below it, any session would either be under-margined (Stripe may reject it on arrival) or outlive
-# the hold (the guest pays for a slot ``EXPIRE_HOLD`` already freed). Both are refused with a 409.
-_MIN_HOLD_REMAINING_FOR_CHECKOUT = CHECKOUT_SESSION_TTL
 
 _NOT_FOUND = "not_found"
 _CAPTCHA_REQUIRED = "captcha_required"
@@ -457,12 +452,16 @@ async def resume_paid_checkout(
     now = _now()
     _require_resumable_hold(booking, now=now)
 
-    gateway = _resolve_gateway(request)
-    secrets = await _resolve_business_secrets(session, request, tenant_id=tenant_id)
+    provider = await _resolve_money_provider(session, tenant_id=tenant_id)
+    gateway = _resolve_gateway(request, provider)
+    secrets = await _resolve_business_secrets(
+        session, request, tenant_id=tenant_id, provider=provider
+    )
     checkout_url = await _open_checkout_and_record(
         session,
         request=request,
         gateway=gateway,
+        provider=provider,
         booking=booking,
         tenant_id=tenant_id,
         price_cents=price_cents,
@@ -525,10 +524,14 @@ async def _start_paid_booking(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"error": "misconfigured", "message": "This service is not configured for pay"},
         )
-    # Resolve the gateway + the BYOK secret BEFORE the hold: a business that cannot charge (no
-    # provider, or no credential) never opens a hold at all (fail-closed, no orphan).
-    gateway = _resolve_gateway(request)
-    secrets = await _resolve_business_secrets(session, request, tenant_id=event_type.tenant_id)
+    # Resolve the PROVIDER, its gateway and the BYOK secret BEFORE the hold: a business that cannot
+    # charge (none configured, two configured, no gateway) never opens a hold at all (fail-closed,
+    # no orphan).
+    provider = await _resolve_money_provider(session, tenant_id=event_type.tenant_id)
+    gateway = _resolve_gateway(request, provider)
+    secrets = await _resolve_business_secrets(
+        session, request, tenant_id=event_type.tenant_id, provider=provider
+    )
 
     # ONE clock for the whole flow: the hold's TTL and the checkout's expiry are both measured from
     # this instant, so their ordering (hold OUTLIVES session — finding 2) is guaranteed by the
@@ -567,6 +570,7 @@ async def _start_paid_booking(
         session,
         request=request,
         gateway=gateway,
+        provider=provider,
         booking=booking,
         tenant_id=event_type.tenant_id,
         price_cents=price_cents,
@@ -581,9 +585,19 @@ async def _start_paid_booking(
     )
 
 
-def _resolve_gateway(request: Request) -> PaymentGateway:
-    """The configured payment gateway, or a 503. Shared by the create and resume paths."""
-    gateway: PaymentGateway | None = getattr(request.app.state, "payment_gateway", None)
+def _resolve_gateway(request: Request, provider: CredentialProvider) -> PaymentGateway:
+    """The gateway for THIS business's provider, or a 503. Shared by the create and resume paths.
+
+    ==Selected by the provider, not by the instance (B-06).== This used to read one instance-wide
+    ``payment_gateway``, which was Stripe's — so a business whose only money credential was Mercado
+    Pago could not be charged at all. The provider comes from
+    :func:`~aethercal.server.services.tenant_credentials.resolve_tenant_money_provider`, derived
+    from the credential the business configured.
+    """
+    gateways: Mapping[str, PaymentGateway] | None = getattr(
+        request.app.state, "payment_gateways", None
+    )
+    gateway = gateways.get(provider.value) if gateways else None
     if gateway is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -592,27 +606,58 @@ def _resolve_gateway(request: Request) -> PaymentGateway:
     return gateway
 
 
+def _payment_unavailable() -> HTTPException:
+    """The ONE public answer for every way a business cannot take money — none configured, two
+    configured. A stranger is owed no detail about how a business is set up."""
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "error": "payment_unavailable",
+            "message": "This service cannot take payment right now",
+        },
+    )
+
+
+async def _resolve_money_provider(
+    session: AsyncSession, *, tenant_id: uuid.UUID
+) -> CredentialProvider:
+    """Which provider this business charges with, or a 402. ==Fail-closed, both ways.==
+
+    ``MissingCredentialError`` (no payment credential) keeps its pre-existing 402.
+    ``AmbiguousMoneyProviderError`` (two configured, and nothing says which) gets the same public
+    answer — from the guest's side "this service cannot take payment right now" is exactly true
+    either way — but it is ALERTED, because unlike the first it is not somebody's pending setup
+    step: it is a misconfiguration that needs a human and will not resolve itself.
+    """
+    try:
+        return await resolve_tenant_money_provider(session, tenant_id=tenant_id)
+    except AmbiguousMoneyProviderError as exc:
+        _logger.error(
+            "ALERT: business %s has more than one payment credential, so no checkout can be opened "
+            "for it — nothing says which account its guests should pay into: %s",
+            tenant_id,
+            exc,
+        )
+        raise _payment_unavailable() from exc
+    except MissingCredentialError as exc:
+        raise _payment_unavailable() from exc
+
+
 async def _resolve_business_secrets(
-    session: AsyncSession, request: Request, *, tenant_id: uuid.UUID
+    session: AsyncSession, request: Request, *, tenant_id: uuid.UUID, provider: CredentialProvider
 ) -> Mapping[str, str]:
-    """The business's OWN Stripe secrets (BYOK), or a 402. ==Fail-closed== — a business with no
-    credential can never fall back to the instance operator's account (criterion 41)."""
+    """The business's OWN secrets for ``provider`` (BYOK), or a 402. ==Fail-closed== — a business
+    with no credential can never fall back to the instance operator's account (criterion 41)."""
     fernet_keys = request.app.state.fernet_keys
     try:
         credential = await resolve_money_credential(
             session,
             tenant_id=tenant_id,
-            provider=CredentialProvider.STRIPE,
+            provider=provider,
             fernet_key=fernet_keys,
         )
     except MissingCredentialError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "error": "payment_unavailable",
-                "message": "This service cannot take payment right now",
-            },
-        ) from exc
+        raise _payment_unavailable() from exc
     return credential.secrets
 
 
@@ -621,6 +666,7 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     *,
     request: Request,
     gateway: PaymentGateway,
+    provider: CredentialProvider,
     booking: Booking,
     tenant_id: uuid.UUID,
     price_cents: int,
@@ -638,7 +684,7 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     delegated to :func:`record_checkout_intent`, which is TOCTOU-safe (r4 finding 1): two concurrent
     resumes of one hold both open the SAME session and both try to record it, and the loser absorbs
     the UNIQUE conflict instead of handing the caller an ``IntegrityError``."""
-    expires_at = _checkout_expires_at(booking, now=now)
+    expires_at = _checkout_expires_at(booking, now=now, gateway=gateway)
     try:
         checkout: CheckoutSession = await gateway.create_checkout_session(
             idempotency_key=str(booking.id),
@@ -664,7 +710,11 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
         session,
         tenant_id=tenant_id,
         booking_id=booking.id,
-        provider=CredentialProvider.STRIPE.value,
+        # ==The provider the business actually charges with (B-06)==, not a hardcoded "stripe".
+        # This string is what the inbound webhook route matches on and what the refund intent
+        # carries to pick its gateway — writing the wrong one here would make a real Mercado Pago
+        # payment unresolvable and its refund unroutable.
+        provider=provider.value,
         checkout_session_id=checkout.checkout_session_id,
         amount_cents=price_cents,
         currency=currency,
@@ -672,40 +722,46 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     return checkout.checkout_url
 
 
-def _checkout_expires_at(booking: Booking, *, now: datetime) -> datetime:
-    """The Stripe Checkout Session ``expires_at``: ==full margin, and never outliving the hold.==
+def _checkout_expires_at(booking: Booking, *, now: datetime, gateway: PaymentGateway) -> datetime:
+    """The checkout's ``expires_at``: ==full margin, and never outliving the hold.==
 
     Two hard rules, and when they cannot BOTH hold there is no session to open:
 
     * **it must never OUTLIVE the hold** (r6) — if it did, ``EXPIRE_HOLD`` could free the slot while
       the session was still payable, and the guest would pay for a slot already given away (a charge
       to capture and immediately refund);
-    * **it must carry the FULL latency margin** (r7) — ``CHECKOUT_SESSION_TTL`` is Stripe's 30-min
-      floor PLUS a buffer, because a value computed here can arrive at Stripe a moment later and a
-      thin margin is one that Stripe may reject on arrival. Shipping a session with less margin than
-      the create path deliberately chose is the same latency bug in a new place.
+    * **it must clear the PROVIDER's own floor with the latency margin** (r7) — a value computed
+      here arrives at the provider a moment later, so a thin margin is one the provider may reject
+      on arrival. Shipping a session with less margin than the create path deliberately chose is
+      the same latency bug in a new place.
 
-    So the hold must have at least ``_MIN_HOLD_REMAINING_FOR_CHECKOUT`` of life left, else 409; and
-    the expiry is capped to the hold's deadline (which, given that floor, is always the standard TTL
-    — the cap is kept as the STRUCTURAL guarantee of rule one, independent of the threshold).
+    So the hold must have at least :func:`min_hold_remaining_for_checkout` of life left, else 409;
+    and the expiry is capped to the hold's deadline — the cap is the STRUCTURAL guarantee of rule
+    one, independent of the threshold.
 
-    .. rubric:: The resume window is short, and that is Stripe's floor speaking
+    .. rubric:: ==The threshold is the PROVIDER's, and it is no longer everyone's (B-06)==
 
-    A fresh hold is ``HOLD_TTL`` (33 min) and a session needs ~31 of them, so a resume is only
-    possible in roughly the first two minutes. That covers the case this endpoint exists for — the
-    checkout call failed, the page got a 502, and it retries within seconds — and every later try
-    gets an honest 409 instead of a session Stripe would reject or that would outlive the hold. The
-    only clean way to widen it is a product decision this module must not make on its own: a longer
-    ``HOLD_TTL`` (slots held longer for everyone, including abandoned holds), or re-arming the hold
-    on resume — which needs the ``EXPIRE_HOLD`` intent RE-TIMED, machinery ``enqueue_effect`` does
-    not have today (it silently no-ops on a dedupe conflict) and which would also need a cap so a
-    guest cannot hold a slot for ever by resuming.
+    It used to be ``CHECKOUT_SESSION_TTL`` — 31 minutes — for every provider, because that constant
+    encoded *Stripe's* 30-minute floor plus the buffer. Against a 33-minute hold that leaves a
+    resume window roughly two minutes wide, which is the case this endpoint exists for (the checkout
+    failed, the page got a 502, it retries within seconds) and no more.
+
+    ==That narrow window is Stripe's floor speaking, and Mercado Pago never had it.== Mercado Pago
+    documents no minimum expiry, so its threshold is the latency buffer alone and its holds stay
+    resumable for nearly their whole life. The provider that imposes the constraint now carries it,
+    instead of it being charged to every provider alike.
+
+    Widening the window *for Stripe* is still a product decision this module must not make alone:
+    a longer ``HOLD_TTL`` (slots held longer for everyone, including abandoned holds), or re-
+    arming the hold on resume — which needs the ``EXPIRE_HOLD`` intent RE-TIMED, machinery
+    ``enqueue_effect`` does not have today (it silently no-ops on a dedupe conflict) and which
+    would also need a cap so a guest cannot hold a slot for ever by resuming.
     """
     hold_deadline = booking.hold_expires_at
     assert hold_deadline is not None  # a paid hold always has one (create_booking with hold_ttl)
     hold_deadline = as_utc(hold_deadline)
     now = as_utc(now)
-    if hold_deadline - now < _MIN_HOLD_REMAINING_FOR_CHECKOUT:
+    if hold_deadline - now < min_hold_remaining_for_checkout(gateway):
         raise _conflict("This hold is about to expire; please book again")
     return min(now + CHECKOUT_SESSION_TTL, hold_deadline)
 

@@ -69,18 +69,10 @@ def webhook_adapter_for(provider: CredentialProvider) -> PaymentWebhookAdapter:
 def gateway_for(provider: CredentialProvider) -> PaymentGateway:
     """The outgoing gateway for one money provider. ==Exhaustive, for the same reason.==
 
-    .. warning::
-
-       ==Nothing routes on this yet, and that is a DECLARED B-06 finding, not an oversight.==
-       ``app.state.payment_gateway`` is a single ``StripeGateway()`` for the whole instance, and
-       ``api/public.py`` hardcodes ``CredentialProvider.STRIPE`` when it resolves the business's
-       secrets and when it records the payment row. So a business whose only money credential is
-       Mercado Pago cannot currently be charged at all, and the refund runner would hand a Mercado
-       Pago credential to ``StripeGateway`` (which ignores the ``provider`` argument it is given).
-
-       Which provider a business CHARGES with is a product decision — it is not this module's to
-       invent. This function is the piece that decision will need, and it is exhaustive so that the
-       cut which makes it cannot silently omit a provider.
+    WHICH provider a business charges with is decided by
+    :func:`~aethercal.server.services.tenant_credentials.resolve_tenant_money_provider` — derived
+    from the money credential the business configured, never defaulted. This turns that answer into
+    the object that can actually talk to it.
     """
     match provider:
         case CredentialProvider.STRIPE:
@@ -124,8 +116,22 @@ def build_webhook_adapters() -> dict[str, PaymentWebhookAdapter]:
     return {provider.value: webhook_adapter_for(provider) for provider in money_providers()}
 
 
+def build_payment_gateways() -> dict[str, PaymentGateway]:
+    """The provider→gateway map the checkout and the REFUND runner look up.
+
+    Keyed by the stored provider value — the same string ``payments.provider`` holds and the refund
+    intent's payload carries — so the runner can route a refund to the gateway that can actually
+    perform it. ==That routing is the fix for a real defect==: with one instance-wide
+    ``StripeGateway``, a Mercado Pago refund resolved the business's Mercado Pago credential and
+    handed it to Stripe's gateway, which read ``secrets["secret_key"]``, raised ``KeyError`` and
+    retried for ever. Built from :func:`money_providers`, so a provider cannot be left unroutable.
+    """
+    return {provider.value: gateway_for(provider) for provider in money_providers()}
+
+
 __all__ = [
     "NotAMoneyProviderError",
+    "build_payment_gateways",
     "build_webhook_adapters",
     "gateway_for",
     "money_providers",

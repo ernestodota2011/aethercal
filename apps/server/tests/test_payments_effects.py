@@ -47,22 +47,20 @@ class _GatewaySpy:
     """
 
     def __init__(self) -> None:
-        self.refunds: list[tuple[str, str, int]] = []
+        self.refunds: list[str] = []
         self.keys: list[str] = []
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        return timedelta(minutes=30)
+
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
         # The BYOK secret must be the BUSINESS's own, never the instance's.
         assert secrets.get("secret_key", "").startswith("sk_test_")
         self.keys.append(idempotency_key)
-        self.refunds.append((provider, provider_ref, amount_cents))
+        self.refunds.append(provider_ref)
 
     @property
     def calls(self) -> int:
@@ -163,10 +161,15 @@ async def test_the_refund_runner_refunds_on_the_business_account_and_marks_refun
         booking_id, payment_id = booking.id, payment.id
 
     gateway = _GatewaySpy()
-    runner = make_refund_runner(sessionmaker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY])
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[_KEY]
+    )
     await runner(_refund_work(tenant_id, booking_id), NOW)
 
-    assert gateway.refunds == [("stripe", _REF, 5000)]
+    # ==The charge alone.== The gateway is no longer TOLD its provider or the amount: it is SELECTED
+    # by the intent's provider (the map key), and it only ever refunds in full. Both parameters used
+    # to be passed and immediately discarded by every implementation — see PaymentGateway.refund.
+    assert gateway.refunds == [_REF]
     async with sqlite_maker() as s:
         refreshed = await s.get(Payment, payment_id)
         assert refreshed is not None
@@ -196,7 +199,9 @@ async def test_the_refund_runner_is_idempotent_on_an_already_refunded_payment(
         booking_id = booking.id
 
     gateway = _GatewaySpy()
-    runner = make_refund_runner(sessionmaker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY])
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[_KEY]
+    )
     await runner(_refund_work(tenant_id, booking_id), NOW)
 
     assert gateway.refunds == [], "an already-refunded payment must not be refunded again"
@@ -225,7 +230,9 @@ async def test_the_refund_runner_is_fail_closed_without_a_business_credential(
         booking_id = booking.id
 
     gateway = _GatewaySpy()
-    runner = make_refund_runner(sessionmaker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY])
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[_KEY]
+    )
     with pytest.raises(MissingCredentialError):
         await runner(_refund_work(tenant_id, booking_id), NOW)
     assert gateway.refunds == [], "no charge is refunded without the business's own account"
@@ -263,7 +270,9 @@ async def test_the_refund_is_provider_idempotent_across_a_lost_commit(
         )
 
     gateway = _GatewaySpy()
-    runner = make_refund_runner(sessionmaker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY])
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[_KEY]
+    )
 
     # First run: the provider refunds, and the runner marks the payment refunded (committed).
     await runner(_refund_work(tenant_id, booking_id), NOW)
@@ -335,25 +344,158 @@ def test_the_money_runners_are_fail_closed_without_keys_or_gateway(
 
     # Both present → the refund runner is wired.
     refund, expire = build_money_runners(
-        exec_maker=sqlite_maker, gateway=gateway, fernet_keys=[_KEY]
+        exec_maker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[_KEY]
     )
     assert refund is not None
     assert expire is not None
 
     # No rotation keys → no refund runner (fail-closed), but EXPIRE_HOLD still runs.
     refund_no_keys, expire_no_keys = build_money_runners(
-        exec_maker=sqlite_maker, gateway=gateway, fernet_keys=None
+        exec_maker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=None
     )
     assert refund_no_keys is None
     assert expire_no_keys is not None
 
     # Empty key tuple is also fail-closed.
-    refund_empty, _ = build_money_runners(exec_maker=sqlite_maker, gateway=gateway, fernet_keys=[])
+    refund_empty, _ = build_money_runners(
+        exec_maker=sqlite_maker, gateways={"stripe": gateway}, fernet_keys=[]
+    )
     assert refund_empty is None
 
     # No gateway → no refund runner.
     refund_no_gw, expire_no_gw = build_money_runners(
-        exec_maker=sqlite_maker, gateway=None, fernet_keys=[_KEY]
+        exec_maker=sqlite_maker, gateways=None, fernet_keys=[_KEY]
     )
     assert refund_no_gw is None
     assert expire_no_gw is not None
+
+
+# --------------------------------------------------------------------------------------
+# ==The refund runner ROUTES by the intent's provider== (B-06).
+# --------------------------------------------------------------------------------------
+
+
+class _MercadoPagoGatewaySpy:
+    """A Mercado Pago gateway. ==Its secret is an ``access_token``, and it has no ``secret_key``.==
+
+    That asymmetry is the whole defect being regressed: hand this business's credential to Stripe's
+    gateway and it reads ``secrets["secret_key"]`` and raises ``KeyError``.
+    """
+
+    def __init__(self) -> None:
+        self.refunds: list[str] = []
+
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        return timedelta(0)
+
+    async def refund(
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
+    ) -> None:
+        assert "secret_key" not in secrets, "a Mercado Pago credential has no Stripe key in it"
+        assert secrets["access_token"].startswith("TEST-")
+        self.refunds.append(provider_ref)
+
+    async def create_checkout_session(
+        self, **_: object
+    ) -> object:  # pragma: no cover - unused here
+        raise AssertionError("checkout is not part of the drain")
+
+
+async def _mercado_pago_credential(session: AsyncSession, tenant_id: uuid.UUID) -> None:
+    await store_credential(
+        session,
+        tenant_id=tenant_id,
+        provider=CredentialProvider.MERCADO_PAGO,
+        secrets={"access_token": "TEST-NOT-A-REAL-TOKEN", "webhook_secret": "mp_whsec_x"},
+        fernet_key=_KEY,
+    )
+
+
+def _mercado_pago_refund_work(tenant_id: uuid.UUID, booking_id: uuid.UUID) -> OutboxWork:
+    return OutboxWork(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        booking_id=booking_id,
+        effect=OutboxEffect.REFUND,
+        dedupe_key=refund_dedupe_key("mp_1"),
+        payload={"provider": "mercado_pago", "provider_ref": "mp_1"},
+        attempts=0,
+        claimed_by="worker-1",
+    )
+
+
+async def test_the_refund_runner_routes_to_the_gateway_for_the_intents_provider(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The B-06 routing defect, closed.==
+
+    The runner used to take ONE gateway and pass it the intent's ``provider`` — which every gateway
+    ignored (``del provider``). So a Mercado Pago refund resolved the business's Mercado Pago
+    credential, handed it to ``StripeGateway``, and died on ``secrets["secret_key"]`` with a
+    ``KeyError``, retrying until the attempts ran out: a refund queued, drained, and never sent.
+
+    The provider now SELECTS the gateway. Stripe's is present here and must NOT be touched.
+    """
+    async with sqlite_maker() as s, s.begin():
+        tenant_id = await _tenant(s)
+        booking = await _booking(s, tenant_id, status=BookingStatus.CANCELLED)
+        s.add(
+            Payment(
+                tenant_id=tenant_id,
+                booking_id=booking.id,
+                provider="mercado_pago",
+                provider_ref="mp_1",
+                status=PaymentStatus.PAID,
+                amount_cents=5000,
+                currency="usd",
+            )
+        )
+        await _mercado_pago_credential(s, tenant_id)
+        booking_id = booking.id
+
+    stripe_gateway = _GatewaySpy()
+    mp_gateway = _MercadoPagoGatewaySpy()
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker,
+        gateways={"stripe": stripe_gateway, "mercado_pago": mp_gateway},
+        fernet_keys=[_KEY],
+    )
+
+    await runner(_mercado_pago_refund_work(tenant_id, booking_id), NOW)
+
+    assert mp_gateway.refunds == ["mp_1"], "the Mercado Pago charge went to Mercado Pago"
+    assert stripe_gateway.refunds == [], "Stripe was not asked to refund another provider's charge"
+
+
+async def test_a_refund_for_a_provider_with_no_gateway_fails_loudly(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Fail-closed, not fail-wrong.== A provider with no gateway raises, so the intent stays
+    queued and a human sees it — rather than reaching for whichever gateway happens to be at hand
+    and refunding a charge through an account that never took it."""
+    async with sqlite_maker() as s, s.begin():
+        tenant_id = await _tenant(s)
+        booking = await _booking(s, tenant_id, status=BookingStatus.CANCELLED)
+        s.add(
+            Payment(
+                tenant_id=tenant_id,
+                booking_id=booking.id,
+                provider="mercado_pago",
+                provider_ref="mp_1",
+                status=PaymentStatus.PAID,
+                amount_cents=5000,
+                currency="usd",
+            )
+        )
+        await _mercado_pago_credential(s, tenant_id)
+        booking_id = booking.id
+
+    stripe_only = _GatewaySpy()
+    runner = make_refund_runner(
+        sessionmaker=sqlite_maker, gateways={"stripe": stripe_only}, fernet_keys=[_KEY]
+    )
+
+    with pytest.raises(LookupError, match="mercado_pago"):
+        await runner(_mercado_pago_refund_work(tenant_id, booking_id), NOW)
+    assert stripe_only.refunds == [], "the wrong gateway is never a fallback"

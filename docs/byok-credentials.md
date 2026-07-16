@@ -72,36 +72,53 @@ guest's money leaves their card and the booking is never confirmed.
 
 Extra fields (an SMTP port, a publishable key) are kept as given.
 
-### Which payment providers actually work today
+### Which payment provider a business charges with
+
+> [!IMPORTANT]
+> **The credential IS the decision.** There is no flag, no column and no default: whichever payment
+> credential a business has configured is the one its guests pay into.
+
+| Configured | What happens |
+|---|---|
+| none | ❌ **it does not charge** — 402. It never falls back to the instance's account |
+| exactly one (`stripe` **or** `mercado_pago`) | ✅ that provider. The normal case |
+| **both** | ❌ **refused, and named** — 402 to the guest, an alert in the log |
+
+Two payment credentials is a **misconfiguration, not a preference**. Nothing in the system says
+which account the business wants the money in, so the system does not choose: choosing would put a
+guest's money somewhere the business may not have meant, and it would not look like a failure —
+every status code would say success. Delete the one you do not charge with:
+
+```bash
+aethercal-admin credentials delete --tenant-slug acme --provider stripe
+```
+
+If a business genuinely needs both configured at once, that needs a **per-tenant preference field**
+(a column, a migration and an admin control) — a product decision, not a default.
+
+### Neither payment adapter has been verified against a live account
 
 > [!WARNING]
-> **Neither payment adapter has ever run against a live account, and Mercado Pago is not yet
-> reachable at all.** Read this before you configure either one.
+> **Zero real charges have ever been made from this codebase.** Read this before you switch either
+> provider on for real money.
 
-| Provider | Webhooks | Checkout + refund | Verified against a live account? |
-|---|---|---|---|
-| `stripe` | ✅ works | ✅ works | ❌ **no** — written to Stripe's documented test-mode API, covered only by contract tests |
-| `mercado_pago` | ✅ adapter exists and verifies | ⚠️ **not reachable** — see below | ❌ **no** — no Mercado Pago account exists for this project; **zero real charges have ever been made** |
+| Provider | Verified against a live account? |
+|---|---|
+| `stripe` | ❌ **no** — written to Stripe's documented test-mode API, covered only by contract tests |
+| `mercado_pago` | ❌ **no** — no Mercado Pago account exists for this project; built against Mercado Pago's documented API and its official SDKs |
 
-The Mercado Pago **adapter** is complete: its `x-signature` manifest is built exactly as Mercado
-Pago's own SDKs build it, and it derives a payment's meaning by fetching `GET /v1/payments/{id}`
-rather than trusting the notification body (which Mercado Pago does not sign).
+The Mercado Pago adapter builds its `x-signature` manifest exactly as Mercado Pago's own SDKs build
+it, and derives a payment's meaning by fetching `GET /v1/payments/{id}` rather than trusting the
+notification body — which Mercado Pago does not sign.
 
-What is **not** built is provider *selection*. The checkout path hardcodes Stripe
-(`api/public.py` resolves `CredentialProvider.STRIPE` and records the payment row as `stripe`), and
-the instance holds a single `StripeGateway`. So **configuring a `mercado_pago` credential today does
-not make a business charge with Mercado Pago** — the booking flow will still ask Stripe, and a
-business with only a Mercado Pago credential gets a 402. Which provider a business charges with is a
-product decision that has not been made yet.
+It also **refuses a currency whose minor unit it cannot prove** (CLP, COP, and anything outside
+`ARS/BRL/MXN/PEN/USD/UYU`). The product carries money as `amount_cents`; Mercado Pago wants a decimal
+`unit_price`, and that conversion is a 100× error in a currency with no minor unit. The canonical
+table (`GET /currencies`) needs an account to read, so the adapter refuses rather than guesses.
 
-Mercado Pago also **refuses a currency whose minor unit it cannot prove** (CLP, COP and anything
-else outside `ARS/BRL/MXN/PEN/USD/UYU`). The product carries money as `amount_cents`; Mercado Pago
-wants a decimal `unit_price`, and that conversion is a 100× error in a currency with no minor unit.
-The canonical table (`GET /currencies`) needs an account, so the adapter refuses rather than guesses.
-
-Before either adapter is switched on for real money, it needs a run against a real account (test
-mode, zero real charges): the shapes above are documented, not observed. See
-`integrations/mercadopago.py` — "What is NOT proven".
+Before either adapter is trusted with real money it needs a run against a real account (test mode,
+zero real charges): the shapes above are documented, not observed. See `integrations/mercadopago.py`
+— "What is NOT proven".
 
 ---
 

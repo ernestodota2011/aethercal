@@ -393,9 +393,7 @@ async def test_the_refund_is_full_and_carries_a_deterministic_idempotency_key() 
 
     gateway = MercadoPagoGateway(transport=httpx.MockTransport(handler))
     await gateway.refund(
-        provider="mercado_pago",
         provider_ref="123456789",
-        amount_cents=5000,
         idempotency_key="refund:123456789",
         secrets=_SECRETS,
     )
@@ -418,9 +416,7 @@ async def test_a_provider_error_propagates_rather_than_being_swallowed() -> None
     gateway = MercadoPagoGateway(transport=httpx.MockTransport(handler))
     with pytest.raises(httpx.HTTPStatusError):
         await gateway.refund(
-            provider="mercado_pago",
             provider_ref="123456789",
-            amount_cents=5000,
             idempotency_key="refund:123456789",
             secrets=_SECRETS,
         )

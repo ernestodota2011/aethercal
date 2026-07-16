@@ -175,9 +175,7 @@ async def test_the_refund_call_sends_a_deterministic_idempotency_key() -> None:
 
     gateway = StripeGateway(transport=httpx.MockTransport(handler))
     await gateway.refund(
-        provider="stripe",
         provider_ref="pi_X",
-        amount_cents=5000,
         idempotency_key="refund:pi_X",
         secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x"},
     )

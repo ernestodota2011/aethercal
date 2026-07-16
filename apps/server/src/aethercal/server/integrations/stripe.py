@@ -31,7 +31,7 @@ import hmac
 import json
 import logging
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -47,6 +47,9 @@ _logger = logging.getLogger(__name__)
 _STRIPE_SIGNATURE_HEADER = "Stripe-Signature"
 _STRIPE_API_BASE = "https://api.stripe.com/v1"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
+
+_CHECKOUT_SESSION_FLOOR = timedelta(minutes=30)
+"""Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes in the future."""
 
 
 def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
@@ -176,6 +179,17 @@ class StripeGateway:
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        """==Stripe's 30-minute MINIMUM ``expires_at``, declared where it belongs (B-06).==
+
+        Stripe rejects a Checkout Session set to expire under 30 minutes out. This number used to
+        live in ``services/payments`` as a constant documented as "Stripe's floor" — inside the
+        provider-AGNOSTIC arbiter, where it silently charged Mercado Pago for a rule Mercado Pago
+        does not have. The provider that has the rule is the one that states it.
+        """
+        return _CHECKOUT_SESSION_FLOOR
+
     def _client(self, secret_key: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=_STRIPE_API_BASE,
@@ -225,15 +239,14 @@ class StripeGateway:
         return CheckoutSession(checkout_url=str(body["url"]), checkout_session_id=str(body["id"]))
 
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
-        del provider, amount_cents  # a full refund keys on the PaymentIntent alone
+        """Refund the PaymentIntent ``provider_ref`` in full, on the business's own key.
+
+        ==No ``provider`` and no ``amount_cents``.== Both used to be taken and immediately
+        ``del``'d; see :meth:`PaymentGateway.refund` for why an ignored parameter was not harmless
+        here. A full refund keys on the PaymentIntent alone.
+        """
         secret_key = secrets["secret_key"]
         async with self._client(secret_key) as client:
             response = await client.post(

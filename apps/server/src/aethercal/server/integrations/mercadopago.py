@@ -63,7 +63,7 @@ import hmac
 import json
 import logging
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, assert_never
@@ -452,6 +452,22 @@ class MercadoPagoGateway:
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
 
+    @property
+    def checkout_session_floor(self) -> timedelta:
+        """==ZERO. Mercado Pago documents no minimum expiry (B-06).==
+
+        ``expires`` / ``expiration_date_from`` / ``expiration_date_to`` are documented with an ISO
+        8601 format and no floor and no ceiling. So a Mercado Pago preference may be as short-lived
+        as the hold has left, and this returns ``timedelta(0)``.
+
+        ==The consequence is a real improvement, not a technicality.== The 31-minute threshold
+        ``min_hold_remaining_for_checkout`` used to apply to everyone is Stripe's floor plus the
+        latency buffer, and against a 33-minute hold it left a resume window roughly two minutes
+        wide. A Mercado Pago hold is now resumable for nearly its whole life: the only thing between
+        a guest and reopening their checkout is the latency buffer.
+        """
+        return timedelta(0)
+
     def _client(self, access_token: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=_MP_API_BASE,
@@ -547,21 +563,15 @@ class MercadoPagoGateway:
         return CheckoutSession(checkout_url=init_point, checkout_session_id=idempotency_key)
 
     async def refund(
-        self,
-        *,
-        provider: str,
-        provider_ref: str,
-        amount_cents: int,
-        idempotency_key: str,
-        secrets: Mapping[str, str],
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> None:
         """Refund the payment ``provider_ref`` IN FULL, on the business's own token.
 
-        ==``amount_cents`` is deliberately unused== — Mercado Pago reads a body carrying an
-        ``amount`` as a PARTIAL refund, and an EMPTY body as a full one. The product only ever
-        returns the whole charge (``is_refund_eligible`` is a boolean, not an amount), so the body
-        stays empty and the whole charge comes back. Sending ``amount`` "for clarity" would silently
-        convert every refund into a partial one the day a rounding difference crept in.
+        ==There is no ``amount`` in the body, and no ``amount_cents`` in the signature== — Mercado
+        Pago reads a body carrying an ``amount`` as a PARTIAL refund, and an EMPTY body as a full
+        one. The product only ever returns the whole charge (``is_refund_eligible`` is a boolean,
+        not an amount), so the body stays empty and the whole charge comes back. Accepting an amount
+        "for clarity" would be one careless edit away from silently refunding the wrong sum.
 
         ==``X-Idempotency-Key`` is the real guarantee== (the finding-1 class): Mercado Pago
         documents it as MANDATORY on the Refunds API precisely so "a retry cannot create two
@@ -569,7 +579,6 @@ class MercadoPagoGateway:
         refunds". A crash between this call and the runner's commit re-sends the same key and gets
         the same refund back, not a second one.
         """
-        del provider, amount_cents  # a full refund keys on the payment id alone
         access_token = secrets["access_token"]
         async with self._client(access_token) as client:
             response = await client.post(
