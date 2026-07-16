@@ -48,6 +48,7 @@ from aethercal.server.services.outbox import (
     drain_outbox,
     make_booking_effect_executor,
 )
+from aethercal.server.services.tenant_senders import TenantSenders, resolve_tenant_senders
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
 
@@ -404,9 +405,35 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     return _tick
 
 
+async def _resolve_senders_for(
+    app: FastAPI, tenant_id: uuid.UUID
+) -> TenantSenders:  # pragma: no cover - live
+    """Open a short, tenant-bound session and resolve THAT business's senders (B-03bis).
+
+    ==On ``pools.exec_maker``, the APP-role pool, inside the drain's per-item ``tenant_scope``.==
+    Both halves matter: the GUC listener stamps the business onto this transaction, so the
+    credential row is read under RLS with exactly that business bound — and ``_row_for``'s own
+    ``tenant_id`` filter is the second, independent reason another business's row cannot come back.
+
+    The session is opened and closed around the read alone. R8 forbids holding a transaction across
+    the network I/O that follows, and this is a pure read.
+    """
+    pools: WorkerPools = app.state.pools
+    async with pools.exec_maker() as session:
+        return await resolve_tenant_senders(
+            session,
+            tenant_id=tenant_id,
+            # The ROTATION READER — the current key plus the retiring one — so a credential the
+            # rotation has not reached yet still sends throughout the window.
+            fernet_key=app.state.fernet_keys,
+            defaults=app.state.instance_sender_defaults,
+            http_client=app.state.http_client,
+        )
+
+
 def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to the worker's state (pools + SMTP sender + a Fernet-built Google
-    factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+    """Bind an outbox-drain tick to the worker's state (pools + a per-business sender resolver + a
+    Fernet-built Google factory) — the live ``execute`` dispatches each intent to its handler.
 
     ==The executor is built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers
     read the booking, decrypt the business's credential and write the ledger, and every one of those
@@ -414,6 +441,12 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     they see exactly that item's business — which is the whole point of splitting the pools: the one
     place a cross-business leak would be *externally visible* is precisely here, in the process that
     sends the guest's name and address to somebody's webhook.
+
+    ==The senders are RESOLVED PER ITEM, never bound here (B-03bis).== This tick used to hand the
+    executor ``app.state.email_sender`` and ``app.state.channel_senders`` — one SMTP relay and one
+    WhatsApp number, read from the instance's environment at boot and then shared by every business
+    the drain worked through. That is how a business's reminder went out from the operator's number.
+    The executor now takes a resolver and asks it for each item's own business, by name.
     """
 
     async def _tick() -> None:
@@ -424,15 +457,8 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
         service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
         execute = make_booking_effect_executor(
             sessionmaker=pools.exec_maker,
-            sender=app.state.email_sender,
+            resolve_senders=functools.partial(_resolve_senders_for, app),
             service_factory=service_factory,
-            # The non-email channel registry. A step on a channel nobody registered is SKIPPED with
-            # its reason, never failed — a channel without credentials is a disabled feature, not an
-            # error.
-            #
-            # Email is deliberately NOT here: it goes through the full composer, which carries the
-            # .ics invite that a plain-body ChannelSender cannot.
-            channels=getattr(app.state, "channel_senders", None),
         )
         await run_outbox_drain_once(pools=pools, execute=execute)
 

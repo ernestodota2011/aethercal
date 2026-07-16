@@ -64,6 +64,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
     workflow_step_dedupe_key,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.services.workflow_rules import (
     DuplicateNameError,
     DuplicateTemplateError,
@@ -969,7 +970,11 @@ _DUE = _STARTS - timedelta(hours=24)
 async def _drain(
     maker: async_sessionmaker[AsyncSession], sender: _RecordingSender, *, now: datetime
 ) -> OutboxReport:
-    execute = make_booking_effect_executor(sessionmaker=maker, sender=sender, service_factory=None)
+    execute = make_booking_effect_executor(
+        sessionmaker=maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
+    )
     return await drain_outbox(_pools(maker), now=now, execute=execute)
 
 

@@ -64,6 +64,7 @@ from aethercal.server.services.outbox import (
     google_dedupe_key,
     make_booking_effect_executor,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.services.webhooks import WebhookSubject, enqueue_event, event_subject
 from aethercal.server.services.workflow_rules import create_workflow
 
@@ -582,7 +583,9 @@ async def test_the_drainer_re_verifies_and_will_not_send_for_an_unconfirmed_book
 
     sender = _RecordingSender()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     await drain_outbox(_pools(sqlite_maker), now=_BEFORE, execute=execute)
 

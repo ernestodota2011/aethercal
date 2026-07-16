@@ -41,20 +41,16 @@ from aethercal.server.admin.mount import mount_admin
 from aethercal.server.api import API_V1_PREFIX, api_router, public
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.api.ratelimit import PublicRateLimitMiddleware, SlidingWindowLimiter
-from aethercal.server.channels import Channel
 from aethercal.server.db.config import DATABASE_URL_ENV
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.roles import DbRole, assert_engine_role
-from aethercal.server.integrations.messaging.guard import PhoneChannelSender
-from aethercal.server.integrations.sms.config import TwilioConfig
-from aethercal.server.integrations.sms.sender import TwilioSmsSender
-from aethercal.server.integrations.smtp.config import SmtpConfig
-from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
 from aethercal.server.integrations.turnstile import CloudflareTurnstile
-from aethercal.server.integrations.whatsapp.config import EvolutionConfig
-from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import WEBHOOK_HTTP_TIMEOUT_SECONDS
+from aethercal.server.services.tenant_senders import (
+    InstanceSenderDefaults,
+    warn_if_operator_identity_is_lent,
+)
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -69,49 +65,30 @@ async def _handle_authentication_error(request: Request, exc: Exception) -> JSON
     )
 
 
-def build_email_sender(environ: Mapping[str, str] | None = None) -> EmailSender | None:
-    """An :class:`SmtpEmailSender` when SMTP is configured via env, else ``None`` (RF-19).
+def build_instance_sender_defaults(
+    environ: Mapping[str, str] | None = None,
+) -> InstanceSenderDefaults:
+    """The OPERATOR's own sending configuration, read once at the process edge (RF-19).
 
-    Boot never hard-fails on unconfigured SMTP: a missing ``AETHERCAL_SMTP_HOST`` / ``_FROM`` makes
-    :meth:`SmtpConfig.from_env` raise, which we translate to ``None`` — the booking flow then simply
-    skips the transactional email rather than 500-ing."""
-    try:
-        config = SmtpConfig.from_env(environ)
-    except RuntimeError:
-        return None
-    return SmtpEmailSender(config)
+    ==This replaces ``build_email_sender`` / ``build_channel_senders``, and the difference is the
+    whole of B-03bis.== Those two returned *senders*: live clients, built from the instance's
+    environment before any business was known, which the drain then used for everybody — so a
+    business's WhatsApp went out from the operator's number. This returns only the **defaults**:
+    inert configuration. Turning any of it into a sender is the job of
+    :func:`~aethercal.server.services.tenant_senders.resolve_tenant_senders`, which cannot be called
+    without naming a business.
 
+    Both retired functions' boot contracts survive inside :meth:`InstanceSenderDefaults.from_env`,
+    deliberately:
 
-def build_channel_senders(
-    http_client: httpx.AsyncClient, environ: Mapping[str, str] | None = None
-) -> dict[Channel, PhoneChannelSender]:
-    """The registry of PHONE channels (WhatsApp, SMS) this instance is configured for (RF-24).
-
-    ==Unlike :func:`build_email_sender` above, a misconfiguration here is NOT swallowed into
-    ``None``.== That asymmetry is deliberate, and it is the whole safety argument.
-
-    An unconfigured SMTP degrades to "no email goes out" — visible, and harmless. A phone channel
-    has a third state that email does not: **configured to send, but with no ceiling.** Its
-    recipient comes from the public booking form, so an uncapped channel can message strangers on
-    the operator's own WhatsApp/Twilio account, and the only symptom would be the bill plus a spam
-    complaint against a number they cannot get back.
-
-    So a half-configured phone channel (credentials without caps, or half a set of credentials)
-    raises out of ``from_env`` and **fails the boot, loudly**. Entirely unconfigured is still simply
-    off: the channel is absent from this registry, and its workflow steps SKIP with a reason.
+    * **unconfigured SMTP is not a boot failure** — it becomes ``None``, and the transactional email
+      is skipped rather than 500-ing the booking flow;
+    * **a HALF-configured phone channel still fails the boot, loudly.** Its recipient comes from the
+      public booking form, so "sending, but with no ceiling" must never be a state any process can
+      reach — the only symptom would be the bill, plus a spam complaint against a number nobody gets
+      back.
     """
-    environment = os.environ if environ is None else environ
-    senders: dict[Channel, PhoneChannelSender] = {}
-
-    whatsapp = EvolutionConfig.from_env(environment)
-    if whatsapp is not None:
-        senders[Channel.WHATSAPP] = EvolutionWhatsAppSender(whatsapp, http_client)
-
-    sms = TwilioConfig.from_env(environment)
-    if sms is not None:
-        senders[Channel.SMS] = TwilioSmsSender(sms, http_client)
-
-    return senders
+    return InstanceSenderDefaults.from_env(os.environ if environ is None else environ)
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -160,10 +137,22 @@ def create_app(settings: Settings) -> FastAPI:
             # for any request-path consumer that decrypts a stored secret under the window. Writes
             # (create_webhook, store_credential) stay on the current key alone (`fernet_key`).
             app.state.fernet_keys = settings.decryption_fernet_keys()
-            app.state.email_sender = build_email_sender()
-            # A half-configured phone channel RAISES here and fails the boot on purpose — see
-            # build_channel_senders. "Sending, but uncapped" must never be a state this reaches.
-            app.state.channel_senders = build_channel_senders(http_client)
+
+            # ==THE WEB PROCESS BUILDS NO SENDER, and it never needed to (B-03bis).==
+            #
+            # This used to set `app.state.email_sender` and `app.state.channel_senders`. Nothing in
+            # this process ever read either one: the only readers are the drain's tick closures, and
+            # those run in `aethercal-worker`, which builds its own. They were dead objects — an
+            # SMTP client and, where the operator ran one, a live WhatsApp client, constructed on
+            # every web boot and used by nobody.
+            #
+            # What was NOT dead is the side effect: `build_channel_senders` fails the boot on a
+            # half-configured phone channel, and that check is worth keeping in the process an
+            # operator restarts first. So the check stays and the objects go — `from_env` raises
+            # here exactly as before, and what it returns is inert configuration, not a sender.
+            # "Sending, but uncapped" must never be a state any process can reach.
+            defaults = build_instance_sender_defaults()
+            warn_if_operator_identity_is_lent(defaults)
 
             # ==NO SCHEDULER LIVES HERE ANY MORE.== `AETHERCAL_RUN_SCHEDULER=1` does not start one:
             # it fails the boot inside Settings, naming `aethercal-worker`. The flag never separated

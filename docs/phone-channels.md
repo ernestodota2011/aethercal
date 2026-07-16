@@ -61,6 +61,27 @@ this batch**, and you should not plan around it existing.
 
 ---
 
+## Whose number does a business send from?
+
+> [!IMPORTANT]
+> **Its own.** The variables below configure the **operator's** account, and on a multi-business
+> instance that is *not* what a business's reminders go out on.
+>
+> A WhatsApp or Twilio account is an **identity**, not a pipe: there is no per-message `From`, so
+> the number is what the guest sees and replies to. A business sends on the credential it brought
+> (`aethercal-admin credentials set --provider whatsapp`), or that channel is **off for it** and its
+> steps are `skipped` with a reason.
+>
+> On a **single-business self-host** the operator is the business, so
+> `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=true` makes the account below the one it sends from. It is
+> off by default and warned about at boot. See
+> [BYOK](byok-credentials.md#the-rule-and-where-it-is-asymmetric).
+
+The **caps** below are different: they stay the operator's policy, and they bound a business's own
+sender too. The recipient comes from the operator's public form, and that harm does not change owner
+along with the API key. A business that brings a credential to an instance with no caps declared
+keeps the channel off — the worker logs which variables would turn it on.
+
 ## Enabling WhatsApp (Evolution API)
 
 Evolution is self-hostable, so this path is open to a self-hoster with no commercial account.
@@ -73,8 +94,13 @@ AETHERCAL_WHATSAPP_INSTANCE=my-instance
 AETHERCAL_WHATSAPP_API_KEY=…
 
 # Both caps are REQUIRED. The channel refuses to activate with credentials but no caps.
+# These bound EVERY business on the instance, including one sending on its own account.
 AETHERCAL_WHATSAPP_DAILY_CAP_PER_PHONE=3
 AETHERCAL_WHATSAPP_DAILY_CAP_PER_IP=50
+
+# Single-business self-hosts only: lend the account above to a business that brought none.
+# Off by default. On a multi-business instance this messages guests from a number they do not own.
+AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=false
 ```
 
 ## Enabling SMS (Twilio)

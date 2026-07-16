@@ -91,10 +91,11 @@ with per-line comments. The essentials:
 | `AETHERCAL_BOOKING_BASE_URL` | — | Public base for guest cancel/reschedule links |
 | `AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS` | — | Origins allowed to iframe `/embed/*` (the [embeddable widget](../docs/embedding.md)). Blank → `*` (any origin) |
 | `AETHERCAL_BOOKING_TRUSTED_PROXIES` | — | CIDRs of reverse proxies trusted to set `CF-Connecting-IP` for the rate limiter. Blank → use the transport peer address |
-| `AETHERCAL_SMTP_*` | — | Transactional email (absent → email skipped, app still boots) |
+| `AETHERCAL_SMTP_*` | — | Transactional email — the instance **relay**, lent to any business with no SMTP of its own (absent → email skipped, app still boots) |
 | `AETHERCAL_GOOGLE_*` | — | Google Calendar busy-check + Meet (absent → skipped) |
-| `AETHERCAL_WHATSAPP_*` | — | WhatsApp (Evolution API). Off unless set — **read [phone channels](../docs/phone-channels.md) first** |
-| `AETHERCAL_SMS_*` | — | SMS (Twilio). Off unless set — **read [phone channels](../docs/phone-channels.md) first** |
+| `AETHERCAL_WHATSAPP_*` | — | The **operator's** WhatsApp (Evolution API). Off unless set. ⚠️ A business does **not** send from this — it sends from its own credential, or not at all. **Read [phone channels](../docs/phone-channels.md) first** |
+| `AETHERCAL_SMS_*` | — | The **operator's** SMS (Twilio). Same rule as WhatsApp — **read [phone channels](../docs/phone-channels.md) first** |
+| `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY` | `false` | Single-business self-hosts: lend the operator's WhatsApp/SMS account to a business that brought none. Warned at boot when on. Leave off on any multi-business instance ([BYOK](../docs/byok-credentials.md#the-rule-and-where-it-is-asymmetric)) |
 
 Unconfigured SMTP or Google **never** hard-fails boot: those effects degrade gracefully (a booking
 still succeeds, it just skips the email / calendar sync).

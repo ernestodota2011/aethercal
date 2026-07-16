@@ -9,6 +9,37 @@ Every package in the repository shares one version number.
 
 ## [Unreleased]
 
+### Changed
+
+**A business's messages now go out on that business's own account** — B-03 stored per-business
+credentials; nothing sent with them.
+
+> [!WARNING]
+> **Breaking for multi-business instances that rely on `AETHERCAL_WHATSAPP_*` / `AETHERCAL_SMS_*`.**
+> A business with no phone credential of its own used to send from the **instance operator's**
+> number, silently. It no longer does: those steps are now `skipped`, with a reason.
+>
+> To restore the old behaviour on a **single-business self-host** (where the operator *is* the
+> business), set `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=true`. On an instance serving more than one
+> business, give each business its own credential instead —
+> `aethercal-admin credentials set --provider whatsapp`.
+
+- The senders are resolved **per business, per outbox item**, from that item's own `tenant_id`,
+  inside the drain's existing per-item `tenant_scope`. They used to be built once at boot from the
+  instance's environment and shared by every business the drain worked through.
+- **Email is unchanged.** An SMTP relay is a transport, not an identity — the `From` header travels
+  per message — so the instance relay is still lent to a business that has no SMTP of its own. A
+  single-business self-hoster who set `AETHERCAL_SMTP_HOST` once keeps working exactly as before.
+- The daily caps stay the **operator's** policy and now bound a business's own phone sender too: the
+  recipient comes from the operator's public booking form regardless of whose API key pays the bill.
+  A business that brings a phone credential to an instance with no caps declared keeps that channel
+  off, and the worker logs which variables would turn it on.
+- `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY` (default `false`) is warned about at boot when enabled.
+- Removed `app.build_email_sender` / `app.build_channel_senders`, replaced by
+  `app.build_instance_sender_defaults` (configuration, not clients). The web process no longer
+  builds senders at all — it never read the ones it was building. Its half-configured-phone-channel
+  boot check is unchanged.
+
 ### Added
 
 **Per-business branding** — a business's booking page is now *theirs*, not the product's.

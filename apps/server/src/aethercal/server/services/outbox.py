@@ -66,7 +66,7 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, assert_never, cast
+from typing import TYPE_CHECKING, Any, assert_never, cast
 
 from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -111,6 +111,12 @@ from aethercal.server.services.templates import (
     load_template,
     render_template,
 )
+
+if TYPE_CHECKING:
+    # Type-only: this module names a business's senders, it never builds one. Keeping the import
+    # out of the runtime is what stops the funnel's dependency arrow from pointing back at the
+    # queue that consumes it.
+    from aethercal.server.services.tenant_senders import TenantSenders
 
 _logger = logging.getLogger(__name__)
 
@@ -440,6 +446,19 @@ class OutboxWork:
 # The injected effect runner. It receives NO session: it opens its own short-lived ones around the
 # I/O. Injected so the drain is testable offline with a fake.
 OutboxExecutor = Callable[[OutboxWork, datetime], Awaitable[None]]
+
+SenderResolver = Callable[[uuid.UUID], Awaitable["TenantSenders"]]
+"""==Ask for a business's senders BY NAME. The only way to obtain one (B-03bis).==
+
+The ``uuid.UUID`` is not decoration: it is the whole argument. The retired shape handed
+:func:`make_booking_effect_executor` a sender built at boot from the instance's environment, and the
+drain — a loop over a batch spanning several businesses — sent everybody's messages through it. A
+business's WhatsApp went out from the operator's number.
+
+Typed as a plain callable so the offline suite injects a fake without a database. The live
+implementation is ``functools.partial`` over
+:func:`~aethercal.server.services.tenant_senders.resolve_tenant_senders`, wired in
+``scheduler.make_outbox_drain_tick``."""
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -2438,9 +2457,8 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
 def make_booking_effect_executor(
     *,
     sessionmaker: Sessionmaker,
-    sender: EmailSender | None,
+    resolve_senders: SenderResolver,
     service_factory: ServiceFactory | None,
-    channels: Mapping[Channel, PhoneChannelSender] | None = None,
 ) -> OutboxExecutor:
     """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
 
@@ -2449,27 +2467,50 @@ def make_booking_effect_executor(
     GOOGLE``, where the ``else`` silently *assumed* Google — so every new effect would have been
     executed as a Google Calendar call.
 
-    ``channels`` is the registry of PHONE senders (email is deliberately not in it — it goes
-    through the composer, which carries the ``.ics``). Its value type is
-    :class:`PhoneChannelSender`, not a bare sender, and that is load-bearing rather than
-    decorative: such a sender carries the daily caps it must not exceed, so ==an uncapped
-    WhatsApp/SMS sender cannot be registered here at all==. Fail-closed as a TYPE, not as a comment.
+    .. rubric:: ==It takes a RESOLVER, not senders. That signature IS the fix (B-03bis).==
+
+    This used to take ``sender=`` and ``channels=``: objects built once, at boot, from the
+    INSTANCE's environment — i.e. **bound before any business was known**. The drain then worked
+    through a batch spanning several businesses and pushed every one of their messages through that
+    single object. So a business's WhatsApp reminder went out from the ==instance operator's
+    number==, and its guest replied to a stranger.
+
+    A check could not have fixed that, because there was nothing to check: by the time an item
+    arrived, the only sender in existence was already the wrong one. So the senders are resolved
+    **per item**, from ``work.tenant_id``, by
+    :func:`~aethercal.server.services.tenant_senders.resolve_tenant_senders` — which cannot be
+    called without naming a business, and is the only place in the product that constructs a live
+    sender at all (``tests/test_sender_belt.py`` walks the source and fails CI otherwise).
+
+    The resolve happens INSIDE the drain's per-item ``tenant_scope``, on the RLS pool, so each
+    credential is decrypted under exactly that business's authority.
+
+    ==Only the branches that actually send resolve.== A Google sync carries its own per-connection
+    OAuth token and needs no messaging credential, so it costs no read and no decrypt.
 
     An absent channel is not a gap: its steps SKIP with a reason, never fail."""
-    registry = dict(channels or {})
 
     async def _execute(work: OutboxWork, now: datetime) -> None:
         effect = work.effect
         if effect is OutboxEffect.EMAIL:
-            if sender is None:  # pragma: no cover - live misconfiguration guard
+            senders = await resolve_senders(work.tenant_id)
+            if senders.email is None:  # pragma: no cover - live misconfiguration guard
+                # RETRYABLE, and deliberately NOT an OutboxSkipped. Email is the one channel with a
+                # legitimate instance-wide default (a relay is a lent transport, not an identity —
+                # see `services/tenant_senders`), so "no email sender for this business" means the
+                # operator has configured no SMTP at all. That is a misconfiguration they will fix,
+                # and the confirmation should still go out when they do.
                 raise RuntimeError("outbox email intent has no configured SMTP sender")
-            await run_email_effect(sessionmaker, work, now, sender=sender)
+            await run_email_effect(sessionmaker, work, now, sender=senders.email)
         elif effect is OutboxEffect.GOOGLE:
             if service_factory is None:  # pragma: no cover - live misconfiguration guard
                 raise RuntimeError("outbox Google intent has no configured service factory")
             await run_google_effect(sessionmaker, work, now, service_factory=service_factory)
         elif effect is OutboxEffect.NOTIFY:
-            await run_notify_effect(sessionmaker, work, now, sender=sender, channels=registry)
+            senders = await resolve_senders(work.tenant_id)
+            await run_notify_effect(
+                sessionmaker, work, now, sender=senders.email, channels=senders.channels
+            )
         else:
             assert_never(effect)
 

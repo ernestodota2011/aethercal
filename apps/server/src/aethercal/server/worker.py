@@ -64,7 +64,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI
 
 from aethercal.server.api import operator
-from aethercal.server.app import build_channel_senders, build_email_sender
+from aethercal.server.app import build_instance_sender_defaults
 from aethercal.server.db.config import DATABASE_URL_ENV, WORKER_DATABASE_URL_ENV
 from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
@@ -79,6 +79,7 @@ from aethercal.server.scheduler import (
     start_scheduler,
     stop_scheduler,
 )
+from aethercal.server.services.tenant_senders import warn_if_operator_identity_is_lent
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -149,11 +150,22 @@ def create_worker_app(settings: Settings) -> FastAPI:
             # The READ reader: the current key, plus the retiring one while a rotation is in flight.
             # The ticks decrypt with this so a row the rotation has not reached yet stays readable —
             # and they still WRITE (re-encrypt nothing here) under the current key alone.
-            app.state.fernet_keys = settings.decryption_fernet_keys()
-            app.state.email_sender = build_email_sender()
-            # A half-configured phone channel RAISES here and fails the boot on purpose: "sending,
-            # but uncapped" must never be a state the process that actually sends can reach.
-            app.state.channel_senders = build_channel_senders(http_client)
+            # ==The OPERATOR's defaults — not senders (B-03bis).==
+            #
+            # This used to build one SMTP client and one WhatsApp/SMS registry here, at boot, and
+            # hand them to the drain. The drain is a loop over a batch spanning SEVERAL businesses,
+            # so every one of them sent through that single object: a business's WhatsApp reminder
+            # left the instance from the OPERATOR's number, and its guest replied to a stranger.
+            #
+            # Now the process edge reads only inert configuration, and each item's senders are
+            # resolved from its own `tenant_id` inside the drain's per-item `tenant_scope`
+            # (`scheduler._resolve_senders_for` → `services/tenant_senders.resolve_tenant_senders`).
+            #
+            # A half-configured phone channel still RAISES here and fails the boot on purpose:
+            # "sending, but uncapped" must never be a state the process that actually sends can
+            # reach.
+            app.state.instance_sender_defaults = build_instance_sender_defaults()
+            warn_if_operator_identity_is_lent(app.state.instance_sender_defaults)
 
             interval_scheduler: Any = build_interval_scheduler()
             start_scheduler(

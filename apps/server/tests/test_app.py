@@ -17,8 +17,14 @@ from httpx import ASGITransport, AsyncClient
 
 from aethercal.server import app as app_module
 from aethercal.server.api.auth import AuthContext, require_api_key
-from aethercal.server.app import build_email_sender, create_app, create_app_from_env
+from aethercal.server.app import (
+    build_instance_sender_defaults,
+    create_app,
+    create_app_from_env,
+)
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
+from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
+from aethercal.server.services.tenant_senders import InstanceSenderDefaults
 from aethercal.server.settings import Settings
 
 
@@ -99,19 +105,71 @@ async def test_create_app_from_env_builds_settings_from_the_environment(
 
 
 # --------------------------------------------------------------------------------------
-# build_email_sender — an SmtpEmailSender only when SMTP is configured; None otherwise (RF-19).
+# build_instance_sender_defaults — the OPERATOR's configuration, and NOT a sender (B-03bis).
+#
+# This replaced `build_email_sender` / `build_channel_senders`, which returned live clients built
+# from the instance's environment before any business was known. The process edge now reads inert
+# configuration; turning it into a sender needs a `tenant_id` (services/tenant_senders).
 # --------------------------------------------------------------------------------------
 
 
-def test_build_email_sender_is_none_without_smtp_config() -> None:
-    assert build_email_sender({}) is None
+def test_the_defaults_are_empty_without_smtp_config() -> None:
+    """Unconfigured SMTP is still not a boot failure — the contract `build_email_sender` carried."""
+    assert build_instance_sender_defaults({}).smtp is None
 
 
-def test_build_email_sender_builds_a_sender_when_smtp_is_configured() -> None:
-    sender = build_email_sender(
+def test_the_defaults_carry_the_smtp_config_when_it_is_set() -> None:
+    defaults = build_instance_sender_defaults(
         {"AETHERCAL_SMTP_HOST": "smtp.example.com", "AETHERCAL_SMTP_FROM": "no-reply@example.com"}
     )
-    assert isinstance(sender, SmtpEmailSender)
+    assert defaults.smtp is not None
+    assert defaults.smtp.host == "smtp.example.com"
+
+
+def test_the_process_edge_builds_configuration_and_never_a_sender() -> None:
+    """==The regression this cut exists to prevent, asserted at the edge that used to cause it.==
+
+    A fully-configured instance still yields no live client here. What comes back is data. The
+    object that decides whose account a message leaves on is built per business, by the funnel —
+    and `tests/test_sender_belt.py` walks the AST to prove nothing else builds one.
+    """
+    defaults = build_instance_sender_defaults(
+        {
+            "AETHERCAL_SMTP_HOST": "smtp.example.com",
+            "AETHERCAL_SMTP_FROM": "no-reply@example.com",
+            "AETHERCAL_WHATSAPP_BASE_URL": "https://evolution.example",
+            "AETHERCAL_WHATSAPP_INSTANCE": "operator",
+            "AETHERCAL_WHATSAPP_API_KEY": "NOT_A_REAL_KEY",
+            "AETHERCAL_WHATSAPP_DAILY_CAP_PER_PHONE": "3",
+            "AETHERCAL_WHATSAPP_DAILY_CAP_PER_IP": "5",
+        }
+    )
+    assert isinstance(defaults, InstanceSenderDefaults)
+    for value in (defaults.smtp, defaults.whatsapp):
+        assert not isinstance(value, SmtpEmailSender | EvolutionWhatsAppSender)
+
+
+def test_a_half_configured_phone_channel_still_fails_the_boot() -> None:
+    """==The one contract `build_channel_senders` existed for, kept.==
+
+    Its recipient comes from the PUBLIC booking form, so "sending, but with no ceiling" must never
+    be a state a process can reach: the only symptom would be the bill, plus a spam complaint
+    against a number nobody gets back. Deleting the function must not delete this.
+    """
+    with pytest.raises(RuntimeError, match="half-configured"):
+        build_instance_sender_defaults({"AETHERCAL_WHATSAPP_BASE_URL": "https://evolution.example"})
+
+
+def test_credentials_without_caps_still_fail_the_boot() -> None:
+    """The other half of "never sending but uncapped": a full credential set, and no ceilings."""
+    with pytest.raises(RuntimeError, match="DAILY_CAP"):
+        build_instance_sender_defaults(
+            {
+                "AETHERCAL_WHATSAPP_BASE_URL": "https://evolution.example",
+                "AETHERCAL_WHATSAPP_INSTANCE": "operator",
+                "AETHERCAL_WHATSAPP_API_KEY": "NOT_A_REAL_KEY",
+            }
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -133,7 +191,14 @@ async def test_lifespan_attaches_the_runtime_effects(
     async with app.router.lifespan_context(app):
         assert isinstance(app.state.http_client, httpx.AsyncClient)
         assert app.state.fernet_key == settings.fernet_key()
-        assert app.state.email_sender is None
+        # ==No sender on the state at all any more (B-03bis).== This used to assert
+        # `email_sender is None`, which quietly documented that the WEB process built one —
+        # an object nothing in this process ever read, because the only readers are the drain's
+        # ticks, and those run in `aethercal-worker`. The web reads the operator's
+        # configuration and builds no client; a business's senders are resolved per item, in
+        # the worker, from that item's own tenant_id.
+        assert not hasattr(app.state, "email_sender")
+        assert not hasattr(app.state, "channel_senders")
 
     # The HTTP client is closed cleanly on shutdown (no leaked resources under filterwarnings).
     assert app.state.http_client.is_closed is True

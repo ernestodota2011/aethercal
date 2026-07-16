@@ -63,6 +63,7 @@ from aethercal.server.services.outbox import (
     drain_outbox,
     make_booking_effect_executor,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.services.workflows import seed_default_workflows
 
 
@@ -416,7 +417,9 @@ async def test_book_then_drain_actually_sends_the_reminder_email(migrated: Sessi
         booking_id = booking.id
 
     execute = make_booking_effect_executor(
-        sessionmaker=migrated, sender=sender, service_factory=None
+        sessionmaker=migrated,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
 
     # Not due yet: the reminder is scheduled for start - 24 h.
@@ -494,7 +497,9 @@ async def test_a_step_on_an_unconfigured_channel_is_skipped_not_dead_lettered(
 
     sender = _RecordingSender()
     execute = make_booking_effect_executor(
-        sessionmaker=migrated, sender=sender, service_factory=None
+        sessionmaker=migrated,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     due = _SLOT - timedelta(hours=24)
     with caplog.at_level("WARNING"):
@@ -607,9 +612,10 @@ async def _drain_whatsapp_at(
     database felt like returning — which is how a test ends up asserting against the wrong row."""
     execute = make_booking_effect_executor(
         sessionmaker=migrated,
-        sender=_RecordingSender(),
+        resolve_senders=TenantSenders.for_offline_tests(
+            email=_RecordingSender(), channels={Channel.WHATSAPP: whatsapp}
+        ),
         service_factory=None,
-        channels={Channel.WHATSAPP: whatsapp},
     )
     await drain_outbox(_pools(migrated), now=now, execute=execute)
     async with migrated() as session:

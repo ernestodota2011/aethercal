@@ -9,30 +9,72 @@ what it does not**, and how to rotate the key.
 
 ---
 
-## The rule, and the one place it is asymmetric
+## The rule, and where it is asymmetric
 
 A business's own credential always wins. The instance's environment variables (`AETHERCAL_SMTP_*`,
 `AETHERCAL_WHATSAPP_*`, `AETHERCAL_SMS_*`) stop being *the* credential and become the instance
-**default**.
+**default** — wherever a default is a legitimate thing to have at all.
 
-Then there is money, and money is not the same:
+There are **three** answers to "the business has none", not two:
 
 |  | The business has its own | The business has none |
 |---|---|---|
-| **Sending** (SMTP, WhatsApp, SMS) | its own is used | the **instance default** is used — and with no default, the channel is simply off |
-| **Payments** (Stripe, Mercado Pago) | its own is used | ❌ **it does not charge.** There is no fallback. |
+| **Email** (SMTP) | its own is used | the **instance relay** is used — with no relay configured, no email goes out |
+| **Phone** (WhatsApp, SMS) | its own is used | ⚠️ **the channel is off for that business.** Its reminders there are *skipped*, with a reason. The operator's number is **not** lent unless they declare it (below) |
+| **Payments** (Stripe, Mercado Pago) | its own is used | ❌ **it does not charge.** No fallback, and no flag either. |
+
+### Why email and WhatsApp do not get the same answer
+
+Both are "sending". They are not the same act, and the difference is visible in the message itself:
+
+* an **SMTP relay is a pipe.** The identity travels per message, in the `From` header — the sender
+  stamps its own address only when the message does not already carry one. A business's mail goes
+  through the operator's relay **as the business**. That is infrastructure the operator lends, and a
+  single-business self-hoster who sets `AETHERCAL_SMTP_HOST` once is entitled to have it keep
+  working, which is exactly what a self-hostable product should do;
+* a **WhatsApp or Twilio account is an identity.** There is no per-message `From` to stamp: the
+  number *is* what the guest sees, and what they reply to. Lending it does not put the business's
+  message through the operator's pipe — **it sends the message as the operator**, to a guest who
+  then replies to a company that has never heard of them.
+
+So a business's phone reminders leave on its own number, or they do not leave.
+
+> [!IMPORTANT]
+> **This is a behaviour change.** Before, a business with no WhatsApp credential sent from the
+> instance's number, silently. Now those steps are `skipped` — visible in the outbox row, in the
+> worker's log, and in the `outcome="skipped"` counter at `/metrics`. If you were relying on the old
+> behaviour, either give each business its own credential or read the next section.
+
+### Lending the operator's number (single-business self-hosts)
+
+On a one-business instance the operator *is* the business, and `AETHERCAL_WHATSAPP_*` is their own
+number. Refusing to use it would be pedantry with a real cost, so:
+
+```bash
+AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=true
+```
+
+**Off by default**, and the process logs a warning at boot when it is on. Leave it off on any
+instance serving more than one business: with it on, every business without its own credential
+messages guests from a number none of them own.
+
+### The caps stay the operator's policy
+
+A business's own phone sender is still bounded by the instance's
+`AETHERCAL_<CHANNEL>_DAILY_CAP_PER_PHONE` / `_PER_IP`. The cap protects the stranger whose number
+somebody typed into the **public booking form**, and that form is the operator's surface no matter
+whose API key pays the bill. The counting was always per-business; only the ceiling is instance-wide.
+
+A business that brings a phone credential to an instance with no caps declared keeps that channel
+**off**, and the worker logs which variables would turn it on. An uncapped phone channel behind a
+public form is the one state this product refuses to reach.
+
+### And money has no flag at all
 
 **A business with no payment credential of its own does not take payments.** It does not fall back to
-the instance's payment account — not once, not in a degraded mode, not "for now".
-
-The asymmetry is deliberate, and it is not a matter of degree:
-
-* sending a booking confirmation through the instance's SMTP relay is **infrastructure the operator
-  lends**. A single-business self-hoster sets `AETHERCAL_SMTP_HOST` once and everything works, which
-  is exactly what a self-hostable product should do;
-* taking a guest's money into the instance operator's payment account is **charging with somebody
-  else's account**. A different act, with a different name — and it does not become acceptable
-  because the code path was convenient.
+the instance's payment account — not once, not in a degraded mode, not "for now". Taking a guest's
+money into the operator's account is **charging with somebody else's account**: a different act, with
+a different name, and it does not become acceptable because the code path was convenient.
 
 So the fallback does not exist on the money path: not as a flag, not as an optional argument. The
 function that resolves a payment credential has no parameter you *could* pass a default to, and the
