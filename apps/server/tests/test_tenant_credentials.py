@@ -14,18 +14,20 @@ repository, in this suite, or in any fixture it loads.
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Awaitable, Callable
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aethercal.server.crypto import derive_fernet_key
+from aethercal.server.crypto import derive_fernet_key, encrypt_secret
 from aethercal.server.db.models import Tenant, TenantCredential
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     CredentialSource,
     IncompleteCredentialError,
+    MalformedCredentialError,
     MissingCredentialError,
     WrongCredentialClassError,
     credential_class,
@@ -451,6 +453,90 @@ class TestAResolvedCredentialDoesNotLeakIntoALog:
             assert STRIPE_A["secret_key"] not in rendering
             assert STRIPE_A["webhook_secret"] not in rendering
         assert "stripe" in repr(resolved)  # it still says WHICH credential — the useful half
+
+
+# ==========================================================================================
+# A payload that decrypts to VALID-but-NON-OBJECT JSON is a legible domain error, never a
+# raw AttributeError on `.items()` — least of all on the money path (B-03 round 4).
+# ==========================================================================================
+
+
+async def _store_raw_payload(
+    session: AsyncSession, tenant: Tenant, *, provider: CredentialProvider, plaintext: bytes
+) -> None:
+    """Write a credential row whose ciphertext bypasses the service's write-time value guard.
+
+    That bypass is the whole point: a valid-but-non-object payload cannot be produced through
+    ``store_credential`` (its input is typed ``Mapping[str, str]``) nor through the CLI (which
+    rejects a non-object at the door). It can only reach the READ path from OUTSIDE — a row written
+    before that guard existed, a corrupted ciphertext that still decrypts to valid JSON, or a writer
+    that skipped the service — which is exactly the case the resolver must survive.
+    """
+    session.add(
+        TenantCredential(
+            tenant_id=tenant.id,
+            provider=provider.value,
+            encrypted_payload=encrypt_secret(plaintext, KEY),
+        )
+    )
+    await session.flush()
+
+
+class TestANonObjectPayloadIsADomainErrorNotACrash:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(42, id="number"),
+            pytest.param([1, 2, 3], id="array"),
+            pytest.param("just-a-string", id="string"),
+            pytest.param(None, id="null"),
+        ],
+    )
+    async def test_resolving_it_raises_a_legible_domain_error(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        payload: object,
+    ) -> None:
+        """==Valid JSON is not a valid credential.== A row that decrypts to a number, an array, a
+        string or ``null`` has no fields; resolving it must be a :class:`MalformedCredentialError`,
+        never a bare ``AttributeError`` on ``.items()`` — the money path surfaces this exactly when
+        a guest's card may already have been charged, the worst place for a stack trace."""
+        tenant = await tenant_factory(sqlite_session)
+        await _store_raw_payload(
+            sqlite_session,
+            tenant,
+            provider=CredentialProvider.STRIPE,
+            plaintext=json.dumps(payload).encode("utf-8"),
+        )
+        with pytest.raises(MalformedCredentialError, match="stripe"):
+            await resolve_money_credential(
+                sqlite_session,
+                tenant_id=tenant.id,
+                provider=CredentialProvider.STRIPE,
+                fernet_key=KEY,
+            )
+
+    async def test_the_error_never_echoes_the_decrypted_payload(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The decrypted payload is a secret, malformed or not. The refusal names the provider and
+        the failure — never the value that was stored."""
+        tenant = await tenant_factory(sqlite_session)
+        await _store_raw_payload(
+            sqlite_session,
+            tenant,
+            provider=CredentialProvider.STRIPE,
+            plaintext=json.dumps("sk_live_MUST_NOT_APPEAR").encode("utf-8"),
+        )
+        with pytest.raises(MalformedCredentialError) as raised:
+            await resolve_money_credential(
+                sqlite_session,
+                tenant_id=tenant.id,
+                provider=CredentialProvider.STRIPE,
+                fernet_key=KEY,
+            )
+        assert "sk_live_MUST_NOT_APPEAR" not in str(raised.value)
 
 
 # ==========================================================================================

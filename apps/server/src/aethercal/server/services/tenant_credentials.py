@@ -148,6 +148,20 @@ class IncompleteCredentialError(CredentialError):
     """
 
 
+class MalformedCredentialError(CredentialError):
+    """A stored credential decrypted to valid JSON that is NOT an object of field → value.
+
+    ==Distinct from :class:`IncompleteCredentialError`.== That is a credential-SHAPED object missing
+    a required field; this is a payload whose whole shape is wrong — a number, a string, an array,
+    ``null`` — so it has no fields to read at all. It can only arrive from OUTSIDE the current write
+    path: a row written before the CLI's value-shape guard existed, a ciphertext corrupted into
+    still-valid JSON, or a writer that bypassed the service. The resolver raises this rather than
+    letting ``.items()`` throw a bare ``AttributeError`` — a raw crash on the money path, where a
+    guest's card may already have been charged, is the worst place to surface a bug as a stack
+    trace.
+    """
+
+
 def credential_class(provider: CredentialProvider) -> CredentialClass:
     """MONEY or INFRA. ==Exhaustive: a new provider does not type-check without an answer.==
 
@@ -336,6 +350,21 @@ def _decrypt(
     row: TenantCredential, provider: CredentialProvider, key: bytes | Sequence[bytes]
 ) -> ResolvedCredential:
     payload = json.loads(decrypt_secret(row.encrypted_payload, key).decode("utf-8"))
+    if not isinstance(payload, dict):
+        # ==Valid JSON is not a valid credential.== A payload that decrypts to a number, a string,
+        # an array or ``null`` has no fields, so ``.items()`` below would throw a bare
+        # ``AttributeError`` — a raw crash on the money path, where a guest's card may already have
+        # been charged. Raise a legible domain error instead. This is the READ mirror of the object
+        # check the CLI does on WRITE; on the write path object-ness is otherwise guaranteed by
+        # ``store_credential``'s ``Mapping[str, str]`` signature, so the runtime guard is only
+        # needed here, where ``json.loads`` hands back ``Any``. The decrypted value is NEVER echoed
+        # (it is a secret, malformed or not); only the provider is named.
+        raise MalformedCredentialError(
+            f"the stored {provider.value} credential did not decrypt to a JSON object of "
+            "field → value, so it has no fields to read. It is corrupt and cannot be used; "
+            "re-enter it with `aethercal-admin credentials set`. (The decrypted value is not "
+            "shown — it is a secret, malformed or not.)"
+        )
     return ResolvedCredential(
         provider=provider,
         source=CredentialSource.TENANT,
@@ -432,6 +461,7 @@ __all__ = [
     "CredentialProvider",
     "CredentialSource",
     "IncompleteCredentialError",
+    "MalformedCredentialError",
     "MissingCredentialError",
     "ResolvedCredential",
     "WrongCredentialClassError",
