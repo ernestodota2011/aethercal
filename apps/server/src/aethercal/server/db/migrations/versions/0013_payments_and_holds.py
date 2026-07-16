@@ -4,6 +4,9 @@ Adds the two money tables and the columns the arbiter reasons over:
 
 * ``payments`` — the ledger. UNIQUE ``(tenant_id, provider, provider_ref)`` is the money's
   idempotency: two Stripe events for one payment share the ``provider_ref`` and collapse to one row.
+  ``provider_ref`` is NULLABLE (finding 1) — the PaymentIntent does not exist when the checkout is
+  opened — so the row also carries ``checkout_session_id`` (the creation-time anchor, its own
+  UNIQUE), which the confirming webhook resolves by before backfilling the intent.
 * ``payment_events`` — the parking lot. UNIQUE ``(tenant_id, provider, event_id)`` is the anti-replay
   of ONE event; an event whose booking does not exist yet is ``parked`` and retried, never dropped.
 * ``bookings.hold_expires_at`` — when an unpaid hold self-cancels.
@@ -84,7 +87,11 @@ def upgrade() -> None:
         sa.Column("tenant_id", sa.Uuid(), nullable=False),
         sa.Column("booking_id", sa.Uuid(), nullable=False),
         sa.Column("provider", sa.String(length=32), nullable=False),
-        sa.Column("provider_ref", sa.String(length=255), nullable=False),
+        # NULLABLE (finding 1): the PaymentIntent does not exist when the checkout is opened; the
+        # confirming webhook backfills it. Forcing a value here once persisted the string "None".
+        sa.Column("provider_ref", sa.String(length=255), nullable=True),
+        # The creation-time anchor (finding 1): the Checkout Session id, which DOES exist at open.
+        sa.Column("checkout_session_id", sa.String(length=255), nullable=True),
         sa.Column("status", _PAYMENT_STATUS, nullable=False),
         sa.Column("amount_cents", sa.Integer(), nullable=False),
         sa.Column("currency", sa.String(length=3), nullable=False),
@@ -122,9 +129,19 @@ def upgrade() -> None:
             "provider_ref",
             name=op.f("uq_payments_tenant_id_provider_provider_ref"),
         ),
+        # The creation-time anchor is unique too (finding 1): one row per Checkout Session id.
+        sa.UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "checkout_session_id",
+            name=op.f("uq_payments_tenant_id_provider_checkout_session_id"),
+        ),
     )
     op.create_index(op.f("ix_payments_tenant_id"), _PAYMENTS, ["tenant_id"], unique=False)
     op.create_index(op.f("ix_payments_booking_id"), _PAYMENTS, ["booking_id"], unique=False)
+    op.create_index(
+        op.f("ix_payments_checkout_session_id"), _PAYMENTS, ["checkout_session_id"], unique=False
+    )
 
     op.create_table(
         _PAYMENT_EVENTS,
@@ -225,6 +242,7 @@ def downgrade() -> None:
     op.drop_index("ix_payment_events_status", table_name=_PAYMENT_EVENTS)
     op.drop_index(op.f("ix_payment_events_tenant_id"), table_name=_PAYMENT_EVENTS)
     op.drop_table(_PAYMENT_EVENTS)
+    op.drop_index(op.f("ix_payments_checkout_session_id"), table_name=_PAYMENTS)
     op.drop_index(op.f("ix_payments_booking_id"), table_name=_PAYMENTS)
     op.drop_index(op.f("ix_payments_tenant_id"), table_name=_PAYMENTS)
     op.drop_table(_PAYMENTS)

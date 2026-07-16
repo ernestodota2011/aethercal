@@ -65,13 +65,18 @@ class WebhookEventKind(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ParsedWebhookEvent:
     """A provider event, normalised to what the arbiter needs — and NOTHING a guest could be found
-    in. ``amount_cents``/``currency`` are present for a PAID event and may be absent otherwise."""
+    in. ``amount_cents``/``currency`` are present for a PAID event and may be absent otherwise.
+
+    ``checkout_session_id`` is the creation-time anchor (finding 1) — set on
+    ``checkout.session.completed`` (which carries both the session id and the now-real intent), so
+    the arbiter can resolve a payment row whose ``provider_ref`` is still NULL."""
 
     kind: WebhookEventKind
     event_id: str
     provider_ref: str
     amount_cents: int | None = None
     currency: str | None = None
+    checkout_session_id: str | None = None
 
     def payload(self) -> dict[str, object]:
         """The PII-free dict persisted on the ``payment_events`` row — enough for the parked tick to
@@ -81,6 +86,10 @@ class ParsedWebhookEvent:
             body["amount_cents"] = self.amount_cents
         if self.currency is not None:
             body["currency"] = self.currency
+        if self.checkout_session_id is not None:
+            # Persisted so a parked ``checkout.session.completed`` can still resolve by the session
+            # id once the checkout row commits (finding 1).
+            body["checkout_session_id"] = self.checkout_session_id
         return body
 
 
@@ -126,12 +135,14 @@ class GenericHmacAdapter:
             return None
         amount = data.get("amount_cents")
         currency = data.get("currency")
+        session_id = data.get("checkout_session_id")
         return ParsedWebhookEvent(
             kind=WebhookEventKind(kind_value),
             event_id=str(event_id),
             provider_ref=str(provider_ref),
             amount_cents=int(amount) if isinstance(amount, int) else None,
             currency=str(currency) if isinstance(currency, str) else None,
+            checkout_session_id=str(session_id) if isinstance(session_id, str) else None,
         )
 
 
@@ -229,6 +240,7 @@ async def dispatch_payment_event(  # noqa: PLR0913 - the event's identity + the 
                 currency=event.currency,
                 now=now,
                 confirm_effects=confirm_effects,
+                checkout_session_id=event.checkout_session_id,
             )
             row.status = PaymentEventStatus.PARKED if result.parked else PaymentEventStatus.APPLIED
         case WebhookEventKind.REFUNDED:

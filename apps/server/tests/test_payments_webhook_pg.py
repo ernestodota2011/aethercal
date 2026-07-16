@@ -24,6 +24,7 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import (
     Booking,
     EventType,
+    Outbox,
     Payment,
     PaymentEvent,
     PaymentStatus,
@@ -31,6 +32,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
 pytestmark = pytest.mark.db
@@ -48,11 +50,24 @@ _SECRET = "whsec_test_NOT_A_REAL_KEY_x"
 _PRICE = 5000
 _CUR = "usd"
 _REF = "pi_test_NOT_A_REAL_KEY_A"
+# ==Finding 1.== The Checkout Session id the row is created with (its ``provider_ref`` NULL) before
+# the confirming webhook backfills the intent ``_REF``.
+_SESSION = "cs_test_NOT_A_REAL_KEY_S"
 
 
-async def _seed(owner_maker: async_sessionmaker[AsyncSession]) -> tuple[str, uuid.UUID]:
-    """A business with a Stripe webhook secret + a PENDING hold and its INTENT payment. OWNER
-    engine."""
+async def _seed(
+    owner_maker: async_sessionmaker[AsyncSession],
+    *,
+    provider_ref: str | None = _REF,
+    checkout_session_id: str | None = None,
+) -> tuple[str, uuid.UUID]:
+    """A business with a Stripe webhook secret + a PENDING hold and its INTENT payment. OWNER.
+
+    ``provider_ref``/``checkout_session_id`` model the payment's anchor state: the default
+    (``provider_ref`` set, no session id) is a row whose intent is already known; passing
+    ``provider_ref=None`` with a ``checkout_session_id`` models the real just-created row (finding
+    1), whose intent does not exist yet and is backfilled by ``checkout.session.completed``.
+    """
     slug = f"biz-{uuid.uuid4().hex[:8]}"
     async with owner_maker() as session, session.begin():
         tenant = Tenant(slug=slug, name="Biz")
@@ -95,7 +110,8 @@ async def _seed(owner_maker: async_sessionmaker[AsyncSession]) -> tuple[str, uui
                 tenant_id=tenant.id,
                 booking_id=booking.id,
                 provider="stripe",
-                provider_ref=_REF,
+                provider_ref=provider_ref,
+                checkout_session_id=checkout_session_id,
                 status=PaymentStatus.INTENT,
                 amount_cents=_PRICE,
                 currency=_CUR,
@@ -120,6 +136,33 @@ def _paid_body(event_id: str = "evt_1") -> bytes:
             "data": {"object": {"id": _REF, "amount": _PRICE, "currency": _CUR}},
         }
     ).encode("utf-8")
+
+
+def _checkout_completed_body(event_id: str = "evt_cs") -> bytes:
+    """A Stripe ``checkout.session.completed`` event — the FIRST event, carrying BOTH the session id
+    (the creation-time anchor) and the now-real PaymentIntent (finding 1)."""
+    return json.dumps(
+        {
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": _SESSION,
+                    "payment_intent": _REF,
+                    "amount_total": _PRICE,
+                    "currency": _CUR,
+                }
+            },
+        }
+    ).encode("utf-8")
+
+
+async def _refund_count(owner_maker: async_sessionmaker[AsyncSession]) -> int:
+    async with owner_maker() as session:
+        rows = (
+            await session.scalars(select(Outbox).where(Outbox.effect == OutboxEffect.REFUND.value))
+        ).all()
+        return len(list(rows))
 
 
 async def _payment_event_count(owner_maker: async_sessionmaker[AsyncSession]) -> int:
@@ -224,3 +267,61 @@ async def test_an_unknown_business_is_401(
     )
 
     assert response.status_code == 401
+
+
+async def test_both_stripe_events_resolve_to_one_row_from_the_session_anchor(
+    client: AsyncClient, owner_maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """==Finding 1, end-to-end (criterion 24).== The row is created the way ``_start_paid_booking``
+    creates it: anchored on the Checkout Session id, ``provider_ref`` NULL (no intent yet).
+    ``checkout.session.completed`` — which carries the session id AND the now-real intent —
+    resolves the row by the session id, BACKFILLS ``provider_ref``, and confirms. Then
+    ``payment_intent.succeeded`` (which knows only the intent) resolves by the backfilled
+    ``provider_ref`` and is an idempotent replay. TWO Stripe events, ONE confirmation, ZERO refunds.
+    """
+    slug, booking_id = await _seed(owner_maker, provider_ref=None, checkout_session_id=_SESSION)
+    headers = {"content-type": "application/json"}
+
+    # (1) checkout.session.completed → resolve by session id, backfill the intent, confirm.
+    cs_body = _checkout_completed_body(event_id="evt_cs_1")
+    first = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=cs_body,
+        headers={**headers, "Stripe-Signature": _stripe_sig(cs_body)},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json() == {"status": "ok"}
+
+    async with owner_maker() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        confirming_payment_id = booking.confirmed_by_payment_id
+        assert confirming_payment_id is not None
+        payment = (
+            await session.scalars(select(Payment).where(Payment.booking_id == booking_id))
+        ).one()
+        # ==The intent was backfilled from the confirming event== — the row is now findable by it.
+        assert payment.provider_ref == _REF
+        assert payment.checkout_session_id == _SESSION
+        assert payment.status is PaymentStatus.PAID
+
+    # (2) payment_intent.succeeded → resolves by the backfilled provider_ref → idempotent replay.
+    pi_body = _paid_body(event_id="evt_pi_1")
+    second = await client.post(
+        f"/webhooks/stripe/{slug}",
+        content=pi_body,
+        headers={**headers, "Stripe-Signature": _stripe_sig(pi_body)},
+    )
+    assert second.status_code == 200, second.text
+
+    async with owner_maker() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        # ==ONE confirmation== — the same payment, never re-confirmed by "another".
+        assert booking.confirmed_by_payment_id == confirming_payment_id
+
+    # ==ZERO refunds.== The replay must not have been mistaken for a double payment.
+    assert await _refund_count(owner_maker) == 0
+    assert await _payment_event_count(owner_maker) == 2  # both events recorded, both applied

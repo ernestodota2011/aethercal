@@ -61,7 +61,9 @@ def test_a_signature_under_the_wrong_secret_fails() -> None:
 
 def test_checkout_session_completed_parses_to_a_paid_event() -> None:
     adapter = StripeWebhookAdapter()
-    obj = {"payment_intent": "pi_X", "amount_total": 5000, "currency": "usd"}
+    # ==Finding 1.== The completed session carries BOTH the session id (``obj["id"]``, the
+    # creation-time anchor) and the now-real PaymentIntent (``obj["payment_intent"]``).
+    obj = {"id": "cs_X", "payment_intent": "pi_X", "amount_total": 5000, "currency": "usd"}
     raw = json.dumps(
         {"id": "evt_A", "type": "checkout.session.completed", "data": {"object": obj}}
     ).encode("utf-8")
@@ -70,8 +72,23 @@ def test_checkout_session_completed_parses_to_a_paid_event() -> None:
     assert event.kind is WebhookEventKind.PAID
     assert event.event_id == "evt_A"
     assert event.provider_ref == "pi_X"
+    assert event.checkout_session_id == "cs_X"
     assert event.amount_cents == 5000
     assert event.currency == "usd"
+
+
+def test_checkout_session_completed_without_the_intent_yet_is_not_parsed() -> None:
+    """The confirming event MUST carry the real intent to backfill; a session object still missing
+    ``payment_intent`` (which a completed payment should not) is not a usable PAID event."""
+    adapter = StripeWebhookAdapter()
+    raw = json.dumps(
+        {
+            "id": "evt_A2",
+            "type": "checkout.session.completed",
+            "data": {"object": {"id": "cs_X", "amount_total": 5000, "currency": "usd"}},
+        }
+    ).encode("utf-8")
+    assert adapter.parse(raw) is None
 
 
 def test_payment_intent_succeeded_parses_to_a_paid_event_keyed_on_the_same_intent() -> None:
@@ -126,8 +143,10 @@ async def test_the_checkout_session_returns_to_the_configured_base_not_a_dead_ur
         captured["path"] = request.url.path
         captured["idempotency_key"] = request.headers.get("Idempotency-Key", "")
         captured["body"] = request.content.decode()
+        # ==Finding 1.== Stripe returns the session ``id`` and leaves ``payment_intent`` null at
+        # open — so the gateway must anchor on ``id``, never on the (absent) intent.
         return httpx.Response(
-            200, json={"url": "https://checkout.stripe/cs_x", "payment_intent": "pi_x"}
+            200, json={"id": "cs_x", "url": "https://checkout.stripe/cs_x", "payment_intent": None}
         )
 
     gateway = StripeGateway(transport=httpx.MockTransport(handler))
@@ -141,7 +160,8 @@ async def test_the_checkout_session_returns_to_the_configured_base_not_a_dead_ur
     )
 
     assert result.checkout_url == "https://checkout.stripe/cs_x"
-    assert result.provider_ref == "pi_x"
+    # The anchor is the session id, and it is NEVER the literal "None" (the intent was null).
+    assert result.checkout_session_id == "cs_x"
     assert captured["idempotency_key"] == "booking:abc"
     body = captured["body"]
     assert "example.invalid" not in body, "the guest must not land on a dead URL after paying"

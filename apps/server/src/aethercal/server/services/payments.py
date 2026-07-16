@@ -36,6 +36,11 @@ event: after a reschedule the payment is re-pointed to the successor while the m
 names the original, now-cancelled row — so trusting the metadata would refund a live appointment
 (criterion 25b). The signature does not even accept a booking id; that is the design.
 
+The one wrinkle is the FIRST event (finding 1): ``checkout.session.completed`` must confirm a row
+created before the intent existed (``provider_ref`` NULL), so the arbiter falls back to resolving by
+the ``checkout_session_id`` that row WAS created with, then backfills ``provider_ref`` with the
+now-real intent. From then on it is the single stable anchor the rest of this module assumes.
+
 .. rubric:: Amount and currency are validated BEFORE confirming
 
 A payment whose amount or currency does not match the event type's price is never honoured: the
@@ -158,6 +163,27 @@ async def resolve_payment(
     ).one_or_none()
 
 
+async def resolve_payment_by_checkout_session(
+    session: AsyncSession, *, tenant_id: uuid.UUID, provider: str, checkout_session_id: str
+) -> Payment | None:
+    """The payment for this Checkout Session id — ==the CREATION-TIME anchor (finding 1)==.
+
+    The row is created with ``provider_ref`` NULL (the intent does not exist yet) and this session
+    id set, so the confirming ``checkout.session.completed`` webhook — which carries the session id
+    AND the now-real intent — finds the row THIS way and backfills ``provider_ref``. By the UNIQUE
+    ``(tenant_id, provider, checkout_session_id)`` this is at most one row.
+    """
+    return (
+        await session.scalars(
+            select(Payment).where(
+                Payment.tenant_id == tenant_id,
+                Payment.provider == provider,
+                Payment.checkout_session_id == checkout_session_id,
+            )
+        )
+    ).one_or_none()
+
+
 def _amount_matches(event_type: EventType, *, amount_cents: int, currency: str) -> bool:
     """Whether a payment's money matches what the event type charges.
 
@@ -237,6 +263,16 @@ async def enqueue_cancellation_refunds(
     ).all()
     count = 0
     for payment in payments:
+        if payment.provider_ref is None:
+            # ==Anomaly (finding 1).== A PAID payment is always one a paid event confirmed, and that
+            # event BACKFILLS the intent — so a PAID row with no charge reference cannot happen by
+            # the normal path, and cannot be refunded (there is nothing to refund against). Skip it
+            # loudly rather than crash or refund a guess.
+            _logger.error(
+                "refund: PAID payment %s has no provider_ref — cannot refund it; skipping",
+                payment.id,
+            )
+            continue
         await enqueue_refund(
             session, booking=booking, provider=payment.provider, provider_ref=payment.provider_ref
         )
@@ -254,25 +290,49 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
     currency: str,
     now: datetime,
     confirm_effects: ConfirmEffects,
+    checkout_session_id: str | None = None,
 ) -> ArbiterResult:
     """Apply one PAID provider event. ==The arbiter.== One of six outcomes, and never a guess.
 
     The event is already verified (its signature checked, its row written to ``payment_events``) by
     the caller; this decides what it MEANS. ``confirm_effects`` fires only on the winning path.
+
+    ==Resolution is two-step (finding 1).== The row is found by ``provider_ref`` (the intent) when
+    it has one; but ``checkout.session.completed`` is the FIRST event and the row it confirms was
+    created before the intent existed (``provider_ref`` NULL), so that event also carries the
+    ``checkout_session_id`` and the arbiter falls back to it — then BACKFILLS ``provider_ref`` with
+    the now-real intent, so the second event (``payment_intent.succeeded``, which knows only the
+    intent) resolves directly and is an idempotent replay. Both Stripe events land on the one row.
     """
     payment = await resolve_payment(
         session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
     )
+    if payment is None and checkout_session_id is not None:
+        # ==The creation-time-anchor fallback (finding 1).== The row was created with a NULL intent,
+        # so a lookup by ``provider_ref`` misses it — but ``checkout.session.completed`` carries the
+        # session id it WAS created with.
+        payment = await resolve_payment_by_checkout_session(
+            session,
+            tenant_id=tenant_id,
+            provider=provider,
+            checkout_session_id=checkout_session_id,
+        )
     if payment is None:
         # The checkout's commit has not landed (or this is an event for a payment we never created).
         # PARK: the caller keeps the event and a tick retries it. Discarding it would be the worst
         # outcome — a charge that neither confirms nor refunds.
         _logger.info(
-            "arbiter: no payment for provider_ref %s (tenant %s); parking for retry",
+            "arbiter: no payment for provider_ref %s / session %s (tenant %s); parking for retry",
             provider_ref,
+            checkout_session_id,
             tenant_id,
         )
         return ArbiterResult(ArbiterOutcome.PARKED)
+
+    if payment.provider_ref is None:
+        # ==Backfill the intent (finding 1).== We resolved by the session id; record the real charge
+        # reference now, so ``payment_intent.succeeded`` (and any refund) then resolves on it.
+        payment.provider_ref = provider_ref
 
     if payment.status is PaymentStatus.REFUNDED:
         # Already refunded: a paid event arriving now cannot un-refund it. No-op, loudly.
@@ -502,10 +562,15 @@ tied to the same instant precisely so this ordering is guaranteed."""
 @dataclass(frozen=True, slots=True)
 class CheckoutSession:
     """What a gateway hands back when a checkout is opened: where to send the guest, and the
-    ``provider_ref`` (the charge/payment-intent id) the arbiter resolves the payment by later."""
+    ``checkout_session_id`` — ==the CREATION-TIME anchor (finding 1)==.
+
+    Not the charge/payment-intent id: that does not exist yet when the session is opened (Stripe
+    mints it only when the guest starts paying). The payment row is written with this session id and
+    a NULL ``provider_ref``; the confirming webhook resolves the row by the session id and backfills
+    the intent."""
 
     checkout_url: str
-    provider_ref: str
+    checkout_session_id: str
 
 
 class PaymentGateway(Protocol):
@@ -795,6 +860,10 @@ async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's
         return
 
     provider_ref = event.provider_ref
+    # The session id the original event carried, if any — a parked ``checkout.session.completed``
+    # still has to resolve by it once the checkout row commits (finding 1).
+    session_payload = event.payload.get("checkout_session_id")
+    checkout_session_id = str(session_payload) if isinstance(session_payload, str) else None
     try:
         amount_cents = int(event.payload["amount_cents"])
         currency = str(event.payload["currency"])
@@ -822,6 +891,7 @@ async def _retry_one_parked(  # noqa: PLR0913 - the item's identity + the tick's
         currency=currency,
         now=now,
         confirm_effects=confirm_effects,
+        checkout_session_id=checkout_session_id,
     )
     if not result.parked:
         event.status = PaymentEventStatus.APPLIED
@@ -864,6 +934,7 @@ __all__ = [
     "make_expire_hold_runner",
     "make_refund_runner",
     "resolve_payment",
+    "resolve_payment_by_checkout_session",
     "run_parked_payment_tick",
     "select_parked_payment_events",
 ]

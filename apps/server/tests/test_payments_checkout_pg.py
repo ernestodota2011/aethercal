@@ -52,7 +52,9 @@ _KEY = derive_fernet_key("test-app-secret")
 _PRICE = 5000
 _CUR = "usd"
 _CHECKOUT_URL = "https://checkout.test/cs_test_NOT_A_REAL_KEY"
-_PROVIDER_REF = "pi_test_NOT_A_REAL_KEY_x"
+# ==Finding 1.== The gateway hands back the Checkout Session id (the creation-time anchor), NOT the
+# PaymentIntent — the intent does not exist yet when the session is opened.
+_SESSION_ID = "cs_test_NOT_A_REAL_KEY_x"
 
 
 class _StubTurnstile:
@@ -91,7 +93,7 @@ class _FakeGateway:
                 "return_url": return_url,
             }
         )
-        return CheckoutSession(checkout_url=_CHECKOUT_URL, provider_ref=_PROVIDER_REF)
+        return CheckoutSession(checkout_url=_CHECKOUT_URL, checkout_session_id=_SESSION_ID)
 
     async def refund(
         self,
@@ -240,7 +242,10 @@ async def test_a_paid_booking_holds_and_returns_a_checkout_url(
 
     payment = await _one_payment(owner_maker, booking_id)
     assert payment.status is PaymentStatus.INTENT
-    assert payment.provider_ref == _PROVIDER_REF
+    # ==Finding 1.== The row is anchored on the Checkout Session id and ``provider_ref`` is NULL
+    # (the intent does not exist yet), never the string "None" that once made the arbiter lose it.
+    assert payment.checkout_session_id == _SESSION_ID
+    assert payment.provider_ref is None
     assert payment.amount_cents == _PRICE
     assert await _has_expire_hold(owner_maker, booking_id)
 

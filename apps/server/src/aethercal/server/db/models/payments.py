@@ -8,7 +8,10 @@
   two events with *different* ``event.id`` values for a single successful payment
   (``checkout.session.completed`` and ``payment_intent.succeeded``), so a ledger keyed on the event
   id would let the same money be processed twice — and *"the webhook that did not win, refunds"*
-  would then return a paying guest's money.
+  would then return a paying guest's money. ==The charge reference does not exist yet when the
+  checkout is opened (finding 1),== so the row is created with ``provider_ref`` NULL and a
+  ``checkout_session_id`` (which does exist then); the confirming webhook resolves the row by that
+  session id and backfills the intent. Both Stripe events then converge on the one row.
 
 * :class:`PaymentEvent` is the parking lot. Every inbound event lands here first, and its UNIQUE is
   ``(tenant_id, provider, event_id)`` — the anti-replay of the SAME event. An event whose booking
@@ -113,8 +116,20 @@ class Payment(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     provider: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     # The provider's OWN reference for this charge (a Stripe PaymentIntent id, say). Stable across
     # every event the provider emits about this payment — which is exactly why the money's
-    # idempotency is anchored HERE and never on a per-event id.
-    provider_ref: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    # idempotency is anchored HERE and never on a per-event id. ==NULLABLE, and NULL at creation
+    # (finding 1).== At checkout-creation time the PaymentIntent does not exist yet (Stripe mints it
+    # only when the guest begins paying), so there is no intent to store. Forcing a value here is
+    # exactly what once persisted the literal string ``"None"`` and left the arbiter unable to find
+    # the row. The confirming webhook (``checkout.session.completed``) carries the real intent and
+    # backfills it; the arbiter finds the still-NULL row by :attr:`checkout_session_id` until then.
+    provider_ref: Mapped[str | None] = mapped_column(sa.String(255))
+    # ==The CREATION-TIME anchor (finding 1).== The provider's Checkout Session id (a Stripe
+    # ``cs_...``), which DOES exist when the session opens. The row is created with this set and
+    # ``provider_ref`` NULL; the confirming webhook resolves the row by THIS, then fills in the
+    # intent. Kept separate from ``provider_ref`` so that column keeps its single documented meaning
+    # (always the intent) instead of holding two different id namespaces at two points in time.
+    # Nullable because a non-checkout provider (or a payment recorded another way) may not have one.
+    checkout_session_id: Mapped[str | None] = mapped_column(sa.String(255), index=True)
     status: Mapped[PaymentStatus] = mapped_column(_PAYMENT_STATUS, nullable=False)
     amount_cents: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     currency: Mapped[str] = mapped_column(sa.String(3), nullable=False)
@@ -123,8 +138,13 @@ class Payment(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
         # ==The money's idempotency, at the database level.== Two Stripe events with different
         # ``event.id`` for one payment carry the SAME ``provider_ref``, so this is what collapses
         # them into one ledger row — and it is a UNIQUE, not an application check, because a
-        # check-then-insert cannot survive the two events arriving concurrently.
+        # check-then-insert cannot survive the two events arriving concurrently. NULLs do not
+        # collide (Postgres + SQLite both treat them as distinct), so many still-unpaid intents
+        # coexist until each is backfilled with its own charge reference.
         sa.UniqueConstraint("tenant_id", "provider", "provider_ref"),
+        # The creation-time anchor is unique too, so resolving a row by its Checkout Session id
+        # returns exactly one. NULLs coexist (a provider that sets no session id).
+        sa.UniqueConstraint("tenant_id", "provider", "checkout_session_id"),
     )
 
 

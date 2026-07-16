@@ -421,7 +421,11 @@ async def _start_paid_booking(
             tenant_id=event_type.tenant_id,
             booking_id=booking.id,
             provider=CredentialProvider.STRIPE.value,
-            provider_ref=checkout.provider_ref,
+            # ==Finding 1.== Anchor the row on the Checkout Session id (it exists now); the intent
+            # does not exist yet, so ``provider_ref`` stays NULL until the confirming webhook
+            # backfills it. Storing ``str(payment_intent)`` here is what once persisted "None".
+            checkout_session_id=checkout.checkout_session_id,
+            provider_ref=None,
             status=PaymentStatus.INTENT,
             amount_cents=price_cents,
             currency=currency,

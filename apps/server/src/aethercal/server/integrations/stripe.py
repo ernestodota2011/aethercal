@@ -100,10 +100,15 @@ class StripeWebhookAdapter:
         # idempotency is anchored on it and never on ``event.id``.
         match event_type:
             case "checkout.session.completed":
+                # ==Finding 1.== This is the FIRST event and the row it confirms was created before
+                # the intent existed (``provider_ref`` NULL), so we carry BOTH the session id
+                # (``obj["id"]``, the creation-time anchor the arbiter resolves by) AND the now-real
+                # intent (``obj["payment_intent"]``, which the arbiter backfills into the row).
                 provider_ref = obj.get("payment_intent")
+                session_id = obj.get("id")
                 amount = obj.get("amount_total")
                 currency = obj.get("currency")
-                if not isinstance(provider_ref, str):
+                if not isinstance(provider_ref, str) or not isinstance(session_id, str):
                     return None
                 return ParsedWebhookEvent(
                     kind=WebhookEventKind.PAID,
@@ -111,6 +116,7 @@ class StripeWebhookAdapter:
                     provider_ref=provider_ref,
                     amount_cents=amount if isinstance(amount, int) else None,
                     currency=currency if isinstance(currency, str) else None,
+                    checkout_session_id=session_id,
                 )
             case "payment_intent.succeeded":
                 provider_ref = obj.get("id")
@@ -196,9 +202,12 @@ class StripeGateway:
             )
             response.raise_for_status()
             body = response.json()
-        return CheckoutSession(
-            checkout_url=str(body["url"]), provider_ref=str(body["payment_intent"])
-        )
+        # ==Finding 1.== Anchor on the Checkout Session id (``body["id"]``, always present at open),
+        # NEVER ``body["payment_intent"]`` — Stripe leaves that ``null`` until the guest starts
+        # paying, so ``str(None)`` used to persist the literal ``"None"`` as the payment's reference
+        # and the arbiter could never find the row. The real intent arrives on the confirming
+        # ``checkout.session.completed`` webhook, which backfills ``provider_ref``.
+        return CheckoutSession(checkout_url=str(body["url"]), checkout_session_id=str(body["id"]))
 
     async def refund(
         self,
