@@ -53,6 +53,12 @@ EXPECTED_TABLES = {
     "memberships",
     # 0010 — BYOK: each business's own provider credentials, encrypted at rest (RF-27).
     "tenant_credentials",
+    # 0015 — payments (B-05b, RF-26). ``payments`` is the money ledger the arbiter reasons over
+    # (idempotency anchored on ``provider_ref``, NEVER ``event.id``); ``payment_events`` is the
+    # "parking lot" — every inbound webhook event lands here first, so an event whose booking does
+    # not exist yet is retried rather than lost, and the same ``event.id`` can never be replayed.
+    "payments",
+    "payment_events",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.
@@ -239,6 +245,50 @@ def test_the_tenant_carries_its_branding(tmp_path: Path) -> None:
     actual = {col["name"] for col in inspector.get_columns("tenants")}
     assert {"public_name", "logo_url", "accent_color", "timezone"} <= actual
     engine.dispose()
+
+
+def test_payments_idempotency_is_anchored_on_the_provider_ref() -> None:
+    """B-05b / RF-26: the money's idempotency key is ``(tenant_id, provider, provider_ref)``.
+
+    ==NEVER ``event.id``.== Stripe delivers two events with distinct ``event.id`` for one payment
+    (``checkout.session.completed`` and ``payment_intent.succeeded``), so a UNIQUE on the event id
+    would let the SAME payment be processed twice. The provider's *charge/reference* is the one
+    identity that is stable across both events, so it is what the ledger row is unique on.
+    """
+    assert ("tenant_id", "provider", "provider_ref") in _unique_column_sets("payments")
+
+
+def test_payment_events_anti_replay_is_on_the_event_id() -> None:
+    """The parking lot's UNIQUE is ``(tenant_id, provider, event_id)`` — anti-replay of ONE event.
+
+    Distinct from the payments UNIQUE above, and the two are not the same key by accident: a webhook
+    endpoint must reject a re-POST of the very same event (``event_id``), while the ARBITER must
+    collapse two DIFFERENT events about one payment (``provider_ref``). One table anchors each.
+    """
+    assert ("tenant_id", "provider", "event_id") in _unique_column_sets("payment_events")
+
+
+def test_a_booking_carries_its_hold_and_its_confirming_payment() -> None:
+    """B-05b: ``hold_expires_at`` (when an unpaid hold self-cancels) and
+    ``confirmed_by_payment_id`` (==the discriminator of the WINNER==: which payment confirmed this
+    booking, so the arbiter can tell "I am the payment that confirmed it" from "I am an orphan").
+    Both nullable — a free booking has neither."""
+    table = Base.metadata.tables["bookings"]
+    assert table.c["hold_expires_at"].nullable
+    assert table.c["confirmed_by_payment_id"].nullable
+    fks = list(table.c["confirmed_by_payment_id"].foreign_keys)
+    assert len(fks) == 1
+    assert fks[0].column.table.name == "payments"
+
+
+def test_an_event_type_carries_its_price_and_refund_rule() -> None:
+    """B-05b: ``price_cents`` (NULL = FREE, and a free type confirms directly with no hold),
+    ``currency``, ``refund_window_minutes`` and ``refund_kind`` (full | none — partial/tiered is
+    F5). The arbiter validates a payment's amount+currency against these before it will confirm."""
+    table = Base.metadata.tables["event_types"]
+    assert table.c["price_cents"].nullable, "price_cents NULL means the type is free"
+    for name in ("currency", "refund_window_minutes", "refund_kind"):
+        assert name in table.c, f"event_types is missing {name}"
 
 
 def test_naming_convention_yields_deterministic_constraint_names() -> None:

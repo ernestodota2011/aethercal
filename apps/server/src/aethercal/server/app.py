@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 from aethercal.schemas import ErrorResponse
 from aethercal.server.admin.mount import mount_admin
-from aethercal.server.api import API_V1_PREFIX, api_router, public
+from aethercal.server.api import API_V1_PREFIX, api_router, public, webhooks_inbound
 from aethercal.server.api.auth import AuthenticationError
 from aethercal.server.api.ratelimit import PublicRateLimitMiddleware, SlidingWindowLimiter
 from aethercal.server.channels import Channel
@@ -51,10 +51,12 @@ from aethercal.server.integrations.sms.config import TwilioConfig
 from aethercal.server.integrations.sms.sender import TwilioSmsSender
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import EmailSender, SmtpEmailSender
+from aethercal.server.integrations.stripe import StripeGateway, StripeWebhookAdapter
 from aethercal.server.integrations.turnstile import CloudflareTurnstile
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import WEBHOOK_HTTP_TIMEOUT_SECONDS
+from aethercal.server.services.payment_webhooks import PAYMENT_WEBHOOK_ADAPTERS
 from aethercal.server.settings import Settings
 from aethercal.server.webhooks.allowlist import warn_if_loopback_is_allowlisted
 
@@ -197,6 +199,26 @@ def create_app(settings: Settings) -> FastAPI:
     # lifespan — every test client — must still resolve addresses exactly as production does. A
     # malformed CIDR has already failed the boot, inside Settings.
     app.state.trusted_proxies = settings.trusted_proxy_networks()
+
+    # ==The inbound payment webhook (B-05b), and the keys it decrypts BYOK credentials with.==
+    # Built EAGERLY (like the sessionmaker and the proxies), not in the lifespan, because the
+    # router reads ``fernet_keys`` off ``app.state`` on every request and a test client never runs
+    # the lifespan. It is the (current, retiring) reader so a credential the key rotation has not
+    # reached yet still verifies. The router is UNAUTHENTICATED-BUT-SIGNED — the HMAC over the
+    # raw body is its whole authority — so it is always mounted: the provider must be able to reach
+    # it whenever payments are in use, and an unsigned or wrongly-signed request is a 401.
+    app.state.fernet_keys = settings.decryption_fernet_keys()
+    app.include_router(webhooks_inbound.router)
+
+    # ==The payment providers (B-05b).== The webhook adapters (signature scheme + event parsing) per
+    # provider, and the outgoing gateway (checkout + refund). Stripe is the primary; its ``stripe``
+    # webhook adapter REPLACES the generic HMAC default. Held per-app rather than mutating the
+    # global, so a test can swap in a fake without leaking across the suite. The gateway's HTTP half
+    # is NOT verified against live Stripe in this cut (see integrations/stripe) — a test injects a
+    # fake; a paid booking on an instance with no gateway answers 503, and a free booking is
+    # unaffected.
+    app.state.webhook_adapters = {**PAYMENT_WEBHOOK_ADAPTERS, "stripe": StripeWebhookAdapter()}
+    app.state.payment_gateway = StripeGateway()
 
     # ==THE PUBLIC ROUTER — an UNAUTHENTICATED WRITE, and therefore opt-in.==
     #

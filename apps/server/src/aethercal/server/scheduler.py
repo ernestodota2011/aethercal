@@ -35,19 +35,22 @@ from sqlalchemy import select
 
 from aethercal.core.model import TimeInterval
 from aethercal.server.db.guc import tenant_scope
-from aethercal.server.db.models import ExternalConnection
+from aethercal.server.db.models import Booking, ExternalConnection
 from aethercal.server.db.pools import BypassReason, WorkerPools
+from aethercal.server.services.bookings import BookingEffects, confirm_paid_booking_effects
 from aethercal.server.services.calendars import (
     ServiceFactory,
     build_live_service,
     refresh_busy_cache,
 )
+from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
     OutboxExecutor,
     OutboxReport,
     drain_outbox,
     make_booking_effect_executor,
 )
+from aethercal.server.services.payments import build_money_runners, run_parked_payment_tick
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
 
@@ -360,7 +363,7 @@ async def run_busy_refresh_once(
 # --------------------------------------------------------------------------------------
 
 
-def _decryption_fernet(app: FastAPI) -> MultiFernet:  # pragma: no cover - live
+def _decryption_fernet(app: FastAPI) -> MultiFernet:
     """The MultiFernet a live tick decrypts with: the current key first, and the retiring one during
     a rotation. ``app.state.fernet_keys`` is ``Settings.decryption_fernet_keys()`` — so a row the
     rotation has not reached yet, still on the old key, is readable throughout the window."""
@@ -404,37 +407,84 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     return _tick
 
 
-def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to the worker's state (pools + SMTP sender + a Fernet-built Google
-    factory) — the live ``execute`` dispatches each intent to its handler (email / Google).
+def _payment_confirm_effects(app: FastAPI):
+    """The arbiter's ``confirm_effects`` for the parked tick: the same chain a free booking runs.
 
-    ==The executor is built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers
-    read the booking, decrypt the business's credential and write the ledger, and every one of those
-    is a tenant-scoped table. They run inside the drain's per-item ``tenant_scope``, so under RLS
-    they see exactly that item's business — which is the whole point of splitting the pools: the one
-    place a cross-business leak would be *externally visible* is precisely here, in the process that
-    sends the guest's name and address to somebody's webhook.
+    Built here in the worker, the one place that may hold both the booking service and the arbiter.
+    """
+    settings = app.state.settings
+    base = (settings.booking_base_url or "http://localhost").rstrip("/")
+    effects = BookingEffects(signer=GuestTokenSigner(settings.app_secret), booking_base_url=base)
+
+    async def _run(session: Any, booking: Booking, now: Any) -> None:
+        await confirm_paid_booking_effects(session, booking=booking, effects=effects, now=now)
+
+    return _run
+
+
+def build_drain_executor(app: FastAPI) -> OutboxExecutor:
+    """The live outbox ``execute``, built from the worker's app state — ==and TESTED (finding 1).==
+
+    Extracted out of the ``# pragma: no cover`` tick so the money-path wiring is verifiable: that
+    the REFUND runner really is armed with the worker's gateway + rotation keys, and is invocable. A
+    path nobody exercises is not acceptable, whatever a static read of the wiring concludes.
+
+    ==Built over ``pools.exec_maker``, the APP-role pool.== The handlers read the booking,
+    decrypt the business's credential and write the ledger — all tenant-scoped tables — inside the
+    drain's per-item ``tenant_scope``, so under RLS they see exactly that item's business.
+    """
+    pools: WorkerPools = app.state.pools
+    # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key during a
+    # rotation, so the drain never fails to decrypt a row the rotation has not reached.
+    fernet = _decryption_fernet(app)
+    service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+    # ==The money runners (B-05b), fail-closed (finding 2).== Read the gateway + rotation keys
+    # DEFENSIVELY off app state (a missing one must not AttributeError), and let
+    # ``build_money_runners`` decide: the REFUND runner needs BOTH, EXPIRE_HOLD needs neither. With
+    # either missing the refund runner is None and a REFUND intent raises loudly, not silently
+    # stranding a guest's money.
+    fernet_keys = getattr(app.state, "fernet_keys", None)
+    gateway = getattr(app.state, "payment_gateway", None)
+    refund_runner, expire_hold_runner = build_money_runners(
+        exec_maker=pools.exec_maker, gateway=gateway, fernet_keys=fernet_keys
+    )
+    return make_booking_effect_executor(
+        sessionmaker=pools.exec_maker,
+        sender=app.state.email_sender,
+        service_factory=service_factory,
+        # The non-email channel registry. A step on a channel nobody registered is SKIPPED with its
+        # reason, never failed — a channel without credentials is a disabled feature, not an error.
+        # Email is deliberately NOT here: it goes through the full composer, which carries the .ics
+        # invite that a plain-body ChannelSender cannot.
+        channels=getattr(app.state, "channel_senders", None),
+        refund_runner=refund_runner,
+        expire_hold_runner=expire_hold_runner,
+    )
+
+
+def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
+    """Bind an outbox-drain tick to the worker's state.
+
+    The live ``execute`` (:func:`build_drain_executor`) dispatches each intent to its handler (email
+    / Google / refund / hold-expiry); then the parked-payment tick re-runs the arbiter for events
+    that beat their checkout.
     """
 
     async def _tick() -> None:
         pools: WorkerPools = app.state.pools
-        # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key
-        # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
-        fernet = _decryption_fernet(app)
-        service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        execute = make_booking_effect_executor(
-            sessionmaker=pools.exec_maker,
-            sender=app.state.email_sender,
-            service_factory=service_factory,
-            # The non-email channel registry. A step on a channel nobody registered is SKIPPED with
-            # its reason, never failed — a channel without credentials is a disabled feature, not an
-            # error.
-            #
-            # Email is deliberately NOT here: it goes through the full composer, which carries the
-            # .ics invite that a plain-body ChannelSender cannot.
-            channels=getattr(app.state, "channel_senders", None),
-        )
+        execute = build_drain_executor(app)
         await run_outbox_drain_once(pools=pools, execute=execute)
+
+        # ==The parked-payment tick (criterion 29).== Runs on the same interval as the drain: re-run
+        # the arbiter for events that beat their checkout's commit, and dead-letter the ones that
+        # never resolve. It swallows its own failures (like every guarded tick) so a bad pass never
+        # kills the loop.
+        try:
+            await run_parked_payment_tick(
+                pools, now=datetime.now(UTC), confirm_effects=_payment_confirm_effects(app)
+            )
+        except Exception:
+            _logger.exception("parked-payment tick failed; scheduler continues")
 
     return _tick
 

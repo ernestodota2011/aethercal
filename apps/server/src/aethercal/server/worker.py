@@ -70,6 +70,7 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.pools import WorkerPools
 from aethercal.server.db.roles import DbRole, assert_engine_role
+from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
@@ -171,6 +172,9 @@ def create_worker_app(settings: Settings) -> FastAPI:
     app = FastAPI(title=f"{settings.app_name} worker", lifespan=lifespan)
     app.state.settings = settings
     app.state.pools = pools
+    # The BYOK payment gateway the REFUND runner calls (B-05b). Eager, so the drain tick built in
+    # lifespan can read it. Its HTTP half is not verified against live Stripe in this cut.
+    app.state.payment_gateway = StripeGateway()
     app.state.webhook_allowlist = settings.private_target_allowlist()
     warn_if_loopback_is_allowlisted(app.state.webhook_allowlist)
 

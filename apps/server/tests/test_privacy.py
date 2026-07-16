@@ -38,6 +38,10 @@ from aethercal.server.db.models import (
     GuestToken,
     Outbox,
     OutboxStatus,
+    Payment,
+    PaymentEvent,
+    PaymentEventStatus,
+    PaymentStatus,
     Schedule,
     SentNotification,
     Tenant,
@@ -52,6 +56,7 @@ from aethercal.server.services.privacy import (
     ERASED_EMAIL,
     ERASED_NAME,
     TABLES_PURGED_BY_BOOKING,
+    TABLES_RETAINED_OFF_BOOKING,
     purge_guest,
 )
 
@@ -486,9 +491,141 @@ def test_every_table_hanging_off_a_booking_is_handled_by_the_purge() -> None:
         if "booking_id" in table.columns and table.name != "bookings"
     }
 
-    assert hanging_off_a_booking == set(TABLES_PURGED_BY_BOOKING), (
-        "a table hangs off `bookings` and the guest purge does not handle it: "
-        f"{hanging_off_a_booking ^ set(TABLES_PURGED_BY_BOOKING)}. A purge that misses one table "
-        "passes its own test and leaves the guest's data behind — handle it in services/privacy.py "
-        "and list it in TABLES_PURGED_BY_BOOKING."
+    # ==Two categories, and every booking_id table must be in EXACTLY one.== Deleted-outright
+    # (``_PURGED_BY_BOOKING``: rows that exist only to message the guest), or retained-with-reason
+    # (``TABLES_RETAINED_OFF_BOOKING``: a financial record kept for audit + idempotency, with no
+    # guest PII to strip). The second category is the mirror of ``BOOKING_RETAINED_GUEST_COLUMNS``:
+    # "keep this one" has to be a decision written down, never an omission that looks like a bug.
+    handled = set(TABLES_PURGED_BY_BOOKING) | set(TABLES_RETAINED_OFF_BOOKING)
+    assert not (set(TABLES_PURGED_BY_BOOKING) & set(TABLES_RETAINED_OFF_BOOKING)), (
+        "a table is BOTH deleted and retained by the purge — one row cannot be two decisions"
     )
+    assert hanging_off_a_booking == handled, (
+        "a table hangs off `bookings` and the guest purge does not handle it: "
+        f"{hanging_off_a_booking ^ handled}. A purge that misses one table passes its own test and "
+        "leaves the guest's data behind — either DELETE its rows (list it in "
+        "TABLES_PURGED_BY_BOOKING and wire it in services/privacy.py) or RETAIN it with a written "
+        "reason (TABLES_RETAINED_OFF_BOOKING, for a financial record with no guest PII)."
+    )
+
+
+async def _pay(
+    session: AsyncSession,
+    booking: Booking,
+    *,
+    provider_ref: str = "pi_test_123",
+    email: str = _EMAIL,
+) -> None:
+    """A paid payment for ``booking`` + an event whose raw payload carries the guest email."""
+    session.add(
+        Payment(
+            tenant_id=booking.tenant_id,
+            booking_id=booking.id,
+            provider="stripe",
+            provider_ref=provider_ref,
+            status=PaymentStatus.PAID,
+            amount_cents=5000,
+            currency="usd",
+        )
+    )
+    session.add(
+        PaymentEvent(
+            tenant_id=booking.tenant_id,
+            provider="stripe",
+            event_id=f"evt_{uuid.uuid4().hex}",
+            provider_ref=provider_ref,
+            # A Stripe event puts PII under keys we do not control (``customer_details.email``).
+            payload={"type": "payment_intent.succeeded", "customer_details": {"email": email}},
+            status=PaymentEventStatus.APPLIED,
+        )
+    )
+    await session.flush()
+
+
+async def test_the_payment_record_survives_but_its_event_payload_is_redacted(
+    sqlite_session: AsyncSession,
+) -> None:
+    """The MONEY record stays (audit + idempotency); the event's raw payload loses the guest.
+
+    ``payments`` names no person and its UNIQUE is the anti-double-charge key, so it is kept. The
+    ``payment_events`` row also stands — deleting it would destroy the anti-replay UNIQUE, letting
+    same provider event apply again — but its payload, which can hold a customer email, is cleared.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "biz")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _pay(sqlite_session, booking)
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    # The payment ledger row is untouched: it is a financial record, and it names nobody.
+    payment = (
+        await sqlite_session.scalars(sa.select(Payment).where(Payment.booking_id == booking.id))
+    ).one()
+    assert payment.status is PaymentStatus.PAID
+    assert payment.provider_ref == "pi_test_123"
+
+    # The event ROW stands (anti-replay key intact) but its payload carries no PII any more.
+    event = (
+        await sqlite_session.scalars(
+            sa.select(PaymentEvent).where(PaymentEvent.provider_ref == "pi_test_123")
+        )
+    ).one()
+    assert event.payload == {"redacted": True}
+    assert _EMAIL not in str(event.payload)
+    assert report.payment_events == 1
+
+
+async def test_a_purge_never_orphans_a_charged_payment_by_redacting_a_parked_event(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==r6 finding 2 — the invariant that outranks the erasure.== A PARKED event has NOT been
+    applied yet: the parked tick re-runs the arbiter from ITS payload to confirm or refund the
+    charge. Redacting it would destroy the amount + currency the arbiter needs and leave a payment
+    that was CHARGED but never confirmed nor refunded — the worst outcome this system can produce.
+
+    So the purge redacts only TERMINAL events (``applied``/``dead``) and leaves an in-flight one
+    applyable. Retaining it costs no privacy: it holds financial identifiers, not guest PII, and a
+    later purge pass redacts it once the tick has driven it terminal.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "biz")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _pay(sqlite_session, booking)  # the payment + one APPLIED (terminal) event
+
+    # A second event for the SAME charge that the arbiter has NOT applied yet — it is waiting for
+    # the tick. Its payload is exactly what the arbiter needs to re-run.
+    parked_payload: dict[str, object] = {
+        "kind": "paid",
+        "provider_ref": "pi_test_123",
+        "amount_cents": 5000,
+        "currency": "usd",
+    }
+    sqlite_session.add(
+        PaymentEvent(
+            tenant_id=tenant.id,
+            provider="stripe",
+            event_id=f"evt_parked_{uuid.uuid4().hex}",
+            provider_ref="pi_test_123",
+            payload=dict(parked_payload),
+            status=PaymentEventStatus.PARKED,
+        )
+    )
+    await sqlite_session.flush()
+
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    events = (
+        await sqlite_session.scalars(
+            sa.select(PaymentEvent).where(PaymentEvent.provider_ref == "pi_test_123")
+        )
+    ).all()
+    by_status = {row.status: row for row in events}
+
+    # ==The parked event is still APPLYABLE== — the arbiter can still confirm or refund the charge.
+    parked = by_status[PaymentEventStatus.PARKED]
+    assert parked.payload == parked_payload, "a parked event must stay applyable after a purge"
+
+    # And the purge is still COMPLETE for what is done with: the terminal event is redacted.
+    applied = by_status[PaymentEventStatus.APPLIED]
+    assert applied.payload == {"redacted": True}
+    assert _EMAIL not in str(applied.payload)
+    assert report.payment_events == 1, "only the terminal event is redacted"

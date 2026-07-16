@@ -310,7 +310,8 @@ async def test_the_public_event_type_projection_leaks_no_internals(
     ``host_id``
     and ``schedule_id`` — internal identifiers of a business, handed to anonymous callers, for
     nothing. What a guest needs in order to choose a time is a slug, a title, a description, a
-    duration and the questions they will be asked."""
+    duration and the questions they will be asked — plus the price they will pay (B-05b), but NEVER
+    the internal refund policy (``refund_window_minutes``/``refund_kind`` stay off it)."""
     response = await public_client.get(f"/api/v1/public/{acme['tenant_slug']}/event-types")
 
     assert set(response.json()[0]) == {
@@ -322,6 +323,8 @@ async def test_the_public_event_type_projection_leaks_no_internals(
         "location",
         "duration_seconds",
         "questions",
+        "price_cents",
+        "currency",
         "collects_phone",
     }
 
@@ -350,8 +353,13 @@ async def test_a_booking_is_created_with_NO_api_key(
 
     assert response.status_code == 201, response.text
     body = response.json()
-    assert set(body) == {"id", "start", "end", "status"}
+    # Six fields now: the four originals + ``checkout_url`` (B-05b) + ``checkout_token`` (r5). Both
+    # carry no PII and are ``None`` for a FREE booking like this one (``acme`` has no price, so it
+    # confirms on the spot with no hold, no checkout, and no resume token).
+    assert set(body) == {"id", "start", "end", "status", "checkout_url", "checkout_token"}
     assert body["status"] == "confirmed"
+    assert body["checkout_url"] is None
+    assert body["checkout_token"] is None
     assert (await _stored(owner_maker, body["id"])).tenant_id == acme["tenant_id"]
 
 

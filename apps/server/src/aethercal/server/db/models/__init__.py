@@ -11,6 +11,13 @@ from aethercal.server.db.models.integrations import (
 )
 from aethercal.server.db.models.notifications import SentNotification
 from aethercal.server.db.models.outbox import Outbox, OutboxStatus
+from aethercal.server.db.models.payments import (
+    Payment,
+    PaymentEvent,
+    PaymentEventStatus,
+    PaymentStatus,
+    RefundKind,
+)
 from aethercal.server.db.models.scheduling import DateOverride, EventType, Schedule
 from aethercal.server.db.models.tenancy import ApiKey, MemberRole, Membership, Tenant, User
 from aethercal.server.db.models.webhooks import Webhook, WebhookDelivery
@@ -34,6 +41,11 @@ __all__ = [
     "Membership",
     "Outbox",
     "OutboxStatus",
+    "Payment",
+    "PaymentEvent",
+    "PaymentEventStatus",
+    "PaymentStatus",
+    "RefundKind",
     "Schedule",
     "SentNotification",
     "Tenant",

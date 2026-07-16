@@ -199,6 +199,14 @@ class OutboxEffect(StrEnum):
     GOOGLE = "google"
     NOTIFY = "notify"
     """One workflow step, on one channel (RF-24). Handler: the workflow-engine cut."""
+    REFUND = "refund"
+    """Return a guest's money (B-05b). ==Acts on a booking that is unpaid/cancelled BY DEFINITION==,
+    so it is EXEMPT from both the confirmation gate and the staleness guard, and it is NON-VOIDABLE:
+    a cancel that killed a refund in flight is money that never comes back."""
+    EXPIRE_HOLD = "expire_hold"
+    """Cancel an unpaid hold whose TTL has passed, freeing its slot (B-05b). No external I/O, so any
+    failure is anomalous by definition — a dead EXPIRE_HOLD is a slot blocked for ever. Same exempt,
+    non-voidable treatment as REFUND."""
 
 
 class GoogleOperation(StrEnum):
@@ -267,6 +275,12 @@ _STALENESS: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], Staleness]] = {
         else Staleness.SUBJECT
     ),
     OutboxEffect.NOTIFY: lambda payload: trigger_staleness(WorkflowTrigger(payload["trigger"])),
+    # ==Both EXEMPT, and it MUST be a conscious choice.== A refund acts on a booking that is
+    # cancelled by definition, and ``_is_chain_current`` is False for a cancelled booking BY
+    # CONSTRUCTION — so a SUBJECT refund would be marked ``delivered`` and never sent, and the
+    # guest's money would never come back. EXPIRE_HOLD acts on a hold nobody paid for, same story.
+    OutboxEffect.REFUND: lambda _payload: Staleness.EXEMPT,
+    OutboxEffect.EXPIRE_HOLD: lambda _payload: Staleness.EXEMPT,
 }
 
 
@@ -308,8 +322,66 @@ def confirmation_policy(effect: OutboxEffect) -> Confirmation:
     match effect:
         case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
             return Confirmation.REQUIRES_CONFIRMATION
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            # They act on bookings that are unpaid or cancelled BY DEFINITION — a refund returns the
+            # money for one that never became live; an expiry cancels the hold itself. A belt that
+            # silenced them would KEEP the guest's money and leave the slot blocked for ever. So the
+            # silence gate lets them straight through, and this arm is what makes that a decision.
+            return Confirmation.EXEMPT
         case _ as unreachable:
             assert_never(unreachable)
+
+
+class Voidability(StrEnum):
+    """Whether a booking transition (cancel / reschedule / no-show) may RETIRE a queued intent."""
+
+    VOIDABLE = "voidable"
+    """A booking's life changed, so this queued intent is now wrong and is retired before it
+    runs."""
+    NON_VOIDABLE = "non_voidable"
+    """==Once queued, it MUST run.== Cancelling the booking does not recall it — for a REFUND that
+    would be money that never comes back."""
+
+
+def voidability_policy(effect: OutboxEffect) -> Voidability:
+    """Whether :func:`void_pending_steps` may retire ``effect`` when a booking's life changes.
+
+    ==EXHAUSTIVE, with ``assert_never``, exactly like the staleness and confirmation tables.== Today
+    ``void_pending_steps`` retires only ``NOTIFY`` (workflow) steps — what it always did, and
+    this table makes it a DECISION rather than an accident of one ``WHERE effect = 'notify'`` clause
+    that the next person to touch could widen without noticing.
+
+    * ``NOTIFY`` → **VOIDABLE**. A reschedule opens a new booking id, so the predecessor's queued
+      steps must be retired or they fire at the hour of a meeting that never happened.
+    * ``EMAIL`` / ``GOOGLE`` → **NON_VOIDABLE** by this belt. They are governed by their own dedupe
+      and staleness (a cancellation email is *supposed* to survive the cancellation), never by this
+      per-trigger sweep — which is why the sweep never selected them.
+    * ==``REFUND`` / ``EXPIRE_HOLD`` → **NON_VOIDABLE**, the load-bearing one.== A cancel
+      must NOT be able to kill a refund already in the queue: ``void_pending_steps`` filtered
+      ``NOTIFY`` and so did not — but *"did not, by accident"* is one edit from *"does, and keeps
+      the guest's money"*. The table makes it impossible to add that edit without failing the type
+      check.
+    """
+    match effect:
+        case OutboxEffect.NOTIFY:
+            return Voidability.VOIDABLE
+        case (
+            OutboxEffect.EMAIL
+            | OutboxEffect.GOOGLE
+            | OutboxEffect.REFUND
+            | OutboxEffect.EXPIRE_HOLD
+        ):
+            return Voidability.NON_VOIDABLE
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+_VOIDABLE_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if voidability_policy(effect) is Voidability.VOIDABLE
+)
+"""The effect values :func:`void_pending_steps` may retire — DERIVED from the table above, never a
+literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE one can never slip
+in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +601,22 @@ def google_dedupe_key(operation: GoogleOperation) -> str:
     return f"{OutboxEffect.GOOGLE.value}:{operation.value}"
 
 
+def refund_dedupe_key(provider_ref: str) -> str:
+    """The idempotency key for a refund intent — ==keyed on ``provider_ref``, never the booking.==
+
+    A refund has TWO enqueue paths (``cancel_booking`` and the arbiter's late-webhook branch), and
+    both must collapse to ONE row: ``UniqueConstraint(tenant_id, booking_id, dedupe_key)`` on the
+    outbox is what does it. Keyed on the payment's ``provider_ref`` so that a double payment (two
+    ``provider_ref``s on one booking) produces two DISTINCT refund intents — each charge is refunded
+    exactly once — while a single charge reached by both paths produces exactly one."""
+    return f"{OutboxEffect.REFUND.value}:{provider_ref}"
+
+
+def expire_hold_dedupe_key(booking_id: uuid.UUID) -> str:
+    """The idempotency key for a hold-expiry intent (one per booking: a hold IS one booking)."""
+    return f"{OutboxEffect.EXPIRE_HOLD.value}:{booking_id}"
+
+
 def workflow_step_dedupe_key(workflow_id: uuid.UUID, step_id: uuid.UUID, channel: Channel) -> str:
     """The idempotency key for one workflow step on one channel (RF-24's exactly-once guarantee).
 
@@ -697,7 +785,10 @@ async def void_pending_steps(
             .where(
                 Outbox.tenant_id == tenant_id,
                 Outbox.booking_id == booking_id,
-                Outbox.effect == OutboxEffect.NOTIFY.value,
+                # ==Only the VOIDABLE effects (derived from ``voidability_policy``, today just
+                # NOTIFY).== A REFUND/EXPIRE_HOLD queued for this booking is NON_VOIDABLE and must
+                # never be swept up by a cancel — the table is what guarantees it, not this clause.
+                Outbox.effect.in_(_VOIDABLE_EFFECTS),
                 Outbox.status.in_(_NON_TERMINAL),
             )
             .with_for_update()
@@ -963,6 +1054,19 @@ async def select_due(
                 select(Outbox.id)
                 .where(due_filter(now))
                 .order_by(
+                    # ==MONEY FIRST, ahead of everything.== A refund waiting behind a backlog of
+                    # notifications is a guest's money withheld for hours; a late EXPIRE_HOLD is a
+                    # slot blocked. So these outrank even ``created_at`` — a refund now must
+                    # not queue behind a reminder enqueued a week ago for a booking three weeks out.
+                    case(
+                        (
+                            Outbox.effect.in_(
+                                (OutboxEffect.REFUND.value, OutboxEffect.EXPIRE_HOLD.value)
+                            ),
+                            0,
+                        ),
+                        else_=1,
+                    ),
                     Outbox.created_at,
                     # Within one instant (intents enqueued in the same transaction share a stamp),
                     # run the Google sync BEFORE the email — so the confirmation/reschedule notice
@@ -2435,12 +2539,14 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
 # --------------------------------------------------------------------------------------
 
 
-def make_booking_effect_executor(
+def make_booking_effect_executor(  # noqa: PLR0913 - one injected handler per effect family
     *,
     sessionmaker: Sessionmaker,
     sender: EmailSender | None,
     service_factory: ServiceFactory | None,
     channels: Mapping[Channel, PhoneChannelSender] | None = None,
+    refund_runner: OutboxExecutor | None = None,
+    expire_hold_runner: OutboxExecutor | None = None,
 ) -> OutboxExecutor:
     """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
 
@@ -2454,6 +2560,12 @@ def make_booking_effect_executor(
     :class:`PhoneChannelSender`, not a bare sender, and that is load-bearing rather than
     decorative: such a sender carries the daily caps it must not exceed, so ==an uncapped
     WhatsApp/SMS sender cannot be registered here at all==. Fail-closed as a TYPE, not as a comment.
+
+    ``refund_runner`` / ``expire_hold_runner`` are the money handlers (B-05b),
+    INJECTED rather than imported so this module never depends on ``services.payments`` (which
+    depends on it). The worker wires them; if a REFUND/EXPIRE_HOLD intent reaches an executor built
+    without them it raises loudly, like an EMAIL with no sender — a misconfiguration, never a
+    silent skip that would strand a guest's money.
 
     An absent channel is not a gap: its steps SKIP with a reason, never fail."""
     registry = dict(channels or {})
@@ -2470,6 +2582,16 @@ def make_booking_effect_executor(
             await run_google_effect(sessionmaker, work, now, service_factory=service_factory)
         elif effect is OutboxEffect.NOTIFY:
             await run_notify_effect(sessionmaker, work, now, sender=sender, channels=registry)
+        elif effect is OutboxEffect.REFUND:
+            if refund_runner is None:
+                raise RuntimeError("outbox REFUND intent reached an executor with no refund runner")
+            await refund_runner(work, now)
+        elif effect is OutboxEffect.EXPIRE_HOLD:
+            if expire_hold_runner is None:
+                raise RuntimeError(
+                    "outbox EXPIRE_HOLD intent reached an executor with no expire-hold runner"
+                )
+            await expire_hold_runner(work, now)
         else:
             assert_never(effect)
 
@@ -2501,6 +2623,7 @@ __all__ = [
     "Staleness",
     "StepSchedule",
     "Suppressed",
+    "Voidability",
     "as_utc",
     "backoff_delay",
     "claim_one",
@@ -2508,12 +2631,14 @@ __all__ = [
     "drain_outbox",
     "email_dedupe_key",
     "enqueue_effect",
+    "expire_hold_dedupe_key",
     "google_dedupe_key",
     "make_booking_effect_executor",
     "message_deadline",
     "new_worker_id",
     "reconcile_workflow_steps",
     "recover_expired_leases",
+    "refund_dedupe_key",
     "run_email_effect",
     "run_google_effect",
     "run_notify_effect",
@@ -2521,6 +2646,7 @@ __all__ = [
     "staleness_policy",
     "trigger_staleness",
     "void_pending_steps",
+    "voidability_policy",
     "workflow_key_prefix",
     "workflow_step_dedupe_key",
 ]

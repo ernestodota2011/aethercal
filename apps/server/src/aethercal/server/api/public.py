@@ -31,13 +31,16 @@ prefix, and never will be.
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import UTC, date, datetime
+from collections.abc import Mapping
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.core.model import BookingStatus
 from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.public import (
     PublicBookingCreate,
@@ -50,7 +53,7 @@ from aethercal.server.api.bookings import map_booking_error
 from aethercal.server.api.slots import require_iana_zone_or_422, require_window_is_sane
 from aethercal.server.client_ip import TrustedProxies, resolve_client_ip
 from aethercal.server.db.guc import bind_tenant
-from aethercal.server.db.models import EventType
+from aethercal.server.db.models import Booking, EventType
 from aethercal.server.deps import get_session
 from aethercal.server.integrations.turnstile import TurnstileVerifier
 from aethercal.server.services.bookings import (
@@ -66,17 +69,51 @@ from aethercal.server.services.event_types import (
     get_bookable_event_type_by_slug,
     list_bookable_event_types,
 )
-from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.guest_tokens import (
+    GuestTokenPurpose,
+    GuestTokenSigner,
+    issue_guest_token,
+    verify_guest_token,
+)
+from aethercal.server.services.outbox import as_utc
+from aethercal.server.services.payments import (
+    CHECKOUT_SESSION_TTL,
+    HOLD_TTL,
+    CheckoutSession,
+    PaymentGateway,
+    enqueue_expire_hold,
+    record_checkout_intent,
+)
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    MissingCredentialError,
+    resolve_money_credential,
+)
 from aethercal.server.services.tenant_resolution import tenant_by_slug
 from aethercal.server.services.workflow_rules import PhoneChannelScope, phone_channel_scope
 from aethercal.server.settings import Settings
+
+_logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public", tags=["public"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 TenantSlug = Annotated[str, Path(max_length=63, description="The business's globally-unique slug")]
 EventSlug = Annotated[str, Path(max_length=63, description="Its slug inside that business")]
+TokenQuery = Annotated[str | None, Query(description="Signed guest token authorizing the resume")]
+
+# The resume token outlives the hold by a small margin, so the HOLD (not the token) is always what
+# gates a resume — an expired hold is a clean 409, never a confusing token failure (r5).
+_CHECKOUT_TOKEN_TTL = HOLD_TTL + timedelta(minutes=5)
+
+# ==The hold must have room for a FULL-MARGIN session, or there is no session to open (r7).==
+# ``CHECKOUT_SESSION_TTL`` already encodes Stripe's 30-minute floor PLUS the latency buffer that
+# keeps the value Stripe receives comfortably above it. Requiring the hold to have at least that
+# much life left means every session we open carries the whole margin AND expires inside the hold.
+# Below it, any session would either be under-margined (Stripe may reject it on arrival) or outlive
+# the hold (the guest pays for a slot ``EXPIRE_HOLD`` already freed). Both are refused with a 409.
+_MIN_HOLD_REMAINING_FOR_CHECKOUT = CHECKOUT_SESSION_TTL
 
 _NOT_FOUND = "not_found"
 _CAPTCHA_REQUIRED = "captcha_required"
@@ -98,6 +135,51 @@ def _not_found() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail={"error": _NOT_FOUND, "message": "Not found"},
+    )
+
+
+def _conflict(message: str) -> HTTPException:
+    """A 409 for a hold that can no longer be paid — already confirmed, cancelled, or lapsed.
+
+    The resume endpoint (finding 2) returns this instead of minting a SECOND checkout session: a
+    confirmed booking is already paid, and a cancelled/expired one no longer holds its slot, so a
+    fresh session would either double-charge or take a slot that has been given away."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error": "hold_not_resumable", "message": message},
+    )
+
+
+def _forbidden() -> HTTPException:
+    """A uniform 403 for a missing or invalid resume token — leaks no booking data (r5, RF-09).
+
+    Resuming a checkout is a WRITE, so it demands the signed guest token minted at booking creation,
+    exactly as cancel/reschedule do. Every failure — no token, bad/expired signature, token bound to
+    another booking — collapses to this one answer, so a caller who cannot prove they booked cannot
+    tell the difference between "wrong token" and "no such hold"."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "forbidden", "message": "Invalid or expired link"},
+    )
+
+
+def _checkout_unavailable(booking_id: uuid.UUID, checkout_token: str) -> HTTPException:
+    """A 502 that carries the ``booking_id`` AND the resume ``checkout_token`` (r3-2, r5-1).
+
+    The hold is already committed when the provider call is made, so a failed checkout must not
+    strand the guest on an opaque error with the slot locked for the hold's whole TTL. The
+    ``booking_id`` + ``checkout_token`` let the page retry via
+    ``POST /{tenant_slug}/bookings/{id}/checkout?token=...``, which resumes the SAME session (the
+    booking-id Idempotency-Key) rather than opening a second one — and the token proves the retry
+    comes from the guest who booked, not merely someone who saw the id."""
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail={
+            "error": "checkout_unavailable",
+            "message": "Could not start payment right now; please retry",
+            "booking_id": str(booking_id),
+            "checkout_token": checkout_token,
+        },
     )
 
 
@@ -296,6 +378,14 @@ async def create_public_booking(
         # writes a value into it, because this is the one path a stranger can reach.
         source_ip=client_ip,
     )
+    # ==Paid types HOLD; free types confirm on the spot.== Only the public path creates a hold — the
+    # admin and the API key are trusted and confirm directly (B-05b). A hold occupies the slot while
+    # the guest pays, and the arbiter confirms it when the payment lands.
+    if event_type.price_cents is not None:
+        return await _start_paid_booking(
+            session, request=request, event_type=event_type, params=params
+        )
+
     try:
         booking = await create_booking(
             session,
@@ -312,6 +402,322 @@ async def create_public_booking(
 
     await session.refresh(booking)
     return PublicBookingRead.model_validate(booking)
+
+
+@router.post(
+    "/{tenant_slug}/bookings/{booking_id}/checkout",
+    response_model=PublicBookingRead,
+)
+async def resume_paid_checkout(
+    tenant_slug: TenantSlug,
+    booking_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    token: TokenQuery = None,
+) -> PublicBookingRead:
+    """==Resume a paid checkout for a live unpaid hold (findings r3-2, r5-1).== Idempotent, and it
+    demands the signed guest token minted at booking creation.
+
+    When the first checkout call fails, ``create_public_booking`` answers 502 with the
+    ``booking_id`` and ``checkout_token``, leaving the hold PENDING (§4.4 designed this for that).
+    This re-opens checkout for that hold: by the booking-id Idempotency-Key the provider returns the
+    SAME session (never a second charge), and the INTENT Payment row is written if the failed first
+    attempt never got that far.
+
+    ==Resuming is a WRITE (r5), so it is authorized like cancel/reschedule==: a valid ``?token=`` of
+    purpose CHECKOUT, bound to THIS booking, is required. ==The token is checked FIRST (r6 finding
+    3), before the booking is even read==, so a caller without a valid token for THIS ``booking_id``
+    gets the SAME 403 whether or not the booking exists — the endpoint is no enumeration oracle. The
+    token is VERIFIED, not consumed, so a guest may resume the same hold again while it lives. ONLY
+    after a valid token does the booking's state shape the answer: a hold that has since confirmed,
+    cancelled or lapsed is a 409, and a vanished/free booking the shared 404.
+
+    The route carries ``tenant_slug`` like every other public endpoint: it BINDS the business so the
+    booking is read under row-level security (without a bound tenant the lookup sees nothing).
+    """
+    tenant_id = await _bind_business(session, tenant_slug)
+    # ==Authorize FIRST (r6 finding 3), before revealing anything about the booking.== A missing,
+    # invalid, or wrong-booking token is a uniform 403 — the same answer whether ``booking_id`` is a
+    # real hold or nothing at all, so an attacker cannot enumerate valid ids. The token is verified
+    # (not consumed), so a guest may resume again while the hold lives. Touches no Stripe, no write.
+    checkout_token = await _authorize_resume(request, session, booking_id=booking_id, token=token)
+
+    # The caller has proven they own THIS booking; only NOW may its state shape the answer.
+    booking = await session.get(Booking, booking_id)
+    if booking is None or booking.tenant_id != tenant_id:
+        # Near-unreachable: a valid CHECKOUT token implies the paid booking existed. Defensive 404.
+        raise _not_found()
+    event_type = await session.get(EventType, booking.event_type_id)
+    price_cents = None if event_type is None else event_type.price_cents
+    currency = None if event_type is None else event_type.currency
+    if price_cents is None or currency is None:
+        # A free type has no checkout to resume — indistinguishable from any other public miss.
+        raise _not_found()
+
+    now = _now()
+    _require_resumable_hold(booking, now=now)
+
+    gateway = _resolve_gateway(request)
+    secrets = await _resolve_business_secrets(session, request, tenant_id=tenant_id)
+    checkout_url = await _open_checkout_and_record(
+        session,
+        request=request,
+        gateway=gateway,
+        booking=booking,
+        tenant_id=tenant_id,
+        price_cents=price_cents,
+        currency=currency,
+        secrets=secrets,
+        now=now,
+        checkout_token=checkout_token,
+    )
+    await session.refresh(booking)
+    return PublicBookingRead.model_validate(booking).model_copy(
+        update={"checkout_url": checkout_url, "checkout_token": checkout_token}
+    )
+
+
+async def _authorize_resume(
+    request: Request, session: AsyncSession, *, booking_id: uuid.UUID, token: str | None
+) -> str:
+    """Authorize a checkout RESUME with the CHECKOUT guest token minted at booking creation (r5).
+
+    Returns the token string (so it can be echoed back for the next resume) or raises a uniform 403.
+    The token is VERIFIED, never consumed — resume is repeatable while the hold lives, so the
+    single-use stamp cancel/reschedule apply would be wrong here. It must be a valid, unexpired,
+    CHECKOUT-purpose token whose backing row binds to THIS booking; any other outcome is 403."""
+    if token is None:
+        raise _forbidden()
+    row = await verify_guest_token(
+        session,
+        GuestTokenSigner(_settings(request).app_secret),
+        token,
+        expected_purpose=GuestTokenPurpose.CHECKOUT,
+    )
+    if row is None or row.booking_id != booking_id:
+        raise _forbidden()
+    return token
+
+
+async def _start_paid_booking(
+    session: AsyncSession,
+    *,
+    request: Request,
+    event_type: EventType,
+    params: BookingParams,
+) -> PublicBookingRead:
+    """Open a paid hold: BYOK credential (fail-closed) → hold + EXPIRE_HOLD → COMMIT → checkout.
+
+    ==The order is the design (§4.4).== The credential is resolved FIRST, so a business that cannot
+    charge never even opens a hold (fail-closed, no orphan). The hold, its self-cancel AND the
+    resume token (r5) are committed BEFORE the provider I/O — *persist the intent before the call* —
+    so a failed checkout leaves a hold that lapses at its TTL, never a charge. ==If the provider
+    call fails the guest gets a 502 carrying the ``booking_id`` and ``checkout_token``==, so they
+    resume the SAME session instead of being stranded; the checkout's idempotency key is the
+    ``booking_id``, and the token proves the resume comes from the guest who booked.
+    """
+    price_cents = event_type.price_cents
+    currency = event_type.currency
+    if price_cents is None or currency is None:
+        # pragma: no cover - the caller only enters here for a priced type; a price with no
+        # currency is a misconfiguration.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "misconfigured", "message": "This service is not configured for pay"},
+        )
+    # Resolve the gateway + the BYOK secret BEFORE the hold: a business that cannot charge (no
+    # provider, or no credential) never opens a hold at all (fail-closed, no orphan).
+    gateway = _resolve_gateway(request)
+    secrets = await _resolve_business_secrets(session, request, tenant_id=event_type.tenant_id)
+
+    # ONE clock for the whole flow: the hold's TTL and the checkout's expiry are both measured from
+    # this instant, so their ordering (hold OUTLIVES session — finding 2) is guaranteed by the
+    # constants, not by two clocks read a few statements apart.
+    now = _now()
+    try:
+        booking = await create_booking(
+            session,
+            tenant_id=event_type.tenant_id,
+            params=params,
+            now=now,
+            effects=None,
+            hold_ttl=HOLD_TTL,
+        )
+    except BookingError as exc:
+        raise _public_booking_error(exc) from exc
+
+    assert booking.hold_expires_at is not None  # create_booking with hold_ttl always sets it
+    await enqueue_expire_hold(session, booking=booking, hold_expires_at=booking.hold_expires_at)
+    # ==Mint the resume token (r5) in the SAME transaction as the hold.== It authorizes reopening
+    # this hold's checkout — a WRITE — so it must be as strong as the cancel/reschedule tokens, and
+    # it is persisted (its hash) atomically with the hold, before the provider I/O.
+    checkout_token = await issue_guest_token(
+        session,
+        GuestTokenSigner(_settings(request).app_secret),
+        booking_id=booking.id,
+        tenant_id=event_type.tenant_id,
+        purpose=GuestTokenPurpose.CHECKOUT,
+        ttl=_CHECKOUT_TOKEN_TTL,
+    )
+    # Persist the hold + its self-cancel + the token BEFORE the provider I/O. The GUC re-stamps the
+    # next transaction (the listener + ContextVar), so the writes below stay bound to this business.
+    await session.commit()
+
+    checkout_url = await _open_checkout_and_record(
+        session,
+        request=request,
+        gateway=gateway,
+        booking=booking,
+        tenant_id=event_type.tenant_id,
+        price_cents=price_cents,
+        currency=currency,
+        secrets=secrets,
+        now=now,
+        checkout_token=checkout_token,
+    )
+    await session.refresh(booking)
+    return PublicBookingRead.model_validate(booking).model_copy(
+        update={"checkout_url": checkout_url, "checkout_token": checkout_token}
+    )
+
+
+def _resolve_gateway(request: Request) -> PaymentGateway:
+    """The configured payment gateway, or a 503. Shared by the create and resume paths."""
+    gateway: PaymentGateway | None = getattr(request.app.state, "payment_gateway", None)
+    if gateway is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "payments_unavailable", "message": "Payments are not configured"},
+        )
+    return gateway
+
+
+async def _resolve_business_secrets(
+    session: AsyncSession, request: Request, *, tenant_id: uuid.UUID
+) -> Mapping[str, str]:
+    """The business's OWN Stripe secrets (BYOK), or a 402. ==Fail-closed== — a business with no
+    credential can never fall back to the instance operator's account (criterion 41)."""
+    fernet_keys = request.app.state.fernet_keys
+    try:
+        credential = await resolve_money_credential(
+            session,
+            tenant_id=tenant_id,
+            provider=CredentialProvider.STRIPE,
+            fernet_key=fernet_keys,
+        )
+    except MissingCredentialError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "payment_unavailable",
+                "message": "This service cannot take payment right now",
+            },
+        ) from exc
+    return credential.secrets
+
+
+async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs ARE the contract
+    session: AsyncSession,
+    *,
+    request: Request,
+    gateway: PaymentGateway,
+    booking: Booking,
+    tenant_id: uuid.UUID,
+    price_cents: int,
+    currency: str,
+    secrets: Mapping[str, str],
+    now: datetime,
+    checkout_token: str,
+) -> str:
+    """Open (or, by the booking-id Idempotency-Key, RE-open the SAME) checkout and ensure the INTENT
+    Payment row, returning the ``checkout_url``. ==Shared by the create path and the resume endpoint
+    (finding 2)==, so both derive the SAME session for one booking and neither can double-charge.
+
+    A failure of the provider call becomes a 502 carrying the ``booking_id`` — the hold is already
+    persisted, so the guest resumes rather than losing the slot. Recording the INTENT row is
+    delegated to :func:`record_checkout_intent`, which is TOCTOU-safe (r4 finding 1): two concurrent
+    resumes of one hold both open the SAME session and both try to record it, and the loser absorbs
+    the UNIQUE conflict instead of handing the caller an ``IntegrityError``."""
+    expires_at = _checkout_expires_at(booking, now=now)
+    try:
+        checkout: CheckoutSession = await gateway.create_checkout_session(
+            idempotency_key=str(booking.id),
+            amount_cents=price_cents,
+            currency=currency,
+            # ==The session NEVER outlives the hold (r6 finding 1).== ``_checkout_expires_at`` caps
+            # the expiry to the hold's real deadline (still ≥ Stripe's 30-min floor + a buffer, or a
+            # 409), so ``EXPIRE_HOLD`` can never free the slot while the checkout is still payable.
+            expires_at=expires_at,
+            # ==Finding 3.== The guest returns to the REAL booking page, never a dead placeholder.
+            return_url=_booking_base_url(request, _settings(request)),
+            secrets=secrets,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # ==Finding 2.== is resumeable — the hold is committed, so answer 502 with the booking id
+        # AND the resume token rather than an opaque 500 that strands the slot for its whole TTL.
+        _logger.exception("checkout: provider call failed for booking %s", booking.id)
+        raise _checkout_unavailable(booking.id, checkout_token) from exc
+
+    await record_checkout_intent(
+        session,
+        tenant_id=tenant_id,
+        booking_id=booking.id,
+        provider=CredentialProvider.STRIPE.value,
+        checkout_session_id=checkout.checkout_session_id,
+        amount_cents=price_cents,
+        currency=currency,
+    )
+    return checkout.checkout_url
+
+
+def _checkout_expires_at(booking: Booking, *, now: datetime) -> datetime:
+    """The Stripe Checkout Session ``expires_at``: ==full margin, and never outliving the hold.==
+
+    Two hard rules, and when they cannot BOTH hold there is no session to open:
+
+    * **it must never OUTLIVE the hold** (r6) — if it did, ``EXPIRE_HOLD`` could free the slot while
+      the session was still payable, and the guest would pay for a slot already given away (a charge
+      to capture and immediately refund);
+    * **it must carry the FULL latency margin** (r7) — ``CHECKOUT_SESSION_TTL`` is Stripe's 30-min
+      floor PLUS a buffer, because a value computed here can arrive at Stripe a moment later and a
+      thin margin is one that Stripe may reject on arrival. Shipping a session with less margin than
+      the create path deliberately chose is the same latency bug in a new place.
+
+    So the hold must have at least ``_MIN_HOLD_REMAINING_FOR_CHECKOUT`` of life left, else 409; and
+    the expiry is capped to the hold's deadline (which, given that floor, is always the standard TTL
+    — the cap is kept as the STRUCTURAL guarantee of rule one, independent of the threshold).
+
+    .. rubric:: The resume window is short, and that is Stripe's floor speaking
+
+    A fresh hold is ``HOLD_TTL`` (33 min) and a session needs ~31 of them, so a resume is only
+    possible in roughly the first two minutes. That covers the case this endpoint exists for — the
+    checkout call failed, the page got a 502, and it retries within seconds — and every later try
+    gets an honest 409 instead of a session Stripe would reject or that would outlive the hold. The
+    only clean way to widen it is a product decision this module must not make on its own: a longer
+    ``HOLD_TTL`` (slots held longer for everyone, including abandoned holds), or re-arming the hold
+    on resume — which needs the ``EXPIRE_HOLD`` intent RE-TIMED, machinery ``enqueue_effect`` does
+    not have today (it silently no-ops on a dedupe conflict) and which would also need a cap so a
+    guest cannot hold a slot for ever by resuming.
+    """
+    hold_deadline = booking.hold_expires_at
+    assert hold_deadline is not None  # a paid hold always has one (create_booking with hold_ttl)
+    hold_deadline = as_utc(hold_deadline)
+    now = as_utc(now)
+    if hold_deadline - now < _MIN_HOLD_REMAINING_FOR_CHECKOUT:
+        raise _conflict("This hold is about to expire; please book again")
+    return min(now + CHECKOUT_SESSION_TTL, hold_deadline)
+
+
+def _require_resumable_hold(booking: Booking, *, now: datetime) -> None:
+    """A checkout may be resumed ONLY for a still-live PENDING hold (finding 2). A confirmed or
+    cancelled booking, or a hold past its TTL, is a 409 — resuming would double-charge a paid
+    booking or take a slot that has already been freed."""
+    if booking.status is not BookingStatus.PENDING:
+        raise _conflict("This booking is no longer awaiting payment")
+    if booking.hold_expires_at is None or as_utc(booking.hold_expires_at) <= as_utc(now):
+        raise _conflict("This hold has expired; please book again")
 
 
 def _booking_base_url(request: Request, settings: Settings) -> str:

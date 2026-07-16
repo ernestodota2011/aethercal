@@ -37,12 +37,12 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus, TimeInterval
-from aethercal.server.db.models import Booking, EventType
+from aethercal.server.db.models import Booking, EventType, Payment
 from aethercal.server.db.models.booking import guest_columns
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import load_active_connections
@@ -59,6 +59,7 @@ from aethercal.server.services.outbox import (
     enqueue_effect,
     google_dedupe_key,
 )
+from aethercal.server.services.payments import enqueue_cancellation_refunds
 from aethercal.server.services.slots import SlotsResult, compute_slots, day_is_at_cap
 from aethercal.server.services.webhooks import enqueue_event
 from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
@@ -435,24 +436,37 @@ def _consent_stamp(params: BookingParams, *, now: datetime) -> datetime | None:
     return now
 
 
-async def create_booking(
+async def create_booking(  # noqa: PLR0913 - each is one knob of a single well-defined write
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     params: BookingParams,
     now: datetime,
     effects: BookingEffects | None = None,
+    hold_ttl: timedelta | None = None,
 ) -> Booking:
     """Book ``params.start`` for a tenant's event type (RF-04/RF-07).
 
-    Validates the slot is on offer, serializes the host (layer 1), inserts the ``confirmed`` booking
-    catching the partial-index conflict as :class:`SlotUnavailableError` (layer 2), and durably
-    queues the ``booking.created`` webhook in the SAME transaction. When ``effects`` is supplied it
-    then mints the cancel/reschedule guest tokens, best-effort sends the confirmation email, syncs
-    the Google event (keeping the booking on failure), and schedules the 24 h reminder. Raises
+    Validates the slot is on offer, serializes the host (layer 1), inserts the booking catching the
+    partial-index conflict as :class:`SlotUnavailableError` (layer 2). Raises
     :class:`EventTypeNotFoundError` (404), :class:`SlotUnavailableError` (409) or
     :class:`AvailabilityUnavailableError` (503). Flushes; the caller owns the commit.
+
+    .. rubric:: ``hold_ttl`` — a PENDING HOLD instead of a confirmed booking (B-05b)
+
+    ``None`` (the default) is the historical path: a ``CONFIRMED`` booking, stamped confirmed_at,
+    with its whole chain fired (the ``booking.created`` webhook, the CONFIRM workflow transition,
+    and — with an ``effects`` bundle — the tokens/Google/email). ==This is what the admin + the API
+    key always get: they are trusted, so they confirm directly.==
+
+    A ``hold_ttl`` makes a ``PENDING`` hold instead — ``confirmed_at`` NULL, hold_expires_at set,
+    and ==NONE of the confirmation chain fires==. Only the PUBLIC path passes it, for a PAID event
+    type: the hold occupies the slot (the ``status <> 'cancelled'`` partial index counts it) while
+    the guest pays, and the ARBITER is what later confirms it and fires the chain. Firing nothing
+    here is not merely the B-05a silence gate doing its job downstream — it is this function
+    to build an announcement for an appointment nobody has paid for.
     """
+    is_hold = hold_ttl is not None
     event_type = await get_event_type(
         session, tenant_id=tenant_id, event_type_id=params.event_type_id
     )
@@ -480,16 +494,14 @@ async def create_booking(
         event_type_id=event_type.id,
         start_at=start,
         end_at=end,
-        status=BookingStatus.CONFIRMED,
-        # The stamp moves WITH the status, in the same statement — never in a later one. It is what
-        # licenses every outbound this booking will ever produce (B-05a), so a confirmed booking
-        # that reached the database without it would be one nothing ever speaks for: no email, no
-        # reminder, no webhook, no calendar event — and no error to say so.
-        #
-        # Today every booking is born confirmed, on every path (the public page, the admin and the
-        # API key alike). When holds arrive (B-05b) this line becomes the ARBITER's: the payment
-        # that wins the conditional UPDATE stamps it, and nothing else may.
-        confirmed_at=now,
+        # A hold is PENDING and unstamped; a confirmed booking carries ``confirmed_at`` in the SAME
+        # statement — never a later one. ``confirmed_at`` licenses every outbound this booking
+        # will ever produce (B-05a): a confirmed booking without it would be one nothing speaks for
+        # (no email, reminder, webhook or calendar event) and no error to say so. For a hold it is
+        # deliberately NULL — the ARBITER stamps it when a payment wins the conditional UPDATE.
+        status=BookingStatus.PENDING if is_hold else BookingStatus.CONFIRMED,
+        confirmed_at=None if is_hold else now,
+        hold_expires_at=(now + hold_ttl) if hold_ttl is not None else None,
         guest_name=params.guest_name,
         guest_email=params.guest_email,
         guest_timezone=params.guest_timezone,
@@ -500,6 +512,11 @@ async def create_booking(
         source_ip=params.source_ip,
     )
     await _insert_active(session, booking, start=start)
+    if is_hold:
+        # ==A hold announces NOTHING.== No ``booking.created`` webhook, no CONFIRM transition, no
+        # create-effects: an appointment nobody paid for is not one anybody may be told about. The
+        # arbiter runs this chain (:func:`confirm_paid_booking_effects`) once a payment confirms it.
+        return booking
     await enqueue_event(
         session,
         booking=booking,
@@ -601,6 +618,43 @@ async def cancel_booking(
     # (RFC 5545, F1-08); the drained cancellation email reads this value.
     booking.sequence += 1
     await session.flush()
+    # The FULL cancellation chain — webhook + CANCEL transition + (with effects) Google DELETE and
+    # the guest email — extracted so the out-of-band-refund path runs the SAME chain, not a partial
+    # copy (r5 finding 2). See :func:`cancel_confirmed_booking_effects`.
+    await cancel_confirmed_booking_effects(session, booking=booking, effects=effects, now=now)
+    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking
+    # cancelled within the refund window queues a REFUND per paid charge — the SECOND enqueue path,
+    # which the arbiter's late-webhook branch collapses with by the shared provider_ref dedupe key
+    # (criterion 30). Not gated on ``effects``: a refund is domain-required money movement, like the
+    # cancellation webhook and the ``on_cancel`` workflow, never contingent on a live sender. It is
+    # the ONE part the out-of-band path does NOT share — that money already went back.
+    await enqueue_cancellation_refunds(session, booking=booking, event_type=event_type, now=now)
+    return booking
+
+
+async def cancel_confirmed_booking_effects(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    effects: BookingEffects | None,
+    now: datetime,
+) -> None:
+    """The full effect chain of cancelling a CONFIRMED booking — everything but the money.
+
+    ==The SAME chain :func:`cancel_booking` runs== on a confirmed booking: the ``booking.cancelled``
+    webhook, the ``CANCEL`` transition (which retires the still-pending reminders and materialises
+    ``on_cancel``), and — with a live ``effects`` bundle — the Google-Calendar DELETE and the guest
+    cancellation email. It does NOT flip the status or bump the SEQUENCE (the caller already did),
+    and it does NOT queue the refund (that is the caller's concern: the out-of-band-refund path must
+    NOT queue one, because the money already went back).
+
+    Injected into the arbiter as its ``cancel_effects`` by the webhook layer — the one place that
+    may import both this module and ``services.payments`` — so an out-of-band ``charge.refunded``
+    runs the IDENTICAL cancellation a guest/host cancel does, instead of a partial hand-rolled copy
+    that dropped the Google delete and the webhook (r5 finding 2)."""
+    event_type = await get_event_type(
+        session, tenant_id=booking.tenant_id, event_type_id=booking.event_type_id
+    )
     await enqueue_event(
         session,
         booking=booking,
@@ -608,13 +662,13 @@ async def cancel_booking(
         data=_serialize_booking(booking),
         now=now,
     )
-    # CANCEL, not RESCHEDULE_PREDECESSOR: this is the OPERATION the guest asked for, so the
-    # `on_cancel` step is materialised and everything else still queued is retired. A reschedule's
-    # swap also leaves a booking cancelled, but it is NOT this transition — see services/workflows.
+    # CANCEL, not RESCHEDULE_PREDECESSOR: this is the OPERATION being performed, so ``on_cancel`` is
+    # materialised and everything else still queued is retired. A reschedule's swap also leaves a
+    # booking cancelled, but it is NOT this transition — see services/workflows.
     await apply_booking_transition(
         session, booking=booking, transition=BookingTransition.CANCEL, now=now
     )
-    if effects is not None:
+    if effects is not None and event_type is not None:
         await _enqueue_google(
             session, booking=booking, event_type=event_type, operation=GoogleOperation.DELETE
         )
@@ -625,7 +679,6 @@ async def cancel_booking(
             cancel_url=None,
             reschedule_url=None,
         )
-    return booking
 
 
 # --------------------------------------------------------------------------------------
@@ -739,6 +792,11 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         # A predecessor is always confirmed here (the guard above refuses anything else), so this is
         # never NULL in practice. It is the same chain B-05b re-points the payment onto.
         confirmed_at=old.confirmed_at,
+        # ==The successor inherits the WINNER discriminator too (B-05b, C-4).== Without it a late
+        # webhook, after resolving the payment to this successor, would read confirmed_by_payment_id
+        # IS NULL`` and treat its own paying charge as an orphan → refund a live, paid appointment.
+        # The payment rows are re-pointed to this row just below, in the same transaction.
+        confirmed_by_payment_id=old.confirmed_by_payment_id,
         rescheduled_from_id=old.id,
         # Carry the predecessor's iCal SEQUENCE forward + 1 so successive reschedules strictly
         # increase (RFC 5545, F1-08); the drained reschedule email snapshots this value.
@@ -764,6 +822,14 @@ async def reschedule_booking(  # noqa: PLR0913 - the spec-mandated keyword contr
         source_ip=old.source_ip,
     )
     await _swap_booking(session, old=old, new=new, now=now, start=start)
+    # ==Tie the payment to the CHAIN, not the row (B-05b, critical C-4).== A reschedule opens a NEW
+    # booking id; if the payment stayed on the old, cancelled row the arbiter would refund a live
+    # appointment (pay→reschedule) or keep the money on a cancelled one (pay→reschedule→cancel).
+    # So EVERY payment of the predecessor moves to the successor here — ALL of them, not just the
+    # winner: with a double payment the orphan row must follow the chain too, or it can never be
+    # refunded. Same transaction as the swap, after the successor's flush gave it an id, and no
+    # commit in between (the whole reschedule is one transaction), so this is atomic with the move.
+    await _repoint_payments(session, old_id=old.id, new_id=new.id)
     await enqueue_event(
         session,
         booking=new,
@@ -805,6 +871,21 @@ async def _swap_booking(
             await session.flush()
     except IntegrityError as exc:
         raise SlotUnavailableError(f"slot {start.isoformat()} is already booked") from exc
+
+
+async def _repoint_payments(session: AsyncSession, *, old_id: uuid.UUID, new_id: uuid.UUID) -> None:
+    """Move EVERY payment from the predecessor booking to its reschedule successor (B-05b, C-4).
+
+    All rows, not only the confirming one: a double payment leaves an extra ``payments`` row on the
+    old booking, and it must follow the chain too — otherwise it can never be refunded once the old
+    row is cancelled. A bulk UPDATE, so a booking with zero payments (every reschedule before this
+    wave, and every free booking) costs one statement matching nothing and changes nothing."""
+    await session.execute(
+        update(Payment)
+        .where(Payment.booking_id == old_id)
+        .values(booking_id=new_id)
+        .execution_options(synchronize_session=False)
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -1069,6 +1150,50 @@ async def _apply_create_effects(  # noqa: PLR0913 - each effect input is part of
     )
 
 
+async def confirm_paid_booking_effects(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    effects: BookingEffects | None,
+    now: datetime,
+    locale: str = "es",
+) -> None:
+    """Fire the confirmation chain for a hold the arbiter just CONFIRMED (B-05b).
+
+    ==The SAME chain :func:`create_booking` runs on a free booking== — the ``booking.created``
+    webhook, the ``CONFIRM`` workflow transition, and (with an ``effects`` bundle) the guest tokens,
+    the Google sync and the confirmation email — so a paid hold's confirmation is indistinguishable
+    from a free one downstream. It runs only AFTER the arbiter has stamped ``confirmed_at`` (the
+    B-05a silence gate kept every one of these effects suppressed while the booking was still
+    an unpaid ``PENDING`` hold), so nothing here can announce an appointment nobody paid for.
+
+    Injected into the arbiter as its ``confirm_effects`` by the webhook layer — the one place
+    that may import both this module and ``services.payments`` — the arbiter itself never does.
+    """
+    event_type = await get_event_type(
+        session, tenant_id=booking.tenant_id, event_type_id=booking.event_type_id
+    )
+    await enqueue_event(
+        session,
+        booking=booking,
+        event="booking.created",
+        data=_serialize_booking(booking),
+        now=now,
+    )
+    await apply_booking_transition(
+        session, booking=booking, transition=BookingTransition.CONFIRM, now=now, locale=locale
+    )
+    if effects is not None and event_type is not None:
+        await _apply_create_effects(
+            session,
+            booking=booking,
+            event_type=event_type,
+            effects=effects,
+            now=now,
+            locale=locale,
+        )
+
+
 async def _apply_reschedule_effects(  # noqa: PLR0913 - each effect input is part of the contract
     session: AsyncSession,
     *,
@@ -1235,6 +1360,8 @@ __all__ = [
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",
+    "cancel_confirmed_booking_effects",
+    "confirm_paid_booking_effects",
     "count_bookings",
     "create_booking",
     "get_booking",

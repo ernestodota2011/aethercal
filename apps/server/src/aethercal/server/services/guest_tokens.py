@@ -58,6 +58,10 @@ class GuestTokenPurpose(StrEnum):
 
     CANCEL = "cancel"
     RESCHEDULE = "reschedule"
+    CHECKOUT = "checkout"
+    """Resume the paid checkout of a hold (B-05b, r5). Unlike CANCEL/RESCHEDULE it is VERIFIED, not
+    consumed — a guest may resume the SAME hold more than once while it lives, so it carries no
+    single-use stamp."""
 
 
 @dataclass(frozen=True, slots=True)

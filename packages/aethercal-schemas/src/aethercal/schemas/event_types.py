@@ -26,15 +26,37 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from typing import Annotated, Any, Protocol, overload
+from typing import Annotated, Any, Literal, Protocol, overload
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Reusable constrained aliases keep the create/update models in lockstep on their bounds.
 PositiveSeconds = Annotated[int, Field(gt=0)]
 NonNegativeSeconds = Annotated[int, Field(ge=0)]
 ShortText = Annotated[str, Field(min_length=1, max_length=255)]
 Slug = Annotated[str, Field(min_length=1, max_length=63)]
+
+# Payment (B-05b, RF-26). ``price_cents`` NULL = a FREE type (confirms directly, no hold); a set
+# price makes the public path hold the slot and demand payment. ``currency`` is a 3-letter ISO 4217
+# code (lower-cased, as Stripe wants). ``refund_kind`` is exactly ``full`` | ``none`` —
+# partial/tiered is F5. ``RefundKind`` the enum lives server-side (``db.models.payments``); this
+# contract package is dependency-free, so it carries the vocabulary as a ``Literal`` and the
+# service maps it across.
+PriceCents = Annotated[int, Field(ge=0)]
+NonNegativeMinutes = Annotated[int, Field(ge=0)]
+Currency = Annotated[str, Field(min_length=3, max_length=3)]
+RefundKindLiteral = Literal["full", "none"]
+
+
+def _normalise_currency(value: str | None) -> str | None:
+    """A 3-letter ISO 4217 code, lower-cased (Stripe's form). ``None`` passes (a free type)."""
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if len(lowered) != 3 or not lowered.isalpha():
+        raise ValueError("currency must be a 3-letter ISO 4217 code (e.g. 'usd')")
+    return lowered
+
 
 # The locales the platform currently has translated chrome for. Extend this set to add a locale —
 # every ``*_translations`` map (Create/Update) is validated against it, so an unsupported key is
@@ -75,6 +97,11 @@ class EventTypeCreate(BaseModel):
     max_per_day: Annotated[int, Field(ge=1)] | None = None
     questions: list[Any] = Field(default_factory=list)
     active: bool = True
+    # -- payment (B-05b) --
+    price_cents: PriceCents | None = None
+    currency: Currency | None = None
+    refund_window_minutes: NonNegativeMinutes = 0
+    refund_kind: RefundKindLiteral = "none"
 
     @field_validator("title_translations", "description_translations")
     @classmethod
@@ -82,6 +109,26 @@ class EventTypeCreate(BaseModel):
         result = _check_translation_locales(value)
         assert result is not None  # Create's maps are never None, only possibly empty.
         return result
+
+    # ``mode="before"`` so trimming + lower-casing run BEFORE the ``Currency`` length constraint —
+    # otherwise ``"  USD "`` (len 6) is rejected by ``max_length`` before it can be normalised, and
+    # the ISO-4217 message is never reached.
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _validate_currency(cls, value: str | None) -> str | None:
+        return _normalise_currency(value)
+
+    @model_validator(mode="after")
+    def _price_and_currency_agree(self) -> EventTypeCreate:
+        """==A price needs a currency, and a free type has neither.== Both-or-neither closes the
+        exact misconfiguration the arbiter guards against (a priced type with no currency can take
+        no payment): a mismatch is refused at the edge (422), not persisted as an unpayable type."""
+        if (self.price_cents is None) != (self.currency is None):
+            raise ValueError(
+                "price_cents and currency must be set together — both for a paid type, or "
+                "neither for a free one"
+            )
+        return self
 
 
 class EventTypeUpdate(BaseModel):
@@ -110,11 +157,23 @@ class EventTypeUpdate(BaseModel):
     max_per_day: Annotated[int, Field(ge=1)] | None = None
     questions: list[Any] | None = None
     active: bool | None = None
+    # -- payment (B-05b). Optional-and-unset like every other field: omit to leave unchanged; send
+    # an explicit ``null`` on price/currency to make the type free again. --
+    price_cents: PriceCents | None = None
+    currency: Currency | None = None
+    refund_window_minutes: NonNegativeMinutes | None = None
+    refund_kind: RefundKindLiteral | None = None
 
     @field_validator("title_translations", "description_translations")
     @classmethod
     def _validate_translation_locales(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         return _check_translation_locales(value)
+
+    # ``mode="before"`` — see :meth:`EventTypeCreate._validate_currency`.
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _validate_currency(cls, value: str | None) -> str | None:
+        return _normalise_currency(value)
 
 
 class EventTypeRead(BaseModel):
@@ -141,6 +200,12 @@ class EventTypeRead(BaseModel):
     max_per_day: int | None
     questions: list[Any]
     active: bool
+    # -- payment (B-05b). Read straight off the ORM row; ``refund_kind`` is a ``RefundKind`` StrEnum
+    # there, which validates against this ``Literal``: a StrEnum member IS its string value. --
+    price_cents: int | None = None
+    currency: str | None = None
+    refund_window_minutes: int = 0
+    refund_kind: RefundKindLiteral = "none"
     #: Whether an ACTIVE WhatsApp/SMS rule governs this event type — i.e. whether a phone number
     #: given here would ever actually be messaged (RF-24). This is NOT a column: the server derives
     #: it per request from the tenant's workflow rules
