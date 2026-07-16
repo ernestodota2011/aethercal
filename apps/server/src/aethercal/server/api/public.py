@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Mapping
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
@@ -69,7 +69,12 @@ from aethercal.server.services.event_types import (
     get_bookable_event_type_by_slug,
     list_bookable_event_types,
 )
-from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.guest_tokens import (
+    GuestTokenPurpose,
+    GuestTokenSigner,
+    issue_guest_token,
+    verify_guest_token,
+)
 from aethercal.server.services.outbox import as_utc
 from aethercal.server.services.payments import (
     CHECKOUT_SESSION_TTL,
@@ -96,6 +101,11 @@ router = APIRouter(prefix="/public", tags=["public"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 TenantSlug = Annotated[str, Path(max_length=63, description="The business's globally-unique slug")]
 EventSlug = Annotated[str, Path(max_length=63, description="Its slug inside that business")]
+TokenQuery = Annotated[str | None, Query(description="Signed guest token authorizing the resume")]
+
+# The resume token outlives the hold by a small margin, so the HOLD (not the token) is always what
+# gates a resume — an expired hold is a clean 409, never a confusing token failure (r5).
+_CHECKOUT_TOKEN_TTL = HOLD_TTL + timedelta(minutes=5)
 
 _NOT_FOUND = "not_found"
 _CAPTCHA_REQUIRED = "captcha_required"
@@ -132,19 +142,35 @@ def _conflict(message: str) -> HTTPException:
     )
 
 
-def _checkout_unavailable(booking_id: uuid.UUID) -> HTTPException:
-    """A 502 that carries the ``booking_id`` (finding 2).
+def _forbidden() -> HTTPException:
+    """A uniform 403 for a missing or invalid resume token — leaks no booking data (r5, RF-09).
+
+    Resuming a checkout is a WRITE, so it demands the signed guest token minted at booking creation,
+    exactly as cancel/reschedule do. Every failure — no token, bad/expired signature, token bound to
+    another booking — collapses to this one answer, so a caller who cannot prove they booked cannot
+    tell the difference between "wrong token" and "no such hold"."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "forbidden", "message": "Invalid or expired link"},
+    )
+
+
+def _checkout_unavailable(booking_id: uuid.UUID, checkout_token: str) -> HTTPException:
+    """A 502 that carries the ``booking_id`` AND the resume ``checkout_token`` (r3-2, r5-1).
 
     The hold is already committed when the provider call is made, so a failed checkout must not
     strand the guest on an opaque error with the slot locked for the hold's whole TTL. The
-    ``booking_id`` lets the page retry via ``POST /{tenant_slug}/bookings/{id}/checkout``, which
-    resumes the SAME session (the booking-id Idempotency-Key) rather than opening a second one."""
+    ``booking_id`` + ``checkout_token`` let the page retry via
+    ``POST /{tenant_slug}/bookings/{id}/checkout?token=...``, which resumes the SAME session (the
+    booking-id Idempotency-Key) rather than opening a second one — and the token proves the retry
+    comes from the guest who booked, not merely someone who saw the id."""
     return HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail={
             "error": "checkout_unavailable",
             "message": "Could not start payment right now; please retry",
             "booking_id": str(booking_id),
+            "checkout_token": checkout_token,
         },
     )
 
@@ -379,20 +405,26 @@ async def resume_paid_checkout(
     booking_id: uuid.UUID,
     request: Request,
     session: SessionDep,
+    token: TokenQuery = None,
 ) -> PublicBookingRead:
-    """==Resume a paid checkout for a live unpaid hold (finding 2).== Idempotent.
+    """==Resume a paid checkout for a live unpaid hold (findings r3-2, r5-1).== Idempotent, and it
+    demands the signed guest token minted at booking creation.
 
     When the first checkout call fails, ``create_public_booking`` answers 502 with the
-    ``booking_id`` and leaves the hold PENDING (§4.4 designed this endpoint for that). This re-opens
-    checkout for that hold: by the booking-id Idempotency-Key the provider returns the SAME session
-    (never a second charge), and the INTENT Payment row is written if the failed first attempt never
-    got that far. A hold that has since confirmed, cancelled, or lapsed is a clear 409 — a fresh
-    session would double-charge or take a freed slot. An unknown/other-business booking, or a free
-    type (nothing to pay), is the shared 404 — the same non-answer every public miss gives.
+    ``booking_id`` and ``checkout_token``, leaving the hold PENDING (§4.4 designed this for that).
+    This re-opens checkout for that hold: by the booking-id Idempotency-Key the provider returns the
+    SAME session (never a second charge), and the INTENT Payment row is written if the failed first
+    attempt never got that far.
+
+    ==Resuming is a WRITE (r5), so it is authorized like cancel/reschedule==: a valid ``?token=`` of
+    purpose CHECKOUT, bound to THIS booking, is required before any Stripe call or DB write. Missing
+    or invalid token → 403, touching neither Stripe nor a payment write. The token is VERIFIED, not
+    consumed, so a guest may resume the same hold again while it lives. A hold that has since
+    confirmed, cancelled, or lapsed is a 409; an unknown/other-business booking, or a free type, is
+    the shared 404.
 
     The route carries ``tenant_slug`` like every other public endpoint: it BINDS the business so the
-    booking is read under row-level security (without a bound tenant the lookup sees nothing), which
-    is also what keeps one business from resuming another's hold.
+    booking is read under row-level security (without a bound tenant the lookup sees nothing).
     """
     tenant_id = await _bind_business(session, tenant_slug)
     booking = await session.get(Booking, booking_id)
@@ -404,6 +436,10 @@ async def resume_paid_checkout(
     if price_cents is None or currency is None:
         # A free type has no checkout to resume — indistinguishable from any other public miss.
         raise _not_found()
+
+    # ==Authorize BEFORE any Stripe call or write (r5).== A missing/invalid/mismatched token is a
+    # uniform 403; the token is verified (not consumed), so a guest may resume again while it lives.
+    checkout_token = await _authorize_resume(request, session, booking_id=booking_id, token=token)
 
     now = _now()
     _require_resumable_hold(booking, now=now)
@@ -420,11 +456,34 @@ async def resume_paid_checkout(
         currency=currency,
         secrets=secrets,
         now=now,
+        checkout_token=checkout_token,
     )
     await session.refresh(booking)
     return PublicBookingRead.model_validate(booking).model_copy(
-        update={"checkout_url": checkout_url}
+        update={"checkout_url": checkout_url, "checkout_token": checkout_token}
     )
+
+
+async def _authorize_resume(
+    request: Request, session: AsyncSession, *, booking_id: uuid.UUID, token: str | None
+) -> str:
+    """Authorize a checkout RESUME with the CHECKOUT guest token minted at booking creation (r5).
+
+    Returns the token string (so it can be echoed back for the next resume) or raises a uniform 403.
+    The token is VERIFIED, never consumed — resume is repeatable while the hold lives, so the
+    single-use stamp cancel/reschedule apply would be wrong here. It must be a valid, unexpired,
+    CHECKOUT-purpose token whose backing row binds to THIS booking; any other outcome is 403."""
+    if token is None:
+        raise _forbidden()
+    row = await verify_guest_token(
+        session,
+        GuestTokenSigner(_settings(request).app_secret),
+        token,
+        expected_purpose=GuestTokenPurpose.CHECKOUT,
+    )
+    if row is None or row.booking_id != booking_id:
+        raise _forbidden()
+    return token
 
 
 async def _start_paid_booking(
@@ -437,11 +496,12 @@ async def _start_paid_booking(
     """Open a paid hold: BYOK credential (fail-closed) → hold + EXPIRE_HOLD → COMMIT → checkout.
 
     ==The order is the design (§4.4).== The credential is resolved FIRST, so a business that cannot
-    charge never even opens a hold (fail-closed, no orphan). The hold and its self-cancel are
-    committed BEFORE the provider I/O — *persist the intent before the call* — so a failed checkout
-    leaves a hold that lapses at its TTL, never a charge. ==If the provider call fails the guest
-    gets a 502 carrying the ``booking_id`` (finding 2)==, so they resume the SAME session instead of
-    being stranded with the slot locked; the checkout's idempotency key is the ``booking_id``.
+    charge never even opens a hold (fail-closed, no orphan). The hold, its self-cancel AND the
+    resume token (r5) are committed BEFORE the provider I/O — *persist the intent before the call* —
+    so a failed checkout leaves a hold that lapses at its TTL, never a charge. ==If the provider
+    call fails the guest gets a 502 carrying the ``booking_id`` and ``checkout_token``==, so they
+    resume the SAME session instead of being stranded; the checkout's idempotency key is the
+    ``booking_id``, and the token proves the resume comes from the guest who booked.
     """
     price_cents = event_type.price_cents
     currency = event_type.currency
@@ -475,8 +535,19 @@ async def _start_paid_booking(
 
     assert booking.hold_expires_at is not None  # create_booking with hold_ttl always sets it
     await enqueue_expire_hold(session, booking=booking, hold_expires_at=booking.hold_expires_at)
-    # Persist the hold + its self-cancel BEFORE the provider I/O. The GUC re-stamps the next
-    # transaction (the listener + ContextVar), so the writes below stay bound to this business.
+    # ==Mint the resume token (r5) in the SAME transaction as the hold.== It authorizes reopening
+    # this hold's checkout — a WRITE — so it must be as strong as the cancel/reschedule tokens, and
+    # it is persisted (its hash) atomically with the hold, before the provider I/O.
+    checkout_token = await issue_guest_token(
+        session,
+        GuestTokenSigner(_settings(request).app_secret),
+        booking_id=booking.id,
+        tenant_id=event_type.tenant_id,
+        purpose=GuestTokenPurpose.CHECKOUT,
+        ttl=_CHECKOUT_TOKEN_TTL,
+    )
+    # Persist the hold + its self-cancel + the token BEFORE the provider I/O. The GUC re-stamps the
+    # next transaction (the listener + ContextVar), so the writes below stay bound to this business.
     await session.commit()
 
     checkout_url = await _open_checkout_and_record(
@@ -489,10 +560,11 @@ async def _start_paid_booking(
         currency=currency,
         secrets=secrets,
         now=now,
+        checkout_token=checkout_token,
     )
     await session.refresh(booking)
     return PublicBookingRead.model_validate(booking).model_copy(
-        update={"checkout_url": checkout_url}
+        update={"checkout_url": checkout_url, "checkout_token": checkout_token}
     )
 
 
@@ -542,6 +614,7 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     currency: str,
     secrets: Mapping[str, str],
     now: datetime,
+    checkout_token: str,
 ) -> str:
     """Open (or, by the booking-id Idempotency-Key, RE-open the SAME) checkout and ensure the INTENT
     Payment row, returning the ``checkout_url``. ==Shared by the create path and the resume endpoint
@@ -569,9 +642,9 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
         raise
     except Exception as exc:
         # ==Finding 2.== is resumeable — the hold is committed, so answer 502 with the booking id
-        # rather than an opaque 500 that strands the slot for its whole TTL.
+        # AND the resume token rather than an opaque 500 that strands the slot for its whole TTL.
         _logger.exception("checkout: provider call failed for booking %s", booking.id)
-        raise _checkout_unavailable(booking.id) from exc
+        raise _checkout_unavailable(booking.id, checkout_token) from exc
 
     await record_checkout_intent(
         session,

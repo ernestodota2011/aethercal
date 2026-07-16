@@ -191,13 +191,19 @@ async def _seed(
             window_to=target,
             now=now,
         )
-        assert result is not None and result.slots
-        return {"slug": slug, "tenant_id": tenant.id, "start": result.slots[0].start.isoformat()}
+        assert result is not None and len(result.slots) >= 2
+        return {
+            "slug": slug,
+            "tenant_id": tenant.id,
+            "start": result.slots[0].start.isoformat(),
+            # A SECOND, distinct slot, so a test can open a second hold in the SAME business.
+            "start2": result.slots[1].start.isoformat(),
+        }
 
 
-def _payload(seeded: dict[str, Any]) -> dict[str, Any]:
+def _payload(seeded: dict[str, Any], *, start: str | None = None) -> dict[str, Any]:
     return {
-        "start": seeded["start"],
+        "start": start or seeded["start"],
         "guest_name": "Ada Lovelace",
         "guest_email": f"ada+{uuid.uuid4().hex[:6]}@example.com",
         "guest_timezone": "UTC",
@@ -337,6 +343,8 @@ async def test_a_failed_checkout_returns_502_with_booking_id_and_keeps_the_hold(
     detail = response.json()["detail"]
     assert detail["error"] == "checkout_unavailable"
     booking_id = uuid.UUID(detail["booking_id"])
+    # ==r5.== The 502 carries the resume token too, so the legitimate guest can authorize a resume.
+    assert isinstance(detail["checkout_token"], str) and detail["checkout_token"]
 
     async with owner_maker() as session:
         booking = await session.get(Booking, booking_id)
@@ -359,18 +367,21 @@ async def test_a_resumed_checkout_reopens_the_same_session_and_records_the_payme
     failed = await paid_client.post(
         f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
     )
-    booking_id = uuid.UUID(failed.json()["detail"]["booking_id"])
+    detail = failed.json()["detail"]
+    booking_id = uuid.UUID(detail["booking_id"])
+    token = detail["checkout_token"]  # r5: the guest resumes WITH the signed token.
     assert gateway.sessions == [], "the failed attempt opened nothing"
 
     gateway.fail = False
     resumed = await paid_client.post(
-        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params={"token": token}
     )
 
     assert resumed.status_code == 200, resumed.text
     body = resumed.json()
     assert body["checkout_url"] == _CHECKOUT_URL
     assert body["status"] == "pending"
+    assert body["checkout_token"] == token, "the resume echoes the token back for the next retry"
     # The resume used the booking id as the idempotency key → the SAME session, never a 2nd charge.
     assert gateway.sessions[-1]["idempotency_key"] == str(booking_id)
     payments = await _payments_for(owner_maker, booking_id)
@@ -379,9 +390,10 @@ async def test_a_resumed_checkout_reopens_the_same_session_and_records_the_payme
     assert payments[0].checkout_session_id is not None
     assert payments[0].provider_ref is None
 
-    # A second resume is idempotent: same session returned, no duplicate Payment row.
+    # A second resume is idempotent: same session returned, no duplicate Payment row. The token is
+    # VERIFIED (not consumed), so it still works.
     again = await paid_client.post(
-        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params={"token": token}
     )
     assert again.status_code == 200, again.text
     assert again.json()["checkout_url"] == _CHECKOUT_URL
@@ -391,8 +403,8 @@ async def test_a_resumed_checkout_reopens_the_same_session_and_records_the_payme
 async def test_resume_is_refused_for_a_non_live_hold(
     paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
 ) -> None:
-    """A hold that is no longer live cannot be resumed: a CONFIRMED booking is 409 (no second
-    charge), an unknown booking is the shared 404 — and neither opens a checkout."""
+    """A hold that is no longer live cannot be resumed EVEN with a valid token: a CONFIRMED booking
+    is 409 (no second charge), an unknown booking is the shared 404 — neither opens a checkout."""
     seeded = await _seed(owner_maker)
     _app, gateway = paid_app
 
@@ -401,6 +413,7 @@ async def test_resume_is_refused_for_a_non_live_hold(
         f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
     )
     booking_id = uuid.UUID(created.json()["id"])
+    token = created.json()["checkout_token"]
     async with owner_maker() as session, session.begin():
         booking = await session.get(Booking, booking_id)
         assert booking is not None
@@ -408,15 +421,74 @@ async def test_resume_is_refused_for_a_non_live_hold(
     opened_before = len(gateway.sessions)
 
     confirmed_resume = await paid_client.post(
-        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout"
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params={"token": token}
     )
     assert confirmed_resume.status_code == 409, confirmed_resume.text
     assert confirmed_resume.json()["detail"]["error"] == "hold_not_resumable"
 
-    # An unknown booking id → the shared 404.
+    # An unknown booking id → the shared 404 (the miss is caught before the token is even checked).
     unknown = await paid_client.post(
-        f"/api/v1/public/{seeded['slug']}/bookings/{uuid.uuid4()}/checkout"
+        f"/api/v1/public/{seeded['slug']}/bookings/{uuid.uuid4()}/checkout", params={"token": token}
     )
     assert unknown.status_code == 404
 
     assert len(gateway.sessions) == opened_before, "a refused resume opens no checkout"
+
+
+async def test_resume_without_a_valid_token_is_forbidden(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==r5: the IDOR is closed.== Resuming is a WRITE, so knowing the ``booking_id`` is not enough
+    — a caller with no token, a garbage token, or a token for a DIFFERENT booking gets a 403, and no
+    checkout is opened and no payment is written. Only the token minted for THIS hold authorizes it.
+    """
+    seeded = await _seed(owner_maker)
+    _app, gateway = paid_app
+
+    # Both creates fail the provider call (502), so each leaves a PENDING hold with NO payment yet —
+    # the clean state for proving a forbidden resume writes nothing. The 502 carries the token.
+    gateway.fail = True
+    created = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    booking_id = uuid.UUID(created.json()["detail"]["booking_id"])
+    good_token = created.json()["detail"]["checkout_token"]
+
+    # A SECOND paid hold (a DIFFERENT slot in the SAME business), to get a valid token that belongs
+    # to a different booking — the exact "valid token, wrong booking" IDOR vector.
+    other = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings",
+        json=_payload(seeded, start=seeded["start2"]),
+    )
+    other_token = other.json()["detail"]["checkout_token"]
+    assert other_token, "the second hold must mint its own token"
+
+    gateway.fail = False
+    opened_before = len(gateway.sessions)
+
+    async def _resume(**params: str) -> int:
+        resp = await paid_client.post(
+            f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params=params
+        )
+        return resp.status_code
+
+    # No token at all.
+    assert await _resume() == 403
+    # A structurally-garbage token.
+    assert await _resume(token="not-a-real-token") == 403
+    # A VALID token, but for another booking — must not authorize THIS one.
+    assert await _resume(token=other_token) == 403
+
+    # Nothing was opened and no extra payment written for the target booking.
+    assert len(gateway.sessions) == opened_before, "a forbidden resume opens no checkout"
+    assert await _payments_for(owner_maker, booking_id) == [], (
+        "a forbidden resume writes no payment"
+    )
+
+    # The rightful token still works — 200, and it opens the session.
+    ok = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout",
+        params={"token": good_token},
+    )
+    assert ok.status_code == 200, ok.text
+    assert len(await _payments_for(owner_maker, booking_id)) == 1

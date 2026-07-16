@@ -112,6 +112,13 @@ class PublicBookingRead(BaseModel):
     guest to pay. It is ``None`` for a free booking (confirmed on the spot, nothing to pay) and it
     carries no personal data — it is a payment-redirect URL, not a booking dump. A PAID booking
     comes back ``status = pending`` with this set; the arbiter confirms it once the payment lands.
+
+    ``checkout_token`` is the sixth (re-Crisol r5): the signed guest token that AUTHORIZES resuming
+    the checkout for this hold, the same class of capability as the cancel/reschedule tokens in a
+    guest's email links. It is ``None`` for a free booking, and it is NOT PII — it is a signed,
+    expiring, booking-scoped capability, held only by the guest who booked. Resuming a checkout is a
+    WRITE (it opens a Stripe session and records a payment), so — like cancel and reschedule — it
+    must prove the caller is that guest, not merely that they know the booking id.
     """
 
     # ``populate_by_name`` so this ONE model works both directions without a hand-rolled remap:
@@ -128,6 +135,9 @@ class PublicBookingRead(BaseModel):
     status: BookingStatus
     #: Where to send the guest to pay (a hold), or ``None`` for a free booking. Not PII.
     checkout_url: str | None = None
+    #: The signed guest token that authorizes RESUMING this hold's checkout (r5), or ``None`` for a
+    #: free booking. A booking-scoped, expiring capability — not PII.
+    checkout_token: str | None = None
 
 
 __all__ = [

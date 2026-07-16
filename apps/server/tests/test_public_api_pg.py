@@ -353,11 +353,13 @@ async def test_a_booking_is_created_with_NO_api_key(
 
     assert response.status_code == 201, response.text
     body = response.json()
-    # Five fields now (B-05b): the four originals + ``checkout_url``, which carries no PII and is
-    # ``None`` for a FREE booking like this one (``acme`` has no price, so it confirms on the spot).
-    assert set(body) == {"id", "start", "end", "status", "checkout_url"}
+    # Six fields now: the four originals + ``checkout_url`` (B-05b) + ``checkout_token`` (r5). Both
+    # carry no PII and are ``None`` for a FREE booking like this one (``acme`` has no price, so it
+    # confirms on the spot with no hold, no checkout, and no resume token).
+    assert set(body) == {"id", "start", "end", "status", "checkout_url", "checkout_token"}
     assert body["status"] == "confirmed"
     assert body["checkout_url"] is None
+    assert body["checkout_token"] is None
     assert (await _stored(owner_maker, body["id"])).tenant_id == acme["tenant_id"]
 
 

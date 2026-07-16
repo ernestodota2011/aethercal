@@ -19,7 +19,12 @@ from aethercal.server.services.guest_tokens import (
 def test_purpose_values() -> None:
     assert GuestTokenPurpose.CANCEL.value == "cancel"
     assert GuestTokenPurpose.RESCHEDULE.value == "reschedule"
-    assert set(GuestTokenPurpose) == {GuestTokenPurpose.CANCEL, GuestTokenPurpose.RESCHEDULE}
+    assert GuestTokenPurpose.CHECKOUT.value == "checkout"  # r5: resume a paid hold's checkout
+    assert set(GuestTokenPurpose) == {
+        GuestTokenPurpose.CANCEL,
+        GuestTokenPurpose.RESCHEDULE,
+        GuestTokenPurpose.CHECKOUT,
+    }
 
 
 def test_hash_token_is_deterministic_hex_sha256() -> None:
