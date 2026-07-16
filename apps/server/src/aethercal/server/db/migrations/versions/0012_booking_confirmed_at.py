@@ -59,7 +59,7 @@ import sqlalchemy as sa
 
 
 revision: str = "0012_booking_confirmed_at"
-down_revision: str | None = "0008_rls_roles_and_policies"
+down_revision: str | None = "0011_booking_source_ip"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
