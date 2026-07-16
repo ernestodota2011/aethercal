@@ -259,6 +259,43 @@ async def test_login_lockout_survives_a_new_session(seeded_maker: Sessionmaker) 
     assert "Too many attempts" in fresh.error
 
 
+async def test_member_login_lockout_is_case_insensitive_on_the_email(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The login budget folds the address to lower case, so casing cannot reset it.==
+
+    ``users`` is unique on ``lower(email)`` and ``authenticate_member`` matches it that way, so
+    ``ana@x.com`` and ``ANA@x.com`` are ONE account. If the limiter keyed the budget by the RAW
+    address, that one account would get a fresh five-attempt budget per spelling
+    (``a@x``, ``A@x``, ``aA@x``, ...) — a per-email cap that caps nothing. Here the budget is
+    exhausted under one spelling and a DIFFERENT spelling of the same address is still locked out.
+    """
+    config = AdminConfig(
+        username="operator", password_hash=hash_password("s3cret"), tenant_slug=None
+    )
+    configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
+
+    # Exhaust the five-attempt budget under the lower-case spelling.
+    for _ in range(5):
+        await AdminState.member_login.fn(
+            _state(), {"tenant_slug": "acme", "email": "ana@x.com", "password": "wrong"}
+        )
+    # Clear ONLY the shared per-IP budget (locked by those same five failures), so the next attempt
+    # is gated by the EMAIL key alone — otherwise the IP lock would mask whether casing shares the
+    # account's budget. `_state()`'s client IP resolves to "unknown" (see the operator tests).
+    LOGIN_LIMITER.record_success("ip:unknown")
+
+    # A DIFFERENT casing of the same address is still refused as locked out: it shares the canonical
+    # budget. Before the fix, `ANA@x.com` keyed a fresh counter and sailed past the limiter.
+    state = _state()
+    redirect = await AdminState.member_login.fn(
+        state, {"tenant_slug": "acme", "email": "ANA@x.com", "password": "wrong"}
+    )
+    assert redirect is None
+    assert state._authenticated is False
+    assert "Too many attempts" in state.error
+
+
 async def test_authenticated_load_reaches_the_service(seeded_maker: Sessionmaker) -> None:
     config = AdminConfig(
         username="operator", password_hash=hash_password("s3cret"), tenant_slug=None

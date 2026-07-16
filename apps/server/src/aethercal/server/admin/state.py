@@ -934,9 +934,13 @@ class AdminState(rx.State):
         """
         tenant_slug = _clean(form_data, "tenant_slug")
         email = _clean(form_data, "email")
-        # The rate-limit budget is per (ip, business, address): a login flood against Acme must not
-        # lock Globex's people out of their own panel.
-        keys = _rate_keys(self, f"{tenant_slug}:{email}")
+        # The rate-limit budget is per (ip, business, address) — and the address is FOLDED TO LOWER
+        # CASE, the same way `users` is unique on `lower(email)` and `authenticate_member` matches
+        # it. Key by the raw address instead and one account gets a fresh budget per casing (`a@x`,
+        # `A@x`, `aA@x`, ...), so the per-email cap is no cap at all: brute force it under whichever
+        # spelling has budget left. Resolution already normalises this way, so the account that gets
+        # locked out is the same one that would authenticate.
+        keys = _rate_keys(self, f"{tenant_slug}:{email.lower()}")
         if LOGIN_LIMITER.any_locked(keys):
             self.error = _LOCKED_OUT_MESSAGE
             return None
