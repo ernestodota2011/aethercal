@@ -1109,3 +1109,110 @@ def test_nothing_deletes_a_booking_out_from_under_its_intents() -> None:
         "that silently deletes their queued intents — including a REFUND the guest is owed — "
         "through a door neither `purge_policy` nor the lock above can see."
     )
+
+
+# --- B-05c re-Crisol r2: a payload that is not an object, and the claimed-row decision -----------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(["pi_legacy", _EMAIL], id="a-list"),
+        pytest.param("pi_legacy", id="a-string"),
+        pytest.param(42, id="a-number"),
+        pytest.param(None, id="null"),
+        pytest.param(True, id="a-bool"),
+    ],
+)
+async def test_a_retained_payload_that_is_not_an_object_is_redacted_not_crashed(
+    sqlite_session: AsyncSession, payload: object
+) -> None:
+    """==A purge that raises is an erasure that DID NOT HAPPEN.==
+
+    ``payload`` is a JSON column, and JSON is not "object": a list, a string, a number, ``true`` or
+    ``null`` are all valid in that column, and a row written before the funnel guard (or by hand, or
+    by an effect since retired) can hold any of them. The allowlist rebuild assumed a ``dict``, so
+    anything else blew up mid-purge — and then the erasure request goes unanswered, which is worse
+    than any single leaked key: nothing at all gets erased, for that guest, in that tenant.
+
+    The rule is the one already applied to the effect with no allowlist: ==a shape nobody can vouch
+    for is a shape we do not keep.== There is no allowlist to apply to a scalar — it has no keys —
+    so the payload goes wholesale.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    await _legacy_retained_row(
+        sqlite_session, booking, effect=OutboxEffect.REFUND.value, payload=payload
+    )
+
+    # The purge must COMPLETE. That is the assertion; the row below is the detail.
+    report = await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    assert report.bookings == 1, "the erasure must have happened at all"
+    row = (
+        await sqlite_session.scalars(
+            sa.select(Outbox).where(
+                Outbox.booking_id == booking.id, Outbox.effect == OutboxEffect.REFUND.value
+            )
+        )
+    ).one()
+    assert row.payload == {"redacted": True}
+    assert _EMAIL not in str(row.payload)
+    # And the booking itself was still erased — a payload of the wrong shape must not be able to
+    # abort the rest of the purge.
+    await sqlite_session.refresh(booking)
+    assert booking.guest_email == ERASED_EMAIL
+
+
+async def test_the_purge_deletes_a_message_intent_a_worker_is_mid_send_on(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==The purge does NOT spare a claimed row, and that is a DECISION (B-05c re-Crisol r2).==
+
+    It looks like one worth reconsidering: a worker holds this row's lease and is on the wire with
+    it, and ``_purge_payment_events`` sets an apparent precedent by RETAINING a still-actionable
+    event for "a later purge pass". The precedent is a trap, and the reason is a fact about this
+    repo rather than a matter of taste: ==there IS no later purge pass.== ``purge_guest`` is reached
+    only from ``run_guest_purge``, which is reached only from the ``guest purge`` CLI command. The
+    scheduler registers exactly three recurring jobs — webhook delivery, busy refresh, outbox drain
+    — and no cron or timer anywhere invokes an erasure. It is a one-shot operator action.
+
+    So "skip it, the next pass will get it" means NEVER, and the guest's address stays in the table
+    for good. A legal obligation cannot rest on an operator remembering to run a command twice.
+    The row goes.
+
+    ==What deleting it does NOT do, and no design could:== a message already handed to the SMTP
+    server will still arrive. Deleting the intent does not recall it, and neither would sparing it.
+    See ``purge_guest``'s docstring — the erasure removes the DATA, and cannot un-send a message
+    that has already left.
+    """
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    # Exactly the state `claim_one` leaves: claimed, leased, and mid-flight on some worker.
+    sqlite_session.add(
+        Outbox(
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            effect=OutboxEffect.EMAIL.value,
+            dedupe_key="email:confirmation:inflight",
+            payload={"kind": "confirmation", "guest_email": _EMAIL},
+            status=OutboxStatus.CLAIMED.value,
+            attempts=1,
+            claimed_by="worker-7",
+            lease_expires_at=_START + timedelta(minutes=5),
+        )
+    )
+    await sqlite_session.flush()
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    survived = (
+        await sqlite_session.scalars(
+            sa.select(Outbox).where(Outbox.dedupe_key == "email:confirmation:inflight")
+        )
+    ).all()
+    assert list(survived) == [], (
+        "the purge spared a CLAIMED intent. There is no second purge pass in this system (the "
+        "command is one-shot and no timer runs it), so 'the next pass will get it' means never — "
+        "and this row carries the guest's address"
+    )

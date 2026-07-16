@@ -171,6 +171,11 @@ _PURGED_BY_BOOKING: dict[str, _PurgedTable] = {
     # ==NOT every row: only the effects that are MESSAGES (B-05c).== The predicate is derived from
     # `purge_policy`, so this line never has to be revisited when an effect is added — the table in
     # `services/outbox.py` is where that decision is made, and it is made or the build fails.
+    #
+    # ==And note what the predicate does NOT say: nothing about STATUS.== A message intent a worker
+    # has CLAIMED and is mid-send on is deleted like any other, and that is a decision rather than
+    # an oversight — `purge_guest`'s docstring argues it (there is no second purge pass, so sparing
+    # a row means keeping the guest's address for good) and `test_privacy` locks it.
     "outbox": _PurgedTable(Outbox, only=Outbox.effect.in_(PURGEABLE_EFFECTS)),
     "guest_tokens": _PurgedTable(GuestToken),
     "sent_notifications": _PurgedTable(SentNotification),
@@ -318,6 +323,37 @@ async def purge_guest(session: AsyncSession, *, tenant_id: uuid.UUID, email: str
     The address is matched case-insensitively: somebody who booked as ``Ada@Example.com`` and writes
     in as ``ada@example.com`` is the same person, and an erasure that misses on capitalisation is an
     erasure that did not happen.
+
+    .. rubric:: ==ONE SHOT. There is no second pass.==
+
+    This is reached from ``run_guest_purge``, which is reached from the ``guest purge`` CLI command,
+    and from nowhere else. The scheduler registers three recurring jobs — webhook delivery, busy
+    refresh, outbox drain — and none of them is this. No cron, no timer, no tick.
+
+    That fact decides things that look like matters of taste. A queued message intent a worker has
+    CLAIMED and is mid-send on is deleted like any other, rather than being spared for "a later
+    pass": there is no later pass, so sparing it would mean the guest's address stays in that row
+    for good — and a legal obligation cannot rest on an operator remembering to run a command twice.
+
+    ==So nothing here may DEFER erasing PII.== :func:`_purge_payment_events` looks like a precedent
+    for deferring (it retains a still-actionable event "for a later purge pass") and it is not one:
+    what it retains is PII-free by CONSTRUCTION — ``payment_webhooks.PaymentEventBody.payload``
+    builds ``{kind, provider_ref, amount_cents, currency, checkout_session_id}`` and never the raw
+    provider body. It defers nothing that a person could be identified by. Any future deferral has
+    to clear that same bar, and "we will get it next time" is not available as an argument.
+
+    .. rubric:: ==What an erasure CANNOT do, stated plainly==
+
+    A message already handed to the SMTP server, or to WhatsApp, or to Google, **will arrive**.
+    Deleting its intent does not recall it; sparing the intent would not either; nothing here can.
+    The drain claims a row, then runs its network I/O with no transaction open, and an erasure
+    landing in that window is racing something that has already left the building.
+
+    So the guarantee is exact, and narrower than "everything is gone": ==this erases the DATA we
+    hold about a person==. It does not un-send what was already sent, and the ledger of what WAS
+    sent is deleted (``sent_notifications``) even though the messages themselves are out there. An
+    operator answering an erasure request should say that, rather than the thing everybody would
+    prefer to be true.
     """
     target = email.strip().lower()
     bookings = list(
@@ -423,8 +459,24 @@ REDACTED_OUTBOX_PAYLOAD: dict[str, Any] = {"redacted": True}
 """What a retained payload becomes when nothing can vouch for a single one of its keys."""
 
 
-def _retained_payload(effect: str, payload: Any) -> tuple[Any, bool]:
-    """Rebuild a retained payload from what it may KEEP. Returns ``(payload, changed)``.
+@dataclass(frozen=True, slots=True)
+class _Rebuilt:
+    """What :func:`_retained_payload` did to one payload, and how to say it to a human.
+
+    The ``reason`` travels WITH the result on purpose. The caller used to re-derive what had been
+    dropped by diffing the two payloads — and that only worked for the one shape it had in mind: it
+    raised ``TypeError`` on a scalar and silently produced a list of CHARACTERS for a string. The
+    function that knows the shape is the function that describes what it did to it.
+    """
+
+    payload: Any
+    changed: bool
+    reason: str = ""
+    """Operator-facing, and ``""`` when nothing changed. Names keys and shapes, never VALUES."""
+
+
+def _retained_payload(effect: str, payload: Any) -> _Rebuilt:
+    """Rebuild a retained payload from what it may KEEP.
 
     ==An ALLOWLIST, and the distinction is the whole finding.== :func:`_redact_json` erases the keys
     it KNOWS (``guest_email``, ``guest_name``, ...), which is right for a row that is about to be
@@ -442,18 +494,50 @@ def _retained_payload(effect: str, payload: Any) -> tuple[Any, bool]:
     row) has no allowlist at all, so it FAILS CLOSED: the payload goes wholesale, the way
     :func:`_purge_payment_events` treats a provider schema that is not ours. That costs nothing
     either — an effect with no member has no handler, so the row was never going to run.
+
+    .. rubric:: ==A payload is not necessarily an object==
+
+    ``payload`` is a JSON column, and JSON is not ``dict``: a list, a string, a number, ``true`` and
+    ``null`` all live there legally, and a row from before the funnel guard can hold any of them.
+    The rule is the same one, a third time: ==a shape nobody can vouch for is a shape we do not
+    keep.== A scalar has no keys, so there is no allowlist to apply and it goes wholesale.
+
+    It matters more than the leak it prevents. Raising here does not leak a key — it aborts the
+    ERASURE, and an erasure that raises is one that did not happen at all, for that guest, in that
+    tenant. The wrong shape must never be able to take the rest of the purge down with it.
     """
+    if payload == REDACTED_OUTBOX_PAYLOAD:
+        # Already erased wholesale. The command is one-shot, but nothing stops an operator running
+        # it twice, and the second run must not "drop" the marker and report a phantom anomaly.
+        return _Rebuilt(payload, changed=False)
     try:
         allowed = RETAINED_PAYLOAD_KEYS[OutboxEffect(effect)]
     except (ValueError, KeyError):
         # No member, or a RETAINED member that declared nothing: we cannot vouch for any key here.
-        kept: Any = dict(REDACTED_OUTBOX_PAYLOAD)
-        return kept, payload != REDACTED_OUTBOX_PAYLOAD
+        return _Rebuilt(
+            dict(REDACTED_OUTBOX_PAYLOAD),
+            changed=True,
+            reason=f"effect {effect!r} has no declared allowlist; payload replaced wholesale",
+        )
     if not isinstance(payload, dict):
-        return dict(REDACTED_OUTBOX_PAYLOAD), True
+        return _Rebuilt(
+            dict(REDACTED_OUTBOX_PAYLOAD),
+            changed=True,
+            reason=(
+                f"payload is {type(payload).__name__}, not a JSON object; replaced wholesale "
+                "(no keys to allow)"
+            ),
+        )
     source: dict[str, Any] = payload
     kept = {key: value for key, value in source.items() if key in allowed}
-    return kept, kept != source
+    if kept == source:
+        return _Rebuilt(source, changed=False)
+    dropped = sorted(set(source) - set(kept))
+    return _Rebuilt(
+        kept,
+        changed=True,
+        reason=f"carried undeclared payload key(s) {dropped}; dropped",
+    )
 
 
 async def _redact_retained_outbox(
@@ -488,21 +572,20 @@ async def _redact_retained_outbox(
     redacted_count = 0
     anomalies: list[str] = []
     for row in rows:
-        rebuilt, changed = _retained_payload(row.effect, row.payload)
-        if not changed:
+        rebuilt = _retained_payload(row.effect, row.payload)
+        if not rebuilt.changed:
             continue
-        dropped = sorted(set(row.payload) - set(rebuilt))
         # REASSIGNED, never mutated in place: SQLAlchemy does not track mutation inside a plain JSON
         # column, so an in-place edit would leave the object looking clean and would never be
         # written — a purge that runs, reports success, and changes nothing at all.
-        row.payload = rebuilt
+        row.payload = rebuilt.payload
         redacted_count += 1
-        # The KEYS, never the values. An anomaly line is evidence an operator may have to show, and
-        # evidence naming the person who asked to be forgotten is the one thing an erasure must not
-        # write down — the same reason the address itself never reaches the log.
-        anomalies.append(
-            f"outbox intent ({row.effect}) carried undeclared payload key(s) {dropped}; dropped"
-        )
+        # The reason comes FROM the rebuild rather than being re-derived here: this line used to
+        # diff the two payloads to work out what went, which raised on a scalar and produced a list
+        # of characters for a string. It carries keys and shapes, never VALUES — an anomaly line is
+        # evidence an operator may have to show, and evidence naming the person who asked to be
+        # forgotten is the one thing an erasure must not write down.
+        anomalies.append(f"outbox intent ({row.effect}) {rebuilt.reason}")
     if anomalies:
         # ERROR, not warning: a row got past the funnel guard. It predates it, or something wrote to
         # the table directly — and either way somebody should find out which.
