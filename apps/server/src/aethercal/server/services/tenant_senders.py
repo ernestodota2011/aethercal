@@ -68,12 +68,25 @@ assumption nobody made into a sentence somebody had to write down.
 
 Nothing goes out on that channel for that business: it is simply absent from
 :attr:`TenantSenders.channels`, and the drain retires the step as
-:class:`~aethercal.server.services.outbox.OutboxSkipped` — terminal, carrying its reason, logged,
-and counted at ``/metrics`` as ``outcome="skipped"``. ==Visible, and therefore not a silent no-op.==
+:class:`~aethercal.server.services.outbox.OutboxSkipped`. That is terminal, it costs no attempt, and
+it is ==visible in three places==: the outbox row settles to ``status='skipped'``, the worker logs
+the reason at WARNING, and ``/metrics`` counts it under ``outcome="skipped"``. The reminder that did
+not go out is a fact somebody can find — which is the whole difference between this and a silent
+no-op.
 
 Deliberately NOT a hard failure: ``services/outbox.OutboxSkipped`` already argues the case — an
 unconfigured channel retried like an outage burns six attempts of exponential backoff, lands in the
 dead-letter, and the message still does not arrive. That is noise instead of an answer.
+
+.. rubric:: ==The residual, stated rather than left to be discovered==
+
+The **reason is not on the row.** ``Outbox`` has no column for it, so ``status='skipped'`` is
+queryable and *why* is only in the worker's log. For an unconfigured channel that is tolerable —
+there are exactly two reasons and this module logs both by name — but it is a real gap, and it is
+the OPERATOR's: somebody asking "why did this business's reminder not go out?" has to go and grep.
+Closing it properly means a ``skip_reason`` column on ``Outbox`` and the drain writing the
+exception's text at settle time. That is a migration, and it belongs to whoever next touches that
+table rather than to a cut about senders.
 """
 
 from __future__ import annotations
