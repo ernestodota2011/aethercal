@@ -41,6 +41,7 @@ from aethercal.schemas.workflows import (
     WorkflowTemplateCreate,
     WorkflowTemplateUpdate,
     WorkflowUpdate,
+    check_offset,
 )
 from aethercal.server.channels import Channel
 from aethercal.server.db.models import (
@@ -238,6 +239,21 @@ def test_before_start_refuses_a_positive_offset_and_after_end_a_negative_one() -
             offset_minutes=-60,
             steps=[WorkflowStepIn(channel="email", kind="reminder")],
         )
+
+
+def test_a_zero_offset_fires_AT_the_moment_and_is_refused_on_both_delayed_triggers() -> None:
+    """The boundary is STRICT, both ways. ``step_send_time`` adds the offset to the anchor, so a
+    ``before_start`` at ``0`` sends ``start_at`` EXACTLY — "your meeting begins in 0 minutes",
+    neither a reminder nor true — and an ``after_end`` at ``0`` fires the instant the meeting ends,
+    the mirror of the same nonsense. So ``before_start`` needs a strictly NEGATIVE offset and
+    ``after_end`` a strictly POSITIVE one; ``0`` is refused on both, and the strictly-signed offsets
+    still pass (the fix tightens the boundary, it does not move it)."""
+    with pytest.raises(ValueError, match="before_start"):
+        check_offset("before_start", 0)
+    with pytest.raises(ValueError, match="after_end"):
+        check_offset("after_end", 0)
+    check_offset("before_start", -30)  # strictly negative — still fine
+    check_offset("after_end", 30)  # strictly positive — still fine
 
 
 def test_two_steps_on_the_same_channel_are_refused() -> None:

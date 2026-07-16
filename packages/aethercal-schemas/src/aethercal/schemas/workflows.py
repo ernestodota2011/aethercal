@@ -113,15 +113,24 @@ def check_offset(trigger: str, offset_minutes: int) -> None:
                 "and that in fact goes out immediately; use before_start/after_end to delay one"
             )
         return
-    if trigger == "before_start" and offset_minutes > 0:
+    # The boundary is STRICT, and symmetric. step_send_time() (services/workflows.py) adds
+    # the offset to the trigger's anchor, so offset 0 lands the send ON the anchor: a
+    # before_start at 0 fires start_at EXACTLY ("your meeting begins in 0 minutes"), and an
+    # after_end at 0 fires the instant the meeting ends ("thanks, how was it?" the second it
+    # finishes). Both are the mirror of the wrong-sign case they sit next to: a message the
+    # tenant believes they scheduled that carries no lead time at all. So before_start demands
+    # a strictly negative offset and after_end a strictly positive one — 0 is refused on BOTH.
+    if trigger == "before_start" and offset_minutes >= 0:
         raise ValueError(
-            "trigger 'before_start' takes a negative offset_minutes (-1440 = 24 h before the "
-            f"start); {offset_minutes} would fire AFTER the meeting began"
+            "trigger 'before_start' takes a strictly NEGATIVE offset_minutes (-1440 = 24 h before "
+            f"the start); {offset_minutes} would fire the reminder at the meeting's start (0) or "
+            "after it has begun — never in time to warn the guest"
         )
-    if trigger == "after_end" and offset_minutes < 0:
+    if trigger == "after_end" and offset_minutes <= 0:
         raise ValueError(
-            "trigger 'after_end' takes a non-negative offset_minutes (60 = an hour after the end); "
-            f"{offset_minutes} would fire BEFORE the meeting was over"
+            "trigger 'after_end' takes a strictly POSITIVE offset_minutes (60 = an hour after the "
+            f"end); {offset_minutes} would fire at the meeting's end (0) or before it was over — "
+            "never after it"
         )
 
 
