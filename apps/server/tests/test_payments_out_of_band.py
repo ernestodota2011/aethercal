@@ -23,6 +23,7 @@ from aethercal.server.db.models import (
     Booking,
     EventType,
     Outbox,
+    OutboxStatus,
     Payment,
     PaymentStatus,
     Schedule,
@@ -149,6 +150,45 @@ async def test_our_own_refund_echoed_back_is_a_noop(sqlite_session: AsyncSession
     await sqlite_session.refresh(booking)
     assert booking.status is BookingStatus.CONFIRMED, "our own refund echo does not re-cancel"
     assert await _count(sqlite_session, booking.id, OutboxEffect.EMAIL) == 0
+
+
+async def test_an_out_of_band_refund_voids_the_pending_reminders(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Re-Crisol #3.== An external refund cancels the booking AND reconciles its queued effects.
+    Setting the status is not enough: a ``before_start`` reminder still sitting in the outbox would
+    fire the hour before a meeting that was refunded and cancelled. The out-of-band path runs the
+    same ``CANCEL`` transition ``cancel_booking`` does, which VOIDS those pending NOTIFY steps."""
+    tenant_id, booking, _payment = await _seed(sqlite_session)
+    reminder = Outbox(
+        tenant_id=tenant_id,
+        booking_id=booking.id,
+        effect=OutboxEffect.NOTIFY.value,
+        dedupe_key=f"wf:{uuid.uuid4()}:step:whatsapp",
+        payload={
+            "trigger": "before_start",
+            "channel": "whatsapp",
+            "kind": "reminder",
+            "step_id": str(uuid.uuid4()),
+        },
+        status=OutboxStatus.PENDING.value,
+        attempts=0,
+        next_retry_at=_SLOT - timedelta(days=1),  # a real queued reminder, due 24 h before the slot
+    )
+    sqlite_session.add(reminder)
+    await sqlite_session.flush()
+    reminder_id = reminder.id
+
+    result = await _apply_refund(sqlite_session, tenant_id)
+
+    assert result is ArbiterOutcome.OUT_OF_BAND_REFUND
+    await sqlite_session.refresh(booking)
+    assert booking.status is BookingStatus.CANCELLED
+    voided = await sqlite_session.get(Outbox, reminder_id)
+    assert voided is not None
+    assert voided.status == OutboxStatus.VOIDED.value, (
+        "the pending reminder must be voided, not fire after the external refund cancelled it"
+    )
 
 
 async def test_a_dispute_marks_and_alerts_but_does_not_cancel(sqlite_session: AsyncSession) -> None:

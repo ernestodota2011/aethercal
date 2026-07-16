@@ -84,6 +84,7 @@ from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     resolve_money_credential,
 )
+from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
 
 _logger = logging.getLogger(__name__)
 
@@ -410,6 +411,15 @@ async def apply_refunded_event(
         booking.cancelled_at = now
         # Bump the iCal sequence so the cancellation .ics supersedes the confirmation (RFC 5545).
         booking.sequence += 1
+        # ==Finding 3: RECONCILE the queued effects, exactly as ``cancel_booking`` does.== Setting
+        # the status is not enough — the booking's still-pending workflow steps (its reminders) are
+        # live, and a reminder firing the hour before a meeting that was refunded and cancelled is
+        # the guest messaged about an appointment that no longer exists. ``CANCEL`` voids those
+        # pending NOTIFY steps and materialises ``on_cancel``, the same transition the normal
+        # cancel path runs. Without it the cancellation is cosmetic and the reminders still fire.
+        await apply_booking_transition(
+            session, booking=booking, transition=BookingTransition.CANCEL, now=now
+        )
         # Tell the guest it is cancelled. ``confirmed_at`` is set, so the B-05a silence
         # gate lets it out. Enqueued directly (not via ``cancel_booking``) so no refund is queued.
         await enqueue_effect(
