@@ -14,17 +14,24 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
 from aethercal.server.integrations.mercadopago import (
+    _SIGNATURE_MAX_AGE,
+    _SIGNATURE_MAX_SKEW_AHEAD,
     MercadoPagoGateway,
     MercadoPagoWebhookAdapter,
     UnsupportedCurrencyError,
 )
 from aethercal.server.services.payment_webhooks import InboundWebhook, WebhookEventKind
+
+_SIGNED_AT = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+"""When the notification under test was signed. ==Every signature test stands at a KNOWN clock==,
+because the freshness window is measured in days and a test must reach either end of it without
+sleeping through a fortnight."""
 
 _SECRET = "mp_whsec_NOT_A_REAL_KEY_x"
 _TOKEN = "TEST-NOT-A-REAL-ACCESS-TOKEN"
@@ -52,15 +59,30 @@ def _sign(
     *,
     data_id: str | None = "123456789",
     request_id: str | None = "req-abc",
-    ts: str = "1704908010000",
+    ts: str | None = None,
     secret: str = _SECRET,
 ) -> str:
+    ts = ts or _ts_ms(_SIGNED_AT)
     mac = hmac.new(
         secret.encode("utf-8"),
         _manifest(data_id=data_id, request_id=request_id, ts=ts).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     return f"ts={ts},v1={mac}"
+
+
+def _ts_ms(moment: datetime) -> str:
+    """Mercado Pago's ``ts`` is Unix MILLISECONDS, not seconds."""
+    return str(int(moment.timestamp() * 1000))
+
+
+def _at(moment: datetime) -> MercadoPagoWebhookAdapter:
+    """An adapter whose clock reads ``moment``."""
+    return MercadoPagoWebhookAdapter(now=lambda: moment)
+
+
+def _signed_now() -> str:
+    return _sign(ts=_ts_ms(_SIGNED_AT))
 
 
 def _inbound(
@@ -88,12 +110,12 @@ def _inbound(
 
 
 def test_a_valid_mercado_pago_signature_verifies() -> None:
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     assert adapter.verify_signature(_inbound(signature=_sign()), secret=_SECRET)
 
 
 def test_a_forged_or_absent_signature_fails() -> None:
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     assert not adapter.verify_signature(
         _inbound(signature="ts=1704908010000,v1=deadbeef"), secret=_SECRET
     )
@@ -102,7 +124,7 @@ def test_a_forged_or_absent_signature_fails() -> None:
 
 
 def test_a_signature_under_the_wrong_secret_fails() -> None:
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     header = _sign(secret="mp_whsec_OTHER_KEY")
     assert not adapter.verify_signature(_inbound(signature=header), secret=_SECRET)
 
@@ -119,7 +141,7 @@ def test_the_request_id_pair_is_omitted_when_the_header_is_absent() -> None:
     """==The SDKs' documented omission rule.== No ``x-request-id`` → the ``request-id:`` pair is
     left OUT of the manifest, not included as empty. Getting this wrong fails every notification
     that arrives without the header."""
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     header = _sign(request_id=None)
     assert adapter.verify_signature(_inbound(signature=header, request_id=None), secret=_SECRET)
 
@@ -128,7 +150,7 @@ def test_the_data_id_is_lowercased_before_hashing() -> None:
     """The majority of Mercado Pago's official SDKs lowercase ``data.id`` before hashing. For a
     numeric payment id this is a no-op; it is asserted with an ALPHANUMERIC id so the rule itself
     is pinned rather than accidentally satisfied."""
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     header = _sign(data_id="abc-DEF-123".lower())
     inbound = InboundWebhook(
         raw_body=b"{}",
@@ -147,7 +169,7 @@ def test_the_signature_does_not_cover_the_body() -> None:
     payment from the API instead. If this ever starts failing, the body became authenticated and
     the fetch could be reconsidered.
     """
-    adapter = MercadoPagoWebhookAdapter()
+    adapter = _at(_SIGNED_AT)
     header = _sign()
     tampered = _inbound(body=b'{"totally":"different"}', signature=header)
     assert adapter.verify_signature(tampered, secret=_SECRET)
@@ -420,3 +442,70 @@ async def test_a_provider_error_propagates_rather_than_being_swallowed() -> None
             idempotency_key="refund:123456789",
             secrets=_SECRETS,
         )
+
+
+# --------------------------------------------------------------------------------------
+# ==A signature that is authentic but STALE is not fresh== (Crisol, B-06 round 2).
+# --------------------------------------------------------------------------------------
+
+
+def test_a_fresh_signature_verifies() -> None:
+    adapter = _at(_SIGNED_AT + timedelta(seconds=30))
+    assert adapter.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+
+
+def test_an_ancient_signature_is_refused_even_though_it_is_authentic() -> None:
+    """==Authentic is not fresh.== The ``ts`` travels INSIDE the manifest, so it is signed and
+    cannot be edited — but a signature nobody dates against a clock is valid for ever. Whoever
+    captures one real notification could replay it next year. The HMAC proves WHO sent it; only
+    the clock proves WHEN."""
+    adapter = _at(_SIGNED_AT + _SIGNATURE_MAX_AGE + timedelta(minutes=1))
+    assert not adapter.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+
+
+def test_a_signature_from_the_future_is_refused() -> None:
+    """A ``ts`` ahead of our clock is skew, and nothing else — no legitimate notification is signed
+    in the future. Bounding only the past would let a captured signature be paired with a forged
+    clock and live for ever in the other direction."""
+    adapter = _at(_SIGNED_AT - _SIGNATURE_MAX_SKEW_AHEAD - timedelta(minutes=1))
+    assert not adapter.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+
+
+def test_ordinary_clock_skew_in_either_direction_still_verifies() -> None:
+    """The window must absorb real skew, or the endpoint goes flaky for no security we gain."""
+    behind = _at(_SIGNED_AT - _SIGNATURE_MAX_SKEW_AHEAD + timedelta(minutes=1))
+    ahead = _at(_SIGNED_AT + timedelta(minutes=30))
+    assert behind.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+    assert ahead.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+
+
+def test_the_whole_documented_retry_schedule_still_verifies() -> None:
+    """==The tension, resolved by sizing rather than by hoping.==
+
+    Mercado Pago redelivers an unacknowledged notification at 0, 15min, 30min, 6h, 48h and then
+    96h three times — roughly **14.3 days** from the first attempt. ==Whether a retry is re-signed
+    with a fresh ``ts`` or replays the original one is NOT documented, and cannot be checked without
+    a live account.== So the window is sized for the worse hypothesis: if retries replay the
+    original ``ts``, the last one is ~14.3 days old and must STILL be honoured — rejecting it would
+    turn a transient outage into a guest who paid for a booking that never confirms, which is the
+    worst outcome this system can produce. A replay window is a nuisance; a lost payment is not.
+    """
+    last_retry = _SIGNED_AT + timedelta(hours=0.25 + 0.5 + 6 + 48 + 96 * 3)
+    adapter = _at(last_retry)
+    assert adapter.verify_signature(_inbound(signature=_signed_now()), secret=_SECRET)
+
+
+def test_a_forged_timestamp_fails_the_hmac_not_the_clock() -> None:
+    """Moving the ``ts`` to look fresh breaks the signature: it is part of the signed manifest. The
+    freshness check is a SECOND line, not the only one — an attacker cannot re-date a capture."""
+    adapter = _at(_SIGNED_AT)
+    stale = _sign(ts=_ts_ms(_SIGNED_AT - timedelta(days=400)))
+    forged = stale.replace(stale.split(",")[0], f"ts={_ts_ms(_SIGNED_AT)}")
+    assert not adapter.verify_signature(_inbound(signature=forged), secret=_SECRET)
+
+
+def test_a_non_numeric_timestamp_is_refused() -> None:
+    adapter = _at(_SIGNED_AT)
+    assert not adapter.verify_signature(
+        _inbound(signature="ts=not-a-number,v1=deadbeef"), secret=_SECRET
+    )

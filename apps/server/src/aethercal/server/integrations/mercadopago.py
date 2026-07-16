@@ -62,8 +62,8 @@ import hashlib
 import hmac
 import json
 import logging
-from collections.abc import Mapping
-from datetime import datetime, timedelta
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, assert_never
@@ -89,6 +89,35 @@ _TOPIC_QUERY = "type"
 _PAYMENT_TOPIC = "payment"
 
 _MINOR_UNITS_PER_MAJOR = Decimal(100)
+
+_SIGNATURE_MAX_AGE = timedelta(days=15)
+"""How old a signature may be. ==Sized by Mercado Pago's RETRY SCHEDULE, not by taste.==
+
+The ``ts`` is inside the signed manifest, so it cannot be edited — but a timestamp nobody compares
+to a clock proves nothing about WHEN. Without this, one captured notification is replayable for
+ever: the HMAC says who sent it, and stays true indefinitely.
+
+==The window cannot simply be "short", and that is the whole difficulty.== Mercado Pago redelivers
+an unacknowledged notification at 0, 15min, 30min, 6h, 48h and then 96h three times — about **14.3
+days** from the first attempt. ==Whether a retry is re-signed with a fresh ``ts`` or replays the
+original one is NOT documented, and cannot be established without a live account.== So this is sized
+for the WORSE hypothesis: if retries carry the original ``ts``, the final one is ~14.3 days old and
+must still be honoured. Fifteen days covers the documented schedule with a margin.
+
+That is a weak expiry, and it is named as weak rather than dressed up. What it buys is real and
+bounded: a captured signature stops working once the provider's own redelivery horizon has passed,
+so "valid for ever" becomes "valid for as long as Mercado Pago itself would still be trying".
+Buying more would mean betting that retries are re-signed — and losing that bet turns a transient
+outage into a guest who paid for a booking that never confirms, the worst outcome this system can
+produce. ==A replay window is a nuisance; a lost payment is not.== If a live account ever shows that
+retries carry a fresh ``ts``, this can drop to minutes, and it should."""
+
+_SIGNATURE_MAX_SKEW_AHEAD = timedelta(minutes=5)
+"""How far into the future a ``ts`` may be. ==Clock skew, and nothing else.==
+
+No legitimate notification is signed in the future, so this needs no room for a retry schedule and
+gets none. It is deliberately NOT symmetric with :data:`_SIGNATURE_MAX_AGE`: bounding only the past
+would leave the other direction open for ever."""
 
 _TWO_DECIMAL_CURRENCIES = frozenset({"ARS", "BRL", "MXN", "PEN", "USD", "UYU"})
 """The currencies this adapter will price. ==An ALLOW-list, and it is deliberately short.==
@@ -279,21 +308,28 @@ class MercadoPagoWebhookAdapter:
     """Mercado Pago's signature scheme and event layout.
 
     ``transport`` is injectable so a test can stub the ``GET /v1/payments/{id}`` round-trip;
-    production passes ``None`` and a fresh :class:`httpx.AsyncClient` is used per call.
+    production passes ``None`` and a fresh :class:`httpx.AsyncClient` is used per call. ``now`` is
+    injectable for the same reason: the freshness window is measured in days, and a test must be
+    able to stand at either end of it without sleeping through a fortnight.
     """
 
-    def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self._transport = transport
+        self._now = now or (lambda: datetime.now(UTC))
 
     def verify_signature(self, request: InboundWebhook, *, secret: str) -> bool:
-        """Recompute the manifest's HMAC-SHA256 and constant-time compare it.
+        """Recompute the manifest's HMAC-SHA256, constant-time compare it, THEN check the clock.
 
-        .. rubric:: The ``ts`` tolerance is NOT enforced here, for the reason Stripe's is not
-
-        Mercado Pago's SDK can reject a ``ts`` outside a drift window; that check is optional there
-        and omitted here, because the anti-replay in THIS system is the
-        ``UNIQUE(tenant_id, provider, event_id)`` on ``payment_events`` — which does not expire and
-        does not go flaky under clock skew. It is documented rather than silently dropped.
+        ==Two questions, and the HMAC only answers the first.== *Who sent this?* is settled by the
+        signature. *When?* is not: the ``ts`` rides inside the signed manifest, so it is authentic
+        and unforgeable — and authentic is not fresh. A signature nobody dates is valid for ever,
+        and whoever captures one real notification can replay it next year. So the HMAC is checked
+        first (nothing is trusted before it) and the freshness window second, as a second line.
         """
         header = _header(request, _SIGNATURE_HEADER)
         if not header:
@@ -310,7 +346,42 @@ class MercadoPagoWebhookAdapter:
         expected = hmac.new(
             secret.encode("utf-8"), manifest.encode("utf-8"), hashlib.sha256
         ).hexdigest()
-        return hmac.compare_digest(expected, presented)
+        if not hmac.compare_digest(expected, presented):
+            return False
+        return self._is_fresh(timestamp)
+
+    def _is_fresh(self, timestamp: str) -> bool:
+        """Whether a signed ``ts`` (Unix MILLISECONDS) is inside the replay window.
+
+        ==Asymmetric, and deliberately.== The past is bounded by Mercado Pago's own redelivery
+        horizon (:data:`_SIGNATURE_MAX_AGE`), because a legitimate retry may — for all the
+        documentation says — carry the ORIGINAL ``ts`` up to ~14.3 days later, and rejecting it
+        would lose a real payment. The future is bounded tightly
+        (:data:`_SIGNATURE_MAX_SKEW_AHEAD`), because nothing legitimate is signed ahead of our
+        clock and an unbounded future is the same hole facing the other way.
+        """
+        if not timestamp.isdigit():
+            # The SDK treats a non-numeric ts as a malformed header. It cannot be dated, so it
+            # cannot be trusted.
+            _logger.warning("mercado pago: non-numeric ts in x-signature; refusing")
+            return False
+        signed_at = datetime.fromtimestamp(int(timestamp) / 1000, tz=UTC)
+        age = self._now() - signed_at
+        if age > _SIGNATURE_MAX_AGE:
+            _logger.warning(
+                "mercado pago: refusing a signature %s old — authentic, but past Mercado Pago's "
+                "own redelivery horizon, so it can only be a replay",
+                age,
+            )
+            return False
+        if -age > _SIGNATURE_MAX_SKEW_AHEAD:
+            _logger.warning(
+                "mercado pago: refusing a signature dated %s in the FUTURE — no notification is "
+                "legitimately signed ahead of our clock",
+                -age,
+            )
+            return False
+        return True
 
     async def parse(  # noqa: PLR0911 - every early return is a distinct fail-closed guard
         self, request: InboundWebhook, *, secrets: Mapping[str, str]
