@@ -1,0 +1,590 @@
+=== ronda 1 — 2026-07-13T06:45:13-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+
+########## 8a24d99 — feat(webhooks): allow declared private targets, an ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 1: 9/13 cortes con GO ===
+=== ronda 2 — 2026-07-13T07:11:46-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+
+########## 8a24d99 — feat(webhooks): allow declared private targets, an ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 2: 9/13 cortes con GO ===
+=== ronda 3 — 2026-07-13T07:38:18-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+
+########## 8a24d99 — feat(webhooks): allow declared private targets, an ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 3: 9/13 cortes con GO ===
+=== ronda 4 — 2026-07-13T08:04:51-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 7cfaa19 — fix: three settings that did nothing, and the gues ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 4: 9/13 cortes con GO ===
+=== ronda 5 — 2026-07-13T08:31:22-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 7cfaa19 — fix: three settings that did nothing, and the gues ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 5: 9/13 cortes con GO ===
+=== ronda 6 — 2026-07-13T08:57:54-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 7cfaa19 — fix: three settings that did nothing, and the gues ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 6: 9/13 cortes con GO ===
+=== ronda 7 — 2026-07-13T09:24:26-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 7cfaa19 — fix: three settings that did nothing, and the gues ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 9
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 7: 9/13 cortes con GO ===
+=== ronda 8 — 2026-07-13T09:50:57-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 7cfaa19 — fix: three settings that did nothing, and the gues ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio implementa de forma coherente la desactivación y el límite diario, con buena cobertura. Encontré un defecto en el mensaje interno usado por administración: identifica el día en UTC, aunque el límite se calcula según la zona horaria del calendario.
+  [medium·high·correctness] apps/server/src/aethercal/server/services/bookings.py:331 [69757362-0961-4af9-b696-ba009ac354f2::0] DayFullError informa el día UTC en vez del día local limitado
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+
+########## 8a24d99 — feat(webhooks): allow declared private targets, an ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio está bien cubierto y la política SSRF es, en general, coherente y fail-closed. Encontré un problema concreto de seguridad operativa: se registra la URL completa del webhook, que es input no confiable y puede contener secretos o caracteres de control.
+
+########## 11b44a8 — refactor(server): one owner for users and for the  ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: La centralización mejora la validación y elimina duplicación, pero la unicidad case-insensitive sigue siendo vulnerable a carreras y la eliminación conserva otra ventana de concurrencia relevante. Los tests cubren bien los flujos secuenciales, no estos casos concurrentes.
+  [high·high·correctness] apps/server/src/aethercal/server/services/users.py:214 [55a6bb59-3679-40a5-919e-410b91f015ce::0] La unicidad case-insensitive no es atómica
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+
+########## ea938a2 — test(db): give every run its own Postgres schema ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El aislamiento por esquema está bien planteado, pero la ruta de inicialización deja el esquema recién creado sin limpiar si falla la verificación de aislamiento. No encontré otros defectos sólidos en el diff.
+  [medium·high·completeness] apps/server/tests/conftest.py:305 [3266bc16-cc00-44c3-93ae-0355c27a61bd::0] El esquema se filtra si falla la verificación inicial
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+
+########## c8e416f — test: pin the invariant that a retired step never  ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio solo amplía la documentación y añade una prueba de regresión coherente con el contrato descrito: la cuota se deriva del ledger de envíos efectivos y no de intentos retirados antes del envío. No se observan defectos concretos ni problemas estructurales relevantes anclados en las líneas modificadas.
+
+########## ba750c5 — integrate: f3-noshow-metrics ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 8: 13/13 cortes con GO ===
+TODOS LOS CORTES CON GO
+=== ronda 1 — 2026-07-13T09:57:39-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+
+########## 11b44a8 — refactor(server): one owner for users and for the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 1: 13/19 cortes con GO ===
+=== ronda 2 — 2026-07-13T10:24:12-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+
+########## 11b44a8 — refactor(server): one owner for users and for the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 2: 13/19 cortes con GO ===
+=== ronda 3 — 2026-07-13T10:50:44-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+
+########## 11b44a8 — refactor(server): one owner for users and for the  ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: La centralización mejora la consistencia, pero la unicidad case-insensitive del email sigue implementada mediante un check-then-insert no atómico. Dos altas concurrentes válidas pueden crear los duplicados que el servicio promete impedir.
+  [high·high·correctness] apps/server/src/aethercal/server/services/users.py:164 [8012c796-dc9b-40b5-b8b5-9aa824d604c4::0] La unicidad case-insensitive falla bajo concurrencia
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+  ✓ ea938a2  test(db): give every run its own Postgres sc  (ya revisado)
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+  ✓ c8e416f  test: pin the invariant that a retired step   (ya revisado)
+
+########## ba750c5 — integrate: f3-noshow-metrics ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 3: 13/19 cortes con GO ===
+=== ronda 4 — 2026-07-13T11:18:06-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 4: 13/19 cortes con GO ===
+=== ronda 5 — 2026-07-13T11:44:39-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 5: 13/19 cortes con GO ===
+=== ronda 6 — 2026-07-13T12:11:11-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 6: 13/19 cortes con GO ===
+=== ronda 7 — 2026-07-13T12:37:45-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 7: 13/19 cortes con GO ===
+=== ronda 8 — 2026-07-13T13:04:17-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 8: 13/19 cortes con GO ===
+=== ronda 9 — 2026-07-13T13:30:49-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 9: 13/19 cortes con GO ===
+=== ronda 10 — 2026-07-13T13:57:21-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 10: 13/19 cortes con GO ===
+=== ronda 11 — 2026-07-13T14:23:53-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 11: 13/19 cortes con GO ===
+=== ronda 12 — 2026-07-13T14:50:25-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 12: 13/19 cortes con GO ===
+=== ronda 13 — 2026-07-13T15:16:57-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 13: 13/19 cortes con GO ===
+=== ronda 14 — 2026-07-13T15:43:29-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 14: 13/19 cortes con GO ===
+=== ronda 15 — 2026-07-13T16:10:01-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 15: 13/19 cortes con GO ===
+=== ronda 16 — 2026-07-13T16:36:33-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 16: 13/19 cortes con GO ===
+=== ronda 17 — 2026-07-13T17:03:05-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 17: 13/19 cortes con GO ===
+=== ronda 18 — 2026-07-13T17:29:38-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: la API devolvio 504: {'detail': 'error code: 504\n'}
+  PARA AQUI: cuota agotada. Reanuda mas tarde; el ledger conserva el progreso.
+
+Cortes con GO: 13
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 18: 13/19 cortes con GO ===
+=== ronda 19 — 2026-07-13T17:56:10-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El refuerzo de RLS está bien planteado, pero el nuevo chequeo de rol del CLI introduce reutilización de un AsyncEngine entre dos event loops distintos, lo que puede romper comandos válidos en ejecución.
+  [high·high·correctness] apps/server/src/aethercal/server/cli.py:389 [f7c1dea7-0a4e-455e-a65a-fd46856ac905::0] El AsyncEngine se reutiliza entre distintos event loops
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+
+########## 11b44a8 — refactor(server): one owner for users and for the  ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El refactor centraliza correctamente la lógica y añade buena cobertura, pero la unicidad case-insensitive prometida sigue siendo vulnerable a concurrencia. Además, el SAVEPOINT de la actualización no protege realmente el flush de cambios realizados antes de abrirlo.
+  [medium·high·correctness] apps/server/src/aethercal/server/services/users.py:165 [ce50d6ca-a0f8-4a25-a79a-f0758164fda5::0] La unicidad case-insensitive no es atómica
+  [medium·high·correctness] apps/server/src/aethercal/server/services/users.py:269 [ce50d6ca-a0f8-4a25-a79a-f0758164fda5::1] El SAVEPOINT de update se abre después de modificar la entidad
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+  ✓ ea938a2  test(db): give every run its own Postgres sc  (ya revisado)
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+  ✓ c8e416f  test: pin the invariant that a retired step   (ya revisado)
+
+########## ba750c5 — integrate: f3-noshow-metrics ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio aporta buena cobertura, pero la métrica de no-shows calcula un ratio incorrecto y la purga tiene huecos relevantes: omite PII en JSON y no coordina los efectos ya reclamados por un worker. Además, ciertos tokens de métricas válidos según Settings son imposibles de presentar por HTTP.
+  [high·medium·security] apps/server/src/aethercal/server/services/privacy.py:258 [86341397-3c5b-4fc9-80d0-a529a75dcedc::0] La purga no impide que un efecto reclamado use PII después del borrado
+  [medium·high·correctness] apps/server/src/aethercal/server/observability.py:209 [86341397-3c5b-4fc9-80d0-a529a75dcedc::1] El ratio de no-shows incluye reservas futuras en el denominador
+  [medium·high·correctness] apps/server/src/aethercal/server/settings.py:97 [86341397-3c5b-4fc9-80d0-a529a75dcedc::3] Un token con espacios exteriores pasa validación pero no puede autenticarse
+  ✓ 4586355  integrate: f3-channels  (ya revisado)
+
+########## 26134fa — integrate: v1-docs-release ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio está bien orientado, pero el quickstart queda obsoleto inmediatamente por usar fechas absolutas y el flujo de publicación permite releases manuales sin un tag que vincule la versión al commit. No hay evidencia de vulnerabilidades explotables en el diff.
+  [high·high·correctness] docs/quickstart.md:110 [ec0d196a-5878-4eeb-a2ef-f6afb3053050::0] El quickstart deja de funcionar después del 20 de julio de 2026
+  [medium·high·completeness] .github/workflows/publish.yml:45 [ec0d196a-5878-4eeb-a2ef-f6afb3053050::1] La publicación manual no exige que el commit tenga un tag de release
+
+########## 1d6b846 — integrate: v1-e2e ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio integra una suite E2E amplia y configura correctamente los intervalos del scheduler, sin defectos funcionales evidentes en esas rutas. Quedan dos huecos de completitud: CI no ejecuta el typecheck estricto y la cobertura de no-show está desactivada permanentemente.
+  [medium·high·completeness] e2e/specs/no-show.spec.ts:30 [3957678e-bccf-49cb-9677-7d5147abdaee::0] La prueba de no-show nunca se ejecuta
+  [low·high·completeness] .github/workflows/ci.yml:226 [3957678e-bccf-49cb-9677-7d5147abdaee::1] CI no ejecuta el typecheck de la nueva suite
+
+########## c359e3b — integrate: f3-engine ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio incorpora una superficie CRUD amplia y buenos tests, pero la reconciliación tiene dos defectos sólidos: no retira mensajes al estrechar el alcance por tipo de evento y conserva filas programadas al convertir una regla temporal en un trigger basado en eventos. Además, el límite de entrega permite enviar exactamente cuando comienza la reunión.
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:531 [4097073a-d87e-4d9b-99fa-ba685be51ead::0] Cambiar event_type_id deja activas las notificaciones del alcance anterior
+  [high·high·correctness] apps/server/src/aethercal/server/services/outbox.py:699 [4097073a-d87e-4d9b-99fa-ba685be51ead::1] Un cambio a trigger de evento conserva el mensaje programado anterior
+  [medium·high·correctness] apps/server/src/aethercal/server/services/outbox.py:1588 [4097073a-d87e-4d9b-99fa-ba685be51ead::2] El deadline permite enviar un recordatorio exactamente al comenzar la reunión
+
+########## a2a5bf8 — integrate: f4-multihost ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio está bien cubierto en los flujos principales, pero la nueva invariancia de propiedad de horarios no está protegida frente a escrituras concurrentes. Dos operaciones válidas pueden confirmar por separado sus comprobaciones y dejar un event type usando el horario privado de otro host.
+  [high·high·correctness] apps/server/src/aethercal/server/services/schedules.py:342 [f90030eb-d892-451b-8603-25153091aefd::0] Carrera al cambiar el propietario de un horario en uso
+
+Cortes con GO: 16
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 19: 16/19 cortes con GO ===
+=== ronda 20 — 2026-07-13T18:27:29-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El aislamiento por RLS está cuidadosamente planteado, pero la nueva inicialización del motor del CLI introduce un fallo real al reutilizar un AsyncEngine entre dos event loops distintos.
+  [high·high·correctness] apps/server/src/aethercal/server/cli.py:389 [66fd8572-eb00-44cf-9af3-08220739780f::0] El CLI reutiliza el AsyncEngine en un event loop distinto
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+  ✓ 11b44a8  refactor(server): one owner for users and fo  (ya revisado)
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+  ✓ ea938a2  test(db): give every run its own Postgres sc  (ya revisado)
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+  ✓ c8e416f  test: pin the invariant that a retired step   (ya revisado)
+  ✓ ba750c5  integrate: f3-noshow-metrics  (ya revisado)
+  ✓ 4586355  integrate: f3-channels  (ya revisado)
+
+########## 26134fa — integrate: v1-docs-release ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El flujo de publicación está razonablemente protegido, pero el quickstart no es reproducible: consulta y reserva fechas fijas, y además ignora el slot realmente devuelto por la API. Esto hará que una guía presentada como ejecutable falle según la fecha, la hora o la disponibilidad real.
+  [high·high·correctness] docs/quickstart.md:113 [fe8b06e6-b33c-4bc3-a706-879dc883138b::0] El quickstart intenta reservar un slot fijo en vez del slot devuelto
+  ✓ 1d6b846  integrate: v1-e2e  (ya revisado)
+
+########## c359e3b — integrate: f3-engine ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio cubre bien el CRUD y varios casos difíciles, pero deja un defecto funcional importante al cambiar el alcance por tipo de evento: las notificaciones ya encoladas fuera del nuevo alcance permanecen activas. También hay inconsistencias relevantes entre la validación de plantillas y su identidad por locale.
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:391 [1993e7d3-d9a2-4176-a0d3-59d19b60e4e3::0] Cambiar event_type_id no retira mensajes del alcance anterior
+  [medium·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:630 [1993e7d3-d9a2-4176-a0d3-59d19b60e4e3::2] Una carrera permite dejar reglas activas sin plantilla
+
+########## a2a5bf8 — integrate: f4-multihost ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio mejora sustancialmente el cableado de Google Calendar, pero conserva un caso real de eventos huérfanos al eliminar una conexión y deja la nueva invariancia de ownership vulnerable a carreras concurrentes.
+  [high·high·correctness] apps/server/src/aethercal/server/services/outbox.py:1347 [666e3c84-5072-44da-9e37-75ecc963a76a::0] Eliminar la conexión hace que el borrado apunte a un calendario potencialmente incorrecto
+  [medium·high·correctness] apps/server/src/aethercal/server/services/schedules.py:343 [666e3c84-5072-44da-9e37-75ecc963a76a::1] Las validaciones de ownership no son atómicas frente a cambios concurrentes
+
+Cortes con GO: 16
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 20: 16/19 cortes con GO ===
+=== ronda 21 — 2026-07-13T18:55:52-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+
+########## 59c9c27 — feat(isolation): each business is sealed from the  ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio refuerza ampliamente el aislamiento por tenant, pero deja un privilegio excesivo importante en la tabla raíz `tenants`: los roles de aplicación y worker reciben permisos de escritura globales sobre una tabla sin RLS.
+  [medium·high·security] apps/server/src/aethercal/server/db/migrations/versions/0008_rls_roles_and_policies.py:128 [c4e642aa-552b-4827-94ff-26e0a7231c18::0] Los roles no propietarios reciben escritura global sobre `tenants`
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+  ✓ 11b44a8  refactor(server): one owner for users and fo  (ya revisado)
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+  ✓ ea938a2  test(db): give every run its own Postgres sc  (ya revisado)
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+  ✓ c8e416f  test: pin the invariant that a retired step   (ya revisado)
+  ✓ ba750c5  integrate: f3-noshow-metrics  (ya revisado)
+  ✓ 4586355  integrate: f3-channels  (ya revisado)
+
+########## 26134fa — integrate: v1-docs-release ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio de publicación parece razonablemente protegido, pero el quickstart queda inutilizable en cuanto pasan las fechas codificadas: consulta y reserva slots fijos de julio de 2026. Esto contradice su promesa de llevar al usuario desde una instalación limpia hasta una reserva real.
+  [high·high·correctness] docs/quickstart.md:119 [20b1029b-e7c0-4328-8faa-7180e5b4009e::0] El quickstart caduca por usar una ventana de fechas fija
+  ✓ 1d6b846  integrate: v1-e2e  (ya revisado)
+
+########## c359e3b — integrate: f3-engine ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio está bien cubierto por tests, pero hay tres defectos de consistencia en la reconciliación y resolución de plantillas. El más grave permite que un workflow siga enviando mensajes a reservas que dejó de gobernar tras cambiar su alcance.
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:536 [b4d064cb-6f4b-4bd7-9393-4e403c2e28e6::0] Cambiar event_type_id no retira mensajes del alcance anterior
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:167 [b4d064cb-6f4b-4bd7-9393-4e403c2e28e6::1] La validación de renderizado ignora el locale requerido
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:664 [b4d064cb-6f4b-4bd7-9393-4e403c2e28e6::2] Se puede borrar la plantilla del locale que aún usan mensajes vivos
+  [medium·high·correctness] apps/server/src/aethercal/server/services/outbox.py:702 [b4d064cb-6f4b-4bd7-9393-4e403c2e28e6::3] Un paso vencido conserva un payload anterior tras reactivar la regla
+
+########## a2a5bf8 — integrate: f4-multihost ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio mejora el cableado y cubre muchos casos, pero mantiene una brecha crítica entre la creación remota y la persistencia local: un reintento puede duplicar eventos de Google. El problema afecta tanto altas como reprogramaciones bajo el modelo at-least-once del outbox.
+  [high·low·correctness] apps/server/src/aethercal/server/services/outbox.py:1176 [08463c28-8c3c-4b66-81b3-09c97e0c0739::0] Un reintento puede crear eventos duplicados en Google
+
+Cortes con GO: 18
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 21: 18/19 cortes con GO ===
+=== ronda 22 — 2026-07-13T19:24:11-04:00 ===
+fatal: 'D:/aethercal-wt/review' already exists
+Cortes de integration/batch-a (más reciente primero):
+  ✓ 59c9c27  feat(isolation): each business is sealed fro  (ya revisado)
+  ✓ 7cfaa19  fix: three settings that did nothing, and th  (ya revisado)
+  ✓ 02c56bd  fix(channels): a lost response is not a fail  (ya revisado)
+  ✓ aec6214  fix(booking): E.164 accepted Unicode digits,  (ya revisado)
+  ✓ 1bca3eb  fix(metrics): the no-show rate counted appoi  (ya revisado)
+  ✓ a80ba2d  fix(core): one owner for the IANA-zone rule,  (ya revisado)
+  ✓ e935615  fix(core): one owner for the IANA-zone rule   (ya revisado)
+  ✓ 0203995  fix(users): the database now owns the case-i  (ya revisado)
+  ✓ 8a24d99  feat(webhooks): allow declared private targe  (ya revisado)
+  ✓ 11b44a8  refactor(server): one owner for users and fo  (ya revisado)
+  ✓ 02689c8  feat(booking): guest phone and explicit cons  (ya revisado)
+  ✓ ea938a2  test(db): give every run its own Postgres sc  (ya revisado)
+  ✓ 9e7b2e7  feat(admin): adopt the Batch A work — work  (ya revisado)
+  ✓ c8e416f  test: pin the invariant that a retired step   (ya revisado)
+  ✓ ba750c5  integrate: f3-noshow-metrics  (ya revisado)
+  ✓ 4586355  integrate: f3-channels  (ya revisado)
+
+########## 26134fa — integrate: v1-docs-release ##########
+crisol-remote: GO  [motor: codex (codex)]
+  resumen: El cambio está mayormente bien estructurado, pero el quickstart deja de funcionar de forma determinista porque usa fechas absolutas para consultar y reservar slots. No encontré una vulnerabilidad de seguridad trazable en el diff.
+  [medium·high·correctness] docs/quickstart.md:111 [c5d1c90e-020a-46bb-9458-9c39fec0c6fc::0] El quickstart caduca al usar fechas fijas
+  ✓ 1d6b846  integrate: v1-e2e  (ya revisado)
+
+########## c359e3b — integrate: f3-engine ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  resumen: El cambio incorpora una superficie CRUD amplia y buenos tests, pero contiene tres defectos de consistencia entre las reglas, las plantillas y las filas ya encoladas. En particular, ciertos cambios de alcance o trigger dejan mensajes antiguos activos, y la validación de plantillas ignora el locale realmente usado al enviar.
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:543 [6507ca24-8ff7-4607-af47-56466f8c428e::0] Cambiar el event_type_id no retira mensajes del alcance anterior
+  [high·high·correctness] apps/server/src/aethercal/server/services/outbox.py:699 [6507ca24-8ff7-4607-af47-56466f8c428e::1] Cambiar a un trigger inmediato deja viva la notificación del trigger anterior
+  [high·high·correctness] apps/server/src/aethercal/server/services/workflow_rules.py:172 [6507ca24-8ff7-4607-af47-56466f8c428e::2] La validación considera renderizable una plantilla de un locale distinto
+  ✓ a2a5bf8  integrate: f4-multihost  (ya revisado)
+
+Cortes con GO: 19
+Cuando TODOS tengan GO:
+  cd /d/aethercal && git checkout main && git merge --no-ff integration/batch-a
+=== ronda 22: 19/19 cortes con GO ===
+TODOS LOS CORTES CON GO

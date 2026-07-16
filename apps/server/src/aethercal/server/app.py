@@ -154,6 +154,10 @@ def create_app(settings: Settings) -> FastAPI:
             stack.push_async_callback(http_client.aclose)
             app.state.http_client = http_client
             app.state.fernet_key = settings.fernet_key()
+            # The READ reader: the current key, plus the retiring one while a rotation is in flight,
+            # for any request-path consumer that decrypts a stored secret under the window. Writes
+            # (create_webhook, store_credential) stay on the current key alone (`fernet_key`).
+            app.state.fernet_keys = settings.decryption_fernet_keys()
             app.state.email_sender = build_email_sender()
             # A half-configured phone channel RAISES here and fails the boot on purpose — see
             # build_channel_senders. "Sending, but uncapped" must never be a state this reaches.

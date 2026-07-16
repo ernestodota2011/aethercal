@@ -1,0 +1,12 @@
+########## b03-creds ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  [high·high·correctness] apps/server/src/aethercal/server/services/key_rotation.py:181 [c95feda9-39c9-45e3-a146-36db905a326c::0] La rotación puede sobrescribir una credencial actualizada concurrentemente
+  [medium·high·completeness] apps/server/src/aethercal/server/services/tenant_credentials.py:344 [c95feda9-39c9-45e3-a146-36db905a326c::1] Los resolvers BYOK no están integrados en los consumidores reales
+  [medium·high·completeness] apps/server/src/aethercal/server/cli.py:448 [c95feda9-39c9-45e3-a146-36db905a326c::2] El CLI convierte valores JSON no escalares en credenciales aparentemente válidas
+########## b05a-silence ##########
+crisol-remote: GO  [motor: codex (codex)]
+########## b07-branding ##########
+crisol-remote: NO-GO  [motor: codex (codex)]
+  [high·high·correctness] apps/server/src/aethercal/server/admin/state.py:1309 [413665a2-a05b-48bd-9789-061c31ae888f::0] El mensaje de validación se borra inmediatamente
+  [medium·high·correctness] apps/server/src/aethercal/server/admin/state.py:1301 [413665a2-a05b-48bd-9789-061c31ae888f::1] Una zona horaria vacía se guarda silenciosamente como UTC
+=== fin

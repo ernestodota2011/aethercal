@@ -51,3 +51,4 @@ packages/aethercal-ui/js/dist/
 *.swp
 .DS_Store
 Thumbs.db
+.crisol-reviewed

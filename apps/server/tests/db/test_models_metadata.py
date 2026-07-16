@@ -16,10 +16,11 @@ from aethercal.core.model.booking import BookingStatus
 from aethercal.server.db import Base
 from aethercal.server.db.migrate import run_migrations
 
-# The F1 MVP core, plus the shared foundation this cut lands: the multichannel Workflow tables
-# (migration 0005) and ``memberships`` (migration 0009, B-02 — who is in a business, and what they
-# may do there). Payments and per-tenant credentials are still deliberately NOT here: they ship with
-# their own cuts of the payments/tenancy batch, each carrying its own migration and its own gate.
+# The F1 MVP core, plus the shared foundation these cuts land: the multichannel Workflow tables
+# (migration 0005), ``memberships`` (migration 0009, B-02 — who is in a business, and what they may
+# do there) and the per-business credential vault (migration 0010, B-03 — BYOK, encrypted at rest).
+# Payments are still deliberately NOT here: they ship with their own cut of the payments/tenancy
+# batch, carrying its own migration and its own gate.
 # ``outbox`` (the transactional-outbox queue for a booking's post-commit effects, and now also the
 # durable scheduler) landed with the F1-05 residual fix in migration 0003. This set is asserted
 # EXACTLY, so an accidental omission or a stray extra table fails loudly — which is what it did the
@@ -50,6 +51,8 @@ EXPECTED_TABLES = {
     # migrated PostgreSQL) — but ==RLS cannot enforce a ROLE==, and this table is the input to the
     # layer that can: ``services/rbac.py``.
     "memberships",
+    # 0010 — BYOK: each business's own provider credentials, encrypted at rest (RF-27).
+    "tenant_credentials",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.

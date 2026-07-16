@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -171,7 +172,7 @@ async def deliver_due(  # noqa: PLR0913 — fully dependency-injected worker: ev
     http_client: httpx.AsyncClient,
     *,
     now: datetime,
-    fernet_key: bytes,
+    fernet_key: bytes | Sequence[bytes],
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     resolver: Resolver | None = None,
     allowlist: PrivateTargetAllowlist,
@@ -258,7 +259,7 @@ async def _deliver_one(  # noqa: PLR0913 — the injected seams travel together,
     delivery_id: uuid.UUID,
     *,
     now: datetime,
-    fernet_key: bytes,
+    fernet_key: bytes | Sequence[bytes],
     max_attempts: int,
     resolver: Resolver | None,
     allowlist: PrivateTargetAllowlist,

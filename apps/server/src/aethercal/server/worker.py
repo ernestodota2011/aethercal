@@ -146,6 +146,10 @@ def create_worker_app(settings: Settings) -> FastAPI:
             stack.push_async_callback(http_client.aclose)
             app.state.http_client = http_client
             app.state.fernet_key = settings.fernet_key()
+            # The READ reader: the current key, plus the retiring one while a rotation is in flight.
+            # The ticks decrypt with this so a row the rotation has not reached yet stays readable —
+            # and they still WRITE (re-encrypt nothing here) under the current key alone.
+            app.state.fernet_keys = settings.decryption_fernet_keys()
             app.state.email_sender = build_email_sender()
             # A half-configured phone channel RAISES here and fails the boot on purpose: "sending,
             # but uncapped" must never be a state the process that actually sends can reach.

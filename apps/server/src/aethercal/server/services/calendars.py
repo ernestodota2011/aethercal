@@ -64,7 +64,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -366,17 +366,23 @@ async def invalidate_busy_cache(session: AsyncSession, *, connection: ExternalCo
     await session.flush()
 
 
-def load_credentials(connection: ExternalConnection, *, fernet: Fernet) -> str:
+def load_credentials(connection: ExternalConnection, *, fernet: Fernet | MultiFernet) -> str:
     """Decrypt and return a connection's stored OAuth token JSON (the serialized credentials).
 
     The connection row is already loaded by the caller, so this is a pure decrypt (no DB access).
     Build a live Google client from the result with :func:`build_live_service`.
+
+    ``fernet`` is a single :class:`~cryptography.fernet.Fernet` normally, and a
+    :class:`~cryptography.fernet.MultiFernet` built from ``Settings.decryption_fernet_keys()``
+    during a key rotation — so a connection stored before the rotation reached it, still on the
+    retiring key, is readable throughout the window and the ticks never write a token under the old
+    key.
     """
     return fernet.decrypt(connection.encrypted_credentials).decode("utf-8")
 
 
 def build_live_service(
-    connection: ExternalConnection, *, fernet: Fernet
+    connection: ExternalConnection, *, fernet: Fernet | MultiFernet
 ) -> Any:  # pragma: no cover - live wiring
     """Production ``ServiceFactory``: decrypt the connection's token and build a live Google client.
 

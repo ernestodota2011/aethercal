@@ -12,18 +12,25 @@ from cryptography.fernet import Fernet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from typer.testing import CliRunner
 
 from aethercal.core.model import BookingStatus
 from aethercal.server.cli import (
     ReplayOutcome,
     RevokeKeyOutcome,
+    _credential_fields,
+    credentials_app,
     run_connect_google,
     run_create_tenant,
+    run_credentials_delete,
+    run_credentials_list,
+    run_credentials_set,
     run_issue_key,
     run_list_dead_intents,
     run_list_keys,
     run_replay_intent,
     run_revoke_key,
+    run_rotate_key,
 )
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
@@ -36,11 +43,17 @@ from aethercal.server.db.models import (
     OutboxStatus,
     Schedule,
     Tenant,
+    TenantCredential,
     User,
 )
 from aethercal.server.services.api_keys import verify_api_key
 from aethercal.server.services.calendars import GoogleCredential, load_credentials
 from aethercal.server.services.outbox import OutboxEffect
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    required_fields,
+    resolve_money_credential,
+)
 
 
 @pytest_asyncio.fixture
@@ -483,3 +496,240 @@ async def test_listing_dead_intents_finds_them_without_touching_the_database_by_
     rows = await run_list_dead_intents(maker)
 
     assert [row.id for row in rows] == [dead_id]
+
+
+# ======================================================================================
+# BYOK credentials — the operator's surface (criteria 40, 41, 42).
+#
+# ==Every secret below is synthetic.== `sk_test_NOT_A_REAL_KEY` is not a redaction of anything.
+# ======================================================================================
+
+
+CLI_STRIPE = {"secret_key": "sk_test_NOT_A_REAL_KEY", "webhook_secret": "whsec_FAKE"}
+
+
+async def test_credentials_set_stores_an_encrypted_credential_the_business_can_charge_with(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    async with maker() as session:
+        row = (await session.scalars(select(TenantCredential))).one()
+        resolved = await resolve_money_credential(
+            session, tenant_id=row.tenant_id, provider=CredentialProvider.STRIPE, fernet_key=key
+        )
+    assert resolved.secrets == CLI_STRIPE
+    assert CLI_STRIPE["secret_key"].encode() not in row.encrypted_payload
+
+
+async def test_credentials_set_for_an_unknown_business_is_a_hard_stop(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The same rule as ``guest purge``.== An unresolvable business is never a filter to fall back
+    from: a payment credential written to the wrong business is money going to the wrong account."""
+    with pytest.raises(LookupError, match="ghost"):
+        await run_credentials_set(
+            maker,
+            tenant_slug="ghost",
+            provider=CredentialProvider.STRIPE,
+            secrets=CLI_STRIPE,
+            key=derive_fernet_key("cli-secret"),
+        )
+
+
+async def test_credentials_list_names_the_providers_and_never_a_secret(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """What the operator sees on their terminal. It answers "is Stripe configured?" without
+    decrypting anything — which is why the coroutine takes no key at all."""
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    await run_credentials_set(
+        maker,
+        tenant_slug="acme",
+        provider=CredentialProvider.STRIPE,
+        secrets=CLI_STRIPE,
+        key=derive_fernet_key("cli-secret"),
+    )
+
+    listed = await run_credentials_list(maker, tenant_slug="acme")
+    assert listed == (CredentialProvider.STRIPE,)
+
+
+async def test_credentials_delete_is_the_off_switch(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    assert await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+    assert await run_credentials_list(maker, tenant_slug="acme") == ()
+    # And deleting again reports "there was nothing", rather than pretending it removed something.
+    assert not await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+
+
+async def test_rotate_key_moves_every_business_onto_the_new_key(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Criterion 42, through the operator's actual command.==
+
+    Two businesses, so the rotation is proved to be instance-wide: it runs as the OWNER precisely
+    because, under row-level security, no other role can see more than one business at a time.
+    """
+    old, new = derive_fernet_key("old-app-secret"), derive_fernet_key("new-app-secret")
+    for slug in ("acme", "globex"):
+        await run_create_tenant(
+            maker, slug=slug, name=slug, email=f"host@{slug}.test", timezone="UTC"
+        )
+        await run_credentials_set(
+            maker,
+            tenant_slug=slug,
+            provider=CredentialProvider.STRIPE,
+            secrets={"secret_key": f"sk_test_NOT_REAL_{slug}", "webhook_secret": "whsec_FAKE"},
+            key=old,
+        )
+
+    report = await run_rotate_key(maker, new_key=new, previous_key=old)
+    assert report.total == 2
+
+    async with maker() as session:
+        rows = (await session.scalars(select(TenantCredential))).all()
+        for row in rows:
+            resolved = await resolve_money_credential(
+                session,
+                tenant_id=row.tenant_id,
+                provider=CredentialProvider.STRIPE,
+                fernet_key=new,
+            )
+            assert resolved.secrets["secret_key"].startswith("sk_test_NOT_REAL_")
+
+    # And the summary the operator reads back is counts — never a secret.
+    assert "sk_test" not in report.summary()
+
+
+# ======================================================================================
+# `credentials set` — the JSON piped in must be an object of field → NON-EMPTY STRING.
+#
+# `json.loads` yields values of ANY JSON type, but a credential field is a string. The old code
+# coerced every value with `str(value)`, so `{"secret_key": {"nested": "x"}}` was stored as the
+# literal text `"{'nested': 'x'}"` — a credential that looks perfectly configured and fails only
+# once a guest's money has already left their card. The parse step now refuses any value that is not
+# already a non-empty string, at the door, with exit code 2, and WITHOUT echoing the value.
+#
+# The rule lives at the CLI because the CLI is the ONLY place untyped JSON becomes a credential:
+# `store_credential`'s type is `Mapping[str, str]`, so every other (typed, Python) caller cannot
+# reach it with a non-string, and the service's own `_validate` still guards completeness for them.
+# ======================================================================================
+
+
+CLI_RUNNER = CliRunner()
+
+
+# The provider's fixed field set — the ONLY names the refusal is allowed to echo (any other key
+# could itself be a secret). ``credentials_set_command`` passes exactly this to _credential_fields.
+STRIPE_EXPECTED = required_fields(CredentialProvider.STRIPE)
+
+
+def test_credential_fields_accepts_an_object_of_non_empty_strings() -> None:
+    """The happy path: a scalar object is returned unchanged, ready for the service."""
+    scalar = {"secret_key": "sk_test_x", "webhook_secret": "whsec_x"}
+    assert _credential_fields(scalar, expected=STRIPE_EXPECTED) == scalar
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param({"secret_key": {"a": 1}}, id="nested-object"),
+        pytest.param({"secret_key": [1, 2, 3]}, id="array"),
+        pytest.param({"secret_key": None}, id="null"),
+        pytest.param({"secret_key": 123}, id="number"),
+        pytest.param({"secret_key": True}, id="boolean"),
+        pytest.param({"secret_key": ""}, id="empty-string"),
+        pytest.param({"secret_key": "   "}, id="whitespace-only"),
+    ],
+)
+def test_credential_fields_refuses_anything_that_is_not_a_non_empty_string(
+    bad: dict[str, object],
+) -> None:
+    """A dict/list/null/number/boolean or a blank string is not a credential value — it is refused,
+    and the message names an EXPECTED field (a provider literal, not a secret) but never the
+    value."""
+    with pytest.raises(ValueError, match="secret_key"):
+        _credential_fields(bad, expected=STRIPE_EXPECTED)
+
+
+def test_credential_fields_never_echoes_the_rejected_value() -> None:
+    """==The value is a secret, even when it is the wrong shape.== The refusal names the (expected)
+    field and the JSON type, and nothing that was piped in."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields(
+            {"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}, expected=STRIPE_EXPECTED
+        )
+    assert "sk_live_MUST_NOT_APPEAR" not in str(raised.value)
+
+
+def test_credential_fields_does_not_echo_an_unexpected_field_name() -> None:
+    """==A field name outside the provider's set may be a secret, so it is never printed.== The
+    operator still learns a field is the wrong shape (and its JSON type), enough to fix their
+    input, without the caller-supplied key reaching the terminal or a log."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields({"whsec_A_SECRET_IN_THE_KEY": {"inner": 1}}, expected=STRIPE_EXPECTED)
+    assert "whsec_A_SECRET_IN_THE_KEY" not in str(raised.value)
+    assert "credential field" in str(raised.value)  # it still says SOMETHING legible
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param('{"secret_key": {"a": 1}}', id="nested-object"),
+        pytest.param('{"secret_key": [1]}', id="array"),
+        pytest.param('{"secret_key": ""}', id="empty-string"),
+    ],
+)
+def test_credentials_set_command_exits_2_on_a_non_scalar_field(payload: str) -> None:
+    """Through the real command over STDIN: a non-scalar (or blank) field is a usage error (exit 2),
+    refused before the credential ever reaches the database."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input=payload,
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_value() -> None:
+    """The command's stderr names the field, never the value piped in."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}',
+    )
+    assert result.exit_code == 2
+    assert "sk_live_MUST_NOT_APPEAR" not in result.output
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_field_name() -> None:
+    """==A field NAME is caller-supplied, so it can be a secret too.== Someone can paste the secret
+    into the key as easily as the value (a mislabelled export, a copy-paste slip). Only a field name
+    the PROVIDER declares — a fixed literal we control — is safe to echo; an unexpected key is named
+    only as "a field", so the refusal names the JSON type but never the piped-in key itself."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"sk_live_A_SECRET_IN_THE_KEY": {"inner": 1}}',
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+    assert "sk_live_A_SECRET_IN_THE_KEY" not in result.output

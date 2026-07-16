@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, UUIDPrimaryKey
+from aethercal.server.db.encrypted import FERNET_AT_REST
 
 
 class ExternalConnection(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
@@ -24,7 +25,11 @@ class ExternalConnection(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
     provider: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     account_email: Mapped[str] = mapped_column(sa.String(320), nullable=False)
-    encrypted_credentials: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
+    # The host's OAuth credentials, held as a Fernet token (services/calendars.py). The `info`
+    # marker enrols this column in the key rotation — see `db.encrypted` and `models/webhooks.py`.
+    encrypted_credentials: Mapped[bytes] = mapped_column(
+        sa.LargeBinary, nullable=False, info={FERNET_AT_REST: True}
+    )
     revoked_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
     # The busy-cache coverage window this connection last synced, and when (RF-12/13). read_busy

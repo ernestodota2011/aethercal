@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, UUIDPrimaryKey
+from aethercal.server.db.encrypted import FERNET_AT_REST
 
 
 class Webhook(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
@@ -18,7 +19,14 @@ class Webhook(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     __tablename__ = "webhooks"
 
     url: Mapped[str] = mapped_column(sa.String(2048), nullable=False)
-    secret: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
+    # The HMAC secret shared with the subscriber, held as a Fernet token (services/webhooks.py). The
+    # `info` marker is what enrols this column in `db.encrypted.encrypted_columns`, and therefore in
+    # the key rotation. A rotation that missed it would leave every webhook secret encrypted under a
+    # secret the operator has just retired — and the symptom would arrive weeks later, as an
+    # InvalidToken in the delivery worker, on data nothing can decrypt any more.
+    secret: Mapped[bytes] = mapped_column(
+        sa.LargeBinary, nullable=False, info={FERNET_AT_REST: True}
+    )
     events: Mapped[list[Any]] = mapped_column(sa.JSON, default=list, nullable=False)
     active: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("true"), nullable=False)
 
