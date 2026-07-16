@@ -1439,6 +1439,31 @@ async def _should_skip_as_stale(session: AsyncSession, booking: Booking, work: O
     return not await _is_chain_current(session, booking)
 
 
+def _should_skip_as_unconfirmed(booking: Booking, work: OutboxWork) -> bool:
+    """==DEFENCE IN DEPTH at the point of EXECUTION.== Whether to drop this intent because its
+    booking was never confirmed.
+
+    :func:`enqueue_effect` already refuses to QUEUE an effect for a booking with no confirmation,
+    so under today's paths nothing that requires confirmation ever reaches here for a hold. This is
+    the second belt, for the path nobody has written yet: a future caller that builds an intent some
+    other way, a bug that flips a status, a manual insert. The drainer re-checks at the last
+    moment — an intent whose booking has no confirmation, for an effect that REQUIRES_CONFIRMATION,
+    DIES here rather than reaching a provider.
+
+    ==It is NOT the same question as :func:`_should_skip_as_stale`.== Staleness asks *"did a later
+    transition overtake this booking?"* and leans on :func:`_is_chain_current`, which is False only
+    for a CANCELLED booking — a ``PENDING`` hold sails straight through it. This asks *"was this
+    appointment ever real?"*, and it is exactly the gap that guard cannot see.
+
+    EXEMPT effects (``REFUND`` / ``EXPIRE_HOLD``, B-05b) are let through: acting on an unpaid or
+    cancelled booking is their entire purpose. Same enum, same policy, same ``assert_never`` as the
+    funnel — one decision, enforced in two places.
+    """
+    if confirmation_policy(work.effect) is Confirmation.EXEMPT:
+        return False
+    return booking.confirmed_at is None
+
+
 async def _chain_awaits_meeting_link(session: AsyncSession, booking: Booking) -> bool:
     """True while a non-terminal Google intent that WOULD write the chain's Meet link is queued.
 
@@ -1513,6 +1538,10 @@ async def _prepare_email(session: AsyncSession, work: OutboxWork) -> _EmailPlan 
     payload = work.payload
     kind = NotificationKind(payload["kind"])
 
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth: an intent for a booking that was never confirmed (a hold) must not be
+        # sent, even if some path the funnel does not guard managed to queue it. It dies here.
+        return None
     if await _should_skip_as_stale(session, booking, work):
         # A later transition superseded this booking: drop the notice (never mail a "confirmed"
         # after a "cancelled", nor a reminder for a slot that was rescheduled away).
@@ -1664,6 +1693,13 @@ async def _prepare_google(
     """
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a booking that was never
+        # confirmed must not sync to a calendar — a Google event with the guest as an attendee makes
+        # Google mail them the invitation, so this is how a hold would announce itself.
+        # Dropped BEFORE the host/target machinery, which is irrelevant for something that will
+        # never be sent.
         return None
     payload = work.payload
     host_id = await _payload_host_id(session, payload)
@@ -2211,6 +2247,12 @@ async def _prepare_notify(
     destroyed."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a workflow step — a WhatsApp
+        # or SMS to the guest — must not fire for a booking that was never confirmed, whatever path
+        # queued it. It dies here rather than reaching a provider.
         return None
 
     payload = work.payload

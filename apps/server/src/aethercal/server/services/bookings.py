@@ -551,12 +551,34 @@ async def cancel_booking(
     sees it already cancelled and is a no-op that queues NO second webhook. Best-effort deletes the
     Google event and sends the cancellation email when ``effects`` is supplied. Raises
     :class:`BookingNotFoundError` (404) if the tenant has no such booking.
+
+    ==A booking that was never confirmed (a hold, ``confirmed_at is None``) is cancelled SILENTLY:==
+    its slot is freed but nothing is announced — no webhook, no ``on_cancel`` workflow, no sequence
+    bump. You do not announce the cancellation of an appointment nobody was ever told existed.
     """
     booking, event_type = await _lock_and_reload_booking(
         session, tenant_id=tenant_id, booking_id=booking_id
     )
     if booking.status == BookingStatus.CANCELLED:
         return booking  # already cancelled under the lock → no-op, no duplicate webhook (RF-04)
+
+    if booking.confirmed_at is None:
+        # ==A hold nobody paid for is being abandoned.== It was never announced, so its cancellation
+        # is not announced either — you cannot retract an appointment nobody was ever told about.
+        # Free the slot (that part of a cancel is real: ``status <> 'cancelled'`` reopens it), and
+        # STOP. No ``booking.cancelled`` webhook, no ``apply_booking_transition(CANCEL)`` (which
+        # would try to materialise the ``on_cancel`` workflow), and no iCal SEQUENCE bump for an
+        # event that never existed.
+        #
+        # The funnels would suppress every one of those effects anyway (``confirmed_at`` is NULL) —
+        # this is the root-cause short-circuit that never builds the announcement at all, rather
+        # rather than building it and relying on the belt to throw it away. The guard keys on
+        # ``confirmed_at``, never on ``status``: a CONFIRMED booking being cancelled reads
+        # ``cancelled`` too and its guest is owed the notice (that path is below, untouched).
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = now
+        await session.flush()
+        return booking
 
     booking.status = BookingStatus.CANCELLED
     booking.cancelled_at = now

@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.event_types import EventTypeCreate
@@ -34,12 +34,14 @@ from aethercal.schemas.webhooks import WEBHOOK_EVENTS
 from aethercal.server.db.models import (
     Booking,
     EventType,
+    Outbox,
     Schedule,
     Tenant,
     User,
     Webhook,
     WebhookDelivery,
 )
+from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.bookings import (
     BookingParams,
@@ -51,14 +53,15 @@ from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
     Confirmation,
     GoogleOperation,
-    Outbox,
     OutboxEffect,
     Suppressed,
     as_utc,
     confirmation_policy,
+    drain_outbox,
     email_dedupe_key,
     enqueue_effect,
     google_dedupe_key,
+    make_booking_effect_executor,
 )
 from aethercal.server.services.webhooks import WebhookSubject, enqueue_event, event_subject
 
@@ -68,6 +71,11 @@ _WEEKLY_9_TO_5 = {str(day): [{"start": "09:00", "end": "17:00"}] for day in rang
 _BEFORE = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)
 _SLOT_9 = datetime(2026, 7, 6, 9, 0, tzinfo=UTC)
 _SLOT_11 = datetime(2026, 7, 6, 11, 0, tzinfo=UTC)
+
+
+def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
+    """Both of the drain's pools over ONE offline sessionmaker (SQLite has no roles to split)."""
+    return WorkerPools.for_offline_tests(maker)
 
 
 async def _seed(session: AsyncSession, tenant_factory: Any) -> tuple[Tenant, EventType]:
@@ -367,6 +375,176 @@ def test_every_webhook_event_declares_whose_it_is() -> None:
 
     # Every event today is about ONE appointment, and that is why the funnel can take a Booking.
     assert {event_subject(event) for event in WEBHOOK_EVENTS} == {WebhookSubject.BOOKING}
+
+
+# --------------------------------------------------------------------------------------
+# Cancelling / abandoning a hold — criteria 21 and 23b.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancelling_an_unpaid_hold_announces_nothing(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 21.== A hold that is abandoned frees its slot and announces NOTHING.
+
+    ==You never announce the cancellation of an appointment you never announced the creation of.==
+    Today a cancel emits ``booking.cancelled`` and runs ``apply_booking_transition(CANCEL)`` — which
+    would tell a subscriber, and materialise the ``on_cancel`` workflow, for a booking nobody was
+    ever told existed. The funnels would suppress both, but the cancel of a hold should not build
+    the announcement at all: it is put down quietly.
+
+    Proven through ``cancel_booking`` (not the funnel directly) because the SHORT-CIRCUIT is what
+    this criterion is about — that the cancel operation itself declines to speak, not merely that
+    the funnel catches it afterwards.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    await _subscribe_to_everything(sqlite_session, tenant)
+    hold = await _hold(sqlite_session, tenant, event_type)
+
+    cancelled = await cancel_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=hold.id,
+        now=_BEFORE + timedelta(minutes=5),
+        effects=None,
+    )
+
+    # The slot is freed — that part of a cancel is real.
+    assert cancelled.status is BookingStatus.CANCELLED
+    # ...but nothing was announced: no webhook, and no queued effect of any kind.
+    webhooks = (
+        await sqlite_session.scalars(
+            select(WebhookDelivery).where(WebhookDelivery.tenant_id == tenant.id)
+        )
+    ).all()
+    assert list(webhooks) == []
+    assert await _outbox_of(sqlite_session, hold) == []
+    # And the SHORT-CIRCUIT ran, not merely the funnel afterwards: the cancel of a hold never builds
+    # the announcement, so it never bumps the iCal sequence for an event that does not exist. A hold
+    # is born at sequence 0 and a quiet cancel leaves it there. (Without the short-circuit, cancel
+    # would run its full machinery — bumping this to 1 — only for the funnels to throw the output
+    # away.)
+    assert cancelled.sequence == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_confirmed_booking_still_announces_its_cancellation(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 23, cancel half.== A REAL booking's cancellation still goes out. No regression.
+
+    The short-circuit above must key on ``confirmed_at``, never on ``status``: a confirmed booking
+    that is cancelled reads ``cancelled`` too, and its guest is owed the notice.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    await _subscribe_to_everything(sqlite_session, tenant)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_11), now=_BEFORE
+    )
+
+    await cancel_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=booking.id,
+        now=_BEFORE + timedelta(minutes=5),
+        effects=None,
+    )
+
+    webhooks = (
+        await sqlite_session.scalars(
+            select(WebhookDelivery).where(
+                WebhookDelivery.tenant_id == tenant.id,
+                WebhookDelivery.event == "booking.cancelled",
+            )
+        )
+    ).all()
+    assert len(list(webhooks)) == 1  # the cancellation WAS announced
+
+
+@pytest.mark.asyncio
+async def test_admin_and_api_create_confirmed_directly_with_a_stamp(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """==Criterion 23b.== Every ``create_booking`` caller gets a CONFIRMED, stamped booking today.
+
+    ``create_booking`` is shared by the public page, the admin and the API key. NOBODY writes
+    ``PENDING`` in this wave — holds arrive with payments (B-05b) — so the belt must not
+    accidentally starve the host who books a client by hand: every path still produces a real,
+    speakable booking. This pins that invariant so a later change cannot quietly regress it.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    booking = await create_booking(
+        sqlite_session, tenant_id=tenant.id, params=_params(event_type.id, _SLOT_9), now=_BEFORE
+    )
+
+    assert booking.status is BookingStatus.CONFIRMED
+    assert booking.confirmed_at is not None
+
+
+# --------------------------------------------------------------------------------------
+# Defence in depth at the point of EXECUTION — criterion 20b's drainer clause.
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSender:
+    """An in-memory EmailSender that records what it was asked to send (no network)."""
+
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def send(self, message: Any) -> None:
+        self.sent.append(message)
+
+
+@pytest.mark.asyncio
+async def test_the_drainer_re_verifies_and_will_not_send_for_an_unconfirmed_booking(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+) -> None:
+    """==Criterion 20b, the drainer clause.== A hold's intent that somehow got queued dies at SEND.
+
+    The funnel refuses to queue this — so to test the LAST line of defence we insert the ``Outbox``
+    row by hand, exactly modelling *a future enqueue path nobody foresaw* that slipped past the
+    funnel. `_is_chain_current` (the existing drain-time guard) only knows ``CANCELLED``, so a
+    ``PENDING`` intent passes it and would be sent. The re-verification of ``confirmed_at`` is what
+    kills it here instead of at a provider.
+
+    The proof is that the recording sender is never called: the intent is dropped in the READ phase,
+    before any message is composed or dispatched.
+    """
+    tenant, event_type = await _seed(sqlite_session, tenant_factory)
+    hold = await _hold(sqlite_session, tenant, event_type)
+    # Straight to the table — NOT through the funnel, which would refuse it. This is the smuggled
+    # intent the drainer must catch.
+    sqlite_session.add(
+        Outbox(
+            tenant_id=tenant.id,
+            booking_id=hold.id,
+            effect=OutboxEffect.EMAIL.value,
+            dedupe_key=email_dedupe_key(NotificationKind.CONFIRMATION),
+            payload={"kind": "confirmation", "sequence": 0},
+            status="pending",
+            attempts=0,
+        )
+    )
+    await sqlite_session.commit()
+
+    sender = _RecordingSender()
+    execute = make_booking_effect_executor(
+        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+    )
+    await drain_outbox(_pools(sqlite_maker), now=_BEFORE, execute=execute)
+
+    # THE proof of silence: the sender was never reached. The message was dropped in the READ phase,
+    # before anything could be composed or dispatched.
+    assert not sender.sent
+    # And it settled as a terminal no-op (exactly like a stale skip), so it is not retried in a loop
+    # on every drain — the smuggled intent is put down, not left knocking.
+    async with sqlite_maker() as check:
+        row = (await check.scalars(select(Outbox).where(Outbox.booking_id == hold.id))).one()
+        assert row.status != "pending"
 
 
 def test_every_effect_declares_whether_it_needs_a_confirmation() -> None:
