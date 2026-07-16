@@ -130,6 +130,8 @@ async def _seed(maker: async_sessionmaker[AsyncSession]) -> Tenant:
             start_at=_NOW,
             end_at=_NOW + timedelta(minutes=30),
             status=BookingStatus.NO_SHOW,
+            # A no-show was confirmed once, so it carries the stamp (B-05a).
+            confirmed_at=_NOW - timedelta(days=1),
             guest_name="Ada Lovelace",
             guest_email="ada@example.com",
             guest_timezone="UTC",
