@@ -17,11 +17,13 @@ from aethercal.server.db import Base
 from aethercal.server.db.migrate import run_migrations
 
 # The F1 MVP core, plus the shared foundation this cut lands: the multichannel Workflow tables
-# (migration 0005). Payments, RBAC/memberships and per-tenant credentials are deliberately NOT here
-# — they ship with the payments/tenancy batch, which carries its own migration and its own gate.
+# (migration 0005) and ``memberships`` (migration 0009, B-02 — who is in a business, and what they
+# may do there). Payments and per-tenant credentials are still deliberately NOT here: they ship with
+# their own cuts of the payments/tenancy batch, each carrying its own migration and its own gate.
 # ``outbox`` (the transactional-outbox queue for a booking's post-commit effects, and now also the
 # durable scheduler) landed with the F1-05 residual fix in migration 0003. This set is asserted
-# EXACTLY, so an accidental omission or a stray extra table fails loudly.
+# EXACTLY, so an accidental omission or a stray extra table fails loudly — which is what it did the
+# moment ``memberships`` arrived, and why this line is a decision rather than a rubber stamp.
 EXPECTED_TABLES = {
     "tenants",
     "users",
@@ -42,6 +44,12 @@ EXPECTED_TABLES = {
     "workflows",
     "workflow_steps",
     "workflow_templates",
+    # 0009 — RBAC (B-02, RF-27). Who is in a business, and what they may do there. It carries a
+    # ``tenant_id`` like everything else, so the belt of 0008 reaches it (``tests/rls/`` derives the
+    # scoped set from this same metadata and asserts the policy is really on the table in a real,
+    # migrated PostgreSQL) — but ==RLS cannot enforce a ROLE==, and this table is the input to the
+    # layer that can: ``services/rbac.py``.
+    "memberships",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.
@@ -89,6 +97,9 @@ def test_tenant_scoping_unique_constraints() -> None:
     # functional index rather than a column constraint — see the test immediately below.
     assert ("tenant_id", "slug") in _unique_column_sets("event_types")
     assert ("tenant_id", "name") in _unique_column_sets("schedules")
+    # B-02: one person, one role, one business. Two rows would be two answers to "what may they do",
+    # and the code acts on whichever it reads first — which is how a demoted owner keeps a panel.
+    assert ("tenant_id", "user_id") in _unique_column_sets("memberships")
     assert ("tenant_id", "schedule_id", "date") in _unique_column_sets("date_overrides")
     assert ("tenant_id", "workflow_id", "position") in _unique_column_sets("workflow_steps")
     assert ("tenant_id", "channel", "kind", "locale") in _unique_column_sets("workflow_templates")
