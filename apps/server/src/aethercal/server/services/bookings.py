@@ -618,6 +618,43 @@ async def cancel_booking(
     # (RFC 5545, F1-08); the drained cancellation email reads this value.
     booking.sequence += 1
     await session.flush()
+    # The FULL cancellation chain — webhook + CANCEL transition + (with effects) Google DELETE and
+    # the guest email — extracted so the out-of-band-refund path runs the SAME chain, not a partial
+    # copy (r5 finding 2). See :func:`cancel_confirmed_booking_effects`.
+    await cancel_confirmed_booking_effects(session, booking=booking, effects=effects, now=now)
+    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking
+    # cancelled within the refund window queues a REFUND per paid charge — the SECOND enqueue path,
+    # which the arbiter's late-webhook branch collapses with by the shared provider_ref dedupe key
+    # (criterion 30). Not gated on ``effects``: a refund is domain-required money movement, like the
+    # cancellation webhook and the ``on_cancel`` workflow, never contingent on a live sender. It is
+    # the ONE part the out-of-band path does NOT share — that money already went back.
+    await enqueue_cancellation_refunds(session, booking=booking, event_type=event_type, now=now)
+    return booking
+
+
+async def cancel_confirmed_booking_effects(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    effects: BookingEffects | None,
+    now: datetime,
+) -> None:
+    """The full effect chain of cancelling a CONFIRMED booking — everything but the money.
+
+    ==The SAME chain :func:`cancel_booking` runs== on a confirmed booking: the ``booking.cancelled``
+    webhook, the ``CANCEL`` transition (which retires the still-pending reminders and materialises
+    ``on_cancel``), and — with a live ``effects`` bundle — the Google-Calendar DELETE and the guest
+    cancellation email. It does NOT flip the status or bump the SEQUENCE (the caller already did),
+    and it does NOT queue the refund (that is the caller's concern: the out-of-band-refund path must
+    NOT queue one, because the money already went back).
+
+    Injected into the arbiter as its ``cancel_effects`` by the webhook layer — the one place that
+    may import both this module and ``services.payments`` — so an out-of-band ``charge.refunded``
+    runs the IDENTICAL cancellation a guest/host cancel does, instead of a partial hand-rolled copy
+    that dropped the Google delete and the webhook (r5 finding 2)."""
+    event_type = await get_event_type(
+        session, tenant_id=booking.tenant_id, event_type_id=booking.event_type_id
+    )
     await enqueue_event(
         session,
         booking=booking,
@@ -625,19 +662,13 @@ async def cancel_booking(
         data=_serialize_booking(booking),
         now=now,
     )
-    # CANCEL, not RESCHEDULE_PREDECESSOR: this is the OPERATION the guest asked for, so the
-    # `on_cancel` step is materialised and everything else still queued is retired. A reschedule's
-    # swap also leaves a booking cancelled, but it is NOT this transition — see services/workflows.
+    # CANCEL, not RESCHEDULE_PREDECESSOR: this is the OPERATION being performed, so ``on_cancel`` is
+    # materialised and everything else still queued is retired. A reschedule's swap also leaves a
+    # booking cancelled, but it is NOT this transition — see services/workflows.
     await apply_booking_transition(
         session, booking=booking, transition=BookingTransition.CANCEL, now=now
     )
-    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking
-    # cancelled within the refund window queues a REFUND per paid charge — the SECOND enqueue path,
-    # which the arbiter's late-webhook branch collapses with by the shared provider_ref dedupe key
-    # (criterion 30). Not gated on ``effects``: a refund is domain-required money movement, like the
-    # cancellation webhook and the ``on_cancel`` workflow above, never contingent on a live sender.
-    await enqueue_cancellation_refunds(session, booking=booking, event_type=event_type, now=now)
-    if effects is not None:
+    if effects is not None and event_type is not None:
         await _enqueue_google(
             session, booking=booking, event_type=event_type, operation=GoogleOperation.DELETE
         )
@@ -648,7 +679,6 @@ async def cancel_booking(
             cancel_url=None,
             reschedule_url=None,
         )
-    return booking
 
 
 # --------------------------------------------------------------------------------------
@@ -1330,6 +1360,7 @@ __all__ = [
     "EventTypeNotFoundError",
     "SlotUnavailableError",
     "cancel_booking",
+    "cancel_confirmed_booking_effects",
     "confirm_paid_booking_effects",
     "count_bookings",
     "create_booking",

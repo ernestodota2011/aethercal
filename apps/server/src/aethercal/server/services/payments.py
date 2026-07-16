@@ -75,13 +75,11 @@ from aethercal.server.db.models import (
     RefundKind,
 )
 from aethercal.server.db.pools import BypassReason, WorkerPools
-from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
     OutboxWork,
     as_utc,
-    email_dedupe_key,
     enqueue_effect,
     expire_hold_dedupe_key,
     refund_dedupe_key,
@@ -90,7 +88,6 @@ from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     resolve_money_credential,
 )
-from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
 
 _logger = logging.getLogger(__name__)
 
@@ -101,6 +98,13 @@ _Sessionmaker = async_sessionmaker[AsyncSession]
 # reaches into ``services.bookings`` (which would import it back). The worker/API supplies the real
 # one; a test supplies a spy.
 ConfirmEffects = Callable[[AsyncSession, Booking, datetime], Awaitable[None]]
+
+# The mirror for an OUT-OF-BAND refund (r5 finding 2): the FULL cancellation chain of a confirmed
+# booking — the ``booking.cancelled`` webhook, the CANCEL transition, the Google-Calendar DELETE and
+# the guest email. Injected the SAME way as ``ConfirmEffects`` (the webhook layer builds it from
+# ``services.bookings.cancel_confirmed_booking_effects``), so the arbiter runs the identical
+# cancellation a guest/host cancel does without importing the booking-effects wiring itself.
+CancelEffects = Callable[[AsyncSession, Booking, datetime], Awaitable[None]]
 
 
 class ArbiterOutcome(StrEnum):
@@ -480,8 +484,14 @@ async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event fie
     return ArbiterResult(ArbiterOutcome.REFUNDED_DOUBLE, booking.id, payment.id)
 
 
-async def apply_refunded_event(
-    session: AsyncSession, *, tenant_id: uuid.UUID, provider: str, provider_ref: str, now: datetime
+async def apply_refunded_event(  # noqa: PLR0913 - the event's identity + the injected cancel effects
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    provider: str,
+    provider_ref: str,
+    now: datetime,
+    cancel_effects: CancelEffects,
 ) -> ArbiterResult:
     """Apply a ``charge.refunded`` event (B-05b, criterion 35). ==Out-of-band vs our own echo.==
 
@@ -492,9 +502,12 @@ async def apply_refunded_event(
     money returned AND the service still delivered, so the booking is CANCELLED (freeing the slot),
     the guest is told, and the host is alerted.
 
-    ==No second refund is queued== on the out-of-band path: the money already went back, and the
-    booking is cancelled INLINE (not through ``cancel_booking``, which would re-enqueue one), so the
-    dedupe never even matters here.
+    ==The cancellation runs the FULL chain, not a partial copy (r5 finding 2).== After flipping the
+    status the arbiter fires the injected ``cancel_effects`` — the SAME chain ``cancel_booking``
+    runs on a confirmed booking: the ``booking.cancelled`` webhook, the CANCEL transition (retiring
+    the still-pending reminders + materialising ``on_cancel``), the Google-Calendar DELETE and the
+    guest email. ==No second refund is queued==: the money already went back, and ``cancel_effects``
+    deliberately excludes the refund, so the dedupe never even matters here.
     """
     payment = await resolve_payment(
         session, tenant_id=tenant_id, provider=provider, provider_ref=provider_ref
@@ -524,30 +537,14 @@ async def apply_refunded_event(
         booking.cancelled_at = now
         # Bump the iCal sequence so the cancellation .ics supersedes the confirmation (RFC 5545).
         booking.sequence += 1
-        # ==Finding 3: RECONCILE the queued effects, exactly as ``cancel_booking`` does.== Setting
-        # the status is not enough — the booking's still-pending workflow steps (its reminders) are
-        # live, and a reminder firing the hour before a meeting that was refunded and cancelled is
-        # the guest messaged about an appointment that no longer exists. ``CANCEL`` voids those
-        # pending NOTIFY steps and materialises ``on_cancel``, the same transition the normal
-        # cancel path runs. Without it the cancellation is cosmetic and the reminders still fire.
-        await apply_booking_transition(
-            session, booking=booking, transition=BookingTransition.CANCEL, now=now
-        )
-        # Tell the guest it is cancelled. ``confirmed_at`` is set, so the B-05a silence
-        # gate lets it out. Enqueued directly (not via ``cancel_booking``) so no refund is queued.
-        await enqueue_effect(
-            session,
-            booking=booking,
-            effect=OutboxEffect.EMAIL,
-            dedupe_key=email_dedupe_key(NotificationKind.CANCELLATION),
-            payload={
-                "kind": NotificationKind.CANCELLATION.value,
-                "cancel_url": None,
-                "reschedule_url": None,
-                "locale": "es",
-                "sequence": booking.sequence,
-            },
-        )
+        # ==Run the FULL cancellation chain (r5 finding 2), the SAME one ``cancel_booking`` runs==:
+        # the ``booking.cancelled`` webhook, the CANCEL transition (which retires the still-pending
+        # reminders — a reminder firing the hour before a refunded, cancelled meeting is the guest
+        # messaged about an appointment that no longer exists — and materialises ``on_cancel``), the
+        # Google-Calendar DELETE (so the event does not linger in the host's calendar forever) and
+        # the guest cancellation email. ``confirmed_at`` is set, so the B-05a silence gate lets
+        # these out. The refund is NOT part of ``cancel_effects`` — the money already went back.
+        await cancel_effects(session, booking, now)
     _logger.error(
         "ALERT: OUT-OF-BAND refund for payment %s — booking %s CANCELLED and its slot freed. "
         "Notify the host: money was returned outside our flow",
@@ -972,6 +969,7 @@ __all__ = [
     "HOLD_TTL",
     "ArbiterOutcome",
     "ArbiterResult",
+    "CancelEffects",
     "CheckoutSession",
     "ConfirmEffects",
     "ParkedPaymentReport",

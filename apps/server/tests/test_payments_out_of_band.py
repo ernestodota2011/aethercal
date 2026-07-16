@@ -30,9 +30,15 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.services.bookings import (
+    BookingEffects,
+    cancel_confirmed_booking_effects,
+)
+from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.payments import (
     ArbiterOutcome,
+    CancelEffects,
     apply_dispute_event,
     apply_refunded_event,
 )
@@ -44,8 +50,25 @@ _CUR = "usd"
 _REF = "pi_test_NOT_A_REAL_KEY_A"
 
 
+def _cancel_effects() -> CancelEffects:
+    """The FULL cancellation chain (r5 finding 2), the SAME one the webhook layer injects in prod —
+    so the arbiter's out-of-band path runs the real ``cancel_confirmed_booking_effects``, not a
+    partial copy. The ``effects`` bundle is present, so Google DELETE + email are enqueued."""
+    effects = BookingEffects(
+        signer=GuestTokenSigner("test-secret"), booking_base_url="https://book.example.com"
+    )
+
+    async def _run(session: AsyncSession, booking: Booking, now: datetime) -> None:
+        await cancel_confirmed_booking_effects(session, booking=booking, effects=effects, now=now)
+
+    return _run
+
+
 async def _seed(
-    session: AsyncSession, *, payment_status: PaymentStatus = PaymentStatus.PAID
+    session: AsyncSession,
+    *,
+    payment_status: PaymentStatus = PaymentStatus.PAID,
+    external_event_id: str | None = None,
 ) -> tuple[uuid.UUID, Booking, Payment]:
     tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="T")
     session.add(tenant)
@@ -87,6 +110,9 @@ async def _seed(
         guest_name="Ada",
         guest_email="ada@example.com",
         guest_timezone="UTC",
+        # A booking already synced to the host's Google Calendar — so the cancellation must DELETE
+        # that event (the chain-has-external-event gate in ``_enqueue_google``).
+        external_event_id=external_event_id,
     )
     session.add(booking)
     await session.flush()
@@ -113,7 +139,12 @@ async def _count(session: AsyncSession, booking_id: uuid.UUID, effect: OutboxEff
 
 async def _apply_refund(session: AsyncSession, tenant_id: uuid.UUID) -> ArbiterOutcome:
     result = await apply_refunded_event(
-        session, tenant_id=tenant_id, provider="stripe", provider_ref=_REF, now=NOW
+        session,
+        tenant_id=tenant_id,
+        provider="stripe",
+        provider_ref=_REF,
+        now=NOW,
+        cancel_effects=_cancel_effects(),
     )
     return result.outcome
 
@@ -135,6 +166,28 @@ async def test_an_out_of_band_refund_cancels_the_booking_and_frees_the_slot(
     assert payment.status is PaymentStatus.REFUNDED
     assert await _count(sqlite_session, booking.id, OutboxEffect.REFUND) == 0, "money already back"
     assert await _count(sqlite_session, booking.id, OutboxEffect.EMAIL) == 1, "the guest is told"
+
+
+async def test_an_out_of_band_refund_runs_the_full_cancellation_chain(
+    sqlite_session: AsyncSession,
+) -> None:
+    """==Re-Crisol r5 finding 2.== A CONFIRMED booking already synced to Google, cancelled by an
+    external refund, must run the FULL cancellation chain — not a partial copy. It enqueues the
+    guest cancellation email AND the Google-Calendar DELETE (so the event does not linger in the
+    host's calendar), exactly as ``cancel_booking``. Before this fix only the email/void ran."""
+    tenant_id, booking, _payment = await _seed(sqlite_session, external_event_id="google-event-abc")
+
+    outcome = await _apply_refund(sqlite_session, tenant_id)
+
+    assert outcome is ArbiterOutcome.OUT_OF_BAND_REFUND
+    await sqlite_session.refresh(booking)
+    assert booking.status is BookingStatus.CANCELLED
+    assert await _count(sqlite_session, booking.id, OutboxEffect.EMAIL) == 1, "the guest is told"
+    # ==The gap this fix closes.== The Google event is deleted, not left in the host's calendar.
+    assert await _count(sqlite_session, booking.id, OutboxEffect.GOOGLE) == 1, (
+        "delete the GCal event"
+    )
+    assert await _count(sqlite_session, booking.id, OutboxEffect.REFUND) == 0, "money already back"
 
 
 async def test_our_own_refund_echoed_back_is_a_noop(sqlite_session: AsyncSession) -> None:

@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.db.models import PaymentEvent, PaymentEventStatus
 from aethercal.server.services.payments import (
+    CancelEffects,
     ConfirmEffects,
     apply_dispute_event,
     apply_paid_event,
@@ -213,6 +214,7 @@ async def dispatch_payment_event(  # noqa: PLR0913 - the event's identity + the 
     row: PaymentEvent,
     now: datetime,
     confirm_effects: ConfirmEffects,
+    cancel_effects: CancelEffects,
 ) -> None:
     """Send a freshly-recorded event to the arbiter and set the row's terminal status.
 
@@ -250,6 +252,7 @@ async def dispatch_payment_event(  # noqa: PLR0913 - the event's identity + the 
                 provider=provider,
                 provider_ref=event.provider_ref,
                 now=now,
+                cancel_effects=cancel_effects,
             )
             row.status = PaymentEventStatus.APPLIED
         case WebhookEventKind.DISPUTE:

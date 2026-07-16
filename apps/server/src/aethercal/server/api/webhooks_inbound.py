@@ -27,7 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.server.db.guc import bind_tenant
 from aethercal.server.db.models import Booking
 from aethercal.server.deps import get_session
-from aethercal.server.services.bookings import BookingEffects, confirm_paid_booking_effects
+from aethercal.server.services.bookings import (
+    BookingEffects,
+    cancel_confirmed_booking_effects,
+    confirm_paid_booking_effects,
+)
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.payment_webhooks import (
     PAYMENT_WEBHOOK_ADAPTERS,
@@ -120,6 +124,26 @@ def _confirm_effects(request: Request, settings: Settings) -> _ConfirmEffects:
     return _run
 
 
+def _cancel_effects(request: Request, settings: Settings) -> _ConfirmEffects:
+    """The arbiter's ``cancel_effects`` (r5 finding 2): the SAME cancellation chain a guest/host
+    cancel runs, for an OUT-OF-BAND ``charge.refunded``.
+
+    Built here — the one layer that may import both the booking service and the arbiter — so the
+    out-of-band refund fires the full chain (webhook + CANCEL transition + Google DELETE + guest
+    email) instead of a partial copy. The bundle is present, so the Google delete and the email are
+    enqueued: an appointment cancelled by an external refund is owed both, like any cancellation.
+    """
+    base = settings.booking_base_url or str(request.base_url)
+    effects = BookingEffects(
+        signer=GuestTokenSigner(settings.app_secret), booking_base_url=base.rstrip("/")
+    )
+
+    async def _run(session: AsyncSession, booking: Booking, now: datetime) -> None:
+        await cancel_confirmed_booking_effects(session, booking=booking, effects=effects, now=now)
+
+    return _run
+
+
 @router.post("/{provider}/{tenant_slug}", status_code=status.HTTP_200_OK)
 async def receive_payment_webhook(
     provider: ProviderPath,
@@ -199,6 +223,7 @@ async def receive_payment_webhook(
         row=row,
         now=_now(),
         confirm_effects=_confirm_effects(request, settings),
+        cancel_effects=_cancel_effects(request, settings),
     )
     return {"status": "ok"}
 
