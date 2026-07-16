@@ -107,12 +107,13 @@ TokenQuery = Annotated[str | None, Query(description="Signed guest token authori
 # gates a resume — an expired hold is a clean 409, never a confusing token failure (r5).
 _CHECKOUT_TOKEN_TTL = HOLD_TTL + timedelta(minutes=5)
 
-# ==Stripe's documented floor for a Checkout Session ``expires_at`` (r6 finding 1).== A session must
-# expire at least 30 minutes in the future. On CREATE the hold (``HOLD_TTL``) always has room; on a
-# late RESUME the hold has already spent part of its life, so if less than this remains there is no
-# way to open a session that BOTH clears Stripe's floor AND expires within the hold — refuse (409)
-# rather than open one that outlives the hold (paying for a slot ``EXPIRE_HOLD`` already freed).
-_STRIPE_MIN_CHECKOUT_TTL = timedelta(minutes=30)
+# ==The hold must have room for a FULL-MARGIN session, or there is no session to open (r7).==
+# ``CHECKOUT_SESSION_TTL`` already encodes Stripe's 30-minute floor PLUS the latency buffer that
+# keeps the value Stripe receives comfortably above it. Requiring the hold to have at least that
+# much life left means every session we open carries the whole margin AND expires inside the hold.
+# Below it, any session would either be under-margined (Stripe may reject it on arrival) or outlive
+# the hold (the guest pays for a slot ``EXPIRE_HOLD`` already freed). Both are refused with a 409.
+_MIN_HOLD_REMAINING_FOR_CHECKOUT = CHECKOUT_SESSION_TTL
 
 _NOT_FOUND = "not_found"
 _CAPTCHA_REQUIRED = "captcha_required"
@@ -672,22 +673,39 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
 
 
 def _checkout_expires_at(booking: Booking, *, now: datetime) -> datetime:
-    """The Stripe Checkout Session ``expires_at`` — ==capped to the hold's deadline (r6 finding 1).
+    """The Stripe Checkout Session ``expires_at``: ==full margin, and never outliving the hold.==
 
-    The session must never OUTLIVE the hold: if it did, ``EXPIRE_HOLD`` could free the slot while
-    the session was still payable, and the guest would pay for a slot already given away (a charge
-    to capture and immediately refund). On CREATE this is a non-issue — a fresh hold has
-    ``HOLD_TTL``, longer than ``CHECKOUT_SESSION_TTL``. On a late RESUME the hold has spent part of
-    its life, so the expiry is the EARLIER of our standard TTL and the hold's deadline. But Stripe
-    rejects a session under 30 minutes out, so if the hold no longer has room for one, there is no
-    valid session to open — refuse with a 409 rather than open one doomed to be rejected or to
-    outlive the hold.
+    Two hard rules, and when they cannot BOTH hold there is no session to open:
+
+    * **it must never OUTLIVE the hold** (r6) — if it did, ``EXPIRE_HOLD`` could free the slot while
+      the session was still payable, and the guest would pay for a slot already given away (a charge
+      to capture and immediately refund);
+    * **it must carry the FULL latency margin** (r7) — ``CHECKOUT_SESSION_TTL`` is Stripe's 30-min
+      floor PLUS a buffer, because a value computed here can arrive at Stripe a moment later and a
+      thin margin is one that Stripe may reject on arrival. Shipping a session with less margin than
+      the create path deliberately chose is the same latency bug in a new place.
+
+    So the hold must have at least ``_MIN_HOLD_REMAINING_FOR_CHECKOUT`` of life left, else 409; and
+    the expiry is capped to the hold's deadline (which, given that floor, is always the standard TTL
+    — the cap is kept as the STRUCTURAL guarantee of rule one, independent of the threshold).
+
+    .. rubric:: The resume window is short, and that is Stripe's floor speaking
+
+    A fresh hold is ``HOLD_TTL`` (33 min) and a session needs ~31 of them, so a resume is only
+    possible in roughly the first two minutes. That covers the case this endpoint exists for — the
+    checkout call failed, the page got a 502, and it retries within seconds — and every later try
+    gets an honest 409 instead of a session Stripe would reject or that would outlive the hold. The
+    only clean way to widen it is a product decision this module must not make on its own: a longer
+    ``HOLD_TTL`` (slots held longer for everyone, including abandoned holds), or re-arming the hold
+    on resume — which needs the ``EXPIRE_HOLD`` intent RE-TIMED, machinery ``enqueue_effect`` does
+    not have today (it silently no-ops on a dedupe conflict) and which would also need a cap so a
+    guest cannot hold a slot for ever by resuming.
     """
     hold_deadline = booking.hold_expires_at
     assert hold_deadline is not None  # a paid hold always has one (create_booking with hold_ttl)
     hold_deadline = as_utc(hold_deadline)
     now = as_utc(now)
-    if hold_deadline - now < _STRIPE_MIN_CHECKOUT_TTL:
+    if hold_deadline - now < _MIN_HOLD_REMAINING_FOR_CHECKOUT:
         raise _conflict("This hold is about to expire; please book again")
     return min(now + CHECKOUT_SESSION_TTL, hold_deadline)
 
