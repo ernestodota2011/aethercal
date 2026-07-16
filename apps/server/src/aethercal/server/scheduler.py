@@ -15,8 +15,13 @@ Three layers, isolated so the wiring is fully offline-testable:
 
 The live tick *closures* (:func:`make_webhook_delivery_tick` / :func:`make_busy_refresh_tick` /
 :func:`make_outbox_drain_tick`) read the runtime effects the app's lifespan puts on ``app.state``
-(``sessionmaker`` / ``http_client`` / ``fernet_key`` / ``email_sender``) and are
+(``pools`` / ``http_client`` / ``fernet_keys`` / ``instance_sender_defaults``) and are
 ``# pragma: no cover - live`` — importing this module starts no scheduler.
+
+==What those closures DECIDE is not behind the pragma== (:func:`build_drain_executor` /
+:func:`resolve_senders_for`). The seam between what the boot writes onto ``app.state`` and what a
+tick reads back off it is where a silent break hides, and a pragma over it buys the green without
+buying the truth.
 """
 
 from __future__ import annotations
@@ -405,9 +410,7 @@ def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     return _tick
 
 
-async def _resolve_senders_for(
-    app: FastAPI, tenant_id: uuid.UUID
-) -> TenantSenders:  # pragma: no cover - live
+async def resolve_senders_for(app: FastAPI, tenant_id: uuid.UUID) -> TenantSenders:
     """Open a short, tenant-bound session and resolve THAT business's senders (B-03bis).
 
     ==On ``pools.exec_maker``, the APP-role pool, inside the drain's per-item ``tenant_scope``.==
@@ -417,6 +420,18 @@ async def _resolve_senders_for(
 
     The session is opened and closed around the read alone. R8 forbids holding a transaction across
     the network I/O that follows, and this is a pure read.
+
+    .. rubric:: ==NOT ``# pragma: no cover``, and that is the point==
+
+    This is the live glue between the worker's BOOT and the funnel: the one place
+    ``app.state.instance_sender_defaults`` is read. If the boot ever stops writing that name, every
+    drain tick dies here with an ``AttributeError`` — and no amount of unit-testing the funnel would
+    notice, because the funnel would still be perfect. A pragma here buys the green without buying
+    the truth.
+
+    It reaches no network (building a sender opens no socket), so there is nothing to excuse it
+    from coverage with. ``tests/test_worker_sender_wiring.py`` drives it against an app state built
+    by the worker's OWN lifespan.
     """
     pools: WorkerPools = app.state.pools
     async with pools.exec_maker() as session:
@@ -431,36 +446,49 @@ async def _resolve_senders_for(
         )
 
 
-def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to the worker's state (pools + a per-business sender resolver + a
-    Fernet-built Google factory) — the live ``execute`` dispatches each intent to its handler.
+def build_drain_executor(app: FastAPI) -> OutboxExecutor:
+    """The live outbox ``execute``, built from the worker's app state — ==and TESTED.==
 
-    ==The executor is built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers
-    read the booking, decrypt the business's credential and write the ledger, and every one of those
-    is a tenant-scoped table. They run inside the drain's per-item ``tenant_scope``, so under RLS
-    they see exactly that item's business — which is the whole point of splitting the pools: the one
+    Extracted out of the ``# pragma: no cover`` tick on purpose. The seam between *what the boot
+    puts on* ``app.state`` and *what the drain reads back off it* is exactly where a silent break
+    hides: an ``AttributeError`` on a name nobody typed twice is invisible until every reminder on
+    the instance has already stopped going out.
+
+    ==Built over ``pools.exec_maker``, the APP-role pool, on purpose.== The handlers read the
+    booking, decrypt the business's credential and write the ledger, and every one of those is a
+    tenant-scoped table. They run inside the drain's per-item ``tenant_scope``, so under RLS they
+    see exactly that item's business — which is the whole point of splitting the pools: the one
     place a cross-business leak would be *externally visible* is precisely here, in the process that
     sends the guest's name and address to somebody's webhook.
 
-    ==The senders are RESOLVED PER ITEM, never bound here (B-03bis).== This tick used to hand the
+    ==The senders are RESOLVED PER ITEM, never bound here (B-03bis).== This used to hand the
     executor ``app.state.email_sender`` and ``app.state.channel_senders`` — one SMTP relay and one
-    WhatsApp number, read from the instance's environment at boot and then shared by every business
-    the drain worked through. That is how a business's reminder went out from the operator's number.
-    The executor now takes a resolver and asks it for each item's own business, by name.
+    WhatsApp number, read from the instance's environment at boot and shared by every business the
+    drain worked through. That is how a business's reminder went out from the operator's number. The
+    executor now takes a resolver and asks it for each item's own business, by name.
+    """
+    pools: WorkerPools = app.state.pools
+    # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key during a
+    # rotation, so the drain never fails to decrypt a row the rotation has not reached.
+    fernet = _decryption_fernet(app)
+    service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+    return make_booking_effect_executor(
+        sessionmaker=pools.exec_maker,
+        resolve_senders=functools.partial(resolve_senders_for, app),
+        service_factory=service_factory,
+    )
+
+
+def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
+    """Bind an outbox-drain tick to the worker's state.
+
+    Thin on purpose: every decision it makes lives in :func:`build_drain_executor`, which is tested.
+    What is left here is the loop itself.
     """
 
     async def _tick() -> None:
         pools: WorkerPools = app.state.pools
-        # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key
-        # during a rotation, so the drain never fails to decrypt a row the rotation has not reached.
-        fernet = _decryption_fernet(app)
-        service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        execute = make_booking_effect_executor(
-            sessionmaker=pools.exec_maker,
-            resolve_senders=functools.partial(_resolve_senders_for, app),
-            service_factory=service_factory,
-        )
-        await run_outbox_drain_once(pools=pools, execute=execute)
+        await run_outbox_drain_once(pools=pools, execute=build_drain_executor(app))
 
     return _tick
 
@@ -491,12 +519,14 @@ __all__ = [
     "WEBHOOK_HTTP_TIMEOUT_SECONDS",
     "SchedulerLike",
     "Tick",
+    "build_drain_executor",
     "build_interval_scheduler",
     "make_busy_refresh_tick",
     "make_outbox_drain_tick",
     "make_webhook_delivery_tick",
     "refresh_all_busy_caches",
     "register_scheduler_jobs",
+    "resolve_senders_for",
     "run_busy_refresh_once",
     "run_outbox_drain_once",
     "run_webhook_delivery_once",

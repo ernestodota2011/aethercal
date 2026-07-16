@@ -150,6 +150,15 @@ def create_worker_app(settings: Settings) -> FastAPI:
             # The READ reader: the current key, plus the retiring one while a rotation is in flight.
             # The ticks decrypt with this so a row the rotation has not reached yet stays readable —
             # and they still WRITE (re-encrypt nothing here) under the current key alone.
+            #
+            # ==ALL THREE ticks die without this name, and none of them says so.== The webhook
+            # delivery tick signs with it, `_decryption_fernet` builds the busy-refresh and drain
+            # readers from it, and `resolve_senders_for` decrypts each business's credential.
+            # Every tick body catches and logs, so a missing name here is an inert worker that
+            # reports healthy for ever. Pinned by `tests/test_worker_sender_wiring.py`, which boots
+            # this lifespan for real rather than mirroring it in a fake.
+            app.state.fernet_keys = settings.decryption_fernet_keys()
+
             # ==The OPERATOR's defaults — not senders (B-03bis).==
             #
             # This used to build one SMTP client and one WhatsApp/SMS registry here, at boot, and

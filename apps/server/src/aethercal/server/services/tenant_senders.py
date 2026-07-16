@@ -111,6 +111,7 @@ from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.services.tenant_credentials import (
     CredentialClass,
+    CredentialError,
     CredentialProvider,
     CredentialSource,
     ResolvedCredential,
@@ -134,6 +135,56 @@ _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
 _WHATSAPP_CAP_PREFIX = "WHATSAPP"
 _SMS_CAP_PREFIX = "SMS"
+
+_DEFAULT_SMTP_PORT = 587
+"""The submission port, matching :class:`SmtpConfig`'s own default for an unset ``port``."""
+
+
+class UnusableCredentialError(CredentialError):
+    """A stored credential has every field it needs, and one of those fields cannot be USED.
+
+    ==Distinct from :class:`IncompleteCredentialError`, and the gap between them is real.==
+    ``store_credential`` refuses a credential MISSING a required field — but ``port`` is *optional*
+    for SMTP, so ``{"host": …, "from_addr": …, "port": "abc"}`` passes the door happily. Nothing
+    notices until the worker builds the sender, hours later, mid-drain, where ``int("abc")`` throws
+    a bare ``ValueError``: a trace naming neither the business, nor the provider, nor the field.
+
+    Validating every value-shape at the door is the tempting fix, and it does not work: the door
+    would have to know every provider's optional schema, the rows already stored predate any such
+    check, and a credential can be written by an older CLI or restored from a backup. ==A read-side
+    guard is the only one that covers a row this process did not write.== (Same argument, and same
+    shape, as :class:`MalformedCredentialError` — the read-side guard for a payload that is not an
+    object at all.)
+
+    .. rubric:: It is RETRYABLE, and that is a decision
+
+    It is NOT an :class:`~aethercal.server.services.outbox.OutboxSkipped`. That is TERMINAL, and its
+    own docstring says terminal "means IRREVERSIBLE, so it may only carry a condition that cannot be
+    undone". A broken credential is undoable in one command — ``aethercal-admin credentials set`` —
+    so retiring the step would destroy a reminder the fix would otherwise have delivered, which is
+    the exact trap the paused-rule case already documents.
+
+    So it propagates, the drain's ``except Exception`` fails the item, and it backs off toward the
+    dead-letter. Every one of those six attempts is a chance for the fix to land in time, and the
+    dead-letter is this product's channel for *"a human is needed"* — which is true here, and is
+    precisely NOT true of a channel the operator simply never configured.
+    """
+
+
+def _unusable_message(provider: CredentialProvider, *, field: str, expected: str) -> str:
+    """The refusal, naming the provider and the FIELD — and ==never the value==.
+
+    The value is not echoed even though a port looks harmless. A credential's fields are secret, and
+    a rule that holds only for the fields somebody judged boring is not a rule: the next field
+    through here is a password.
+    """
+    return (
+        f"the stored {provider.value} credential's {field!r} is not usable: it must be {expected}. "
+        "The credential is not incomplete — this field is optional, so it was accepted when it was "
+        "stored, and only a send can discover that its value cannot be used. Re-enter it with "
+        f"`aethercal-admin credentials set --provider {provider.value}`. (The value is not shown — "
+        "a credential's fields are secret, whichever one is at fault.)"
+    )
 
 
 class InstanceFallback(StrEnum):
@@ -458,18 +509,61 @@ class TenantSenders:
         return _resolve
 
 
+def _credential_port(raw: str | None) -> int:
+    """The stored ``port``, or the submission default. ==A bad one is a domain error, not a crash.==
+
+    ``int()`` on ``"abc"`` raises a bare ``ValueError`` from inside the worker, mid-drain: a stack
+    trace that names neither the business, nor the provider, nor the field. See
+    :class:`UnusableCredentialError` for why this cannot be caught at the door instead.
+    """
+    if not raw:
+        return _DEFAULT_SMTP_PORT
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise UnusableCredentialError(
+            _unusable_message(CredentialProvider.SMTP, field="port", expected="a whole number")
+        ) from exc
+
+
+def _credential_bool(raw: str | None, *, field: str, default: bool) -> bool:
+    """A stored boolean field. ==Names ITS OWN field — never an environment variable.==
+
+    Deliberately not :func:`_parse_bool`, and that separation is the fix for a real defect: that
+    function exists for :data:`LEND_OPERATOR_PHONE_IDENTITY_ENV` and hardcodes that variable's name
+    in its error. Reused here it told an operator their lend-identity FLAG was malformed when what
+    was actually wrong was one field of one business's stored SMTP credential — a variable they may
+    never have set, on the other side of the product from the fault. ==An error that misdirects is
+    worse than one that only says "no".==
+    """
+    if not raw:
+        return default
+    token = raw.strip().lower()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    raise UnusableCredentialError(
+        _unusable_message(
+            CredentialProvider.SMTP, field=field, expected="a boolean (true/false, 1/0, yes/no)"
+        )
+    )
+
+
 def _smtp_from_secrets(secrets: Mapping[str, str]) -> SmtpConfig:
-    """An :class:`SmtpConfig` from the stored field shape. ``host``/``from_addr`` are guaranteed
-    present by ``required_fields(SMTP)``, which ``store_credential`` enforces at the door."""
-    port = secrets.get("port")
-    use_tls = secrets.get("use_tls")
+    """An :class:`SmtpConfig` from the stored field shape.
+
+    ``host`` / ``from_addr`` are guaranteed present by ``required_fields(SMTP)``, which
+    ``store_credential`` enforces at the door. The OPTIONAL fields are not guaranteed anything, and
+    that is exactly where :class:`UnusableCredentialError` lives.
+    """
     return SmtpConfig(
         host=secrets["host"],
         from_addr=secrets["from_addr"],
-        port=int(port) if port else 587,
+        port=_credential_port(secrets.get("port")),
         username=secrets.get("username") or None,
         password=secrets.get("password") or None,
-        use_tls=_parse_bool(use_tls, default=True) if use_tls else True,
+        use_tls=_credential_bool(secrets.get("use_tls"), field="use_tls", default=True),
     )
 
 
@@ -633,6 +727,7 @@ __all__ = [
     "InstanceFallback",
     "InstanceSenderDefaults",
     "TenantSenders",
+    "UnusableCredentialError",
     "channel_for",
     "instance_fallback",
     "resolve_tenant_senders",

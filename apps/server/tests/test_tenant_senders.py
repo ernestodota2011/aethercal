@@ -30,7 +30,9 @@ from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.services.outbox import (
+    OutboxDeferred,
     OutboxEffect,
+    OutboxSkipped,
     OutboxWork,
     make_booking_effect_executor,
 )
@@ -46,6 +48,8 @@ from aethercal.server.services.tenant_senders import (
     InstanceFallback,
     InstanceSenderDefaults,
     TenantSenders,
+    UnusableCredentialError,
+    _smtp_from_secrets,
     channel_for,
     instance_fallback,
     resolve_tenant_senders,
@@ -395,6 +399,93 @@ class TestACredentialWithNoCeilingIsNotACeilingAtAll:
         caps = senders.channels[Channel.WHATSAPP].caps
         assert caps.per_phone == 3
         assert caps.per_ip == 5
+
+
+class TestAStoredCredentialWhoseValueCannotBeUsed:
+    """==A credential can be complete and still be unusable, and that difference decides the
+    outcome.==
+
+    ``store_credential`` refuses a credential MISSING a required field. It does not — and cannot
+    usefully — validate the *shape of every value*: ``port`` is optional for SMTP, so
+    ``{"host": …, "from_addr": …, "port": "abc"}`` is stored happily and only detonates at the send,
+    inside the worker, as a bare ``ValueError`` out of ``int()``.
+
+    A raw crash is the wrong answer twice over: it is unreadable in a log, and it names neither the
+    business, nor the provider, nor the field a human has to go and fix.
+    """
+
+    def test_a_non_numeric_port_is_a_legible_domain_error_naming_the_field(self) -> None:
+        with pytest.raises(UnusableCredentialError) as caught:
+            _smtp_from_secrets(
+                {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"}
+            )
+
+        message = str(caught.value)
+        assert "port" in message, "the error must name the field a human has to go and fix"
+        assert "abc" not in message, (
+            "the offending VALUE is not echoed. A credential's fields are secret whether or not "
+            "this particular one looks harmless — the rule does not get to depend on the field."
+        )
+
+    def test_an_unparseable_use_tls_does_not_blame_an_unrelated_environment_variable(self) -> None:
+        """==The second bug in the same function, and the more insidious one.==
+
+        ``_parse_bool`` was written for the lend-identity FLAG and hardcodes that variable's name in
+        its error. Reused for a stored credential's ``use_tls``, it told the operator that
+        ``AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY`` was malformed — a variable they may never have
+        set, on the other side of the product from the actual fault. An error that misdirects is
+        worse than one that only says "no".
+        """
+        with pytest.raises(UnusableCredentialError) as caught:
+            _smtp_from_secrets(
+                {"host": "smtp.x.example", "from_addr": "a@x.example", "use_tls": "maybe"}
+            )
+
+        message = str(caught.value)
+        assert "use_tls" in message
+        assert LEND_OPERATOR_PHONE_IDENTITY_ENV not in message, (
+            "the error blames an environment variable that has nothing to do with this business's "
+            "stored credential."
+        )
+
+    def test_the_flag_itself_still_names_itself_when_IT_is_malformed(self) -> None:
+        """The env-var error is still right where it IS the env var: fixing one must not break the
+        other."""
+        with pytest.raises(RuntimeError, match=LEND_OPERATOR_PHONE_IDENTITY_ENV):
+            InstanceSenderDefaults.from_env({LEND_OPERATOR_PHONE_IDENTITY_ENV: "perhaps"})
+
+    async def test_an_unusable_credential_FAILS_the_step_rather_than_retiring_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Why ``failed`` and not ``skipped`` — the codebase's own rule decides it.==
+
+        ``OutboxSkipped`` is TERMINAL, and its docstring says terminal "means IRREVERSIBLE, so it
+        may only carry a condition that cannot be undone". A broken credential is emphatically
+        undoable: a human runs ``credentials set`` and it is fixed. Retire the step and that
+        reminder could never be delivered afterwards — the trap the paused-rule case documents.
+
+        So it fails, backs off, and dead-letters after six attempts. Each of those is a chance for
+        the fix to land in time, and the dead-letter is this product's channel for "a human is
+        needed" — which is true here, and is NOT true of a channel the operator simply never
+        configured.
+        """
+        business = await _business(sqlite_session, tenant_factory, "bad-port")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(UnusableCredentialError):
+                await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        # ...and the drain turns exactly that into a RETRYABLE failure, never a terminal skip:
+        # `_run_one_item` names OutboxSkipped / OutboxDeferred / OutboxUnknownOutcome explicitly,
+        # and everything else lands in `except Exception` -> _Outcome.FAILED -> backoff.
+        assert not issubclass(UnusableCredentialError, OutboxSkipped | OutboxDeferred)
 
 
 class TestTheExecutorResolvesPerItemAndNotPerProcess:
