@@ -424,18 +424,27 @@ async def resume_paid_checkout(
     attempt never got that far.
 
     ==Resuming is a WRITE (r5), so it is authorized like cancel/reschedule==: a valid ``?token=`` of
-    purpose CHECKOUT, bound to THIS booking, is required before any Stripe call or DB write. Missing
-    or invalid token → 403, touching neither Stripe nor a payment write. The token is VERIFIED, not
-    consumed, so a guest may resume the same hold again while it lives. A hold that has since
-    confirmed, cancelled, or lapsed is a 409; an unknown/other-business booking, or a free type, is
-    the shared 404.
+    purpose CHECKOUT, bound to THIS booking, is required. ==The token is checked FIRST (r6 finding
+    3), before the booking is even read==, so a caller without a valid token for THIS ``booking_id``
+    gets the SAME 403 whether or not the booking exists — the endpoint is no enumeration oracle. The
+    token is VERIFIED, not consumed, so a guest may resume the same hold again while it lives. ONLY
+    after a valid token does the booking's state shape the answer: a hold that has since confirmed,
+    cancelled or lapsed is a 409, and a vanished/free booking the shared 404.
 
     The route carries ``tenant_slug`` like every other public endpoint: it BINDS the business so the
     booking is read under row-level security (without a bound tenant the lookup sees nothing).
     """
     tenant_id = await _bind_business(session, tenant_slug)
+    # ==Authorize FIRST (r6 finding 3), before revealing anything about the booking.== A missing,
+    # invalid, or wrong-booking token is a uniform 403 — the same answer whether ``booking_id`` is a
+    # real hold or nothing at all, so an attacker cannot enumerate valid ids. The token is verified
+    # (not consumed), so a guest may resume again while the hold lives. Touches no Stripe, no write.
+    checkout_token = await _authorize_resume(request, session, booking_id=booking_id, token=token)
+
+    # The caller has proven they own THIS booking; only NOW may its state shape the answer.
     booking = await session.get(Booking, booking_id)
     if booking is None or booking.tenant_id != tenant_id:
+        # Near-unreachable: a valid CHECKOUT token implies the paid booking existed. Defensive 404.
         raise _not_found()
     event_type = await session.get(EventType, booking.event_type_id)
     price_cents = None if event_type is None else event_type.price_cents
@@ -443,10 +452,6 @@ async def resume_paid_checkout(
     if price_cents is None or currency is None:
         # A free type has no checkout to resume — indistinguishable from any other public miss.
         raise _not_found()
-
-    # ==Authorize BEFORE any Stripe call or write (r5).== A missing/invalid/mismatched token is a
-    # uniform 403; the token is verified (not consumed), so a guest may resume again while it lives.
-    checkout_token = await _authorize_resume(request, session, booking_id=booking_id, token=token)
 
     now = _now()
     _require_resumable_hold(booking, now=now)

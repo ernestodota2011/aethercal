@@ -426,13 +426,42 @@ async def test_resume_is_refused_for_a_non_live_hold(
     assert confirmed_resume.status_code == 409, confirmed_resume.text
     assert confirmed_resume.json()["detail"]["error"] == "hold_not_resumable"
 
-    # An unknown booking id → the shared 404 (the miss is caught before the token is even checked).
+    # An unknown booking id with THIS booking's token → 403 (r6 finding 3): the token is checked
+    # first and does not bind to that id, so the endpoint never reveals the id does not exist.
     unknown = await paid_client.post(
         f"/api/v1/public/{seeded['slug']}/bookings/{uuid.uuid4()}/checkout", params={"token": token}
     )
-    assert unknown.status_code == 404
+    assert unknown.status_code == 403
 
     assert len(gateway.sessions) == opened_before, "a refused resume opens no checkout"
+
+
+async def test_resume_gives_no_enumeration_oracle(
+    paid_client: AsyncClient, paid_app: tuple[FastAPI, _FakeGateway], owner_maker: Sessionmaker
+) -> None:
+    """==r6 finding 3.== The token is checked BEFORE the booking is read, so a caller without a
+    valid token for the id gets the SAME answer whether the booking exists or not — no enumeration.
+    A REAL hold and a NONEXISTENT id, both queried WITHOUT a token, are 403; only a valid token lets
+    the booking's real state (409/200) show through."""
+    seeded = await _seed(owner_maker)
+    _app, _gateway = paid_app
+    created = await paid_client.post(
+        f"/api/v1/public/{seeded['slug']}/intro/bookings", json=_payload(seeded)
+    )
+    real_booking_id = uuid.UUID(created.json()["id"])
+    real_token = created.json()["checkout_token"]
+
+    async def _status(booking_id: uuid.UUID, **params: str) -> int:
+        resp = await paid_client.post(
+            f"/api/v1/public/{seeded['slug']}/bookings/{booking_id}/checkout", params=params
+        )
+        return resp.status_code
+
+    # A REAL hold and a NONEXISTENT id, both WITHOUT a token → identical 403 (no oracle).
+    assert await _status(real_booking_id) == 403
+    assert await _status(uuid.uuid4()) == 403
+    # Only the rightful token for the REAL hold lets its real state show (here: still resumable).
+    assert await _status(real_booking_id, token=real_token) == 200
 
 
 async def test_a_resumed_checkout_expiry_is_capped_to_the_hold(
