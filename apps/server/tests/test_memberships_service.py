@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import MemberRole
@@ -361,6 +362,20 @@ async def test_the_last_owner_cannot_be_demoted(
         await service.set_role(
             sqlite_session, tenant_id=tenant.id, membership_id=granted.id, role=MemberRole.ADMIN
         )
+
+
+def test_the_last_owner_guard_locks_the_owner_rows_for_update() -> None:
+    """==The guard is a check-then-act, and it must be atomic.== "Is there another owner?" followed
+    by a ``revoke``/``set_role`` is a race: two removals can BOTH read two owners and BOTH
+    proceed, leaving the business with none. The serialization point is a ``SELECT ... FOR UPDATE``
+    over the owner rows BEFORE the count — the second remover blocks on it until the first commits,
+    then re-reads the reduced set and is refused. This asserts the lock is compiled into the query;
+    ``test_memberships_concurrency`` proves the behaviour against a real PostgreSQL.
+    """
+    compiled = str(
+        service._owner_memberships_for_update(uuid.uuid4()).compile(dialect=postgresql.dialect())
+    )
+    assert "FOR UPDATE" in compiled.upper()
 
 
 async def test_an_owner_may_be_removed_while_another_owner_remains(

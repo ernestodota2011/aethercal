@@ -42,7 +42,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -177,7 +177,13 @@ async def list_members(session: AsyncSession, *, tenant_id: uuid.UUID) -> list[M
 
 
 async def count_owners(session: AsyncSession, *, tenant_id: uuid.UUID) -> int:
-    """How many owners this business has — the input to the last-owner refusal."""
+    """How many owners this business has — a plain, UNLOCKED read (a display count).
+
+    ==Do not build the last-owner REFUSAL on this.== It is a bare ``SELECT count(*)``: two
+    concurrent "remove an owner" transactions can each read two here and each proceed, leaving the
+    business with none. The refusal locks the owner rows first — see :func:`_refuse_if_last_owner`
+    and :func:`_owner_memberships_for_update`. It shows a number; it does not gate a delete.
+    """
     found = await session.scalar(
         select(func.count())
         .select_from(Membership)
@@ -360,10 +366,29 @@ def _require_strong(password: str) -> None:
         )
 
 
+def _owner_memberships_for_update(tenant_id: uuid.UUID) -> Select[tuple[uuid.UUID]]:
+    """The business's OWNER membership ids, locked ``FOR UPDATE`` — the guard's serialization point.
+
+    ==This is what makes the last-owner refusal atomic.== ``count_owners`` + ``delete`` is a
+    check-then-act: two concurrent removals both read two owners and both proceed. Locking the owner
+    rows BEFORE counting serialises them — the second removal blocks here until the first commits,
+    then the lock re-evaluates its predicate against the now-committed state and returns the reduced
+    set (the demoted/deleted owner no longer matches ``role = OWNER``), so the count is one and the
+    removal is refused. A ``SELECT ... FOR UPDATE`` cannot carry an aggregate, so the rows are
+    locked and counted in Python; the LOCK is the invariant here, not the ``count()``.
+    """
+    return (
+        select(Membership.id)
+        .where(Membership.tenant_id == tenant_id, Membership.role == MemberRole.OWNER)
+        .with_for_update()
+    )
+
+
 async def _refuse_if_last_owner(
     session: AsyncSession, *, tenant_id: uuid.UUID, action: str
 ) -> None:
-    if await count_owners(session, tenant_id=tenant_id) > 1:
+    owners = (await session.scalars(_owner_memberships_for_update(tenant_id))).all()
+    if len(owners) > 1:
         return
     raise LastOwnerError(
         f"refusing to {action} the last owner of this business.\n"
