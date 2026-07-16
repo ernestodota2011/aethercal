@@ -436,7 +436,7 @@ def _consent_stamp(params: BookingParams, *, now: datetime) -> datetime | None:
     return now
 
 
-async def create_booking(
+async def create_booking(  # noqa: PLR0913 - each is one knob of a single well-defined write
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,

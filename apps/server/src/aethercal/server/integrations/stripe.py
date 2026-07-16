@@ -76,7 +76,7 @@ class StripeWebhookAdapter:
         # rotation). Any match authorises.
         return any(hmac.compare_digest(expected, presented) for presented in signatures)
 
-    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:
+    def parse(self, raw_body: bytes) -> ParsedWebhookEvent | None:  # noqa: PLR0911 - one return per Stripe event type + the guards
         try:
             event = json.loads(raw_body)
         except (json.JSONDecodeError, ValueError):

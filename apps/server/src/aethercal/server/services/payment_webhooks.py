@@ -193,7 +193,7 @@ async def record_payment_event(
     return row, True
 
 
-async def dispatch_payment_event(
+async def dispatch_payment_event(  # noqa: PLR0913 - the event's identity + the arbiter's inputs
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
