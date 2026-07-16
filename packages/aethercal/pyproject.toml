@@ -14,7 +14,7 @@ dependencies = [
     "aethercal-core",
     "aethercal-schemas",
     "aethercal-client",
-    "typer>=0.12",
+    "typer>=0.27.0",
 ]
 # NOTE: the console_scripts entry point (`aethercal = ...`) is added when the CLI is built
 # test-first in F1. No untested entry point is wired during F0 scaffolding.

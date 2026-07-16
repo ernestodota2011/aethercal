@@ -48,11 +48,11 @@ dev = [
     # in-memory AsyncSession the service-layer TDD runs against (no Postgres needed).
     "pytest-asyncio>=0.24",
     "aiosqlite>=0.20",
-    "hypothesis>=6.100",
+    "hypothesis>=6.156.6",
     # Independent oracle for cross-checking our recurrence expansion (test-only, never runtime —
     # using it both to expand and to verify would make the cross-check circular).
     "recurring-ical-events>=3",
-    "ruff>=0.6",
+    "ruff>=0.15.22",
     "pyright>=1.1.380",
     "import-linter>=2",
     "poethepoet>=0.29",
