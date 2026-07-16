@@ -150,11 +150,22 @@ async def rotate_fernet_key(
         name = f"{column.table}.{column.column}"
         rewritten[name] = 0
 
+        # ==FOR UPDATE, and it is load-bearing.== The read and the re-encrypting UPDATE below are
+        # two statements with a gap between them, and a credential updated in that gap (a business
+        # rotating its own payment key, on the app role) would otherwise be LOST: the rotation would
+        # write the re-encryption of the value it read — the stale one — on top of it, and report
+        # success. Locking each row as it is read makes a concurrent write WAIT for this transaction
+        # to commit and then apply on top; the rotation runs as the owner (BYPASSRLS), so the lock
+        # is taken across every business's rows regardless of RLS. Proved in
+        # ``tests/test_key_rotation_concurrency.py``.
+        #
         # Loaded in one go: these tables hold one row per business per provider (and one per webhook
         # subscription), so they are small by construction — there is no design in which an instance
         # has a million credentials. If that ever stops being true, THIS is the line to batch, and
-        # the batching has to stay inside the single transaction.
-        rows: list[Any] = list(await session.execute(sa.select(primary_key, ciphertext)))
+        # the batching (and its FOR UPDATE) has to stay inside the single transaction.
+        rows: list[Any] = list(
+            await session.execute(sa.select(primary_key, ciphertext).with_for_update())
+        )
 
         for row_id, token in rows:
             try:
