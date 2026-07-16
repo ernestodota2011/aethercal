@@ -50,7 +50,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -58,11 +58,12 @@ from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model.booking import BookingStatus
-from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus
+from aethercal.server.db.models import Booking, EventType, Payment, PaymentStatus, RefundKind
 from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
     OutboxWork,
+    as_utc,
     enqueue_effect,
     refund_dedupe_key,
 )
@@ -168,6 +169,56 @@ async def enqueue_refund(
         dedupe_key=refund_dedupe_key(provider_ref),
         payload={"provider": provider, "provider_ref": provider_ref},
     )
+
+
+def is_refund_eligible(event_type: EventType, *, booking: Booking, now: datetime) -> bool:
+    """Whether cancelling ``booking`` right now earns a refund, per the event type's rule.
+
+    ==full | none, and a grace window measured against the LIVE booking's start.== ``refund_kind``
+    must be ``FULL`` (``NONE`` gives nothing back), and the cancellation must land at or before
+    ``start_at + refund_window_minutes`` — the window is measured against the CURRENT booking's
+    start, which after a reschedule is the successor's, never the original's (§4.4).
+
+    Partial/tiered refunds are F5, so this is a boolean, not an amount: the whole charge comes back
+    or none of it does.
+    """
+    if event_type.refund_kind is not RefundKind.FULL:
+        return False
+    window_end = as_utc(booking.start_at) + timedelta(minutes=event_type.refund_window_minutes)
+    return as_utc(now) <= window_end
+
+
+async def enqueue_cancellation_refunds(
+    session: AsyncSession, *, booking: Booking, event_type: EventType, now: datetime
+) -> int:
+    """When an eligible paid booking is cancelled, queue a REFUND per PAID payment. Returns count.
+
+    ==The SECOND refund enqueue path (the arbiter's late-webhook branch is the first).== Both key on
+    ``provider_ref``, so the outbox UNIQUE collapses them to one row (criterion 30). Only ``paid``
+    payments are refunded — an ``intent`` never captured money, and a ``refunded`` one is already
+    done. A double payment (two paid rows) queues two refunds, one per charge.
+
+    Not gated on the ``effects`` bundle: a refund is domain-required money movement, like the
+    cancellation webhook and the ``on_cancel`` workflow — never contingent on a live SMTP/Google at
+    cancel time.
+    """
+    if not is_refund_eligible(event_type, booking=booking, now=now):
+        return 0
+    payments = (
+        await session.scalars(
+            select(Payment).where(
+                Payment.booking_id == booking.id,
+                Payment.status == PaymentStatus.PAID.value,
+            )
+        )
+    ).all()
+    count = 0
+    for payment in payments:
+        await enqueue_refund(
+            session, booking=booking, provider=payment.provider, provider_ref=payment.provider_ref
+        )
+        count += 1
+    return count
 
 
 async def apply_paid_event(  # noqa: PLR0913,PLR0911 - one keyword per event field; one return per named §4.4 branch
@@ -406,7 +457,9 @@ __all__ = [
     "ConfirmEffects",
     "PaymentGateway",
     "apply_paid_event",
+    "enqueue_cancellation_refunds",
     "enqueue_refund",
+    "is_refund_eligible",
     "make_expire_hold_runner",
     "make_refund_runner",
     "resolve_payment",

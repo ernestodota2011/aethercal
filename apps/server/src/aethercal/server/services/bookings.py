@@ -59,6 +59,7 @@ from aethercal.server.services.outbox import (
     enqueue_effect,
     google_dedupe_key,
 )
+from aethercal.server.services.payments import enqueue_cancellation_refunds
 from aethercal.server.services.slots import SlotsResult, compute_slots, day_is_at_cap
 from aethercal.server.services.webhooks import enqueue_event
 from aethercal.server.services.workflows import BookingTransition, apply_booking_transition
@@ -614,6 +615,12 @@ async def cancel_booking(
     await apply_booking_transition(
         session, booking=booking, transition=BookingTransition.CANCEL, now=now
     )
+    # ==The money, if the cancellation earns it back (B-05b, criterion 26).== A paid booking cancelled
+    # within the event type's refund window queues a REFUND per paid charge — the SECOND enqueue path,
+    # which the arbiter's late-webhook branch collapses with by the shared provider_ref dedupe key
+    # (criterion 30). Not gated on ``effects``: a refund is domain-required money movement, like the
+    # cancellation webhook and the ``on_cancel`` workflow above, never contingent on a live sender.
+    await enqueue_cancellation_refunds(session, booking=booking, event_type=event_type, now=now)
     if effects is not None:
         await _enqueue_google(
             session, booking=booking, event_type=event_type, operation=GoogleOperation.DELETE
