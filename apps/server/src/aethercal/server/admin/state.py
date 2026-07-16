@@ -1299,7 +1299,11 @@ class AdminState(rx.State):
                     public_name=_clean(form_data, "public_name"),
                     logo_url=_clean(form_data, "logo_url"),
                     accent_color=_clean(form_data, "accent_color"),
-                    timezone=_clean(form_data, "timezone") or "UTC",
+                    # NO "or UTC": a blank box is the operator's decision, not consent to a
+                    # default. Coercing it here skips validation and writes UTC in silence; let the
+                    # empty reach the schema, which refuses it (the column's server_default still
+                    # backfills existing rows — that is the migration's job, not the form's).
+                    timezone=_clean(form_data, "timezone"),
                 ),
             )
             self.branding = branding_row(view)

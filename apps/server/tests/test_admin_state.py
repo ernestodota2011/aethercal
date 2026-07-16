@@ -769,3 +769,44 @@ async def test_save_branding_keeps_the_validation_error_visible(
     # ...and the boxes show what is stored (the seed's UTC), not the rejected submission.
     assert state.branding["timezone"] == "UTC"
     assert state.branding["public_name"] == ""
+
+
+async def test_save_branding_refuses_a_blank_timezone_instead_of_silently_choosing_utc(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A cleared timezone box is not consent to UTC — it is refused, and nothing is written.==
+
+    The handler used to coerce a blank with ``or "UTC"`` before the schema ever saw it, so the
+    operator's empty field was silently decided for them (a no-op the docstring's "NOTHING is
+    written" contract forbids). A blank must reach the validator and come back as an error, leaving
+    the stored zone untouched.
+    """
+    state = await _authenticated_state(seeded_maker)
+    # A known, non-UTC starting point, so "kept" and "silently set to UTC" cannot look the same.
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "America/New_York",
+        },
+    )
+    assert state.error == ""
+    assert state.branding["timezone"] == "America/New_York"
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # Nothing was written: a fresh read still finds the zone from the successful save.
+    await AdminState.load_branding.fn(state)
+    assert state.branding["timezone"] == "America/New_York"
