@@ -63,6 +63,47 @@
   // exactly as if the iframe had been hand-authored in that spot.
   script.parentNode.insertBefore(iframe, script.nextSibling);
 
+  // Graceful fallback: if the service is down (`onerror`) or loads but never posts a resize (the
+  // 12s timeout), a bare iframe leaves a silent hole on the host page. Swap in an accessible message
+  // linking straight to the full booking page, so a visitor is never stranded.
+  var booted = false;
+  var replaced = false;
+  var pageSrc = base + "/e/" + encodeURIComponent(slug);
+  if (lang) {
+    pageSrc += "?lang=" + encodeURIComponent(lang);
+  }
+  var spanish = lang && lang.indexOf("es") === 0;
+  function showFallback() {
+    if (replaced || booted) {
+      return;
+    }
+    replaced = true;
+    var box = document.createElement("div");
+    box.setAttribute("role", "alert");
+    box.style.padding = "16px";
+    box.style.font = "16px/1.5 system-ui, sans-serif";
+    box.appendChild(
+      document.createTextNode(
+        spanish
+          ? "No pudimos cargar el calendario de reservas aquí. "
+          : "We couldn't load the booking calendar here. ",
+      ),
+    );
+    var link = document.createElement("a");
+    link.href = pageSrc;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.appendChild(
+      document.createTextNode(spanish ? "Abrir la página de reservas" : "Open the booking page"),
+    );
+    box.appendChild(link);
+    if (iframe.parentNode) {
+      iframe.parentNode.replaceChild(box, iframe);
+    }
+  }
+  iframe.onerror = showFallback;
+  window.setTimeout(showFallback, 12000);
+
   // The origin an incoming `postMessage` must match to be trusted (derived from `data-base`, not
   // hardcoded) — computed via the classic anchor-element trick rather than the `URL` constructor,
   // so this keeps working on older browsers with no native `URL` support.
@@ -90,6 +131,8 @@
     if (!data || data.type !== "aethercal:resize") {
       return;
     }
+    // A trusted resize from our own iframe is proof the page is alive — cancel the fallback.
+    booted = true;
     var height = data.height;
     if (typeof height === "number" && height > 0) {
       iframe.style.height = height + "px";
