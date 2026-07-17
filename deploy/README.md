@@ -89,6 +89,7 @@ with per-line comments. The essentials:
 | `AETHERCAL_RUN_SCHEDULER` | — | Run the background scheduler in **this** process (see below) |
 | `AETHERCAL_AUTO_MIGRATE` | — | **RETIRED.** A truthy value now FAILS the boot; the one-shot `migrate` service owns migrations. See below. |
 | `AETHERCAL_BOOKING_BASE_URL` | — | Public base for guest cancel/reschedule links |
+| `AETHERCAL_TENANT_SLUG` | for `/e/…` | The business the **booking page** serves when the URL does not name one — your `create-tenant --slug`. Blank → the page has no default and answers every unprefixed `/e/{slug}` with **404** (only `/t/{slug}/e/{slug}` works), while `/healthz` still reports 200 |
 | `AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS` | — | Origins allowed to iframe `/embed/*` (the [embeddable widget](../docs/embedding.md)). Blank → `*` (any origin) |
 | `AETHERCAL_BOOKING_TRUSTED_PROXIES` | — | CIDRs of reverse proxies trusted to set `CF-Connecting-IP` for the rate limiter. Blank → use the transport peer address |
 | `AETHERCAL_SMTP_*` | — | Transactional email — the instance **relay**, lent to any business with no SMTP of its own (absent → email skipped, app still boots) |

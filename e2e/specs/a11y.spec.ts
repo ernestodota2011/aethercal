@@ -42,7 +42,22 @@ function summarise(violations: Violation[]): string {
 }
 
 async function auditPage(page: Page, url: string): Promise<void> {
-  await page.goto(url);
+  const response = await page.goto(url);
+
+  // ==axe cannot tell you that it audited the wrong page.== These specs passed, in 1m44s, through
+  // an entire run in which every `/e/{slug}` answered 404: a "Not found" page is a heading and a
+  // paragraph, and it has no WCAG violations whatsoever. The gate returned a clean, confident green
+  // about a page that was not there — while the golden flow, pointed at the very same URL, failed
+  // looking for the slot picker.
+  //
+  // "Zero violations" says something only once the thing audited is the thing we meant. A status
+  // check is not ceremony here: it is the difference between an audit and a photograph of an error
+  // page.
+  expect(
+    response?.status(),
+    `${url} did not render — axe would audit the error page and report zero violations`,
+  ).toBeLessThan(400);
+
   const results = await new AxeBuilder({ page }).withTags(WCAG).analyze();
   const violations = results.violations as unknown as Violation[];
   expect(

@@ -31,6 +31,34 @@ async function assertBookingPageIsUp(bookingUrl: string): Promise<void> {
   }
 }
 
+/**
+ * ==The premise every browser spec rests on — asked HERE, of the page, in the page's own terms.==
+ *
+ * `/healthz` is a liveness probe, and it answered 200 through an entire run in which every
+ * `/e/{slug}` was a 404: the page was perfectly healthy and simply had no business to serve
+ * (`AETHERCAL_TENANT_SLUG` unset means "no default — every route must carry `/t/{tenant}/…`"). The
+ * suite met that as `locator('#slots')` timing out in the first browser journey, which names
+ * neither the cause nor the fix — and the a11y specs met the very same 404 as a clean GREEN, because
+ * a "Not found" page has no accessibility violations to report.
+ *
+ * Health is not readiness to be BOOKED. So this asks the one question the specs are actually about:
+ * can a guest open the event we just created? Everything else in this file is fail-closed; this was
+ * the hole in it.
+ */
+async function assertBookingPageServesTheEvent(bookingUrl: string, slug: string): Promise<void> {
+  const url = `${bookingUrl}/e/${slug}?tz=UTC&lang=en`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(
+      `The booking page answered ${response.status} for ${url}, so no browser spec can book ` +
+        "anything. The event type exists and the API offers its slots, so this is the PAGE failing " +
+        "to resolve the business — check AETHERCAL_TENANT_SLUG in deploy/.env: unset, the page has " +
+        "no default business and answers every unprefixed /e/{slug} with a 404. stack-up.sh writes " +
+        "it from the same TENANT_SLUG it creates the tenant with.",
+    );
+  }
+}
+
 export default async function globalSetup(): Promise<void> {
   const stack = stackConfig(); // throws when the stack was never brought up
   const api = new Api(stack);
@@ -88,6 +116,10 @@ export default async function globalSetup(): Promise<void> {
         "server clock is wrong — the suite refuses to run on an empty calendar.",
     );
   }
+
+  // The API offers the slots; now prove the PAGE will hand them to a guest. Last, because it is the
+  // composite of everything above — the key, the business, the event type and the schedule.
+  await assertBookingPageServesTheEvent(stack.bookingUrl, eventType.slug);
 
   const context: RunContext = {
     runId,
