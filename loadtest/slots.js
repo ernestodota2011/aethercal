@@ -35,6 +35,9 @@ export const options = {
   thresholds: {
     http_req_failed: ["rate<0.01"], // < 1% of requests error
     http_req_duration: ["p(95)<500", "p(99)<1500"], // p95 under 500ms, p99 under 1.5s
+    // The functional `check()`s below must ALSO gate the run — otherwise a fast 200 that returns a
+    // malformed body (no slots array) passes silently, and "fast but wrong" reads as success.
+    checks: ["rate>0.99"], // > 99% of the status/body checks pass
   },
 };
 
