@@ -83,10 +83,17 @@ CRASHED_BEFORE = [
 #: a comment saying exactly that and asserting NOTHING, because pinning either answer would have
 #: failed the suite on the other operating system.
 #:
-#: The rule no longer asks the filesystem: a zone is a MEMBER of ``available_timezones()``, so these
-#: are refused everywhere. That is a deliberate behaviour change — ``tz=utc`` now 422s on a
-#: developer's Windows box exactly as it always did in production — and it is the point: a rule with
-#: two answers is not a rule, and the machine getting the wrong one was the one serving guests.
+#: The rule no longer asks the filesystem: a zone is a MEMBER of the set IANA PUBLISHES (the listing
+#: shipped inside ``tzdata``), so these are refused everywhere. That is a deliberate behaviour
+#: change — ``tz=utc`` now 422s on a developer's Windows box exactly as it always did in production
+#: — and it is the point: a rule with two answers is not a rule, and the machine getting the wrong
+#: one was the one serving guests.
+#:
+#: ==This comment used to say "a MEMBER of ``available_timezones()``", and that was the NEXT bug.==
+#: That function unions a walk of ``TZPATH`` into the published listing, so it varies by host too:
+#: it accepted ``localtime`` on Linux (a Debian/Ubuntu artifact) while refusing it on Windows —
+#: ``/slots?tz=localtime`` resolving to the SERVER's clock. The authority is the published listing;
+#: see ``aethercal.core.tz.zones._published_zones``.
 OS_DIVERGED = [
     "utc",
     "UTC ",

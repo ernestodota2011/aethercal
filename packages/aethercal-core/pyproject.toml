@@ -24,7 +24,12 @@ dependencies = [
     "python-dateutil>=2.9",
     "icalendar>=6",
     "pydantic>=2.7",
-    "tzdata>=2024.1; platform_system == 'Windows'",
+    # The IANA zone LISTING is what `core.tz` decides "is this a real timezone" against, so it is
+    # required on every platform — not just the one with no system tz tree. The old
+    # `platform_system == 'Windows'` marker is exactly what kept a defect latent: with the wheel
+    # absent on Linux, the rule fell through to a walk of /usr/share/zoneinfo and accepted
+    # `localtime` (a Debian/Ubuntu artifact) as a real zone, in production only.
+    "tzdata>=2024.1",
 ]
 
 [project.urls]
