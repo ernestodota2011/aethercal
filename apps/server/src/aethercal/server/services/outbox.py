@@ -390,6 +390,48 @@ literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE 
 in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
 
 
+class Priority(StrEnum):
+    """Where an effect sits in the drain order when several intents are due at once."""
+
+    MONEY_FIRST = "money_first"
+    """Ahead of everything, even OLDER intents. A refund waiting behind a backlog of notifications
+    is a guest's money withheld for hours; a late ``EXPIRE_HOLD`` is a slot blocked."""
+    NORMAL = "normal"
+    """Ordered by ``created_at`` (with the GOOGLE-before-EMAIL causal tie-break applied on top)."""
+
+
+def priority_policy(effect: OutboxEffect) -> Priority:
+    """Whether ``effect`` jumps the drain queue ahead of older intents. EXHAUSTIVE, assert_never.
+
+    Exactly like the staleness / confirmation / voidability tables, and for the same reason: the
+    money-first ordering in :func:`select_due` USED to be a hand-written
+    ``effect.in_((REFUND, EXPIRE_HOLD))`` inside the ``ORDER BY``. A new money effect added to
+    ``OutboxEffect`` would then queue behind a week-old reminder in silence — the exact "did not, by
+    accident" one edit away from a real fault that this repo keeps turning into type errors.
+
+    * ``REFUND`` / ``EXPIRE_HOLD`` → **MONEY_FIRST**. Money out or a slot freed outranks even
+      ``created_at``: a refund now must not wait behind a reminder enqueued a week ago.
+    * ``EMAIL`` / ``GOOGLE`` / ``NOTIFY`` → **NORMAL**. Ordered by age; GOOGLE's precedence over
+      EMAIL within one instant is a separate causal tie-break, not a queue jump.
+    """
+    match effect:
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            return Priority.MONEY_FIRST
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Priority.NORMAL
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+_MONEY_FIRST_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if priority_policy(effect) is Priority.MONEY_FIRST
+)
+"""The effect values that outrank ``created_at`` in :func:`select_due` — DERIVED from
+:func:`priority_policy`, never a literal. A new money effect is prioritised for free; forget to
+classify one and the type check fails at ``priority_policy`` rather than letting it queue behind a
+week-old reminder in silence."""
+
+
 class Purgeability(StrEnum):
     """Whether the GUEST ERASURE (``services/privacy.py``) may delete a queued intent."""
 
@@ -1268,12 +1310,7 @@ async def select_due(
                     # slot blocked. So these outrank even ``created_at`` — a refund now must
                     # not queue behind a reminder enqueued a week ago for a booking three weeks out.
                     case(
-                        (
-                            Outbox.effect.in_(
-                                (OutboxEffect.REFUND.value, OutboxEffect.EXPIRE_HOLD.value)
-                            ),
-                            0,
-                        ),
+                        (Outbox.effect.in_(_MONEY_FIRST_EFFECTS), 0),
                         else_=1,
                     ),
                     Outbox.created_at,
