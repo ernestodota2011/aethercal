@@ -210,31 +210,37 @@ def test_the_loopback_rule_is_derived_not_a_host_list() -> None:
     assert not _is_loopback(("api.stripe.com", 443)), "a hostname means a real resolution was meant"
 
 
-@pytest.mark.db
-def test_the_database_reaches_its_tailnet_host_through_the_floor(pg_admin_url: str) -> None:
-    """==Anti-vacuity, at the place everyone expected the guard to break.==
+def _database_host_is_loopback(url: str) -> bool:
+    """Whether the DB URL denotes THIS machine — by address (``127.0.0.1``) or by name.
 
-    The test database is at a TAILNET address, not localhost, so a loopback-only rule looks certain
-    to block it — which is why the obvious design was an allowance derived from
-    ``AETHERCAL_TEST_DATABASE_URL``. ==It was never written, because measurement says the DB does
-    not reach this guard at all==: ``psycopg`` connects through ``libpq``, in C, and never touches
-    Python's ``socket`` module.
+    ==Derived, and it reuses the guard's own rule rather than forming a second opinion about it.==
+    The host comes from SQLAlchemy's parser (the same one that hands libpq its target), is resolved,
+    and every answer is put to :func:`_is_loopback` — the very function the guard consults. So
+    "would the loopback allowance apply here?" is answered by the allowance itself and cannot drift
+    from it.
 
-    This test is that measurement, kept: it records every ``socket.socket.connect`` Python makes
-    during a real query and asserts BOTH that the query worked and that the guard saw nothing. If a
-    future driver were pure-Python, the recorded list would stop being empty and this would say so —
-    which is the moment to derive the allowance, with a test that can prove it.
+    This used to be ``"127.0.0.1" not in url and "localhost" not in url``. A substring of the whole
+    URL is not the host: it says "on loopback" for a database NAMED ``localhost_test`` and for a
+    password that merely contains ``127.0.0.1``. The key must be as fine as the meaning.
     """
-    # ==The skip rides on the fixture, not on the marker.== `pytest.mark.db` only SELECTS; what
-    # makes an offline run skip quietly is depending on `pg_admin_url`, which is where conftest
-    # calls `pytest.skip`. Reading the environment directly instead made this fail on every laptop
-    # without a database — the marker is not a guard.
-    url = pg_admin_url
-    assert "127.0.0.1" not in url and "localhost" not in url, (
-        "this test is only meaningful while the DB is NOT on loopback — if it moved to localhost "
-        "the loopback rule would let it through and prove nothing about libpq"
-    )
+    host = sa.engine.make_url(url).host
+    if host is None:
+        return True  # a UNIX socket: the connection cannot leave the machine by construction
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False  # a name that does not resolve is not this machine
+    return bool(infos) and all(_is_loopback(info[4]) for info in infos)
 
+
+def _python_connects_during_a_real_query(url: str) -> list[object]:
+    """Every address Python's ``socket`` layer was asked to connect to while a real query ran.
+
+    ==The query is asserted HERE, not by the callers.== A recording that captured nothing because
+    the database was never reached is an empty list — the same value success produces — and both
+    tests below read exactly that list for their verdict. So the measurement fails loudly rather
+    than handing back "nothing happened".
+    """
     seen: list[object] = []
     real_connect = socket.socket.connect
 
@@ -248,7 +254,70 @@ def test_the_database_reaches_its_tailnet_host_through_the_floor(pg_admin_url: s
             assert conn.execute(sa.text("SELECT 1")).scalar_one() == 1
     finally:
         engine.dispose()
+    return seen
 
+
+@pytest.mark.db
+def test_psycopg_never_reaches_pythons_socket_layer(pg_admin_url: str) -> None:
+    """==The alarm — and it must ring WHEREVER a database runs.==
+
+    ``psycopg`` connects through ``libpq``, in C, and never touches Python's ``socket`` module,
+    which is why the guard has no allowance for the database and needs none. This is that
+    measurement, kept as a test rather than a comment: if a future driver were pure-Python the
+    recorded list would stop being empty and this would say so — the moment to derive the allowance
+    from ``AETHERCAL_TEST_DATABASE_URL``, with a test that can prove it.
+
+    ==It deliberately does NOT require the database to be off loopback.== Its sibling below does,
+    and skips in CI for exactly that reason; gating this measurement on the same premise would have
+    left the alarm ringing on one laptop and nowhere else — the driver could go pure-Python and
+    every CI run would stay green. Whether libpq calls Python's socket layer has nothing to do with
+    the address it is calling about.
+    """
+    seen = _python_connects_during_a_real_query(pg_admin_url)
+    assert seen == [], (
+        "psycopg reached Python's socket layer — the floor now applies to the database, and the "
+        f"allowance derived from AETHERCAL_TEST_DATABASE_URL must be written. Saw: {seen}"
+    )
+
+
+@pytest.mark.db
+def test_the_database_reaches_its_tailnet_host_through_the_floor(pg_admin_url: str) -> None:
+    """==Anti-vacuity, at the place everyone expected the guard to break.==
+
+    A tailnet database sits at an address the loopback-only rule looks certain to block, so a query
+    that SUCCEEDS while the guard is armed is the proof that no DB allowance is needed. On loopback
+    that proof evaporates — the connection is let through by the allowance regardless, and the test
+    would pass while demonstrating nothing about libpq.
+
+    ==So it declines instead of pretending.== The premise is a property of the environment, not a
+    defect, and the two outcomes must stay distinguishable: a PASS here means *measured, and the
+    floor really was crossed*; a SKIP means *this database is in no position to tell us*. An
+    unconditional pass would be the vacuous green this file exists to prevent. The skip costs this
+    INFERENCE only — the measurement it rests on keeps running above, on every database.
+
+    .. note::
+
+       ==This is not the house rule bending.== ``-m db`` FAILS rather than skips when Postgres is
+       absent, because a green report about a database nobody tested is the no-op that rule forbids.
+       Nothing is absent here: the CI service container is present, reachable, and every other
+       db-marked test runs against it. What is missing is a database somewhere the guard would
+       refuse — a shape of the environment, which no arranging inside this process can conjure. CI
+       runs ``pytest -m db -rs``, so the reason is printed: it declines out loud.
+    """
+    # ==The skip rides on the fixture, not on the marker.== `pytest.mark.db` only SELECTS; what
+    # makes an offline run skip quietly is depending on `pg_admin_url`, which is where conftest
+    # calls `pytest.skip`. Reading the environment directly instead made this fail on every laptop
+    # without a database — the marker is not a guard.
+    if _database_host_is_loopback(pg_admin_url):
+        pytest.skip(
+            "the test database is on loopback (the CI service container), so the guard's loopback "
+            "allowance lets it through whatever libpq does — this test cannot discriminate here. "
+            "Point AETHERCAL_TEST_DATABASE_URL at a non-loopback host (the tailnet database) to "
+            "measure it. The libpq measurement itself still runs, in "
+            "test_psycopg_never_reaches_pythons_socket_layer."
+        )
+
+    seen = _python_connects_during_a_real_query(pg_admin_url)
     assert seen == [], (
         "psycopg reached Python's socket layer — the floor now applies to the database, and the "
         f"allowance derived from AETHERCAL_TEST_DATABASE_URL must be written. Saw: {seen}"
