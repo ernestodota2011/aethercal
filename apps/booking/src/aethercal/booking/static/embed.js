@@ -58,10 +58,73 @@
   iframe.style.width = "100%";
   iframe.style.border = "0";
   iframe.style.minHeight = "640px"; // a reasonable first paint; the resize listener refines it
+  // NOTE: the iframe is NOT inserted here. It is added to the DOM at the very end, AFTER the
+  // `message` listener is registered — an iframe outside the DOM has no browsing context, so it
+  // cannot load or post a resize until it is attached, and by attaching last we guarantee the
+  // listener already exists. No resize can slip through the gap because there is no gap.
 
-  // Insert right where the <script> tag sits, so the host's own layout/CSS around it applies
-  // exactly as if the iframe had been hand-authored in that spot.
-  script.parentNode.insertBefore(iframe, script.nextSibling);
+  // Graceful fallback: if the service is down (`onerror`) or loads but never posts a resize (the
+  // timer below), a bare iframe leaves a silent hole. Swap in an accessible message linking to the
+  // full booking page, so a visitor is never stranded.
+  var booted = false;
+  var replaced = false;
+  var pageSrc = base + "/e/" + encodeURIComponent(slug);
+  if (lang) {
+    pageSrc += "?lang=" + encodeURIComponent(lang);
+  }
+  var spanish = lang && lang.indexOf("es") === 0;
+  function showFallback() {
+    if (replaced || booted) {
+      return;
+    }
+    replaced = true;
+    var box = document.createElement("div");
+    box.setAttribute("role", "alert");
+    box.style.padding = "16px";
+    box.style.font = "16px/1.5 system-ui, sans-serif";
+    box.appendChild(
+      document.createTextNode(
+        spanish
+          ? "No pudimos cargar el calendario de reservas aquí. "
+          : "We couldn't load the booking calendar here. ",
+      ),
+    );
+    var link = document.createElement("a");
+    link.href = pageSrc;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.appendChild(
+      document.createTextNode(spanish ? "Abrir la página de reservas" : "Open the booking page"),
+    );
+    box.appendChild(link);
+    if (iframe.parentNode) {
+      iframe.parentNode.replaceChild(box, iframe);
+    }
+  }
+  iframe.onerror = showFallback;
+  // The "never posted a resize" timer must not start at mount when the iframe DEFERS loading: a
+  // lazy iframe below the fold loads only when scrolled into view, so a mount-time timer would
+  // replace a good iframe. Gate on the viewport only when BOTH hold — lazy is honoured AND IO can
+  // report entry. If lazy is unsupported the iframe loads at mount (IO does not change that), so
+  // arm now; likewise if IO is missing.
+  function armFallbackTimer() {
+    window.setTimeout(showFallback, 12000);
+  }
+  var lazyHonoured = "loading" in HTMLIFrameElement.prototype;
+  if (lazyHonoured && "IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].isIntersecting) {
+          io.disconnect();
+          armFallbackTimer();
+          return;
+        }
+      }
+    });
+    io.observe(iframe);
+  } else {
+    armFallbackTimer();
+  }
 
   // The origin an incoming `postMessage` must match to be trusted (derived from `data-base`, not
   // hardcoded) — computed via the classic anchor-element trick rather than the `URL` constructor,
@@ -91,8 +154,16 @@
       return;
     }
     var height = data.height;
-    if (typeof height === "number" && height > 0) {
+    if (typeof height === "number" && isFinite(height) && height > 0) {
+      // Only a VALID resize (finite, positive) cancels the fallback — proof the page rendered live
+      // content. Booting on a malformed post (height 0/NaN/missing) would let a broken page disarm it.
+      booted = true;
       iframe.style.height = height + "px";
     }
   });
+
+  // NOW attach the iframe — after the message listener exists, so the resize it posts on load can
+  // never arrive before something is listening. Placed where the <script> tag sits, so the host's
+  // own layout/CSS around it applies as if the iframe had been hand-authored in that spot.
+  script.parentNode.insertBefore(iframe, script.nextSibling);
 })();

@@ -10,6 +10,7 @@ the live seam (``integrations/google/calendar.py``) makes:
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -713,6 +714,67 @@ async def test_create_event_for_booking_google_failure_raises_calendar_sync_erro
         await create_event_for_booking(
             calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
         )
+
+
+class _ThreadRecordingService(FakeGoogleService):
+    """A fake that records the OS thread its blocking ``execute`` was run on.
+
+    The whole point of the ``asyncio.to_thread`` offload is that the synchronous googleapiclient
+    call does NOT run on the event-loop thread. A stub that just returns a value cannot tell whether
+    it ran inline or on a worker thread, so this one remembers the thread ident.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.freebusy_thread: int | None = None
+        self.insert_thread: int | None = None
+
+    def freebusy(self) -> Any:
+        self.freebusy_thread = threading.get_ident()
+        return super().freebusy()
+
+    def events(self) -> Any:
+        self.insert_thread = threading.get_ident()
+        return super().events()
+
+
+async def test_create_event_for_booking_runs_the_blocking_call_off_the_event_loop(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    service = _ThreadRecordingService(insert_result=_INSERT_RESULT)
+    loop_thread = threading.get_ident()
+
+    await create_event_for_booking(
+        calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
+    )
+
+    assert service.insert_thread is not None
+    assert service.insert_thread != loop_thread, (
+        "the synchronous Google insert must run on a worker thread, not the event loop"
+    )
+
+
+async def test_refresh_busy_cache_runs_the_blocking_call_off_the_event_loop(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    tenant = await tenant_factory(sqlite_session)
+    connection = await _connect(sqlite_session, tenant, fernet=fernet)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    window = TimeInterval(start=now, end=now + timedelta(days=1))
+    service = _ThreadRecordingService(freebusy_response=_freebusy([]))
+    loop_thread = threading.get_ident()
+
+    await refresh_busy_cache(
+        sqlite_session, connection=connection, window=window, now=now, service=service
+    )
+
+    assert service.freebusy_thread is not None
+    assert service.freebusy_thread != loop_thread, (
+        "the synchronous freebusy query must run on a worker thread, not the event loop"
+    )
 
 
 async def test_delete_event_for_booking_calls_google(

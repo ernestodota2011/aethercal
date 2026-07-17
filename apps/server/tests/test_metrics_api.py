@@ -221,6 +221,43 @@ async def test_metrics_with_the_operator_token_serves_prometheus_text(
     assert "ada@example.com" not in body
 
 
+async def test_metrics_summary_with_the_operator_token_serves_the_human_report(
+    sqlite_maker: async_sessionmaker[AsyncSession], client_factory: ClientFactory
+) -> None:
+    """The human-readable twin: the operator running the shadow reads the same numbers as a person,
+    and it leaks no more than the Prometheus text does."""
+    tenant = await _seed(sqlite_maker)
+    client = await client_factory(metrics_token=_TOKEN)
+
+    resp = await client.get(
+        "/api/v1/metrics/summary", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    body = resp.text
+    # The operator-facing sections a shadow run reads.
+    assert "Bookings" in body
+    assert "Outbox" in body
+    assert "Payments" in body
+    assert "dead-man" in body  # the health line is named, not buried
+    # And, exactly like /metrics, it says the numbers but never WHOSE.
+    assert tenant.slug not in body
+    assert "ada@example.com" not in body
+
+
+async def test_metrics_summary_without_a_token_is_unauthorized(
+    client_factory: ClientFactory,
+) -> None:
+    """Same guard as /metrics: it is every business's volume side by side, so a scrape with no
+    operator token is refused, never served."""
+    client = await client_factory(metrics_token=_TOKEN)
+
+    resp = await client.get("/api/v1/metrics/summary")
+
+    assert resp.status_code == 401
+
+
 async def test_a_non_ascii_bearer_token_is_401_not_500(
     sqlite_maker: async_sessionmaker[AsyncSession], client_factory: ClientFactory
 ) -> None:

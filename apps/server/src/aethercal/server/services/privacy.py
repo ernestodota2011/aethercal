@@ -268,6 +268,10 @@ RETAINED_OUTBOX_COLUMNS: dict[str, str] = {
     "claimed_by": "the WORKER's id (host:pid:uuid, from `new_worker_id`) — our infrastructure, "
     "never the guest.",
     "lease_expires_at": "when our own worker's lease runs out.",
+    "skip_reason": "free-form — an exception's own text (`str(SendRefused)`, a rendered "
+    "`TemplateError`), so it cannot be vouched PII-free by construction the way the others are. So "
+    "the erasure does NOT trust it: `_redact_retained_outbox` CLEARS it, same spirit as `payload` "
+    "being rebuilt — keep the row, remove the person.",
 }
 """Every column a RETAINED intent keeps, and why keeping it names nobody.
 
@@ -656,6 +660,13 @@ async def _redact_retained_outbox(
     redacted_count = 0
     anomalies: list[str] = []
     for row in rows:
+        # skip_reason is free-form: it is an exception's own text (``str(SendRefused)``, a rendered
+        # ``TemplateError``), so it CANNOT be vouched PII-free the way the classified columns are.
+        # An erasure "cannot be conditional on the history of the codebase" (see this function's
+        # docstring), and that applies to a message string exactly as it does to the payload: do not
+        # trust it, remove it. Cleared unconditionally on a retained row — losing a skip diagnostic
+        # for the one booking a guest asked to be forgotten is the correct side of that trade.
+        row.skip_reason = None
         rebuilt = _retained_payload(row.effect, row.payload)
         if not rebuilt.changed:
             continue

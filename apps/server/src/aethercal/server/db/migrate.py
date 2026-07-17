@@ -7,7 +7,11 @@ same tables; migrations are forward-only (expand-and-contract), per the plan's s
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import psycopg
 from alembic import command
@@ -22,6 +26,56 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 # A fixed 63-bit key (ASCII "AethCal1") namespacing the boot-migration advisory lock. Any process
 # running AetherCal migrations against this database contends on the same key.
 ADVISORY_LOCK_KEY = 0x4165_7468_4361_6C31
+
+# How long to wait for that lock before giving up. Replicas booting together should serialize in far
+# less; a wait this long means the holder is STUCK -- a migration that hung, or a crashed booter
+# whose session Postgres has not yet reaped. The old code took the lock with ``pg_advisory_lock``,
+# which blocks FOREVER behind such a holder, wedging the one-shot ``migrate`` job with no diagnostic
+# at all. Bounded acquisition (``pg_try_advisory_lock`` polled to a deadline) turns the hang into a
+# named, legible failure instead.
+MIGRATION_LOCK_TIMEOUT = timedelta(minutes=2)
+MIGRATION_LOCK_POLL_INTERVAL = timedelta(seconds=1)
+
+
+class MigrationLockUnavailableError(RuntimeError):
+    """The boot-migration advisory lock could not be acquired within ``MIGRATION_LOCK_TIMEOUT``.
+
+    Some other process is holding it -- most likely a migration that hung or a crashed booter whose
+    session has not been reaped. Named explicitly so a stuck lock surfaces as a message pointing at
+    ``pg_locks``/``pg_stat_activity``, never as the silent forever-block ``pg_advisory_lock`` gave.
+    """
+
+
+def _acquire_migration_lock(
+    lock_conn: Any,
+    *,
+    timeout: timedelta = MIGRATION_LOCK_TIMEOUT,
+    poll_interval: timedelta = MIGRATION_LOCK_POLL_INTERVAL,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Take the session-level advisory lock non-blockingly, polling to a deadline.
+
+    Same lock the blocking ``pg_advisory_lock`` took -- session-scoped, one acquire, released by the
+    single ``pg_advisory_unlock`` in :func:`run_migrations` -- but a stuck holder now costs a
+    bounded wait and a clear error, not an unbounded hang. ``monotonic``/``sleep`` for tests.
+    """
+    key = ADVISORY_LOCK_KEY
+    deadline = monotonic() + timeout.total_seconds()
+    while True:
+        acquired = lock_conn.exec_driver_sql(
+            "SELECT pg_try_advisory_lock(%(key)s)", {"key": key}
+        ).scalar()
+        if acquired:
+            return
+        if monotonic() >= deadline:
+            raise MigrationLockUnavailableError(
+                f"Could not acquire the migration advisory lock (key {key:#018x}) within "
+                f"{timeout.total_seconds():.0f}s. Another process is holding it -- a hung "
+                "migration or a crashed booter whose session is not yet reaped. Inspect pg_locks / "
+                "pg_stat_activity for the holder before retrying `aethercal-admin db upgrade`."
+            )
+        sleep(poll_interval.total_seconds())
 
 
 def make_alembic_config(url: str) -> Config:
@@ -56,7 +110,7 @@ def run_migrations(engine: Engine) -> None:
     # Hold the lock on a dedicated autocommit connection while a separate connection (opened by
     # Alembic from the URL) applies the migrations; concurrent booters block on the lock.
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as lock_conn:
-        lock_conn.exec_driver_sql("SELECT pg_advisory_lock(%(key)s)", {"key": ADVISORY_LOCK_KEY})
+        _acquire_migration_lock(lock_conn)
         try:
             command.upgrade(config, "head")
         finally:

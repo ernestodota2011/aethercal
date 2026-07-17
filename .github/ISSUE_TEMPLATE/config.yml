@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ernestodota2011/aethercal/security/advisories/new
+    about: Please report vulnerabilities privately here, not as a public issue. See SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/ernestodota2011/aethercal/discussions
+    about: For usage questions and open-ended discussion rather than a specific bug or request.

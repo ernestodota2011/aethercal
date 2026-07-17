@@ -56,6 +56,7 @@ the booking back.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Callable
@@ -526,7 +527,13 @@ async def refresh_busy_cache(
     """
     busy: list[TimeInterval] = []
     for calendar_id in await busy_calendar_ids(session, connection=connection):
-        busy.extend(query_busy(service, calendar_id, window))
+        # ``query_busy`` is a BLOCKING network call (googleapiclient is sync). Run it off the event
+        # loop: called inline it would freeze the whole worker -- every other booking, the webhook
+        # drain, ``/metrics`` -- and, worse, defeat the ``asyncio.timeout`` the outbox wraps every
+        # effect in (that timeout only interrupts at an ``await``), so a hung Google call could
+        # outlive its lease and get re-executed. Offloading keeps the loop responsive and the
+        # timeout real. See ``create_event_for_booking`` for the write side.
+        busy.extend(await asyncio.to_thread(query_busy, service, calendar_id, window))
     await session.execute(
         delete(BusyCache).where(
             BusyCache.tenant_id == connection.tenant_id,
@@ -770,7 +777,9 @@ async def create_event_for_booking(
     transaction. A Google failure raises :class:`CalendarSyncError` so the intent retries.
     """
     try:
-        created = insert_event_with_meet(service, calendar_id, request)
+        # Blocking network write, offloaded so a hung insert cannot freeze the worker nor outlive
+        # the outbox lease (a re-drain would duplicate the event). See refresh_busy_cache.
+        created = await asyncio.to_thread(insert_event_with_meet, service, calendar_id, request)
     except Exception as exc:
         raise CalendarSyncError(f"failed to create Google event in calendar {calendar_id}") from exc
     return str(created["id"]), _extract_meet_url(created)
@@ -804,7 +813,9 @@ async def delete_event_for_booking(
     intent retries.
     """
     try:
-        delete_event(service, calendar_id, external_event_id)
+        # Blocking network call, offloaded (see ``refresh_busy_cache``): keeps the loop responsive
+        # and the outbox timeout enforceable.
+        await asyncio.to_thread(delete_event, service, calendar_id, external_event_id)
     except Exception as exc:
         if _is_already_gone(exc):
             _logger.info(
@@ -846,7 +857,10 @@ async def reschedule_event_for_booking(  # noqa: PLR0913 - source/target + their
         service=source_service,
     )
     try:
-        created = insert_event_with_meet(target_service, target_calendar_id, request)
+        # Blocking network write, offloaded (see ``refresh_busy_cache``).
+        created = await asyncio.to_thread(
+            insert_event_with_meet, target_service, target_calendar_id, request
+        )
     except Exception as exc:
         raise CalendarSyncError(
             f"failed to re-create Google event {external_event_id} in calendar {target_calendar_id}"

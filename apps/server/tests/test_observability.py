@@ -38,30 +38,13 @@ from aethercal.server.db.pools import BypassReason, WorkerPools, mark_bypass
 from aethercal.server.observability import (
     DRAIN_COUNTERS,
     DrainCounters,
+    MetricsSnapshot,
     collect_metrics,
     observe_drain,
+    render_human,
     render_prometheus,
 )
 from aethercal.server.services.outbox import OutboxEffect, OutboxReport, OutboxWork, drain_outbox
-
-
-@pytest.fixture(autouse=True)
-def _the_offline_session_is_a_scan_session(sqlite_session: AsyncSession) -> None:
-    """==Mark the fixture, because ``collect_metrics`` now REFUSES a session with no bypass.==
-
-    It reads across EVERY business by design, and it fills its gauges with zeros wherever it finds
-    nothing. Under row-level security, on the app role, those two facts together produce
-    ``outbox.due = 0`` and ``status: ready`` - for ever, with the queue on fire. So it fails rather
-    than degrading.
-
-    The detection is a MARKER on ``session.info`` rather than ``SELECT current_user``, and this
-    fixture is exactly why: these eleven tests run on SQLite, which has no roles at all. Detecting
-    by
-    role would have forced the whole suite into the Postgres job and cost real offline coverage. The
-    marker is set by ``scan_session`` in the product - a structural test asserts nothing else does -
-    and by a test fixture here, where there is no RLS to bypass in the first place.
-    """
-    mark_bypass(sqlite_session, BypassReason.OPERATOR_METRICS)
 
 
 @pytest.fixture(autouse=True)
@@ -525,3 +508,42 @@ async def test_the_scheduler_enabled_gauge_is_gone_with_the_process_that_needed_
     # precisely why the dead-man switch was built on them, and not on the counters.
     assert "aethercal_outbox_oldest_due_age_seconds" in text
     assert "aethercal_outbox_due" in text
+
+
+def test_render_human_names_the_sections_and_the_health_lines() -> None:
+    """The human summary a person reads: the operational sections and the three lines that decide
+    whether the shadow is healthy, each called out by name rather than buried in a gauge."""
+    snapshot = MetricsSnapshot(
+        outbox_by_status={"pending": 2, "delivered": 5, "skipped": 1},
+        outbox_due=3,
+        outbox_oldest_due_age_seconds=42.0,
+        bookings_by_status={"confirmed": 4, "no_show": 1, "cancelled": 2},
+        no_show_ratio=0.2,
+        webhook_deliveries_by_status={"delivered": 6},
+        webhook_deliveries_by_reason={"blocked-private-target": 0, "http-error": 1},
+        payment_events_parked=0,
+        payment_events_dead=0,
+    )
+
+    report = render_human(snapshot, now=_NOW)
+
+    assert "Bookings" in report
+    assert "Outbox" in report
+    assert "Webhooks" in report
+    assert "Payments" in report
+    # The no-show rate reads as a percentage over the appointments that were meant to happen.
+    assert "20.0%" in report
+    # The three named health lines.
+    assert "dead-man" in report  # the outbox oldest-due
+    assert "blocked-*" in report  # the webhook refusal
+    assert "MONEY dead-man" in report  # the payment dead-letter
+
+
+def test_render_human_shows_zeroes_rather_than_hiding_an_absent_series() -> None:
+    """An empty instance still prints every section with (none)/0 — "absent" and "healthy zero" must
+    never look the same to the operator, the same rule the Prometheus gauges hold."""
+    report = render_human(MetricsSnapshot(), now=_NOW)
+
+    assert "Bookings" in report
+    assert "(none)" in report  # the empty status maps, spelled out, not omitted
+    assert "0.0%" in report

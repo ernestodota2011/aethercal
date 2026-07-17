@@ -19,8 +19,15 @@ from aethercal.booking.app import STATIC_DIR, create_app
 from aethercal.booking.settings import BookingSettings
 from aethercal.client import AetherCalClient
 
-#: The loader must stay small — this is the budget the task set (B2.1), not an arbitrary number.
-_MAX_EMBED_JS_BYTES = 5 * 1024
+#: The loader must stay small — it loads on every host page. The original B2.1 budget was 5 KiB,
+#: for a loader that mounted an iframe and nothing else. The graceful fallback (a down service, or
+#: an iframe that never posts a resize, must not leave a silent hole on the tenant's page) is a real
+#: capability, and making it CORRECT cost the rest: it must gate its timer on the viewport only when
+#: the iframe truly defers loading (lazy honoured AND IntersectionObserver) and disarm only on a
+#: validated resize — two edges Crisol caught. That earns the budget to 8 KiB; the file is ~7.3 KiB
+#: (~2.3 KiB gzipped), still a small dependency-free script, which is what the budget protects —
+#: raised deliberately for a correctness requirement, never to make a bloated file fit.
+_MAX_EMBED_JS_BYTES = 8 * 1024
 
 
 def _make_client() -> TestClient:
@@ -85,6 +92,54 @@ def test_embed_js_builds_the_embed_url_from_slug_and_base() -> None:
 def test_embed_js_is_idempotent_against_double_inclusion() -> None:
     source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
     assert "data-aethercal-mounted" in source
+
+
+def test_embed_js_falls_back_when_the_iframe_cannot_load() -> None:
+    # A down service or an iframe that never posts a resize must NOT leave a silent hole on the host
+    # page: the loader arms `onerror` AND a timeout, and both lead to an accessible message that
+    # links straight to the full booking page (`/e/{slug}`, opened in a new tab).
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "onerror" in source
+    assert "setTimeout" in source
+    assert "/e/" in source  # the direct link to the full booking page
+    assert 'role", "alert"' in source or "role\", 'alert'" in source  # accessible fallback
+
+
+def test_embed_js_fallback_timer_waits_for_the_iframe_to_enter_the_viewport() -> None:
+    # Crisol finding (high·correctness): the loader also sets `loading="lazy"`, so a mount-time
+    # timer would replace a below-the-fold iframe that had not started loading yet. The timer must
+    # be gated on IntersectionObserver — armed when the iframe enters the viewport — with a direct
+    # arm as the fallback for browsers that support neither IO nor lazy loading.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "IntersectionObserver" in source
+    assert "isIntersecting" in source
+    # Lazy support and IntersectionObserver support are detected SEPARATELY (a browser can have IO
+    # but not honour iframe lazy loading, in which case the iframe loads at mount and the timer must
+    # arm immediately). The IO path is taken only when the iframe actually defers loading.
+    assert '"loading" in HTMLIFrameElement.prototype' in source
+
+
+def test_embed_js_attaches_the_iframe_only_after_the_listener_exists() -> None:
+    # Crisol finding (high·correctness): the iframe must be inserted into the DOM AFTER the message
+    # listener is registered. An iframe outside the DOM has no browsing context and cannot post a
+    # resize, so attaching it last guarantees the listener is already there when the load-time
+    # resize arrives — there is no window in which a fast resize could be missed.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    listener = source.index('addEventListener("message"')
+    insert = source.index("insertBefore(iframe")
+    assert insert > listener, "iframe attached before the message listener — a resize can race"
+
+
+def test_embed_js_only_a_valid_resize_disarms_the_fallback() -> None:
+    # Crisol finding (medium·completeness): a single malformed but correctly-typed resize post must
+    # NOT permanently disable the fallback. `booted` is set only after the height is validated as a
+    # finite positive number, so a broken page that posts `height: 0`/NaN still falls back.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "isFinite(height)" in source
+    # The boot flag lives after the validation guard, not before it.
+    guard = source.index("isFinite(height)")
+    booted = source.index("booted = true", guard)
+    assert booted > guard, "`booted = true` must come AFTER the height validation, not before"
 
 
 def test_embed_js_iframe_is_responsive_and_lazy() -> None:

@@ -185,7 +185,10 @@ _SKIPPED = OutboxStatus.SKIPPED.value
 A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
 reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
 noise in the backlog, and the message still does not arrive. The step is retired with its reason
-instead, loudly in the log and visibly in the row. """
+instead, loudly in the log and visibly in the row (``skip_reason``). """
+_SKIP_REASON_MAX_LEN = 500
+"""Cap on the persisted ``skip_reason``. It is a human diagnostic, not a payload — the two skip
+causes are short, but truncating defends the column against an unexpectedly long exception text."""
 _UNKNOWN = OutboxStatus.UNKNOWN.value
 """Handed to the provider; the answer was lost. Terminal, and NOT retried — see OutboxStatus."""
 _VOIDED = OutboxStatus.VOIDED.value
@@ -388,6 +391,48 @@ _VOIDABLE_EFFECTS: tuple[str, ...] = tuple(
 """The effect values :func:`void_pending_steps` may retire — DERIVED from the table above, never a
 literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE one can never slip
 in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
+
+
+class Priority(StrEnum):
+    """Where an effect sits in the drain order when several intents are due at once."""
+
+    MONEY_FIRST = "money_first"
+    """Ahead of everything, even OLDER intents. A refund waiting behind a backlog of notifications
+    is a guest's money withheld for hours; a late ``EXPIRE_HOLD`` is a slot blocked."""
+    NORMAL = "normal"
+    """Ordered by ``created_at`` (with the GOOGLE-before-EMAIL causal tie-break applied on top)."""
+
+
+def priority_policy(effect: OutboxEffect) -> Priority:
+    """Whether ``effect`` jumps the drain queue ahead of older intents. EXHAUSTIVE, assert_never.
+
+    Exactly like the staleness / confirmation / voidability tables, and for the same reason: the
+    money-first ordering in :func:`select_due` USED to be a hand-written
+    ``effect.in_((REFUND, EXPIRE_HOLD))`` inside the ``ORDER BY``. A new money effect added to
+    ``OutboxEffect`` would then queue behind a week-old reminder in silence — the exact "did not, by
+    accident" one edit away from a real fault that this repo keeps turning into type errors.
+
+    * ``REFUND`` / ``EXPIRE_HOLD`` → **MONEY_FIRST**. Money out or a slot freed outranks even
+      ``created_at``: a refund now must not wait behind a reminder enqueued a week ago.
+    * ``EMAIL`` / ``GOOGLE`` / ``NOTIFY`` → **NORMAL**. Ordered by age; GOOGLE's precedence over
+      EMAIL within one instant is a separate causal tie-break, not a queue jump.
+    """
+    match effect:
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            return Priority.MONEY_FIRST
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Priority.NORMAL
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+_MONEY_FIRST_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if priority_policy(effect) is Priority.MONEY_FIRST
+)
+"""The effect values that outrank ``created_at`` in :func:`select_due` — DERIVED from
+:func:`priority_policy`, never a literal. A new money effect is prioritised for free; forget to
+classify one and the type check fails at ``priority_policy`` rather than letting it queue behind a
+week-old reminder in silence."""
 
 
 class Purgeability(StrEnum):
@@ -1268,12 +1313,7 @@ async def select_due(
                     # slot blocked. So these outrank even ``created_at`` — a refund now must
                     # not queue behind a reminder enqueued a week ago for a booking three weeks out.
                     case(
-                        (
-                            Outbox.effect.in_(
-                                (OutboxEffect.REFUND.value, OutboxEffect.EXPIRE_HOLD.value)
-                            ),
-                            0,
-                        ),
+                        (Outbox.effect.in_(_MONEY_FIRST_EFFECTS), 0),
                         else_=1,
                     ),
                     Outbox.created_at,
@@ -1494,6 +1534,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
     # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
     # something actually stops the send. This is that something.
     defer_for: timedelta | None = None
+    skip_reason: str | None = None
     try:
         async with asyncio.timeout(provider_timeout.total_seconds()):
             await execute(work, item_now)
@@ -1530,7 +1571,9 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
         outcome = _Outcome.UNKNOWN
     except OutboxSkipped as skipped:
         # NOT a failure: this effect can never run, so retrying it would only burn the backoff
-        # budget and dead-letter. Loud, terminal, and out of the queue.
+        # budget and dead-letter. Loud, terminal, and out of the queue. The reason travels to the
+        # ROW now, not only this log line, so an operator asking "why did it not go out?" reads the
+        # answer off the intent instead of grepping the worker.
         _logger.warning(
             "outbox intent %s (%s) for booking %s SKIPPED: %s",
             work.id,
@@ -1539,6 +1582,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
             skipped,
         )
         outcome = _Outcome.SKIPPED
+        skip_reason = str(skipped)
     except Exception:
         _logger.exception(
             "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
@@ -1554,6 +1598,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
         report=report,
         max_attempts=max_attempts,
         defer_for=defer_for,
+        skip_reason=skip_reason,
     )
 
 
@@ -1566,6 +1611,7 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
     report: OutboxReport,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     defer_for: timedelta | None = None,
+    skip_reason: str | None = None,
 ) -> None:
     """Record one intent's outcome in its OWN short transaction, releasing the lease.
 
@@ -1609,9 +1655,12 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             return
 
         if outcome is _Outcome.SKIPPED:
-            # Terminal, and it costs no attempt: nothing was tried, so nothing failed.
+            # Terminal, and it costs no attempt: nothing was tried, so nothing failed. Persist WHY
+            # on the row (truncated — a diagnostic, not a payload) so the answer to "why did this
+            # business's reminder not go out?" lives with the intent, not only in the worker log.
             row.status = _SKIPPED
             row.next_retry_at = None
+            row.skip_reason = skip_reason[:_SKIP_REASON_MAX_LEN] if skip_reason else None
             report.skipped.append(row.id)
             return
 

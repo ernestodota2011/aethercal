@@ -103,6 +103,10 @@ BusyRefresher = Callable[[], Awaitable[int | None]]
 
 ==Everything :func:`make_busy_refresh_tick` decides.=="""
 
+ParkedPaymentRunner = Callable[[], Awaitable[None]]
+"""One fully-bound parked-payment pass — the boot-seam reads of :func:`make_outbox_drain_tick`
+lifted out where a test can drive them (B-09)."""
+
 
 class SchedulerLike(Protocol):
     """The scheduler seam: register an interval job, start, and stop. APScheduler is untyped, so the
@@ -572,46 +576,49 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
     )
 
 
-def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind an outbox-drain tick to the worker's state.
+def build_parked_payment_runner(app: FastAPI) -> ParkedPaymentRunner:
+    """The live parked-payment pass, built from the worker's state — ==and TESTED (B-09).==
 
-    Most of what it decides lives in :func:`build_drain_executor`, which is tested (email / Google /
-    refund / hold-expiry). What is left here is the loop itself, plus the parked-payment tick that
-    re-runs the arbiter for events that beat their checkout.
+    The same extraction as :func:`build_drain_executor` / :func:`build_busy_refresher`, and the one
+    B-09 left for last because it was the lowest-risk. The seam it protects:
+    :func:`_payment_confirm_effects` reads ``app.state.settings`` (the booking base URL and the
+    guest signer), and this reads ``app.state.pools``. Both are put on the state by the boot; if it
+    ever stops, this pass dies with an ``AttributeError`` on a name nobody typed twice, and every
+    payment event that beat its checkout stops being reconciled — invisibly. Read here, out of the
+    pragma'd tick, ``tests/test_worker_tick_wiring.py`` drives it against the REAL lifespan and
+    catches that.
 
-    .. rubric:: ==The residual, stated rather than left to be discovered (B-09)==
-
-    This is the ONE tick still carrying a pragma, and "thin on purpose" was doing some work in that
-    sentence: :func:`_payment_confirm_effects` reads ``app.state.settings`` in here, so a boot-seam
-    read is under the pragma after all. Its two siblings had theirs extracted into ``build_*``
-    functions and driven against the real lifespan; this one did not, because B-09's scope was the
-    other two.
-
-    It is the LOWEST-risk of the three, and that is why it was declared instead of rushed:
-    ``app.state.settings`` is set in :func:`~aethercal.server.worker.create_worker_app` itself, not
-    in the lifespan, and unconditionally — so losing it breaks every test that builds a worker,
-    loudly. ``fernet_keys`` (the name an edit really did eat) was set inside the lifespan, which is
-    exactly why it could vanish in silence.
-
-    The fix is the same shape as the other two and is a cut of its own: extract
-    ``build_parked_payment_runner(app)``, drive it from ``tests/test_worker_tick_wiring.py``'s
-    ``booted_worker``, and drop this pragma.
+    The pass itself (criterion 29): re-run the arbiter for events that beat their checkout's commit,
+    dead-letter the ones that never resolve. It swallows its own failures (like every guarded tick)
+    so a bad pass never kills the loop.
     """
+    pools: WorkerPools = app.state.pools
+    confirm_effects = _payment_confirm_effects(app)
 
-    async def _tick() -> None:
-        pools: WorkerPools = app.state.pools
-        await run_outbox_drain_once(pools=pools, execute=build_drain_executor(app))
-
-        # ==The parked-payment tick (criterion 29).== Runs on the same interval as the drain: re-run
-        # the arbiter for events that beat their checkout's commit, and dead-letter the ones that
-        # never resolve. It swallows its own failures (like every guarded tick) so a bad pass never
-        # kills the loop.
+    async def _run() -> None:
         try:
             await run_parked_payment_tick(
-                pools, now=datetime.now(UTC), confirm_effects=_payment_confirm_effects(app)
+                pools, now=datetime.now(UTC), confirm_effects=confirm_effects
             )
         except Exception:
             _logger.exception("parked-payment tick failed; scheduler continues")
+
+    return _run
+
+
+def make_outbox_drain_tick(app: FastAPI) -> Tick:
+    """Bind an outbox-drain tick to the worker's state.
+
+    Thin on purpose: every decision it makes lives in :func:`build_drain_executor` (the drain) and
+    :func:`build_parked_payment_runner` (the parked-payment pass), both TESTED against the real
+    lifespan. Not ``# pragma: no cover`` any more — B-09's last residual was the boot-seam read that
+    used to hide in here, and it now lives in a build function a test drives, same as its two
+    siblings.
+    """
+
+    async def _tick() -> None:
+        await run_outbox_drain_once(pools=app.state.pools, execute=build_drain_executor(app))
+        await build_parked_payment_runner(app)()
 
     return _tick
 
@@ -641,12 +648,14 @@ __all__ = [
     "WEBHOOK_DELIVERY_JOB_ID",
     "WEBHOOK_HTTP_TIMEOUT_SECONDS",
     "BusyRefresher",
+    "ParkedPaymentRunner",
     "SchedulerLike",
     "Tick",
     "WebhookDeliverer",
     "build_busy_refresher",
     "build_drain_executor",
     "build_interval_scheduler",
+    "build_parked_payment_runner",
     "build_webhook_deliverer",
     "make_busy_refresh_tick",
     "make_outbox_drain_tick",

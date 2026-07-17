@@ -140,6 +140,28 @@ def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
     assert "cdn." not in html
 
 
+def test_page_shell_self_hosts_the_display_font_not_a_font_cdn() -> None:
+    # The editorial display face (Bricolage Grotesque) must be served by the app itself — the same
+    # strict-CSP reason htmx is vendored: `font-src 'self'` (app.py) allows only same-origin fonts,
+    # so shipping the woff2 removes the third-party request a Google/Fontshare CDN would introduce.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert "@font-face" in html
+    assert "/static/bricolage-grotesque.woff2" in html
+    assert "fonts.googleapis.com" not in html
+    assert "fonts.gstatic.com" not in html
+
+
+def test_accent_family_tokens_derive_from_the_brand_accent_not_a_frozen_ember() -> None:
+    # A tenant brand override (`_brand_style`) sets ONLY --accent/--focus, so every accent-derived
+    # surface (the slot hover tint --accent-wash, the input hairline --accent-line) must follow it —
+    # not stay the product's ember. They derive from --accent via color-mix, so overriding --accent
+    # (and the light/dark switch) re-tints them with no extra override. Guards the regression Crisol
+    # caught: new accent-family tokens hardcoded to ember while --accent alone was themeable.
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+    assert "color-mix(in srgb, var(--accent) 12%, transparent)" in html  # --accent-wash
+    assert "color-mix(in srgb, var(--accent) 55%, transparent)" in html  # --accent-line
+
+
 def test_detect_script_is_external_with_no_inline_body() -> None:
     # A5.2: the timezone-detection script must be an external <script src=...>, not inline JS —
     # a strict `script-src 'self'` CSP (A5.3) would otherwise block it.

@@ -165,13 +165,18 @@ services:
       app:
         condition: service_healthy
     # The inherited image HEALTHCHECK probes :8000 (the API); this process serves :5001, so override
-    # it to probe the booking port (any non-5xx means the page renders).
+    # it. Probe /healthz, NOT /: /healthz is pure liveness (always 200, never touches the API), while
+    # / needs a tenant — in a multi-tenant deploy without AETHERCAL_TENANT_SLUG it 404s and the page
+    # would read as permanently unhealthy — and / also 503s whenever the API is down, coupling this
+    # process's liveness to the backend it is supposed to survive. The exit code is explicit: 0 only
+    # on a real 200, 1 on anything else. (The old probe compared `.status < 500`, a dead branch:
+    # urlopen raises on >=400 before .status is ever read.)
     healthcheck:
       test:
         - "CMD"
         - "python"
         - "-c"
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/', timeout=4).status < 500 else 1)"
+        - "import urllib.request, sys\ntry:\n    r = urllib.request.urlopen('http://127.0.0.1:5001/healthz', timeout=4)\n    sys.exit(0 if r.status == 200 else 1)\nexcept Exception:\n    sys.exit(1)"
       interval: 30s
       timeout: 5s
       start_period: 15s

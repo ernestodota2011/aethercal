@@ -86,90 +86,178 @@ from aethercal.schemas.slots import Availability
 _HTMX_SRC = "/static/htmx-2.0.4.min.js"
 
 # Premium-dark, brand-warm (ember accent) — deliberately NOT the lavender/violet/cyan-glow AI-slop
-# palette. Boxless: hairline separators + air, not stacked cards. Light mode is provided for
-# preference/accessibility, but dark is the primary aesthetic.
+# palette. Boxless: hairline separators + air + an editorial display face, not stacked cards.
+# ==Character comes from craft, not emptiness== (a self-hosted display font on headings/marks +
+# a slot picker with real hover/focus states), because an unstyled system-font page reads
+# "templated" no matter how much whitespace it has. Dark is primary; a warm light mode is provided
+# for preference/accessibility. The four accent tokens (--accent/--accent-ink/--focus/--danger)
+# are contrast-AA-tuned and MUST NOT drift: a tenant's brand override (`_brand_style`) replaces
+# --accent/--focus only, and the rest of the sheet keeps working on top of whatever it sets.
+#
+# The display face (Bricolage Grotesque, SIL OFL 1.1 — redistributable) is VENDORED at
+# `static/bricolage-grotesque.woff2` and served by the app itself, never a font CDN: same reason
+# htmx is vendored (strict CSP, no third-party dependency). `font-src 'self'` (app.py) allows it.
 _CSS = """
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/static/bricolage-grotesque.woff2") format("woff2");
+  font-weight: 200 800; font-style: normal; font-display: swap;
+}
 :root {
-  --bg: #0e0e10; --surface: #16161a; --border: #2a2a30;
+  --bg: #0e0e10; --surface: #17171b; --surface-2: #1e1e24; --border: #2b2b32;
+  --hairline: rgba(255,255,255,0.08);
   --text: #ededee; --muted: #a2a2aa; --accent: #e0894b; --accent-ink: #1b1206;
-  --focus: #f4b477; --danger: #e08497; --radius: 10px; --maxw: 42rem;
+  --focus: #f4b477; --danger: #e08497;
+  /* DERIVED from --accent via color-mix, so a tenant's brand override (`_brand_style` sets only
+     --accent/--focus) AND the light/dark switch both cascade into the hover tint + hairline for
+     free — the whole accent family tracks one token. The rgba line is the pre-color-mix fallback
+     (ember); a browser without color-mix keeps the product's own accent, never a broken value. */
+  --accent-wash: rgba(224,137,75,0.12);
+  --accent-wash: color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-line: rgba(224,137,75,0.55);
+  --accent-line: color-mix(in srgb, var(--accent) 55%, transparent);
+  --radius: 14px; --radius-sm: 10px; --maxw: 40rem; --shadow: 0 6px 20px rgba(0,0,0,0.35);
+  --page: radial-gradient(120% 90% at 50% -20%, rgba(224,137,75,0.07), transparent 55%);
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   color-scheme: dark;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --bg: #faf9f7; --surface: #ffffff; --border: #e5e2dc;
+    --bg: #faf7f2; --surface: #ffffff; --surface-2: #f6f2ec; --border: #e7e1d8;
+    --hairline: rgba(28,22,16,0.10);
     /* The ember, darkened until white can sit on it: #b4632a gave 4.41:1 against --accent-ink and
        4.19:1 as link text on --bg, and AA wants 4.5. Hue (24.8deg) and saturation are untouched —
        only lightness moves — so both uses now pass (4.75 and 4.51). Fixed at the TOKEN, not at the
        one button axe landed on: the failing pair is --accent/--accent-ink itself, so every element
        wearing it was failing, including the ones nobody has written yet. */
     --text: #1b1b1e; --muted: #5f5f68; --accent: #ac5f28; --accent-ink: #ffffff;
-    --focus: #ac5f28; --danger: #b23a52; color-scheme: light;
+    --focus: #ac5f28; --danger: #b23a52;
+    /* --accent-wash / --accent-line are NOT redeclared here: they derive from --accent (above) via
+       color-mix, so redefining --accent alone re-tints them for the light theme automatically. */
+    --shadow: 0 8px 24px rgba(60,42,24,0.10);
+    --page: linear-gradient(180deg, #fdfaf6 0%, #f5f0e9 100%);
+    color-scheme: light;
   }
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body {
-  margin: 0; background: var(--bg); color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  line-height: 1.55; font-size: 1rem;
+  margin: 0; min-height: 100vh; color: var(--text); background: var(--page), var(--bg);
+  font-family: var(--font-sans); line-height: 1.55; font-size: 1rem;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
 }
-a { color: var(--accent); }
-main { max-width: var(--maxw); margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+a { color: var(--accent); text-underline-offset: 0.18em; }
+::selection { background: var(--accent-wash); }
+main { max-width: var(--maxw); margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
 .site-header, .site-footer {
-  max-width: var(--maxw); margin: 0 auto; padding: 1rem 1.25rem;
+  max-width: var(--maxw); margin: 0 auto; padding: 1.15rem 1.25rem;
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
 }
-.site-footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--border);
-  margin-top: 2rem; }
+.site-header { border-bottom: 1px solid var(--hairline); }
+.site-footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--hairline);
+  margin-top: 2.5rem; }
 .brand {
-  font-weight: 600; letter-spacing: -0.01em; color: var(--text); text-decoration: none;
+  font-family: var(--font-display); font-weight: 640; letter-spacing: -0.02em;
+  color: var(--text); text-decoration: none;
   display: inline-flex; align-items: center; gap: .55rem; min-width: 0;
 }
+.site-header .brand { font-size: 1.2rem; }
 /* The business's mark. Height-bounded and `width: auto`, so ANY logo an operator uploads sits on
    the baseline of the header instead of resizing it — a tall PNG must not push the page down. */
 .brand-logo { height: 1.75rem; width: auto; max-width: 10rem; object-fit: contain; }
 .langs a { color: var(--muted); text-decoration: none; font-size: .85rem; padding: 0 .35rem; }
 .langs a[aria-current="true"] { color: var(--text); font-weight: 600; }
-h1 { font-size: 1.6rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 .5rem; }
-h2 { font-size: 1.05rem; margin: 1.75rem 0 .75rem; letter-spacing: -0.01em; }
-.lead { color: var(--muted); margin: 0 0 1.5rem; }
+h1 {
+  font-family: var(--font-display); font-weight: 630; line-height: 1.03;
+  font-size: clamp(2rem, 1.5rem + 2.2vw, 2.7rem); letter-spacing: -0.032em; margin: 0 0 .6rem;
+}
+h2 {
+  font-family: var(--font-display); font-weight: 560; font-size: 1.2rem;
+  letter-spacing: -0.02em; margin: 2rem 0 .85rem;
+}
+.lead { color: var(--muted); margin: 0 0 1.5rem; font-size: 1.05rem; }
 .meta { color: var(--muted); font-size: .9rem; }
 .skip-link {
   position: absolute; left: -999px; top: 0; background: var(--accent); color: var(--accent-ink);
-  padding: .6rem 1rem; border-radius: 0 0 var(--radius) 0; z-index: 10;
+  padding: .6rem 1rem; border-radius: 0 0 var(--radius-sm) 0; z-index: 10;
 }
 .skip-link:focus { left: 0; }
 .stack > * + * { margin-top: 1.5rem; }
 .event-list { list-style: none; padding: 0; margin: 0; }
-.event-list li { padding: 1rem 0; border-top: 1px solid var(--border); }
+.event-list li { padding: 1.15rem 0; border-top: 1px solid var(--hairline);
+  display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
+  flex-wrap: wrap; }
 .event-list li:first-child { border-top: 0; }
-.tz-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; margin: 0 0 1rem; }
-label { display: block; font-weight: 500; margin-bottom: .35rem; }
+.event-list .brand { font-size: 1.15rem; }
+.event-list a.brand:hover { color: var(--accent); }
+.tz-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; margin: 0 0 1.25rem; }
+label { display: block; font-weight: 560; margin-bottom: .4rem; font-size: .92rem; }
 .req { color: var(--muted); font-weight: 400; font-size: .8rem; }
 input, select, textarea {
-  width: 100%; padding: .6rem .7rem; background: var(--surface); color: var(--text);
-  border: 1px solid var(--border); border-radius: var(--radius); font: inherit;
+  width: 100%; padding: .68rem .8rem; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+input:hover, select:hover, textarea:hover { border-color: var(--accent-line); }
+select {
+  appearance: none; -webkit-appearance: none; padding-right: 2.2rem; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 1.15rem) 55%, calc(100% - 0.85rem) 55%;
+  background-size: 6px 6px, 6px 6px; background-repeat: no-repeat;
 }
 .tz-form .field { flex: 1 1 14rem; }
 textarea { min-height: 5rem; resize: vertical; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.btn {
-  display: inline-block; padding: .65rem 1.1rem; border-radius: var(--radius); border: 0;
-  background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 600;
-  text-decoration: none; cursor: pointer; text-align: center;
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash);
 }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: .7rem 1.2rem; border-radius: var(--radius-sm); border: 0;
+  background: var(--accent); color: var(--accent-ink);
+  font-family: var(--font-display); font-weight: 560; font-size: .98rem;
+  text-decoration: none; cursor: pointer;
+  transition: transform 130ms cubic-bezier(.2,.7,.2,1), filter 130ms ease;
+}
+.btn:hover { filter: brightness(1.06); }
+.btn:active { transform: scale(.97); }
 .btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
-.day { margin: 1.25rem 0 .5rem; font-size: .8rem; text-transform: uppercase;
-  letter-spacing: .06em; color: var(--muted); }
+.btn.secondary:hover { border-color: var(--accent); filter: none; }
+/* Attribute-PRESENCE selector, NOT a value-match: the disabled pager control is the only element
+   that ever carries the aria-disabled attribute (always the true value), so presence is exact.
+   Matching on presence also keeps the quoted true-valued attribute string OUT of this inline
+   <style> — written literally here it would leak into the page text and defeat the tests that
+   assert its ABSENCE to prove the "previous week" control is an ENABLED link (app_routes/views). */
+.btn.secondary[aria-disabled] {
+  color: var(--muted); border-color: var(--hairline); cursor: default;
+}
+.day {
+  display: flex; align-items: center; gap: .55rem; margin: 1.6rem 0 .7rem;
+  font-family: var(--font-display); font-size: .74rem; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--muted); font-weight: 560;
+}
+.day::before {
+  content: ""; width: .5rem; height: .5rem; border-radius: 2px;
+  background: var(--accent); opacity: .85; flex: 0 0 auto;
+}
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr)); gap: .6rem; }
 .slots form { margin: 0; }
 .slot {
-  display: block; text-align: center; padding: .65rem .5rem; border: 1px solid var(--border);
-  border-radius: var(--radius); background: var(--surface); color: var(--text);
-  text-decoration: none; font: inherit; cursor: pointer; width: 100%;
+  display: flex; align-items: center; justify-content: center; min-height: 46px;
+  padding: .6rem .5rem; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: transparent; color: var(--text); text-decoration: none; width: 100%;
+  font-family: var(--font-display); font-weight: 500; font-size: .98rem; cursor: pointer;
+  transition: transform 140ms cubic-bezier(.2,.7,.2,1), border-color 140ms ease,
+    background 140ms ease, box-shadow 140ms ease;
 }
-.slot:hover { border-color: var(--accent); }
+.slot:hover {
+  border-color: var(--accent); background: var(--accent-wash);
+  transform: translateY(-1px); box-shadow: var(--shadow);
+}
+.slot:active { transform: translateY(0) scale(.98); }
 .field { margin-bottom: 1.1rem; }
 .field-error { color: var(--danger); font-size: .85rem; margin-top: .35rem; }
 .hint { color: var(--muted); font-size: .85rem; margin: .35rem 0 0; }
@@ -181,15 +269,20 @@ textarea { min-height: 5rem; resize: vertical; }
   margin: 0; cursor: pointer; }
 .consent input[type="checkbox"] { width: 1.05rem; height: 1.05rem; flex: 0 0 auto;
   margin-top: .28rem; accent-color: var(--accent); cursor: pointer; }
-.notice { border: 1px solid var(--border); border-left: 3px solid var(--accent);
-  padding: .9rem 1rem; border-radius: var(--radius); color: var(--muted); }
-.notice.error { border-left-color: var(--danger); color: var(--text); }
-.pager { display: flex; justify-content: space-between; gap: .75rem; margin-top: 1.5rem; }
+.notice { border: 1px solid var(--hairline); border-left: 3px solid var(--accent);
+  background: var(--accent-wash); padding: .9rem 1rem; border-radius: var(--radius-sm);
+  color: var(--text); }
+.notice.error { border-left-color: var(--danger); background: transparent; }
+.pager { display: flex; justify-content: space-between; gap: .75rem; margin-top: 1.75rem; }
 dl.summary { margin: 0; }
-dl.summary dt { color: var(--muted); font-size: .8rem; text-transform: uppercase;
-  letter-spacing: .05em; margin-top: 1rem; }
-dl.summary dd { margin: .2rem 0 0; }
-body.embed main { padding: 1.25rem 1rem 1.75rem; max-width: 100%; }
+dl.summary dt { color: var(--muted); font-size: .78rem; text-transform: uppercase;
+  letter-spacing: .08em; margin-top: 1.1rem; font-weight: 560; }
+dl.summary dd { margin: .25rem 0 0; font-size: 1.05rem; }
+body.embed main { padding: 1.5rem 1.15rem 2rem; max-width: 100%; }
+@media (prefers-reduced-motion: reduce) {
+  .slot, .btn { transition: border-color 140ms ease, background 140ms ease; }
+  .slot:hover, .slot:active, .btn:active { transform: none; box-shadow: none; }
+}
 """
 
 # --------------------------------------------------------------------------------------

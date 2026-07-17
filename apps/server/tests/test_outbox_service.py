@@ -47,6 +47,7 @@ from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
 from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.outbox import (
+    _MONEY_FIRST_EFFECTS,
     DEFAULT_LEASE,
     DEFAULT_MAX_ATTEMPTS,
     PROVIDER_TIMEOUT_CEILING,
@@ -56,6 +57,7 @@ from aethercal.server.services.outbox import (
     OutboxReport,
     OutboxSkipped,
     OutboxWork,
+    Priority,
     Staleness,
     Voidability,
     _Outcome,
@@ -69,6 +71,7 @@ from aethercal.server.services.outbox import (
     expire_hold_dedupe_key,
     google_dedupe_key,
     make_booking_effect_executor,
+    priority_policy,
     recover_expired_leases,
     refund_dedupe_key,
     run_google_effect,
@@ -656,6 +659,30 @@ def test_every_effect_has_a_confirmation_and_a_voidability_policy() -> None:
         assert voidability_policy(effect) in set(Voidability)
 
 
+def test_every_effect_declares_a_priority() -> None:
+    """The drain-order table is exhaustive too: a new effect must declare MONEY_FIRST or NORMAL, or
+    fail the type check, never queue-jump (or be silently starved) by default."""
+    for effect in OutboxEffect:
+        assert priority_policy(effect) in set(Priority)
+
+
+def test_the_money_effects_are_prioritised_and_the_rest_are_not() -> None:
+    """==The money-first ordering is a DERIVED decision, not a hand-written WHERE.== A refund or an
+    expiry must outrank even an older reminder; the messaging effects wait their turn by age. The
+    ``select_due`` ORDER BY reads ``_MONEY_FIRST_EFFECTS``, which is derived from this table — so a
+    new money effect is prioritised for free instead of quietly queueing behind week-old work."""
+    assert priority_policy(OutboxEffect.REFUND) is Priority.MONEY_FIRST
+    assert priority_policy(OutboxEffect.EXPIRE_HOLD) is Priority.MONEY_FIRST
+    assert priority_policy(OutboxEffect.EMAIL) is Priority.NORMAL
+    assert priority_policy(OutboxEffect.GOOGLE) is Priority.NORMAL
+    assert priority_policy(OutboxEffect.NOTIFY) is Priority.NORMAL
+    # The tuple the query actually consumes matches the table, and holds exactly the money effects.
+    assert set(_MONEY_FIRST_EFFECTS) == {
+        OutboxEffect.REFUND.value,
+        OutboxEffect.EXPIRE_HOLD.value,
+    }
+
+
 def test_the_money_effects_are_non_voidable() -> None:
     """==Criterion 31: a cancel must NOT anul a REFUND in flight.== ``void_pending_steps`` retires
     only VOIDABLE effects; a refund is NON_VOIDABLE, so a cancellation can never sweep it up — that
@@ -897,6 +924,47 @@ async def test_the_lease_holder_settles_normally(maker: Sessionmaker) -> None:
     row = await _row(maker, intent_id)
     assert row.status == "delivered"
     assert row.claimed_by is None  # the lease is released
+
+
+async def test_a_skip_records_its_reason_on_the_row(maker: Sessionmaker) -> None:
+    """The reason a step was skipped lands on the intent, not only in the worker's log — so the
+    operator's "why did this business's reminder not go out?" is answered off the row."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id, effect=OutboxEffect.NOTIFY)
+    async with maker() as session, session.begin():
+        work = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work is not None
+
+    report = OutboxReport()
+    await _settle(
+        maker,
+        work,
+        now=NOW,
+        outcome=_Outcome.SKIPPED,
+        report=report,
+        skip_reason="whatsapp channel not configured for this business",
+    )
+
+    assert report.skipped == [intent_id]
+    row = await _row(maker, intent_id)
+    assert row.status == "skipped"
+    assert row.skip_reason == "whatsapp channel not configured for this business"
+    assert row.claimed_by is None  # the lease is released
+
+
+async def test_a_delivered_intent_carries_no_skip_reason(maker: Sessionmaker) -> None:
+    """skip_reason is only for skips — every other outcome leaves it NULL, nothing to say."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id)
+    async with maker() as session, session.begin():
+        work = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work is not None
+
+    await _settle(maker, work, now=NOW, outcome=_Outcome.DELIVERED, report=OutboxReport())
+
+    row = await _row(maker, intent_id)
+    assert row.status == "delivered"
+    assert row.skip_reason is None
 
 
 def test_the_provider_timeout_ceiling_is_strictly_under_the_lease() -> None:

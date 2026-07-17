@@ -1,7 +1,8 @@
 """The OPERATOR surface — served by the ``aethercal-worker`` process, and only by it.
 
-``GET /metrics`` (Prometheus, operator token) · ``GET /health`` (liveness) · ``GET /health/ready``
-(readiness **with the outbox backlog**).
+``GET /metrics`` (Prometheus, operator token) · ``GET /metrics/summary`` (the same numbers,
+human-readable, same token) · ``GET /health`` (liveness) · ``GET /health/ready`` (readiness **with
+the outbox backlog**).
 
 .. rubric:: Why this moved out of the web process
 
@@ -59,6 +60,7 @@ from aethercal.server.observability import (
     DRAIN_COUNTERS,
     MetricsSnapshot,
     collect_metrics,
+    render_human,
     render_prometheus,
 )
 from aethercal.server.settings import Settings
@@ -225,6 +227,20 @@ async def metrics(request: Request) -> PlainTextResponse:
     snapshot = await _snapshot(_pools(request))
     body = render_prometheus(snapshot, counters=DRAIN_COUNTERS)
     return PlainTextResponse(content=body, media_type=CONTENT_TYPE)
+
+
+@router.get("/metrics/summary", response_class=PlainTextResponse, include_in_schema=False)
+async def metrics_summary(request: Request) -> PlainTextResponse:
+    """The SAME instance-wide numbers as ``/metrics``, rendered for a PERSON rather than a scraper.
+
+    The operator running the shadow needs to read booking counts, the outbox backlog, the no-show
+    rate and the money dead-man without either scraping Prometheus or opening psql. This is that
+    read. It is guarded by the SAME operator token as ``/metrics`` and carries the SAME guarantee —
+    instance-wide, no tenant/guest/URL — because it is the same snapshot, only formatted.
+    """
+    _require_operator(request)
+    snapshot = await _snapshot(_pools(request))
+    return PlainTextResponse(content=render_human(snapshot, now=datetime.now(UTC)))
 
 
 __all__ = ["router"]

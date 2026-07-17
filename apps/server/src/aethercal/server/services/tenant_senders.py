@@ -78,15 +78,13 @@ Deliberately NOT a hard failure: ``services/outbox.OutboxSkipped`` already argue
 unconfigured channel retried like an outage burns six attempts of exponential backoff, lands in the
 dead-letter, and the message still does not arrive. That is noise instead of an answer.
 
-.. rubric:: ==The residual, stated rather than left to be discovered==
+.. rubric:: ==The reason is on the row now==
 
-The **reason is not on the row.** ``Outbox`` has no column for it, so ``status='skipped'`` is
-queryable and *why* is only in the worker's log. For an unconfigured channel that is tolerable —
-there are exactly two reasons and this module logs both by name — but it is a real gap, and it is
-the OPERATOR's: somebody asking "why did this business's reminder not go out?" has to go and grep.
-Closing it properly means a ``skip_reason`` column on ``Outbox`` and the drain writing the
-exception's text at settle time. That is a migration, and it belongs to whoever next touches that
-table rather than to a cut about senders.
+It used to only be in the worker's log: ``status='skipped'`` was queryable but *why* was a grep
+away, and it was the OPERATOR's grep — "why did this business's reminder not go out?" had no answer
+on the intent. Migration ``0017_outbox_skip_reason`` added the ``skip_reason`` column, and the drain
+writes this exception's text there at settle time (``services/outbox._settle``). The two skip causes
+this module raises by name now land on the row that was skipped.
 """
 
 from __future__ import annotations
