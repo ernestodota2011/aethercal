@@ -1454,6 +1454,126 @@ class TestTheTenantClientCannotShareAConnectionBetweenBusinesses:
         )
 
 
+class TestATenantsRelayCannotBeTalkedToInPlaintext:
+    """==``use_tls: false`` on a TENANT credential is a password on the open internet (B-09).==
+
+    .. rubric:: Why the "it is their own credential" framing is incomplete
+
+    B-03bis saw this and left it, on the grounds that it is the confidentiality of the tenant's own
+    secret and therefore theirs to spend. Two facts make that the wrong reading:
+
+    * ==the plaintext session carries the GUEST's data too== — their name, their email address, the
+      booking. The guest is not a party to the business's configuration choice and cannot consent to
+      it, and they are the one this product exists to protect;
+    * ==and the egress guard already forced the host PUBLIC.== So there is no "it is on my LAN, it
+      is fine" case left for a tenant: ``use_tls: false`` means, literally and only, the AUTH
+      exchange and the message crossing the open internet in the clear. ==And we are the ones
+      sending it.==
+
+    The asymmetry is the tell. A tenant's ``base_url`` MUST be https ("a tenant's endpoint carries
+    its API key off this network") while a tenant's SMTP relay could be plaintext: same provenance,
+    same secret in flight, opposite rule. Only one of them was derived.
+
+    .. rubric:: ==Provenance decides, exactly as it does for the host==
+
+    ``CredentialSource.INSTANCE`` is exempt, for the reason it is exempt from the public-host check
+    two functions up: that relay is the operator's own, configured by the person running the
+    process, and a self-hoster whose MTA sits on their LAN speaking plaintext is not attacking
+    themselves.
+
+    .. rubric:: And deliberately NO opt-out flag
+
+    ``base_url``'s https rule has no escape hatch and needs none. Adding one here would be a second
+    ``LEND_OPERATOR_PHONE_IDENTITY``-shaped knob for a case with no legitimate use — every real
+    relay has spoken STARTTLS on 587 or implicit TLS on 465 for a decade. The lesson from that flag
+    was that a dangerous thing must not happen by OMISSION; it was not that every refusal owes the
+    world a way to switch it back on.
+    """
+
+    async def test_a_tenants_plaintext_relay_is_refused(self) -> None:
+        """==The refusal, and it names the FIELD and never the value.==
+
+        Same rule as every other credential error here: the next field through this branch is a
+        password, so the rule cannot depend on which field somebody judged boring.
+        """
+        with pytest.raises(UnusableCredentialError) as caught:
+            await _assert_smtp_host_reachable(
+                {**_TENANT_SMTP, "use_tls": "false"},
+                source=CredentialSource.TENANT,
+                resolver=_public_dns,
+            )
+
+        message = str(caught.value)
+        assert "use_tls" in message, "the error must name the field a human has to go and fix"
+        assert "smtp.business.example" not in message, "the credential's fields are not echoed"
+
+    async def test_a_tenant_that_says_nothing_gets_tls(self) -> None:
+        """The default is TLS, and a credential predating this rule is not silently downgraded."""
+        target = await _assert_smtp_host_reachable(
+            _TENANT_SMTP, source=CredentialSource.TENANT, resolver=_public_dns
+        )
+        assert target.use_tls is True
+
+    async def test_the_operators_own_plaintext_relay_still_works(self) -> None:
+        """==Provenance decides. The self-hoster's LAN MTA is not a threat model, it is a
+        deployment.==
+
+        The anti-vacuity half of the pair: if this went red alongside the refusal above, the rule
+        would be "no plaintext ever" rather than "no plaintext for a TENANT", and a real deployment
+        would break for nothing.
+        """
+        target = await _assert_smtp_host_reachable(
+            {"host": "mta.internal", "from_addr": "a@b.example", "use_tls": "false"},
+            source=CredentialSource.INSTANCE,
+            resolver=_public_dns,
+        )
+        assert target.use_tls is False, (
+            "the operator's own relay was forced onto TLS. They configured it with the same hands "
+            "that hold the app secret; this guard is about third-party input."
+        )
+
+    async def test_an_unparseable_use_tls_still_names_itself_not_an_environment_variable(
+        self,
+    ) -> None:
+        """The misdirection guard, moved to the function that now owns the parse.
+
+        ``_parse_bool`` hardcodes ``LEND_OPERATOR_PHONE_IDENTITY_ENV`` in its error; reused for a
+        stored credential it blamed a variable on the other side of the product. That contract did
+        not move with the parse by accident — it is asserted at its new home.
+        """
+        with pytest.raises(UnusableCredentialError) as caught:
+            await _assert_smtp_host_reachable(
+                {**_TENANT_SMTP, "use_tls": "maybe"},
+                source=CredentialSource.TENANT,
+                resolver=_public_dns,
+            )
+
+        message = str(caught.value)
+        assert "use_tls" in message
+        assert LEND_OPERATOR_PHONE_IDENTITY_ENV not in message, (
+            "the error blames an environment variable that has nothing to do with this business's "
+            "stored credential."
+        )
+
+    def test_the_config_builder_cannot_re_derive_plaintext_from_the_raw_field(self) -> None:
+        """==The decision is consulted ONCE, and the code after it cannot express the other
+        answer.==
+
+        ``_smtp_from_secrets`` takes ``use_tls`` off the WITNESS, exactly as it takes ``host`` off
+        it. If it read ``secrets`` instead, the guard above would be a check somebody must remember
+        to run rather than the only way to obtain the value — and the same rule applied by hand in
+        two places is the rule that gets applied differently in two places.
+        """
+        config = _smtp_from_secrets(
+            {**_TENANT_SMTP, "use_tls": "false"},
+            target=_SmtpTarget(host="smtp.business.example", connect=None, use_tls=True),
+        )
+        assert config.use_tls is True, (
+            "the raw credential field overrode the witness, so the egress guard's decision about "
+            "plaintext can be bypassed by whoever calls this with the secrets in hand."
+        )
+
+
 class TestAStoredCredentialWhoseValueCannotBeUsed:
     """==A credential can be complete and still be unusable, and that difference decides the
     outcome.==
@@ -1471,7 +1591,7 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
         with pytest.raises(UnusableCredentialError) as caught:
             _smtp_from_secrets(
                 {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
-                target=_SmtpTarget(host="smtp.x.example", connect=None),
+                target=_SmtpTarget(host="smtp.x.example", connect=None, use_tls=True),
             )
 
         message = str(caught.value)
@@ -1481,27 +1601,11 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
             "this particular one looks harmless — the rule does not get to depend on the field."
         )
 
-    def test_an_unparseable_use_tls_does_not_blame_an_unrelated_environment_variable(self) -> None:
-        """==The second bug in the same function, and the more insidious one.==
-
-        ``_parse_bool`` was written for the lend-identity FLAG and hardcodes that variable's name in
-        its error. Reused for a stored credential's ``use_tls``, it told the operator that
-        ``AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY`` was malformed — a variable they may never have
-        set, on the other side of the product from the actual fault. An error that misdirects is
-        worse than one that only says "no".
-        """
-        with pytest.raises(UnusableCredentialError) as caught:
-            _smtp_from_secrets(
-                {"host": "smtp.x.example", "from_addr": "a@x.example", "use_tls": "maybe"},
-                target=_SmtpTarget(host="smtp.x.example", connect=None),
-            )
-
-        message = str(caught.value)
-        assert "use_tls" in message
-        assert LEND_OPERATOR_PHONE_IDENTITY_ENV not in message, (
-            "the error blames an environment variable that has nothing to do with this business's "
-            "stored credential."
-        )
+    # The ``use_tls`` half of this pair moved to `TestATenantsRelayCannotBeTalkedToInPlaintext`
+    # along with the parse itself (B-09): `_assert_smtp_host_reachable` now owns that field,
+    # because deciding whether plaintext is allowed needs the PROVENANCE, which only it has.
+    # `_smtp_from_secrets` reads the answer off the witness and cannot re-derive it — which is
+    # asserted there too, so the contract lost nothing by moving.
 
     def test_the_flag_itself_still_names_itself_when_IT_is_malformed(self) -> None:
         """The env-var error is still right where it IS the env var: fixing one must not break the

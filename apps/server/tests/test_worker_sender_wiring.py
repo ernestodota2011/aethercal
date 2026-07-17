@@ -187,7 +187,10 @@ class TestTheBootArmsTheResolver:
         )
         assert booted_worker.state.instance_sender_defaults.whatsapp is not None
         assert booted_worker.state.fernet_keys, "the rotation reader is what decrypts a credential"
-        assert booted_worker.state.http_client is not None, "a phone sender needs the HTTP client"
+        # NOT "a phone sender needs it" — that reason expired the day B-03bis moved the senders onto
+        # `sender_clients`. `http_client` is the WEBHOOK delivery tick's, and it is proven by effect
+        # in `tests/test_worker_tick_wiring.py` rather than by this line.
+        assert booted_worker.state.http_client is not None
 
     async def test_the_shared_http_client_does_not_follow_redirects(
         self, booted_worker: FastAPI

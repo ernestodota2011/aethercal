@@ -73,11 +73,17 @@ anything else a third party hands us and we obey:
 | **re-checked at connect** | the address is validated again when the socket opens, and pinned. A DNS answer that changes between the check and the connect (rebinding) cannot move the socket |
 
 The same applies to a **tenant SMTP relay host** — `host: 127.0.0.1, port: 25` would relay your mail
-through the operator's own MTA, which is an open relay on their IP reputation. There is no `https`
-rule there (SMTP has no such scheme), and no certificate to fall back on: the address check is the
-whole defence. It is pinned at connect too — the socket is opened to the validated address and
-handed to the SMTP client, so it performs no lookup of its own, while TLS stays bound to your
-hostname.
+through the operator's own MTA, which is an open relay on their IP reputation. It is pinned at
+connect too — the socket is opened to the validated address and handed to the SMTP client, so it
+performs no lookup of its own, while TLS stays bound to your hostname.
+
+SMTP has no `https` scheme to require, so the same rule is spelled `use_tls`: **a business's own
+relay must use TLS.** It is the default; setting it to `false` makes the credential unusable. Because
+the rule above already forces your relay host onto the public internet, an unencrypted session would
+put your relay password — and your guest's name and email address — in the clear across it, sent by
+this server. The **operator's own** `AETHERCAL_SMTP_*` relay is exempt, as it is exempt from the
+public-address rule: it is configured by the person running the process, and a self-hosted MTA on
+their LAN is a deployment, not a threat.
 
 A credential that fails this is **not usable**: the channel stays off, and the worker logs which
 field is wrong (never its value). Fix it with `credentials set` and the next attempt goes through.

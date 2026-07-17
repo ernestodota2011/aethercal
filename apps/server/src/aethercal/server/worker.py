@@ -147,7 +147,32 @@ def create_worker_app(settings: Settings) -> FastAPI:
             await assert_engine_role(exec_engine, DbRole.APP, url_env=DATABASE_URL_ENV)
             await assert_schema_at_head(exec_engine)
 
-            http_client = httpx.AsyncClient(timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS)
+            # ==NO KEEP-ALIVE, and it is a correctness requirement, not a tuning knob (B-09).==
+            #
+            # `webhooks.pinning.build_pinned_request` rewrites the request's host to the pinned IP,
+            # and httpx's connection pool is keyed by ORIGIN — (scheme, host, port). So after the
+            # pin, two SUBSCRIPTIONS whose different hostnames resolve to the SAME address collapse
+            # onto one pool key, and the second's request can ride a TLS connection established with
+            # the FIRST's SNI and certificate. That delivers ==business A's guest, by name and
+            # email, to business B's webhook== — the one leak this module's own docstring calls the
+            # reason this process got two pools instead of one, reintroduced underneath all of it by
+            # the fix for rebinding.
+            #
+            # With no idle connection kept there is none to reuse, so every delivery stands up its
+            # own — resolved, pinned, and handshaked for its own hostname. `services/tenant_senders`
+            # reached the identical conclusion for the SENDING clients; this is the same mechanism
+            # in the worker that POSTs the guest's data to a stranger's server, and it was left on a
+            # plain keep-alive-by-default client. (HTTP/2 must stay off for the same reason: it
+            # multiplexes CONCURRENT requests onto one connection, with no idle connection ever
+            # involved. It is off by default in httpx and `tests/test_worker_tick_wiring.py` asserts
+            # it, because a default nobody pinned is a default somebody flips.)
+            #
+            # The cost is a TCP/TLS handshake per delivery, on a queue that sends a handful of
+            # webhooks a minute.
+            http_client = httpx.AsyncClient(
+                timeout=WEBHOOK_HTTP_TIMEOUT_SECONDS,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            )
             stack.push_async_callback(http_client.aclose)
             app.state.http_client = http_client
 
@@ -170,8 +195,10 @@ def create_worker_app(settings: Settings) -> FastAPI:
             # delivery tick signs with it, `_decryption_fernet` builds the busy-refresh and drain
             # readers from it, and `resolve_senders_for` decrypts each business's credential.
             # Every tick body catches and logs, so a missing name here is an inert worker that
-            # reports healthy for ever. Pinned by `tests/test_worker_sender_wiring.py`, which boots
-            # this lifespan for real rather than mirroring it in a fake.
+            # reports healthy for ever. Pinned for ALL THREE now (B-09) —
+            # `tests/test_worker_sender_wiring.py` for the drain, `tests/test_worker_tick_wiring.py`
+            # for the webhook and busy-refresh ticks — each booting this lifespan for real rather
+            # than mirroring it in a fake. Delete this line and those go red instead of silent.
             app.state.fernet_keys = settings.decryption_fernet_keys()
 
             # ==The OPERATOR's defaults — not senders (B-03bis).==

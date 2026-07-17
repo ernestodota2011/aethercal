@@ -13,15 +13,22 @@ Three layers, isolated so the wiring is fully offline-testable:
   one bad tick logs and returns rather than killing the loop. :func:`refresh_all_busy_caches`
   refreshes every active connection and skips a failing one without stopping the rest.
 
-The live tick *closures* (:func:`make_webhook_delivery_tick` / :func:`make_busy_refresh_tick` /
-:func:`make_outbox_drain_tick`) read the runtime effects the app's lifespan puts on ``app.state``
-(``pools`` / ``http_client`` / ``fernet_keys`` / ``instance_sender_defaults``) and are
-``# pragma: no cover - live`` — importing this module starts no scheduler.
+Importing this module starts no scheduler.
 
-==What those closures DECIDE is not behind the pragma== (:func:`build_drain_executor` /
-:func:`resolve_senders_for`). The seam between what the boot writes onto ``app.state`` and what a
-tick reads back off it is where a silent break hides, and a pragma over it buys the green without
-buying the truth.
+==What a tick DECIDES is not behind a pragma== (:func:`build_webhook_deliverer` /
+:func:`build_busy_refresher` / :func:`build_drain_executor` / :func:`resolve_senders_for`). The seam
+between what the boot writes onto ``app.state`` and what a tick reads back off it is where a silent
+break hides, and a pragma over it buys the green without buying the truth. All three ticks read
+``app.state.fernet_keys``, and an edit really did eat that line once: the worker boots clean,
+reports healthy for ever, and delivers nothing. So each tick's reads live in a ``build_*`` function
+driven against the worker's REAL lifespan (``tests/test_worker_tick_wiring.py``,
+``tests/test_worker_sender_wiring.py``).
+
+``make_webhook_delivery_tick`` / ``make_busy_refresh_tick`` and their closures are driven by those
+tests too, and carry no pragma: a one-line closure that could call the wrong builder is not
+"unreachable offline", it is unlooked-at. ==:func:`make_outbox_drain_tick` is the one that still
+has one==, and it is not thin — it also builds the parked-payment tick from ``app.state.settings``.
+That read is untested; the residual is stated in its own docstring rather than left to be found.
 """
 
 from __future__ import annotations
@@ -85,6 +92,16 @@ BUSY_REFRESH_HORIZON = timedelta(days=30)
 WEBHOOK_HTTP_TIMEOUT_SECONDS = 10.0
 
 Tick = Callable[[], Awaitable[None]]
+
+WebhookDeliverer = Callable[[], Awaitable[DeliveryReport | None]]
+"""One fully-bound webhook-delivery pass.
+
+==Everything :func:`make_webhook_delivery_tick` decides.=="""
+
+BusyRefresher = Callable[[], Awaitable[int | None]]
+"""One fully-bound busy-cache refresh pass.
+
+==Everything :func:`make_busy_refresh_tick` decides.=="""
 
 
 class SchedulerLike(Protocol):
@@ -376,39 +393,81 @@ def _decryption_fernet(app: FastAPI) -> MultiFernet:
     return MultiFernet([Fernet(key) for key in app.state.fernet_keys])
 
 
-def make_webhook_delivery_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind a webhook-delivery tick to the WORKER app's state (pools / http_client / fernet_key).
+def build_webhook_deliverer(app: FastAPI) -> WebhookDeliverer:
+    """The live webhook-delivery pass, built from the WORKER app's state — ==and TESTED.==
 
-    ``app`` here is the ``aethercal-worker`` process's app, never the web one — the web has no
-    ``pools`` on its state at all, because it holds no engine with ``BYPASSRLS``. That is not a
-    convention: an ``AttributeError`` at boot is what makes it a fact.
+    Extracted out of the ``# pragma: no cover`` tick for the reason :func:`build_drain_executor`
+    was: the seam between what the boot PUTS on ``app.state`` and what a tick READS back off it is
+    where a silent break hides. ==And it is not hypothetical.== While writing the drain's version of
+    this test, its author found that an earlier edit of his own had eaten ``app.state.fernet_keys``
+    out of the worker's boot — the name ==all three ticks read==, and this one signs every envelope
+    with it. The worker would have booted clean, reported healthy for ever, and delivered nothing.
+
+    Each of the FOUR names below is read inside a tick body that catches and logs, so losing any of
+    them is an inert worker with green health checks and not one line of error. Reading them in a
+    function a test can call against a really-booted lifespan is what makes that day loud.
+
+    ``app`` is the ``aethercal-worker`` process's app, never the web one — the web has no ``pools``
+    on its state at all, because it holds no engine with ``BYPASSRLS``.
 
     ``webhook_allowlist`` is put on the state eagerly by the worker factory, so the tick cannot fall
     back to "nothing allowed" for an instance whose operator DID declare their network.
     """
+    return functools.partial(
+        run_webhook_delivery_once,
+        pools=app.state.pools,
+        http_client=app.state.http_client,
+        # The ROTATION READER — current key, plus the retiring one during a rotation — so a
+        # subscription created before the rotation reached it stays signable across the window.
+        fernet_key=app.state.fernet_keys,
+        allowlist=app.state.webhook_allowlist,
+    )
+
+
+def make_webhook_delivery_tick(app: FastAPI) -> Tick:
+    """Bind a webhook-delivery tick to the worker's state.
+
+    Thin on purpose: every decision it makes lives in :func:`build_webhook_deliverer`, which is
+    tested against a really-booted lifespan. What is left here is the call itself.
+
+    ==And NOT ``# pragma: no cover``, though it used to be.== Nothing here is unreachable offline:
+    the tick touches the network only through seams a test already replaces, and
+    ``tests/test_worker_tick_wiring.py`` drives this exact closure. The pragma was covering a line
+    that could have called the wrong builder — a copy-paste that ticks happily for ever and delivers
+    nothing, which is precisely the class of bug this module keeps paying for.
+    """
 
     async def _tick() -> None:
-        await run_webhook_delivery_once(
-            pools=app.state.pools,
-            http_client=app.state.http_client,
-            # The ROTATION READER — current key, plus the retiring one during a rotation — so a
-            # subscription created before the rotation reached it stays signable across the window.
-            fernet_key=app.state.fernet_keys,
-            allowlist=app.state.webhook_allowlist,
-        )
+        await build_webhook_deliverer(app)()
 
     return _tick
 
 
-def make_busy_refresh_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
-    """Bind a busy-cache refresh tick to the worker's state (pools + a Fernet-built factory)."""
+def build_busy_refresher(app: FastAPI) -> BusyRefresher:
+    """The live busy-cache refresh pass, built from the worker's state — ==and TESTED.==
+
+    The same extraction, for the same reason (see :func:`build_webhook_deliverer`). This tick's
+    silence is the quietest of the three: a refresh that never runs does not fail a booking, it lets
+    one be double-booked weeks later against a calendar nobody noticed had gone stale.
+    """
+    # The ROTATION READER: a MultiFernet over the current key (and the retiring one during a
+    # rotation), so a Google token stored before the rotation reached it is still decryptable.
+    fernet = _decryption_fernet(app)
+    service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
+    return functools.partial(
+        run_busy_refresh_once, pools=app.state.pools, service_factory=service_factory
+    )
+
+
+def make_busy_refresh_tick(app: FastAPI) -> Tick:
+    """Bind a busy-cache refresh tick to the worker's state.
+
+    Thin on purpose: every decision it makes lives in :func:`build_busy_refresher`. Not
+    ``# pragma: no cover`` either, and for the same reason as :func:`make_webhook_delivery_tick`.
+    """
 
     async def _tick() -> None:
-        # The ROTATION READER: a MultiFernet over the current key (and the retiring one during a
-        # rotation), so a Google token stored before the rotation reached it is still decryptable.
-        fernet = _decryption_fernet(app)
-        service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
-        await run_busy_refresh_once(pools=app.state.pools, service_factory=service_factory)
+        await build_busy_refresher(app)()
 
     return _tick
 
@@ -490,7 +549,7 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
     invocable. A path nobody exercises is not acceptable, whatever a static read of it concludes.
     """
     pools: WorkerPools = app.state.pools
-    # The ROTATION READER (see make_busy_refresh_tick): reads a credential under EITHER key during a
+    # The ROTATION READER (see build_busy_refresher): reads a credential under EITHER key during a
     # rotation, so the drain never fails to decrypt a row the rotation has not reached.
     fernet = _decryption_fernet(app)
     service_factory: ServiceFactory = functools.partial(build_live_service, fernet=fernet)
@@ -516,9 +575,27 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
 def make_outbox_drain_tick(app: FastAPI) -> Tick:  # pragma: no cover - live
     """Bind an outbox-drain tick to the worker's state.
 
-    Thin on purpose: every decision it makes lives in :func:`build_drain_executor`, which is tested
-    (email / Google / refund / hold-expiry). What is left here is the loop itself, plus the
-    parked-payment tick that re-runs the arbiter for events that beat their checkout.
+    Most of what it decides lives in :func:`build_drain_executor`, which is tested (email / Google /
+    refund / hold-expiry). What is left here is the loop itself, plus the parked-payment tick that
+    re-runs the arbiter for events that beat their checkout.
+
+    .. rubric:: ==The residual, stated rather than left to be discovered (B-09)==
+
+    This is the ONE tick still carrying a pragma, and "thin on purpose" was doing some work in that
+    sentence: :func:`_payment_confirm_effects` reads ``app.state.settings`` in here, so a boot-seam
+    read is under the pragma after all. Its two siblings had theirs extracted into ``build_*``
+    functions and driven against the real lifespan; this one did not, because B-09's scope was the
+    other two.
+
+    It is the LOWEST-risk of the three, and that is why it was declared instead of rushed:
+    ``app.state.settings`` is set in :func:`~aethercal.server.worker.create_worker_app` itself, not
+    in the lifespan, and unconditionally — so losing it breaks every test that builds a worker,
+    loudly. ``fernet_keys`` (the name an edit really did eat) was set inside the lifespan, which is
+    exactly why it could vanish in silence.
+
+    The fix is the same shape as the other two and is a cut of its own: extract
+    ``build_parked_payment_runner(app)``, drive it from ``tests/test_worker_tick_wiring.py``'s
+    ``booted_worker``, and drop this pragma.
     """
 
     async def _tick() -> None:
@@ -563,10 +640,14 @@ __all__ = [
     "OUTBOX_DRAIN_JOB_ID",
     "WEBHOOK_DELIVERY_JOB_ID",
     "WEBHOOK_HTTP_TIMEOUT_SECONDS",
+    "BusyRefresher",
     "SchedulerLike",
     "Tick",
+    "WebhookDeliverer",
+    "build_busy_refresher",
     "build_drain_executor",
     "build_interval_scheduler",
+    "build_webhook_deliverer",
     "make_busy_refresh_tick",
     "make_outbox_drain_tick",
     "make_webhook_delivery_tick",
