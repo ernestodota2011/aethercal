@@ -26,7 +26,7 @@ dependencies = []
 # ImportError. Matches the same bound aethercal-server already declares. Re-verify this import (and
 # lift the bound) deliberately when moving to Reflex 0.10.
 reflex = [
-    "reflex>=0.9.6.post1,<0.10",
+    "reflex>=0.9.7,<0.10",
 ]
 
 [project.urls]

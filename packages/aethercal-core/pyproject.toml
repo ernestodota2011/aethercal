@@ -29,7 +29,7 @@ dependencies = [
     # `platform_system == 'Windows'` marker is exactly what kept a defect latent: with the wheel
     # absent on Linux, the rule fell through to a walk of /usr/share/zoneinfo and accepted
     # `localtime` (a Debian/Ubuntu artifact) as a real zone, in production only.
-    "tzdata>=2024.1",
+    "tzdata>=2026.3",
 ]
 
 [project.urls]
