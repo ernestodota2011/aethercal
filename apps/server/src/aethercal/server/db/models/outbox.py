@@ -102,6 +102,12 @@ class Outbox(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     claimed_by: Mapped[str | None] = mapped_column(sa.String(64))
     lease_expires_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
+    # Why a SKIPPED intent was skipped -- the text of the ``OutboxSkipped`` that ended it. NULL for
+    # every other status. Before this, ``status='skipped'`` was queryable but the reason lived only
+    # in the worker's log, so an operator asking "why did this business's reminder not go out?" had
+    # to go and grep. Now the answer is on the row.
+    skip_reason: Mapped[str | None] = mapped_column(sa.Text)
+
     __table_args__ = (
         # One intent per (booking, effect+variant): a re-run of the same transition never enqueues a
         # duplicate, and the poller's at-least-once retries stay effectively-once.

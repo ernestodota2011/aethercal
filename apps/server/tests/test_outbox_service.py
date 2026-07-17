@@ -926,6 +926,47 @@ async def test_the_lease_holder_settles_normally(maker: Sessionmaker) -> None:
     assert row.claimed_by is None  # the lease is released
 
 
+async def test_a_skip_records_its_reason_on_the_row(maker: Sessionmaker) -> None:
+    """The reason a step was skipped lands on the intent, not only in the worker's log — so the
+    operator's "why did this business's reminder not go out?" is answered off the row."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id, effect=OutboxEffect.NOTIFY)
+    async with maker() as session, session.begin():
+        work = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work is not None
+
+    report = OutboxReport()
+    await _settle(
+        maker,
+        work,
+        now=NOW,
+        outcome=_Outcome.SKIPPED,
+        report=report,
+        skip_reason="whatsapp channel not configured for this business",
+    )
+
+    assert report.skipped == [intent_id]
+    row = await _row(maker, intent_id)
+    assert row.status == "skipped"
+    assert row.skip_reason == "whatsapp channel not configured for this business"
+    assert row.claimed_by is None  # the lease is released
+
+
+async def test_a_delivered_intent_carries_no_skip_reason(maker: Sessionmaker) -> None:
+    """skip_reason is only for skips — every other outcome leaves it NULL, nothing to say."""
+    tenant_id, booking_id = await _seed_booking(maker)
+    intent_id = await _enqueue(maker, tenant_id, booking_id)
+    async with maker() as session, session.begin():
+        work = await claim_one(session, intent_id=intent_id, now=NOW, worker_id="A", lease=_LEASE)
+    assert work is not None
+
+    await _settle(maker, work, now=NOW, outcome=_Outcome.DELIVERED, report=OutboxReport())
+
+    row = await _row(maker, intent_id)
+    assert row.status == "delivered"
+    assert row.skip_reason is None
+
+
 def test_the_provider_timeout_ceiling_is_strictly_under_the_lease() -> None:
     """The invariant that keeps the race above from ever happening in the first place. The lease
     does not renew itself, so a send that outlives the TTL loses its claim AFTER the provider

@@ -185,7 +185,10 @@ _SKIPPED = OutboxStatus.SKIPPED.value
 A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
 reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
 noise in the backlog, and the message still does not arrive. The step is retired with its reason
-instead, loudly in the log and visibly in the row. """
+instead, loudly in the log and visibly in the row (``skip_reason``). """
+_SKIP_REASON_MAX_LEN = 500
+"""Cap on the persisted ``skip_reason``. It is a human diagnostic, not a payload — the two skip
+causes are short, but truncating defends the column against an unexpectedly long exception text."""
 _UNKNOWN = OutboxStatus.UNKNOWN.value
 """Handed to the provider; the answer was lost. Terminal, and NOT retried — see OutboxStatus."""
 _VOIDED = OutboxStatus.VOIDED.value
@@ -1531,6 +1534,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
     # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
     # something actually stops the send. This is that something.
     defer_for: timedelta | None = None
+    skip_reason: str | None = None
     try:
         async with asyncio.timeout(provider_timeout.total_seconds()):
             await execute(work, item_now)
@@ -1567,7 +1571,9 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
         outcome = _Outcome.UNKNOWN
     except OutboxSkipped as skipped:
         # NOT a failure: this effect can never run, so retrying it would only burn the backoff
-        # budget and dead-letter. Loud, terminal, and out of the queue.
+        # budget and dead-letter. Loud, terminal, and out of the queue. The reason travels to the
+        # ROW now, not only this log line, so an operator asking "why did it not go out?" reads the
+        # answer off the intent instead of grepping the worker.
         _logger.warning(
             "outbox intent %s (%s) for booking %s SKIPPED: %s",
             work.id,
@@ -1576,6 +1582,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
             skipped,
         )
         outcome = _Outcome.SKIPPED
+        skip_reason = str(skipped)
     except Exception:
         _logger.exception(
             "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
@@ -1591,6 +1598,7 @@ async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both c
         report=report,
         max_attempts=max_attempts,
         defer_for=defer_for,
+        skip_reason=skip_reason,
     )
 
 
@@ -1603,6 +1611,7 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
     report: OutboxReport,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     defer_for: timedelta | None = None,
+    skip_reason: str | None = None,
 ) -> None:
     """Record one intent's outcome in its OWN short transaction, releasing the lease.
 
@@ -1646,9 +1655,12 @@ async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the 
             return
 
         if outcome is _Outcome.SKIPPED:
-            # Terminal, and it costs no attempt: nothing was tried, so nothing failed.
+            # Terminal, and it costs no attempt: nothing was tried, so nothing failed. Persist WHY
+            # on the row (truncated — a diagnostic, not a payload) so the answer to "why did this
+            # business's reminder not go out?" lives with the intent, not only in the worker log.
             row.status = _SKIPPED
             row.next_retry_at = None
+            row.skip_reason = skip_reason[:_SKIP_REASON_MAX_LEN] if skip_reason else None
             report.skipped.append(row.id)
             return
 
