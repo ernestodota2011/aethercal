@@ -20,12 +20,35 @@ from aethercal.schemas.webhooks import (
 )
 
 
-def test_webhook_events_are_the_three_booking_events() -> None:
+def test_webhook_events_are_the_four_booking_events() -> None:
+    """``booking.no_show`` (RF-25) is part of the contract, not an afterthought.
+
+    Everything else derives from this ``Literal``: the subscription validator, the read model, the
+    envelope and the OpenAPI schema. ``Webhook.events`` is a JSON column, so widening the vocabulary
+    needs no data migration — an existing subscriber cannot have asked for an event that until now
+    did not exist."""
     assert set(WEBHOOK_EVENTS) == {
         "booking.created",
         "booking.cancelled",
         "booking.rescheduled",
+        "booking.no_show",
     }
+
+
+def test_a_subscription_can_be_created_for_the_no_show_event() -> None:
+    created = WebhookCreate(url="https://consumer.test/hook", events=["booking.no_show"])
+
+    assert created.events == ["booking.no_show"]
+
+
+def test_the_envelope_carries_the_no_show_event() -> None:
+    envelope = WebhookEnvelope(
+        event="booking.no_show",
+        timestamp="2026-07-09T12:00:00+00:00",
+        data={"id": "bk_1", "status": "no_show"},
+    )
+
+    assert envelope.model_dump()["event"] == "booking.no_show"
 
 
 def test_envelope_shape_matches_contract() -> None:

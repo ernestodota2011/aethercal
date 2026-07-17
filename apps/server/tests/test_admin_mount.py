@@ -78,14 +78,25 @@ async def test_create_app_does_not_mount_admin_by_default(monkeypatch: pytest.Mo
         await app.state.engine.dispose()
 
 
-def test_build_admin_app_registers_the_four_pages() -> None:
+def test_build_admin_app_registers_every_page() -> None:
+    """The page set is PINNED: a page function written but never routed is a screen the operator
+    cannot reach, and it would fail no other test."""
     engine = create_async_engine("sqlite+aiosqlite://")
     runtime = AdminRuntime(
         sessionmaker=async_sessionmaker(engine),
         config=AdminConfig(username="admin", password_hash="x", tenant_slug=None),
     )
     app = build_admin_app(runtime)
-    assert set(app._unevaluated_pages) == {"index", "login", "event-types", "schedules"}
+    assert set(app._unevaluated_pages) == {
+        "index",
+        "login",
+        "health",
+        "hosts",
+        "event-types",
+        "schedules",
+        "workflows",
+        "branding",
+    }
 
 
 async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
@@ -98,6 +109,12 @@ async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
     ``mount_admin``, so the sessionmaker is present when the admin mounts. We stub only the Reflex
     ASGI build (which needs a compiled frontend); the real ``AdminRuntime`` + the real
     ``app.state.sessionmaker`` access run, exercising the previously-uncovered live mount path.
+
+    The factory is asserted through its PRIVATE name, deliberately: it became private in B-01 so
+    that no admin module could open a session with no business bound (``test_admin_session_belt``
+    locks that). What is asserted here is the WIRING — the admin shares the server's ONE engine/pool
+    rather than opening a second, separately-managed one — and the wiring is exactly what a private
+    field hides. The rule this looks like it bends is a rule about the PRODUCT, not the harness.
     """
     for key, value in _ENABLED_ENV.items():
         monkeypatch.setenv(key, value)
@@ -119,7 +136,7 @@ async def test_create_app_with_admin_enabled_reads_the_eager_sessionmaker(
     try:
         runtime = captured["runtime"]
         assert isinstance(runtime, AdminRuntime)
-        assert runtime.sessionmaker is app.state.sessionmaker
+        assert runtime._sessionmaker is app.state.sessionmaker
         mounted = [r for r in app.routes if getattr(r, "path", "") == ADMIN_MOUNT_PATH]
         assert mounted, "the admin should be mounted at /admin when enabled"
     finally:

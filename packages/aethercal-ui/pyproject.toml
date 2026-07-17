@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aethercal-ui"
-version = "0.0.0"
+version = "0.1.0"
 description = "AetherCal calendar component: Reflex wrapper around a custom TSX core"
 requires-python = ">=3.11"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
-classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+classifiers = ["Development Status :: 4 - Beta", "Typing :: Typed"]
 # `reflex` is an extra (not a hard dependency): a standalone `pip install aethercal-ui` stays
 # lean; the monorepo dev venv opts in via the root pyproject.toml requesting `aethercal-ui[reflex]`
 # instead. See docs/spikes/f0-10-reflex-tsx.md for the full rationale and its trade-offs.
@@ -27,6 +28,12 @@ dependencies = []
 reflex = [
     "reflex>=0.9.6.post1,<0.10",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ernestodota2011/aethercal"
+Repository = "https://github.com/ernestodota2011/aethercal"
+Issues = "https://github.com/ernestodota2011/aethercal/issues"
+Changelog = "https://github.com/ernestodota2011/aethercal/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]

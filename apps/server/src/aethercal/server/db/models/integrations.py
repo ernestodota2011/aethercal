@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, UUIDPrimaryKey
+from aethercal.server.db.encrypted import FERNET_AT_REST
 
 
 class ExternalConnection(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
@@ -24,7 +25,11 @@ class ExternalConnection(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
     provider: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     account_email: Mapped[str] = mapped_column(sa.String(320), nullable=False)
-    encrypted_credentials: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
+    # The host's OAuth credentials, held as a Fernet token (services/calendars.py). The `info`
+    # marker enrols this column in the key rotation — see `db.encrypted` and `models/webhooks.py`.
+    encrypted_credentials: Mapped[bytes] = mapped_column(
+        sa.LargeBinary, nullable=False, info={FERNET_AT_REST: True}
+    )
     revoked_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
     # The busy-cache coverage window this connection last synced, and when (RF-12/13). read_busy
@@ -59,6 +64,17 @@ class ExternalCalendarLink(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
     external_calendar_id: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     sync_token: Mapped[str | None] = mapped_column(sa.Text)
+    # Is this calendar READ when computing the host's busy time? Default true: a newly linked
+    # calendar counts against availability, which is the safe direction — the failure mode is "we
+    # offered too few slots", never "we double-booked the host".
+    busy: Mapped[bool] = mapped_column(
+        sa.Boolean, server_default=sa.text("true"), default=True, nullable=False
+    )
+    # Is this the calendar events are WRITTEN to? Default false, and at most one per connection —
+    # see the partial unique index below.
+    is_booking_target: Mapped[bool] = mapped_column(
+        sa.Boolean, server_default=sa.text("false"), default=False, nullable=False
+    )
 
     __table_args__ = (
         sa.UniqueConstraint(
@@ -66,6 +82,19 @@ class ExternalCalendarLink(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
             "connection_id",
             "external_calendar_id",
             name="uq_external_calendar_links_calendar",
+        ),
+        # At most ONE write target per connection, enforced by the DATABASE. Without it, "which
+        # calendar do we write to?" gets answered by whatever row the code happened to read first —
+        # an arbitrary choice that changes silently when rows are reordered. Partial (only the
+        # targets are constrained), declared for BOTH backends so the offline suite proves the same
+        # rule production enforces — the same technique as ``uq_bookings_active_slot``.
+        sa.Index(
+            "uq_external_calendar_links_target",
+            "tenant_id",
+            "connection_id",
+            unique=True,
+            postgresql_where=sa.text("is_booking_target"),
+            sqlite_where=sa.text("is_booking_target"),
         ),
     )
 

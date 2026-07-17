@@ -4,16 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aethercal-client"
-version = "0.0.0"
+version = "0.1.0"
 description = "AetherCal SDK: sync + async httpx client for the API v1"
 requires-python = ">=3.11"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
-classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+classifiers = ["Development Status :: 4 - Beta", "Typing :: Typed"]
 dependencies = [
     "aethercal-schemas",
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ernestodota2011/aethercal"
+Repository = "https://github.com/ernestodota2011/aethercal"
+Issues = "https://github.com/ernestodota2011/aethercal/issues"
+Changelog = "https://github.com/ernestodota2011/aethercal/blob/main/CHANGELOG.md"
 
 [tool.uv.sources]
 aethercal-schemas = { workspace = true }

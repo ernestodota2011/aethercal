@@ -3,8 +3,7 @@
 Availability windows are stored as JSON that maps directly onto the pure ``aethercal.core`` value
 objects (``Schedule.by_weekday`` / ``DateOverride.ranges``): the core owns the date math, and a
 service loads the whole aggregate and hands it over — so the windows never need to be queried in
-SQL, and this stays a small handful of tables instead of one row per time range.
-"""
+SQL, and this stays a small handful of tables instead of one row per time range."""
 
 from __future__ import annotations
 
@@ -16,6 +15,16 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, UUIDPrimaryKey
+from aethercal.server.db.models.payments import RefundKind
+
+_REFUND_KIND = sa.Enum(
+    RefundKind,
+    name="refund_kind",
+    native_enum=False,
+    length=16,
+    create_constraint=True,
+    values_callable=lambda enum: [member.value for member in enum],
+)
 
 
 class Schedule(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
@@ -23,6 +32,14 @@ class Schedule(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
 
     __tablename__ = "schedules"
 
+    # NULL = a BUSINESS-WIDE schedule (the shop's opening hours), shared by every host. A concrete
+    # id makes it that one host's personal availability. REQUIRED by RF-30: without it `schedules`
+    # is only tenant-scoped, so two hosts silently share one schedule and there is no way to say
+    # otherwise. Nullable because business-wide is the common case for the non-technical businesses
+    # this product serves — a salon has opening hours, not a calendar per stylist.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     rules: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)
@@ -84,6 +101,24 @@ class EventType(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     max_per_day: Mapped[int | None] = mapped_column(sa.Integer)
     questions: Mapped[list[Any]] = mapped_column(sa.JSON, default=list, nullable=False)
     active: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("true"), nullable=False)
+
+    # -- payment (B-05b) -------------------------------------------------------------------
+    # ==NULL price_cents = the type is FREE.== A free type confirms directly with no hold and no
+    # payment (the ``discovery-call`` every business has). A set price means the PUBLIC path holds
+    # the slot and demands payment before it confirms — and the arbiter validates a payment's amount
+    # AND currency against these before it will confirm (a mismatch refunds and alerts, never
+    # confirms). ``currency`` is nullable too: a free type has no price to denominate.
+    price_cents: Mapped[int | None] = mapped_column(sa.Integer)
+    currency: Mapped[str | None] = mapped_column(sa.String(3))
+    # How long after the appointment's START a cancellation still earns a refund, and whether that
+    # refund is full or nothing. Defaults keep an existing (free) type unchanged: a 0-minute window
+    # and ``none`` mean "no automatic refund", which is exactly right for a type that never charged.
+    refund_window_minutes: Mapped[int] = mapped_column(
+        sa.Integer, server_default=sa.text("0"), nullable=False
+    )
+    refund_kind: Mapped[RefundKind] = mapped_column(
+        _REFUND_KIND, server_default=sa.text("'none'"), nullable=False
+    )
 
     __table_args__ = (sa.UniqueConstraint("tenant_id", "slug"),)
 

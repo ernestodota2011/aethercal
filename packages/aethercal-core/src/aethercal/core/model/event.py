@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, model_validator
+
+from aethercal.core.tz import require_iana_zone
 
 
 class Event(BaseModel):
@@ -33,10 +34,13 @@ class Event(BaseModel):
             raise ValueError(
                 "Event.dtstart must be a naive wall-time datetime; timezone is stored separately"
             )
-        try:
-            ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown IANA timezone: {self.timezone!r}") from exc
+        # What counts as a real zone is NOT decided here — it is decided once, by
+        # `aethercal.core.tz.require_iana_zone`, the same rule the guest's booking, the host's
+        # profile, `GET /slots` and the booking page all answer to. The copy that used to live here
+        # asked `ZoneInfo(...)` instead, which asks the FILESYSTEM: it crashed with a raw `OSError`
+        # on a key naming a tz-database directory ("America"), and accepted "utc" on a
+        # case-insensitive volume while production refused it.
+        require_iana_zone(self.timezone)
         if self.duration <= timedelta(0):
             raise ValueError("Event.duration must be strictly positive")
         for label, dates in (("exdates", self.exdates), ("rdates", self.rdates)):

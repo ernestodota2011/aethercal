@@ -37,9 +37,12 @@ async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
 
 
 @pytest_asyncio.fixture
-async def seeded(app: FastAPI) -> dict[str, Any]:
+async def seeded(app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]) -> dict[str, Any]:
     """Provision a tenant with a host user, a schedule, and an API key; return headers + ref ids."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    # ==Seeded on the OWNER engine.== Under FORCE ROW LEVEL SECURITY these rows carry a
+    # business nothing has bound yet, so the WITH CHECK refuses them on the app role. The
+    # REQUEST is what is under test, and it binds its own business from the key below.
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Seeded Tenant")
         session.add(tenant)

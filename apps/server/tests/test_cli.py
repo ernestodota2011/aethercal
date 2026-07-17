@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -11,20 +12,48 @@ from cryptography.fernet import Fernet
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from typer.testing import CliRunner
 
+from aethercal.core.model import BookingStatus
 from aethercal.server.cli import (
+    ReplayOutcome,
     RevokeKeyOutcome,
+    _credential_fields,
+    credentials_app,
     run_connect_google,
     run_create_tenant,
+    run_credentials_delete,
+    run_credentials_list,
+    run_credentials_set,
     run_issue_key,
+    run_list_dead_intents,
     run_list_keys,
+    run_replay_intent,
     run_revoke_key,
+    run_rotate_key,
 )
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db import Base
-from aethercal.server.db.models import ExternalConnection
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    ExternalCalendarLink,
+    ExternalConnection,
+    Outbox,
+    OutboxStatus,
+    Schedule,
+    Tenant,
+    TenantCredential,
+    User,
+)
 from aethercal.server.services.api_keys import verify_api_key
 from aethercal.server.services.calendars import GoogleCredential, load_credentials
+from aethercal.server.services.outbox import OutboxEffect
+from aethercal.server.services.tenant_credentials import (
+    CredentialProvider,
+    required_fields,
+    resolve_money_credential,
+)
 
 
 @pytest_asyncio.fixture
@@ -95,6 +124,73 @@ async def test_connect_google_stores_an_encrypted_connection(
         assert connection.provider == "google"
         assert connection.encrypted_credentials != token_json.encode("utf-8")
         assert load_credentials(connection, fernet=fernet) == token_json
+
+
+async def test_connect_google_can_designate_a_dedicated_booking_calendar(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The operator surface for the credential rule: bookings land in a DEDICATED secondary
+    calendar, never in the connected account's ``primary``. Without ``--calendar-id`` the account
+    default is used (zero-config); with it, the link row is written AND flagged as the booking
+    target — the row ``resolve_calendar_target`` actually reads."""
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+
+    connection_id = await run_connect_google(
+        maker,
+        tenant_slug="acme",
+        user_email="host@acme.test",
+        credential=GoogleCredential(account_email="agency@agency.test", token_json='{"t": "a"}'),
+        fernet=fernet,
+        calendar_id="bookings@group.calendar.google.com",
+    )
+
+    async with maker() as session:
+        link = (
+            await session.scalars(
+                select(ExternalCalendarLink).where(
+                    ExternalCalendarLink.connection_id == connection_id
+                )
+            )
+        ).one()
+        assert link.external_calendar_id == "bookings@group.calendar.google.com"
+        assert link.is_booking_target  # the event is written HERE, not into "primary"
+        assert link.busy  # and its freebusy blocks slots
+
+
+async def test_re_running_connect_google_with_the_same_calendar_is_idempotent(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Re-connecting (a token refresh, a re-run of the same command) must not pile up link rows or
+    trip the one-target-per-connection constraint."""
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+
+    for _ in range(2):
+        connection_id = await run_connect_google(
+            maker,
+            tenant_slug="acme",
+            user_email="host@acme.test",
+            credential=GoogleCredential(
+                account_email="agency@agency.test", token_json='{"t": "a"}'
+            ),
+            fernet=fernet,
+            calendar_id="bookings@group.calendar.google.com",
+        )
+
+    async with maker() as session:
+        links = (
+            await session.scalars(
+                select(ExternalCalendarLink).where(
+                    ExternalCalendarLink.connection_id == connection_id
+                )
+            )
+        ).all()
+        assert len(links) == 1
 
 
 async def test_connect_google_unknown_tenant_raises(
@@ -248,3 +344,394 @@ async def test_revoke_key_for_unknown_slug_raises(
 ) -> None:
     with pytest.raises(LookupError, match="ghost"):
         await run_revoke_key(maker, tenant_slug="ghost", api_key_id=uuid.uuid4())
+
+
+# --------------------------------------------------------------------------------------
+# `aethercal-admin outbox replay` (R9) — reviving a dead intent without opening psql.
+#
+# A dead intent is a message that was never delivered: six attempts, then parked. Until now the
+# only way to give it another chance was to UPDATE the table by hand — which is also the only way
+# to accidentally "replay" a DELIVERED one and mail a guest twice. So the command is a CONDITIONAL
+# update gated on `status = 'dead'`, arbitrated by rowcount, and it says which of the three things
+# happened.
+# --------------------------------------------------------------------------------------
+
+
+async def _seed_intent(
+    maker: async_sessionmaker[AsyncSession], *, status: OutboxStatus, attempts: int = 6
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A tenant with one booking and one outbox intent in ``status``. Returns (tenant, intent)."""
+    async with maker() as session, session.begin():
+        tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Acme")
+        session.add(tenant)
+        await session.flush()
+        host = User(tenant_id=tenant.id, email="host@acme.test", name="H", timezone="UTC")
+        schedule = Schedule(tenant_id=tenant.id, name="W", timezone="UTC", rules={})
+        session.add_all([host, schedule])
+        await session.flush()
+        event_type = EventType(
+            tenant_id=tenant.id,
+            host_id=host.id,
+            schedule_id=schedule.id,
+            slug="intro",
+            title="Intro",
+            duration_seconds=1800,
+            max_advance_seconds=60 * 60 * 24 * 30,
+        )
+        session.add(event_type)
+        await session.flush()
+        start = datetime(2026, 7, 12, 9, 0, tzinfo=UTC)
+        booking = Booking(
+            tenant_id=tenant.id,
+            event_type_id=event_type.id,
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            status=BookingStatus.CONFIRMED,
+            # Confirmed ⇒ stamped: after B-05a a confirmed booking always carries when it became so.
+            confirmed_at=start - timedelta(days=1),
+            guest_name="Ada",
+            guest_email="ada@example.com",
+            guest_timezone="UTC",
+        )
+        session.add(booking)
+        await session.flush()
+        intent = Outbox(
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            effect=OutboxEffect.EMAIL.value,
+            dedupe_key="email:confirmation",
+            payload={"kind": "confirmation"},
+            status=status.value,
+            attempts=attempts,
+            next_retry_at=None,
+            claimed_by="worker-1" if status is OutboxStatus.CLAIMED else None,
+        )
+        session.add(intent)
+        await session.flush()
+        return tenant.id, intent.id
+
+
+async def test_replay_revives_a_dead_intent_and_clears_its_attempts(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Back to ``pending`` and DUE, with the attempt count reset.
+
+    Reviving it with ``attempts`` still at six would put it one failure from the dead-letter again,
+    so the very next transient blip would re-park it — a replay that looks like a replay and buys
+    the operator nothing."""
+    _, intent_id = await _seed_intent(maker, status=OutboxStatus.DEAD)
+
+    outcome = await run_replay_intent(maker, intent_id=intent_id)
+
+    assert outcome is ReplayOutcome.REVIVED
+    async with maker() as session:
+        row = await session.get(Outbox, intent_id)
+        assert row is not None
+        assert row.status == OutboxStatus.PENDING.value
+        assert row.attempts == 0
+        assert row.next_retry_at is None  # due at the next drain
+        assert row.claimed_by is None
+        assert row.lease_expires_at is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        OutboxStatus.DELIVERED,
+        OutboxStatus.PENDING,
+        OutboxStatus.CLAIMED,
+        OutboxStatus.SKIPPED,
+        OutboxStatus.VOIDED,
+        OutboxStatus.FAILED,
+    ],
+)
+async def test_replay_refuses_anything_that_is_not_dead(
+    maker: async_sessionmaker[AsyncSession], status: OutboxStatus
+) -> None:
+    """==The guard that makes this command safe to hand to a tired operator at 3am.==
+
+    "Replaying" a DELIVERED intent re-sends a message the guest already has. "Replaying" a CLAIMED
+    one yanks a row out from under the worker that is sending it right now. A `failed` one is not
+    stuck at all — it is already scheduled to retry. Only `dead` is genuinely parked, so only `dead`
+    is revivable, and the refusal is a rowcount, not a read-then-write that a concurrent drain could
+    slip between."""
+    _, intent_id = await _seed_intent(maker, status=status)
+
+    outcome = await run_replay_intent(maker, intent_id=intent_id)
+
+    assert outcome is ReplayOutcome.NOT_DEAD
+    async with maker() as session:
+        row = await session.get(Outbox, intent_id)
+        assert row is not None
+        assert row.status == status.value  # untouched
+
+
+async def test_replay_of_an_unknown_intent_reports_not_found(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    outcome = await run_replay_intent(maker, intent_id=uuid.uuid4())
+
+    assert outcome is ReplayOutcome.NOT_FOUND
+
+
+async def test_replaying_twice_is_refused_the_second_time(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The first replay made it ``pending``; a second must not reset a row that is now live and may
+    already be in a worker's hands."""
+    _, intent_id = await _seed_intent(maker, status=OutboxStatus.DEAD)
+    await run_replay_intent(maker, intent_id=intent_id)
+
+    again = await run_replay_intent(maker, intent_id=intent_id)
+
+    assert again is ReplayOutcome.NOT_DEAD
+
+
+async def test_listing_dead_intents_finds_them_without_touching_the_database_by_hand(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A replay command you cannot feed an id to is half a fix: finding the id was the very thing
+    that meant opening psql. The listing carries no guest data — id, effect, attempts, booking."""
+    _, dead_id = await _seed_intent(maker, status=OutboxStatus.DEAD)
+    await _seed_intent(maker, status=OutboxStatus.DELIVERED)
+
+    rows = await run_list_dead_intents(maker)
+
+    assert [row.id for row in rows] == [dead_id]
+
+
+# ======================================================================================
+# BYOK credentials — the operator's surface (criteria 40, 41, 42).
+#
+# ==Every secret below is synthetic.== `sk_test_NOT_A_REAL_KEY` is not a redaction of anything.
+# ======================================================================================
+
+
+CLI_STRIPE = {"secret_key": "sk_test_NOT_A_REAL_KEY", "webhook_secret": "whsec_FAKE"}
+
+
+async def test_credentials_set_stores_an_encrypted_credential_the_business_can_charge_with(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    async with maker() as session:
+        row = (await session.scalars(select(TenantCredential))).one()
+        resolved = await resolve_money_credential(
+            session, tenant_id=row.tenant_id, provider=CredentialProvider.STRIPE, fernet_key=key
+        )
+    assert resolved.secrets == CLI_STRIPE
+    assert CLI_STRIPE["secret_key"].encode() not in row.encrypted_payload
+
+
+async def test_credentials_set_for_an_unknown_business_is_a_hard_stop(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The same rule as ``guest purge``.== An unresolvable business is never a filter to fall back
+    from: a payment credential written to the wrong business is money going to the wrong account."""
+    with pytest.raises(LookupError, match="ghost"):
+        await run_credentials_set(
+            maker,
+            tenant_slug="ghost",
+            provider=CredentialProvider.STRIPE,
+            secrets=CLI_STRIPE,
+            key=derive_fernet_key("cli-secret"),
+        )
+
+
+async def test_credentials_list_names_the_providers_and_never_a_secret(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """What the operator sees on their terminal. It answers "is Stripe configured?" without
+    decrypting anything — which is why the coroutine takes no key at all."""
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    await run_credentials_set(
+        maker,
+        tenant_slug="acme",
+        provider=CredentialProvider.STRIPE,
+        secrets=CLI_STRIPE,
+        key=derive_fernet_key("cli-secret"),
+    )
+
+    listed = await run_credentials_list(maker, tenant_slug="acme")
+    assert listed == (CredentialProvider.STRIPE,)
+
+
+async def test_credentials_delete_is_the_off_switch(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC")
+    key = derive_fernet_key("cli-secret")
+    await run_credentials_set(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE, secrets=CLI_STRIPE, key=key
+    )
+
+    assert await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+    assert await run_credentials_list(maker, tenant_slug="acme") == ()
+    # And deleting again reports "there was nothing", rather than pretending it removed something.
+    assert not await run_credentials_delete(
+        maker, tenant_slug="acme", provider=CredentialProvider.STRIPE
+    )
+
+
+async def test_rotate_key_moves_every_business_onto_the_new_key(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Criterion 42, through the operator's actual command.==
+
+    Two businesses, so the rotation is proved to be instance-wide: it runs as the OWNER precisely
+    because, under row-level security, no other role can see more than one business at a time.
+    """
+    old, new = derive_fernet_key("old-app-secret"), derive_fernet_key("new-app-secret")
+    for slug in ("acme", "globex"):
+        await run_create_tenant(
+            maker, slug=slug, name=slug, email=f"host@{slug}.test", timezone="UTC"
+        )
+        await run_credentials_set(
+            maker,
+            tenant_slug=slug,
+            provider=CredentialProvider.STRIPE,
+            secrets={"secret_key": f"sk_test_NOT_REAL_{slug}", "webhook_secret": "whsec_FAKE"},
+            key=old,
+        )
+
+    report = await run_rotate_key(maker, new_key=new, previous_key=old)
+    assert report.total == 2
+
+    async with maker() as session:
+        rows = (await session.scalars(select(TenantCredential))).all()
+        for row in rows:
+            resolved = await resolve_money_credential(
+                session,
+                tenant_id=row.tenant_id,
+                provider=CredentialProvider.STRIPE,
+                fernet_key=new,
+            )
+            assert resolved.secrets["secret_key"].startswith("sk_test_NOT_REAL_")
+
+    # And the summary the operator reads back is counts — never a secret.
+    assert "sk_test" not in report.summary()
+
+
+# ======================================================================================
+# `credentials set` — the JSON piped in must be an object of field → NON-EMPTY STRING.
+#
+# `json.loads` yields values of ANY JSON type, but a credential field is a string. The old code
+# coerced every value with `str(value)`, so `{"secret_key": {"nested": "x"}}` was stored as the
+# literal text `"{'nested': 'x'}"` — a credential that looks perfectly configured and fails only
+# once a guest's money has already left their card. The parse step now refuses any value that is not
+# already a non-empty string, at the door, with exit code 2, and WITHOUT echoing the value.
+#
+# The rule lives at the CLI because the CLI is the ONLY place untyped JSON becomes a credential:
+# `store_credential`'s type is `Mapping[str, str]`, so every other (typed, Python) caller cannot
+# reach it with a non-string, and the service's own `_validate` still guards completeness for them.
+# ======================================================================================
+
+
+CLI_RUNNER = CliRunner()
+
+
+# The provider's fixed field set — the ONLY names the refusal is allowed to echo (any other key
+# could itself be a secret). ``credentials_set_command`` passes exactly this to _credential_fields.
+STRIPE_EXPECTED = required_fields(CredentialProvider.STRIPE)
+
+
+def test_credential_fields_accepts_an_object_of_non_empty_strings() -> None:
+    """The happy path: a scalar object is returned unchanged, ready for the service."""
+    scalar = {"secret_key": "sk_test_x", "webhook_secret": "whsec_x"}
+    assert _credential_fields(scalar, expected=STRIPE_EXPECTED) == scalar
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param({"secret_key": {"a": 1}}, id="nested-object"),
+        pytest.param({"secret_key": [1, 2, 3]}, id="array"),
+        pytest.param({"secret_key": None}, id="null"),
+        pytest.param({"secret_key": 123}, id="number"),
+        pytest.param({"secret_key": True}, id="boolean"),
+        pytest.param({"secret_key": ""}, id="empty-string"),
+        pytest.param({"secret_key": "   "}, id="whitespace-only"),
+    ],
+)
+def test_credential_fields_refuses_anything_that_is_not_a_non_empty_string(
+    bad: dict[str, object],
+) -> None:
+    """A dict/list/null/number/boolean or a blank string is not a credential value — it is refused,
+    and the message names an EXPECTED field (a provider literal, not a secret) but never the
+    value."""
+    with pytest.raises(ValueError, match="secret_key"):
+        _credential_fields(bad, expected=STRIPE_EXPECTED)
+
+
+def test_credential_fields_never_echoes_the_rejected_value() -> None:
+    """==The value is a secret, even when it is the wrong shape.== The refusal names the (expected)
+    field and the JSON type, and nothing that was piped in."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields(
+            {"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}, expected=STRIPE_EXPECTED
+        )
+    assert "sk_live_MUST_NOT_APPEAR" not in str(raised.value)
+
+
+def test_credential_fields_does_not_echo_an_unexpected_field_name() -> None:
+    """==A field name outside the provider's set may be a secret, so it is never printed.== The
+    operator still learns a field is the wrong shape (and its JSON type), enough to fix their
+    input, without the caller-supplied key reaching the terminal or a log."""
+    with pytest.raises(ValueError) as raised:
+        _credential_fields({"whsec_A_SECRET_IN_THE_KEY": {"inner": 1}}, expected=STRIPE_EXPECTED)
+    assert "whsec_A_SECRET_IN_THE_KEY" not in str(raised.value)
+    assert "credential field" in str(raised.value)  # it still says SOMETHING legible
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param('{"secret_key": {"a": 1}}', id="nested-object"),
+        pytest.param('{"secret_key": [1]}', id="array"),
+        pytest.param('{"secret_key": ""}', id="empty-string"),
+    ],
+)
+def test_credentials_set_command_exits_2_on_a_non_scalar_field(payload: str) -> None:
+    """Through the real command over STDIN: a non-scalar (or blank) field is a usage error (exit 2),
+    refused before the credential ever reaches the database."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input=payload,
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_value() -> None:
+    """The command's stderr names the field, never the value piped in."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"secret_key": {"inner": "sk_live_MUST_NOT_APPEAR"}}',
+    )
+    assert result.exit_code == 2
+    assert "sk_live_MUST_NOT_APPEAR" not in result.output
+
+
+def test_credentials_set_command_refusal_does_not_leak_the_field_name() -> None:
+    """==A field NAME is caller-supplied, so it can be a secret too.== Someone can paste the secret
+    into the key as easily as the value (a mislabelled export, a copy-paste slip). Only a field name
+    the PROVIDER declares — a fixed literal we control — is safe to echo; an unexpected key is named
+    only as "a field", so the refusal names the JSON type but never the piped-in key itself."""
+    result = CLI_RUNNER.invoke(
+        credentials_app,
+        ["set", "--tenant-slug", "acme", "--provider", "stripe"],
+        input='{"sk_live_A_SECRET_IN_THE_KEY": {"inner": 1}}',
+    )
+    assert result.exit_code == 2
+    assert result.output.strip(), "the refusal must say something legible to the operator"
+    assert "sk_live_A_SECRET_IN_THE_KEY" not in result.output

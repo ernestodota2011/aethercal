@@ -4,14 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aethercal-core"
-version = "0.0.0"
+version = "0.1.0"
 description = "AetherCal domain engine: recurrence, availability, slots, timezones — pure, zero I/O"
 requires-python = ">=3.11"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
 keywords = ["calendar", "scheduling", "recurrence", "rfc5545", "icalendar", "availability", "timezone"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -23,12 +24,19 @@ dependencies = [
     "python-dateutil>=2.9",
     "icalendar>=6",
     "pydantic>=2.7",
-    "tzdata>=2024.1; platform_system == 'Windows'",
+    # The IANA zone LISTING is what `core.tz` decides "is this a real timezone" against, so it is
+    # required on every platform — not just the one with no system tz tree. The old
+    # `platform_system == 'Windows'` marker is exactly what kept a defect latent: with the wheel
+    # absent on Linux, the rule fell through to a walk of /usr/share/zoneinfo and accepted
+    # `localtime` (a Debian/Ubuntu artifact) as a real zone, in production only.
+    "tzdata>=2024.1",
 ]
 
 [project.urls]
 Homepage = "https://github.com/ernestodota2011/aethercal"
 Repository = "https://github.com/ernestodota2011/aethercal"
+Issues = "https://github.com/ernestodota2011/aethercal/issues"
+Changelog = "https://github.com/ernestodota2011/aethercal/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aethercal"]

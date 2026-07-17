@@ -22,10 +22,21 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.core.model import BookingStatus
 from aethercal.server.api import bookings
-from aethercal.server.db.models import EventType, Outbox, Schedule, Tenant, User
+from aethercal.server.db.models import (
+    Booking,
+    EventType,
+    Outbox,
+    Schedule,
+    Tenant,
+    User,
+    Webhook,
+    WebhookDelivery,
+)
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.services.api_keys import issue_api_key
+from aethercal.server.services.event_types import deactivate_event_type
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
@@ -49,9 +60,15 @@ async def wired_client(app: FastAPI, client: AsyncClient) -> AsyncClient:
 
 
 @pytest_asyncio.fixture
-async def seeded(app: FastAPI) -> dict[str, Any]:
-    """Seed a tenant + host + open schedule + event type + API key; return ids, headers, slots."""
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+async def seeded(app: FastAPI, owner_maker: async_sessionmaker[AsyncSession]) -> dict[str, Any]:
+    """Seed a tenant + host + open schedule + event type + API key; return ids, headers, slots.
+
+    ==On the OWNER engine.== Under ``FORCE ROW LEVEL SECURITY`` these INSERTs carry a business
+    that nothing has bound yet, so the ``WITH CHECK`` refuses every one of them on the app role.
+    The REQUEST is the system under test, and it binds its own business — from the API key this
+    fixture returns, through the resolver, in ``require_api_key``.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         tenant = Tenant(slug=f"t-{uuid.uuid4().hex[:8]}", name="Seeded Tenant")
         session.add(tenant)
@@ -107,9 +124,14 @@ def _payload(seeded: dict[str, Any], start: str) -> dict[str, Any]:
 
 
 async def _mint_token(
-    app: FastAPI, *, booking_id: uuid.UUID, tenant_id: uuid.UUID, purpose: GuestTokenPurpose
+    owner_maker: async_sessionmaker[AsyncSession],
+    *,
+    booking_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    purpose: GuestTokenPurpose,
 ) -> str:
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    """Arrangement: the guest link the product would have e-mailed. On the OWNER engine."""
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session, session.begin():
         return await issue_guest_token(
             session,
@@ -140,7 +162,9 @@ async def test_create_returns_201_and_confirms(
 
 
 async def test_http_create_enqueues_email_intent_but_not_google(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     """R6 deferral is clean + safe: the real HTTP booking path ALWAYS enqueues the confirmation
     email intent (durable, drained post-commit), but with no host ``ExternalConnection`` resolved it
@@ -153,7 +177,9 @@ async def test_http_create_enqueues_email_intent_but_not_google(
     assert resp.status_code == 201
     booking_id = uuid.UUID(resp.json()["id"])
 
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    # Observation, on the OWNER engine: what the REQUEST wrote, read back by something that can
+    # see every business — so a row filed under the wrong one would show up, not vanish.
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
     async with sessionmaker() as session:
         rows = list(
             (await session.scalars(select(Outbox).where(Outbox.booking_id == booking_id))).all()
@@ -194,21 +220,30 @@ async def test_get_and_list(wired_client: AsyncClient, seeded: dict[str, Any]) -
 
     listed = await wired_client.get(BOOKINGS, headers=seeded["headers"])
     assert listed.status_code == 200
-    assert booking_id in [b["id"] for b in listed.json()]
+    # ==A PAGE envelope now, not a bare array (criterion 16).== The authenticated list of a whole
+    # diary is the PII dump; unbounded it was an availability risk for its own owner, and a default
+    # limit returned as a plain list would silently truncate a large diary — ``total`` is the honest
+    # signal that more exists.
+    body = listed.json()
+    assert booking_id in [b["id"] for b in body["items"]]
+    assert body["total"] >= 1
+    assert body["limit"] == 100 and body["offset"] == 0
 
     missing = await wired_client.get(f"{BOOKINGS}{uuid.uuid4()}", headers=seeded["headers"])
     assert missing.status_code == 404
 
 
 async def test_cancel_via_guest_token(
-    app: FastAPI, wired_client: AsyncClient, seeded: dict[str, Any]
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
 ) -> None:
     created = await wired_client.post(
         BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
     )
     booking_id = created.json()["id"]
     token = await _mint_token(
-        app,
+        owner_maker,
         booking_id=uuid.UUID(booking_id),
         tenant_id=seeded["tenant_id"],
         purpose=GuestTokenPurpose.CANCEL,
@@ -244,3 +279,196 @@ async def test_reschedule_via_api_key(wired_client: AsyncClient, seeded: dict[st
     # The original is now cancelled, freeing its slot.
     old = await wired_client.get(f"{BOOKINGS}{original_id}", headers=seeded["headers"])
     assert old.json()["status"] == "cancelled"
+
+
+# --------------------------------------------------------------------------------------
+# No-show (RF-25) over HTTP. The HOST marks it — never the guest.
+# --------------------------------------------------------------------------------------
+
+
+async def _book_in_the_past(
+    owner_maker: async_sessionmaker[AsyncSession], seeded: dict[str, Any]
+) -> uuid.UUID:
+    """A CONFIRMED booking whose appointment has already ENDED.
+
+    Inserted directly: the create path (rightly) refuses to book a slot in the past, and a no-show
+    is only ever a statement about an appointment that already happened. On the OWNER engine.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
+    start = datetime.now(UTC) - timedelta(hours=2)
+    async with sessionmaker() as session, session.begin():
+        booking = Booking(
+            tenant_id=seeded["tenant_id"],
+            event_type_id=uuid.UUID(seeded["event_type_id"]),
+            start_at=start,
+            end_at=start + timedelta(minutes=30),
+            status=BookingStatus.CONFIRMED,
+            # A CONFIRMED booking carries the instant it became so — leaving it NULL would make the
+            # outbound belt (B-05a) treat this real, finished appointment as an unpaid hold and
+            # SILENCE its no-show webhook. It was confirmed when it was booked, before it ended.
+            confirmed_at=start - timedelta(hours=1),
+            guest_name="Ada Lovelace",
+            guest_email="ada@example.com",
+            guest_timezone="UTC",
+        )
+        session.add(booking)
+        await session.flush()
+        return booking.id
+
+
+async def test_no_show_requires_the_api_key(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    """No guest-token door, deliberately: cancelling is the guest's right, but declaring that they
+    failed to show up is the HOST's judgement about them. A guest-reachable no-show would also hand
+    anyone holding an emailed link a way to smear the record."""
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+
+    resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show")
+
+    assert resp.status_code == 401
+
+
+async def test_no_show_marks_a_finished_booking(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+
+    resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "no_show"
+
+
+async def test_no_show_is_idempotent_over_http(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+    first = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    again = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    assert first.status_code == 200
+    assert again.status_code == 200
+    assert again.json()["status"] == "no_show"
+
+
+async def test_no_show_of_an_unfinished_booking_returns_409_not_ended(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    """A DISTINCT machine code. Collapsing "it has not happened yet" into the generic conflict is
+    how an admin ends up staring at "Booking cannot be rescheduled" after clicking *no-show*."""
+    created = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    booking_id = created.json()["id"]
+
+    resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "not_ended"
+
+
+async def test_no_show_of_a_cancelled_booking_returns_409_not_active(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+    await wired_client.post(f"{BOOKINGS}{booking_id}/cancel", headers=seeded["headers"])
+
+    resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "not_active"
+
+
+async def test_no_show_of_an_unknown_booking_returns_404(
+    wired_client: AsyncClient, seeded: dict[str, Any]
+) -> None:
+    resp = await wired_client.post(f"{BOOKINGS}{uuid.uuid4()}/no-show", headers=seeded["headers"])
+
+    assert resp.status_code == 404
+
+
+async def test_no_show_fans_out_the_webhook_over_http(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    """End to end on the real database: the transition and its delivery row commit together."""
+    booking_id = await _book_in_the_past(owner_maker, seeded)
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
+    async with sessionmaker() as session, session.begin():
+        session.add(
+            Webhook(
+                tenant_id=seeded["tenant_id"],
+                url="https://consumer.test/hook",
+                secret=b"opaque",
+                events=["booking.no_show"],
+                active=True,
+            )
+        )
+
+    resp = await wired_client.post(f"{BOOKINGS}{booking_id}/no-show", headers=seeded["headers"])
+
+    assert resp.status_code == 200
+    async with sessionmaker() as session:
+        queued = (
+            await session.scalars(
+                select(WebhookDelivery).where(WebhookDelivery.event == "booking.no_show")
+            )
+        ).all()
+    assert len(queued) == 1
+    assert queued[0].payload["data"]["id"] == str(booking_id)
+
+
+async def test_a_deactivated_event_type_is_indistinguishable_from_an_unknown_one(
+    owner_maker: async_sessionmaker[AsyncSession],
+    wired_client: AsyncClient,
+    seeded: dict[str, Any],
+) -> None:
+    """RF-14 over HTTP: "deleting" an event type must actually stop it taking bookings — and must
+    not become an oracle for which ones a business has switched off.
+
+    Deactivation (``active = False``, what ``DELETE /event-types/{id}`` performs) used to change
+    nothing a guest could observe: ``POST /bookings`` went on confirming appointments for the
+    withdrawn service, because no booking path ever read the flag.
+
+    Both halves are asserted, and the second matters as much as the first: the deactivated type must
+    answer with the EXACT status, code and message an id that never existed answers with. A distinct
+    "this one is disabled" reply would let a stranger enumerate a business's retired services.
+    """
+    unknown = await wired_client.post(
+        BOOKINGS,
+        json={**_payload(seeded, seeded["slot1"]), "event_type_id": str(uuid.uuid4())},
+        headers=seeded["headers"],
+    )
+    assert unknown.status_code == 404
+
+    # Soft-delete through the service (the event-types router is not mounted on this client).
+    # Arrangement for the request that follows — so, the OWNER engine.
+    sessionmaker: async_sessionmaker[AsyncSession] = owner_maker
+    async with sessionmaker() as session, session.begin():
+        assert await deactivate_event_type(
+            session,
+            tenant_id=seeded["tenant_id"],
+            event_type_id=uuid.UUID(seeded["event_type_id"]),
+        )
+
+    deactivated = await wired_client.post(
+        BOOKINGS, json=_payload(seeded, seeded["slot1"]), headers=seeded["headers"]
+    )
+    assert deactivated.status_code == 404
+    assert deactivated.json()["detail"] == unknown.json()["detail"]  # byte-for-byte, no oracle
+
+    # (That it also publishes no SLOTS is proven offline, in
+    # ``test_slots_service.test_a_deactivated_event_type_publishes_no_slots``: the slots router is
+    # not mounted on this client, so asserting it here would pass on a ROUTING 404 and prove
+    # nothing at all.)

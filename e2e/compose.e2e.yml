@@ -1,0 +1,145 @@
+# The E2E stack = the SHIPPING stack + the three things a test needs in order to observe it.
+#
+# Used as an OVERLAY, never alone, so what runs is the artifact users actually deploy:
+#
+#   docker compose -f deploy/docker-compose.yml -f e2e/compose.e2e.yml up -d
+#
+# It adds:
+#   * the ROLES — the one part of the shipping stack that is a human runbook step (BYPASSRLS needs
+#     superuser, so it can never be a migration). See sql/00-provision-roles.sh for why an
+#     `initdb.d` hook is correct HERE and a trap in deploy/;
+#   * mailpit — the SMTP server the WORKER sends through, with an HTTP API the suite reads the
+#     guest's confirmation email from (the ONLY place the cancel/reschedule links ever reach a
+#     guest);
+#   * hooks   — a stdlib webhook sink that records each delivery byte for byte, so the suite can
+#     verify the HMAC over the exact bytes the server signed.
+#
+# ==What the isolation batch changed here — and why this overlay was BROKEN until it was fixed.== The
+# outbox drain and the webhook delivery no longer run inside `app`: they run in the `worker` process,
+# which holds the two pools that work actually requires. So the SMTP settings, the fast tick and the
+# sink's network — every one of which used to be pinned onto `app` — belong to `worker` now. Left
+# where they were, the app would boot perfectly, send nothing, deliver nothing, and every spec would
+# time out blaming itself.
+#
+# Relative paths resolve against the project directory (the first `-f` file's directory, `deploy/`),
+# so the sink script is mounted as `../e2e/sink/receiver.py`. `deploy/` and `e2e/` are siblings, so
+# that path is also correct if a future Compose resolves paths per-file instead — either way it
+# lands on the same file.
+
+services:
+  postgres:
+    environment:
+      # Read by ../e2e/sql/00-provision-roles.sh. Test-only, and destroyed with the stack.
+      AETHERCAL_E2E_ROLE_PASSWORD: ${AETHERCAL_E2E_ROLE_PASSWORD:-e2e-local-only}
+    volumes:
+      # The SHIPPED role DDL, mounted OUTSIDE initdb.d on purpose: the postgres entrypoint would run
+      # any *.sql it finds in initdb.d directly, and this one is a psql script whose `:'pw_owner'`
+      # variables only the shell wrapper can bind. The wrapper is what goes in initdb.d — and it
+      # executes the shipped file rather than a copy, so the E2E can never pass against roles the
+      # product does not actually ship.
+      - ../deploy/sql/provision_roles.sql:/opt/aethercal/provision_roles.sql:ro
+      - ../e2e/sql/00-provision-roles.sh:/docker-entrypoint-initdb.d/00-provision-roles.sh:ro
+
+  app:
+    environment:
+      # The links the app mints must be openable BY THE TEST RUNNER (outside the compose network),
+      # so they carry the published address of the booking page, not its container name.
+      AETHERCAL_BOOKING_BASE_URL: http://localhost:5001
+      AETHERCAL_ENVIRONMENT: e2e
+
+  worker:
+    # ==The process that actually SENDS.== Every observable effect this suite waits for — the guest's
+    # confirmation email, each outbound webhook — is produced HERE, and no longer in `app`.
+    environment:
+      # ---- SMTP → Mailpit. Without it the drain degrades gracefully (no email; the booking still
+      # succeeds) and the guest never receives their signed links — so the suite would be asserting
+      # against a crippled product.
+      AETHERCAL_SMTP_HOST: mailpit
+      AETHERCAL_SMTP_PORT: "1025"
+      AETHERCAL_SMTP_FROM: bookings@e2e.test
+      AETHERCAL_SMTP_USE_TLS: "false"
+      AETHERCAL_SMTP_USERNAME: ""
+      AETHERCAL_SMTP_PASSWORD: ""
+      # The composer mints the guest's cancel/reschedule links at DRAIN time, in this process — so
+      # the public base URL has to be here too, or the guest receives links nobody can open.
+      AETHERCAL_BOOKING_BASE_URL: http://localhost:5001
+      AETHERCAL_ENVIRONMENT: e2e
+      # A 60-second tick is right for production and absurd for a test: every asserted effect (the
+      # confirmation email, each outbound webhook) would cost a real minute of waiting, and this
+      # journey asserts six of them. The production DEFAULT is untouched — this is the same knob an
+      # operator has (RF-19), turned down for a throwaway stack.
+      AETHERCAL_OUTBOX_DRAIN_INTERVAL_SECONDS: "5"
+      AETHERCAL_WEBHOOK_INTERVAL_SECONDS: "5"
+    networks:
+      # Declaring networks here REPLACES the implicit `default`, so it must be listed again — or the
+      # worker loses Postgres. It needs BOTH: `default` for Postgres and Mailpit, and `hooks`
+      # because it is the process that POSTs to the sink.
+      - default
+      - hooks
+
+  booking:
+    environment:
+      AETHERCAL_ENVIRONMENT: e2e
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_MAX_MESSAGES: "500"
+    ports:
+      # 8025 = the HTTP API the suite reads. 1025 = SMTP, reached over the compose network only.
+      - "${MAILPIT_HOST_PORT:-8025}:8025"
+
+  hooks:
+    # The same base image the app is built on, so the E2E pulls nothing exotic. The sink is
+    # stdlib-only (see ../e2e/sink/receiver.py).
+    image: python:3.12-slim-bookworm
+    restart: unless-stopped
+    command: ["python", "/srv/receiver.py"]
+    volumes:
+      - ../e2e/sink/receiver.py:/srv/receiver.py:ro
+    environment:
+      SINK_PORT: "9099"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9099/_health', timeout=3).status ==
+          200 else 1)
+      interval: 5s
+      timeout: 4s
+      retries: 5
+      start_period: 5s
+    networks:
+      hooks:
+        # ⚠️ READ THIS BEFORE "SIMPLIFYING" THE SUBNET BELOW.
+        #
+        # The delivery worker refuses to POST to any address that is not globally routable
+        # (`webhooks/ssrf.py::ip_is_public` — an SSRF egress guard, plus a connect-time IP pin). A
+        # sink on Docker's usual 172.16/12 bridge resolves to a PRIVATE address, so every delivery
+        # would be parked `dead` without one request leaving the container — and a suite that merely
+        # waited for a webhook would time out blaming itself instead of the product.
+        #
+        # So the sink sits on its own bridge whose subnet is public IPv4 space (44.0.0.0/8, AMPRNet)
+        # that nothing in CI routes to. It cannot be a documentation range (192.0.2/24,
+        # 198.51.100/24, 203.0.113/24): Python marks those `is_private`, so the guard rejects them.
+        #
+        # This is TEST TACKLE, not a fix. The product limitation is real and filed as debt: a
+        # self-hoster whose n8n/Make/CRM sits on the same Docker network or LAN CANNOT receive
+        # webhooks today. The root fix belongs in the server — an operator-configured, env-only,
+        # fail-closed allowlist of private targets, never derived from inbound data — not here.
+        ipv4_address: 44.44.44.10
+    ports:
+      - "${SINK_HOST_PORT:-9099}:9099"
+
+networks:
+  hooks:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 44.44.44.0/24
+          gateway: 44.44.44.1

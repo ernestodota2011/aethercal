@@ -25,29 +25,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
 from aethercal.core.model import BookingStatus
+from aethercal.schemas import Page
 from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
 from aethercal.server.api.auth import AuthContext, require_api_key
+from aethercal.server.db.guc import bind_tenant
 from aethercal.server.deps import get_session
 from aethercal.server.services.bookings import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
     AvailabilityUnavailableError,
     BookingEffects,
     BookingError,
     BookingNotActiveError,
+    BookingNotEndedError,
     BookingNotFoundError,
     BookingParams,
+    DayFullError,
+    EventTypeInactiveError,
     EventTypeNotFoundError,
     SlotUnavailableError,
     cancel_booking,
+    count_bookings,
     create_booking,
     get_booking,
     list_bookings,
+    mark_no_show,
     reschedule_booking,
 )
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
     consume_guest_token,
+    hash_token,
 )
+from aethercal.server.services.tenant_resolution import tenant_by_guest_token_hash
 from aethercal.server.settings import Settings
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
@@ -72,10 +83,26 @@ def _http(code: int, error: str, message: str) -> HTTPException:
     return HTTPException(status_code=code, detail={"error": error, "message": message})
 
 
-def _map_booking_error(exc: BookingError) -> HTTPException:
-    """Translate a service domain error to its clean HTTP status (fixed, non-leaking messages)."""
+def map_booking_error(exc: BookingError) -> HTTPException:  # noqa: PLR0911 - it IS the table
+    """Translate a service domain error to its clean HTTP status (fixed, non-leaking messages).
+
+    ==Public, because the PUBLIC router consumes it.== Both routers open a booking through the same
+    service, so they must answer the same domain error with the same machine code — the booking page
+    localises off those codes, and a second table would fork them. ``api/public.py`` narrows exactly
+    one arm (the two event-type errors collapse into its own indistinguishable ``not_found``) and
+    inherits the rest of this one.
+
+    One return per domain error is the contract, not a smell: every arm is a distinct machine code
+    the API promises its callers. Collapsing arms to satisfy a return-count lint is exactly how two
+    different failures start answering with the same code — and how "the appointment has not ended
+    yet" would reach an admin as "Booking could not be completed"."""
     match exc:
-        case EventTypeNotFoundError():
+        case EventTypeNotFoundError() | EventTypeInactiveError():
+            # ==Deliberately ONE arm.== A deactivated event type and one that never existed must be
+            # indistinguishable to a guest — same status, same code, same words. Give the withdrawn
+            # one its own answer and the 404s become an oracle: a stranger could enumerate exactly
+            # which of a business's event types have been switched off. The operator is told the
+            # useful version through the admin's own error map, where the audience is known.
             return _http(status.HTTP_404_NOT_FOUND, "not_found", "Event type not found")
         case BookingNotFoundError():
             return _http(status.HTTP_404_NOT_FOUND, "not_found", "Booking not found")
@@ -85,8 +112,30 @@ def _map_booking_error(exc: BookingError) -> HTTPException:
                 "availability_unavailable",
                 "Host availability is temporarily unavailable; please try again",
             )
+        case BookingNotEndedError():
+            # Its OWN machine code, and BEFORE the generic conflict. Folding "the appointment has
+            # not happened yet" into `conflict` is how an admin ends up reading "Booking could not
+            # be completed" after clicking *no-show* on a meeting that is still running.
+            return _http(status.HTTP_409_CONFLICT, "not_ended", "The appointment has not ended yet")
         case BookingNotActiveError():
-            return _http(status.HTTP_409_CONFLICT, "not_active", "Booking cannot be rescheduled")
+            # Operation-neutral wording: this error is now raised by cancel/reschedule AND by
+            # no-show, so "Booking cannot be rescheduled" is simply false when the caller asked for
+            # something else. The machine CODE (`not_active`) is unchanged — the booking page
+            # localises off the code, never off this string.
+            return _http(
+                status.HTTP_409_CONFLICT,
+                "not_active",
+                "Booking is not in a state that allows this operation",
+            )
+        case DayFullError():
+            # Its OWN machine code, like `not_ended` above and for the same reason: told
+            # `slot_unavailable`, a guest tries the next hour, and the next — every one of which
+            # refuses them, because it is the DAY that is full and no hour on it can be had.
+            return _http(
+                status.HTTP_409_CONFLICT,
+                "day_full",
+                "That day is fully booked; please choose another day",
+            )
         case SlotUnavailableError():
             return _http(
                 status.HTTP_409_CONFLICT, "slot_unavailable", "That time is no longer available"
@@ -118,15 +167,19 @@ def _build_effects(request: Request) -> BookingEffects:
 
     The guest-token signer + booking base URL are always present. The email notice is enqueued to
     the durable outbox unconditionally (the drain worker owns the live SMTP sender), so no sender is
-    passed here. The 24 h reminder runner is read from ``app.state`` when wired (F1-10). Google
-    sync (F1-07) is not wired yet (resolving the host's ``ExternalConnection`` is the last step), so
-    ``connection`` stays ``None`` — a booking never attempts Google in this path.
+    passed here. There is no reminder runner any more: the 24 h reminder is a workflow rule
+    materialised into that same outbox, so nothing is scheduled from the request path.
+
+    The Google sync (RF-11) is NOT assembled here either, and that is the fix rather than an
+    omission: the host is only known once the event type is loaded, which happens inside the booking
+    service. This bundle used to carry a ``connection`` field the API had no way to populate — so it
+    was always ``None``, and every booking skipped the calendar sync in silence. The service now
+    resolves the host's connected calendar from the database and enqueues the Google intent itself.
     """
     settings = _settings(request)
     return BookingEffects(
         signer=GuestTokenSigner(settings.app_secret),
         booking_base_url=_booking_base_url(request, settings),
-        reminder_runner=getattr(request.app.state, "reminder_runner", None),
     )
 
 
@@ -146,8 +199,30 @@ async def _authorize_mutation(
     app-wide 401). Consuming the token in the request transaction means a later failed mutation
     (rolled back by ``get_session``) also rolls back the token's single-use stamp — the guest can
     retry.
+
+    .. rubric:: ==The guest token is the second half of the bootstrap paradox==
+
+    ``guest_tokens`` is a tenant-scoped table, and the cancel link in a guest's inbox carries a
+    token
+    and NOTHING ELSE — no business, no key. Under RLS with no GUC, ``consume_guest_token``'s lookup
+    (which is by hash alone) returns zero rows, and ==every cancel/reschedule link already sitting
+    in
+    a customer's inbox stops working==, permanently: only the ``sha256`` was ever stored, so the
+    business cannot be recovered from the token by any other route.
+
+    So the token is translated into a business FIRST, through the ``SECURITY DEFINER`` resolver, and
+    the GUC is bound before a single scoped row is touched. Everything after that — the consume, the
+    booking read, the mutation — happens under RLS with this business bound and no other. The token
+    payload is deliberately NOT extended with a ``tenant_id``: two sources of truth for one fact is
+    how drift is born, and the tokens already issued could never have been re-signed anyway.
     """
     if token is not None:
+        # Resolve → bind → THEN read. In that order and no other: the read is itself tenant-scoped.
+        tenant_id = await tenant_by_guest_token_hash(session, hash_token(token))
+        if tenant_id is None:
+            raise _http(status.HTTP_403_FORBIDDEN, "forbidden", "Invalid or expired link")
+        await bind_tenant(session, tenant_id)
+
         signer = GuestTokenSigner(_settings(request).app_secret)
         row = await consume_guest_token(session, signer, token, expected_purpose=purpose)
         if row is None or row.booking_id != booking_id:
@@ -182,6 +257,10 @@ async def create(
         guest_notes=payload.guest_notes,
         answers=payload.answers,
         locale=payload.locale or "es",
+        # RF-24: carried all the way down to the column. A consent the API accepts and then drops
+        # on the floor is not a consent — it is a checkbox, and it can never be evidenced later.
+        guest_phone=payload.guest_phone,
+        guest_phone_consent=payload.guest_phone_consent,
     )
     try:
         booking = await create_booking(
@@ -192,27 +271,62 @@ async def create(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 
-@router.get("/", response_model=list[BookingRead])
-async def list_all(
+@router.get("/", response_model=Page[BookingRead])
+async def list_all(  # noqa: PLR0913 - FastAPI declares each query param + dependency as a parameter
     session: SessionDep,
     ctx: AuthDep,
     status_filter: Annotated[BookingStatus | None, Query(alias="status")] = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
-) -> list[BookingRead]:
-    """List the tenant's bookings, filtered by ``status`` and a ``from``/``to`` date window."""
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Page[BookingRead]:
+    """A PAGE of the tenant's bookings, filtered by ``status`` and a ``from``/``to`` date window.
+
+    ==This route stays behind the API key.== It answers with ``guest_name``, ``guest_email``,
+    ``guest_notes`` and ``answers`` for every booking a business ever took — the PII dump of an
+    entire diary. It is not mounted under ``/public``, and it never will be.
+
+    Unbounded, it was also an availability problem *for the owner of the data*: a busy year of
+    appointments, materialised into one response, on a route anybody holding the key can call in a
+    loop. So ``limit`` defaults to 100 and is HARD-capped at 500 — a caller-chosen limit with no
+    maximum is the same unbounded query wearing a parameter.
+
+    ==And the answer is an ENVELOPE, not a bare array.== A default limit on a route that used to
+    return everything means a caller now receives a hundred of their bookings; handed back as a
+    plain
+    list, that is a SILENT TRUNCATION — the integration believes it holds the whole diary and holds
+    a
+    hundredth of it, with nothing anywhere to say so. ``total`` is what makes the missing rows
+    visible, and it is why this is the breaking change that gets made rather than the quiet one that
+    does not.
+    """
     rows = await list_bookings(
         session,
         tenant_id=ctx.tenant_id,
         status=status_filter,
         date_from=date_from,
         date_to=date_to,
+        limit=limit,
+        offset=offset,
     )
-    return [BookingRead.model_validate(row) for row in rows]
+    total = await count_bookings(
+        session,
+        tenant_id=ctx.tenant_id,
+        status=status_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return Page(
+        items=[BookingRead.model_validate(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{booking_id}", response_model=BookingRead)
@@ -244,7 +358,29 @@ async def cancel(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
+    return await _read_model(session, booking)
+
+
+@router.post("/{booking_id}/no-show", response_model=BookingRead)
+async def no_show(booking_id: uuid.UUID, session: SessionDep, ctx: AuthDep) -> BookingRead:
+    """Mark a finished appointment as a no-show (RF-25). Idempotent; fans out ``booking.no_show``.
+
+    ==API key ONLY — deliberately no guest-token door.== Cancelling is the guest's own right, which
+    is why that route accepts a signed link; declaring that they failed to turn up is the HOST's
+    judgement ABOUT them. A guest-reachable no-show would let anyone holding an emailed link write
+    that judgement into the record themselves.
+
+    409 ``not_ended`` while the appointment is still running or in the future, 409 ``not_active`` if
+    it is not confirmed, 404 if the tenant has no such booking. The slot stays OCCUPIED: the time
+    has passed, and freeing it would let a booking be written retroactively over it.
+    """
+    try:
+        booking = await mark_no_show(
+            session, tenant_id=ctx.tenant_id, booking_id=booking_id, now=_now()
+        )
+    except BookingError as exc:
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 
@@ -270,7 +406,7 @@ async def reschedule(
             effects=_build_effects(request),
         )
     except BookingError as exc:
-        raise _map_booking_error(exc) from exc
+        raise map_booking_error(exc) from exc
     return await _read_model(session, booking)
 
 

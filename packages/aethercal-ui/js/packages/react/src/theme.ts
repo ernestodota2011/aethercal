@@ -59,6 +59,26 @@ export const STRUCTURAL_TG_TOKENS: ThemeTokens = {
   "--ac-tg-event-accent": "var(--ac-event-accent)",
 };
 
+/**
+ * STRUCTURAL resource-timeline tokens (RF-28), constant across presets: the resource-column width,
+ * the height of one event lane, and the DERIVED tokens that reference base colour tokens via `var()`.
+ *
+ * Every colour here is DERIVED, never new: the timeline introduces no themeable colour token of its
+ * own, so all four presets — and any custom `--ac-*` object — theme it correctly with no change to
+ * the Python `Theme` model, which stays the single source of truth for colour values.
+ */
+export const STRUCTURAL_TL_TOKENS: ThemeTokens = {
+  "--ac-tl-rowhead-width": "168px",
+  "--ac-tl-lane-height": "30px",
+  "--ac-tl-body-height": "560px",
+  "--ac-tl-line": "var(--ac-border)",
+  "--ac-tl-event-bg": "var(--ac-event-bg)",
+  "--ac-tl-event-fg": "var(--ac-event-fg)",
+  "--ac-tl-event-accent": "var(--ac-event-accent)",
+  "--ac-tl-group-bg": "var(--ac-cell-bg-outside)",
+  "--ac-tl-now": "var(--ac-tg-now)",
+};
+
 /** The one themeable token that lives in the time-grid block (its default comes from the presets). */
 const TG_THEMEABLE_TOKENS: readonly string[] = ["--ac-tg-now"];
 
@@ -111,6 +131,16 @@ export function defaultBaseTokenCss(): string {
  */
 export function defaultTimeGridTokenCss(): string {
   return themeTokensToCss({ ...STRUCTURAL_TG_TOKENS, ...lightTimeGridColorTokens() });
+}
+
+/**
+ * The default `:where(.aethercal-timeline)` token declarations — structural timeline tokens plus the
+ * light preset's time-grid colour token(s), which the timeline's own `--ac-tl-now` derives from.
+ * Emitting them here means the timeline stylesheet stands alone (it does not depend on the time-grid
+ * stylesheet being injected), while still sourcing every value from the one generated origin.
+ */
+export function defaultTimelineTokenCss(): string {
+  return themeTokensToCss({ ...STRUCTURAL_TL_TOKENS, ...lightTimeGridColorTokens() });
 }
 
 /** Keep only well-formed `--ac-*` custom properties with CSS-safe values (injection defense). */

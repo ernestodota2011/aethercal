@@ -40,6 +40,7 @@ from fasthtml.common import (
     Head,
     Header,
     Html,
+    Img,
     Input,
     Label,
     Li,
@@ -61,12 +62,21 @@ from fasthtml.common import (
     to_xml,
 )
 
-from aethercal.booking.forms import FieldError, QuestionSpec, question_field_name
+from aethercal.booking.forms import (
+    CONSENT_SUBMITTED_VALUE,
+    PHONE_CONSENT_FIELD_NAME,
+    PHONE_FIELD_NAME,
+    FieldError,
+    QuestionSpec,
+    is_consent_ticked,
+    question_field_name,
+)
 from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
-from aethercal.schemas.bookings import BookingRead
-from aethercal.schemas.event_types import EventTypeRead, resolve_description, resolve_title
+from aethercal.schemas.branding import TenantBrandingRead
+from aethercal.schemas.event_types import resolve_description, resolve_title
+from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 from aethercal.schemas.slots import Availability
 
 # Self-hosted (vendored at `static/htmx-2.0.4.min.js`, served by the app itself via `/static`) —
@@ -88,8 +98,13 @@ _CSS = """
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     --bg: #faf9f7; --surface: #ffffff; --border: #e5e2dc;
-    --text: #1b1b1e; --muted: #5f5f68; --accent: #b4632a; --accent-ink: #ffffff;
-    --focus: #b4632a; --danger: #b23a52; color-scheme: light;
+    /* The ember, darkened until white can sit on it: #b4632a gave 4.41:1 against --accent-ink and
+       4.19:1 as link text on --bg, and AA wants 4.5. Hue (24.8deg) and saturation are untouched —
+       only lightness moves — so both uses now pass (4.75 and 4.51). Fixed at the TOKEN, not at the
+       one button axe landed on: the failing pair is --accent/--accent-ink itself, so every element
+       wearing it was failing, including the ones nobody has written yet. */
+    --text: #1b1b1e; --muted: #5f5f68; --accent: #ac5f28; --accent-ink: #ffffff;
+    --focus: #ac5f28; --danger: #b23a52; color-scheme: light;
   }
 }
 * { box-sizing: border-box; }
@@ -107,7 +122,13 @@ main { max-width: var(--maxw); margin: 0 auto; padding: 2rem 1.25rem 4rem; }
 }
 .site-footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--border);
   margin-top: 2rem; }
-.brand { font-weight: 600; letter-spacing: -0.01em; color: var(--text); text-decoration: none; }
+.brand {
+  font-weight: 600; letter-spacing: -0.01em; color: var(--text); text-decoration: none;
+  display: inline-flex; align-items: center; gap: .55rem; min-width: 0;
+}
+/* The business's mark. Height-bounded and `width: auto`, so ANY logo an operator uploads sits on
+   the baseline of the header instead of resizing it — a tall PNG must not push the page down. */
+.brand-logo { height: 1.75rem; width: auto; max-width: 10rem; object-fit: contain; }
 .langs a { color: var(--muted); text-decoration: none; font-size: .85rem; padding: 0 .35rem; }
 .langs a[aria-current="true"] { color: var(--text); font-weight: 600; }
 h1 { font-size: 1.6rem; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 .5rem; }
@@ -151,6 +172,15 @@ textarea { min-height: 5rem; resize: vertical; }
 .slot:hover { border-color: var(--accent); }
 .field { margin-bottom: 1.1rem; }
 .field-error { color: var(--danger); font-size: .85rem; margin-top: .35rem; }
+.hint { color: var(--muted); font-size: .85rem; margin: .35rem 0 0; }
+/* The consent control (RF-24). The `input {width:100%}` rule above would stretch a checkbox right
+   across the column, so it is reset here. The label WRAPS the box — a large, obvious hit target,
+   with no `for=`/`id=` pair that can drift apart — and sits beside it, never above: the reading
+   order of a checkbox is "[ ] I agree to ...", not "I agree to ... [ ]". */
+.consent label { display: flex; align-items: flex-start; gap: .6rem; font-weight: 400;
+  margin: 0; cursor: pointer; }
+.consent input[type="checkbox"] { width: 1.05rem; height: 1.05rem; flex: 0 0 auto;
+  margin-top: .28rem; accent-color: var(--accent); cursor: pointer; }
 .notice { border: 1px solid var(--border); border-left: 3px solid var(--accent);
   padding: .9rem 1rem; border-radius: var(--radius); color: var(--muted); }
 .notice.error { border-left-color: var(--danger); color: var(--text); }
@@ -229,9 +259,57 @@ def _lang_switcher(locale: Locale, lang_urls: Mapping[Locale, str]) -> Any:
     return Nav(*links, cls="langs", aria_label=t(locale, "language"))
 
 
-def _header(locale: Locale, lang_urls: Mapping[Locale, str]) -> Any:
+def site_name(locale: Locale, brand: TenantBrandingRead | None) -> str:
+    """What this page calls itself: the BUSINESS's name, or the product's when there is no brand.
+
+    One function, because the answer is needed in three places that must not drift — the header, the
+    ``<title>``, and ``og:site_name``. A page whose tab says "AetherCal" and whose header says
+    "Clínica Sol" is a page that has half-shipped its own feature.
+    """
+    return brand.display_name if brand is not None else t(locale, "app_name")
+
+
+def _brand_mark(brand: TenantBrandingRead | None) -> list[Any]:
+    """The business's logo, or nothing at all.
+
+    ``alt=""`` on purpose: the business's name sits immediately beside it, in text, so a screen
+    reader that also announced the logo would say the name twice. The mark is decorative *because*
+    the name is not (RNF-7).
+    """
+    if brand is None or not brand.logo_url:
+        return []
+    return [Img(src=brand.logo_url, alt="", cls="brand-logo")]
+
+
+def _brand_style(brand: TenantBrandingRead | None) -> list[Any]:
+    """The business's accent colour, as an override of the theme's two accent variables.
+
+    An OVERRIDE, not a replacement: the whole stylesheet keeps working (contrast, focus rings, the
+    light-mode block), and a business that has chosen no colour gets no element at all — which is
+    what ``id="brand"`` lets a test, and a person reading the source, actually see.
+
+    ==The value is safe to interpolate because of its FORMAT, not because it is escaped.==
+    ``accent_color`` is a hex triplet or it does not exist: :func:`require_accent_color` refuses it
+    at the write edge (the admin, 422) *and* at this read edge (``TenantBrandingRead`` validates on
+    parse), so a string carrying ``;``, ``}`` or ``</style>`` cannot reach this f-string — not from
+    the API, and not from a row somebody edited by hand in ``psql``.
+    """
+    if brand is None or not brand.accent_color:
+        return []
+    accent = brand.accent_color
+    return [Style(f":root {{ --accent: {accent}; --focus: {accent}; }}", id="brand")]
+
+
+def _header(
+    locale: Locale, lang_urls: Mapping[Locale, str], brand: TenantBrandingRead | None
+) -> Any:
     return Header(
-        A(t(locale, "app_name"), href=_with_lang("/", locale), cls="brand"),
+        A(
+            *_brand_mark(brand),
+            Span(site_name(locale, brand)),
+            href=_with_lang("/", locale),
+            cls="brand",
+        ),
         _lang_switcher(locale, lang_urls),
         cls="site-header",
     )
@@ -265,9 +343,20 @@ _OG_LOCALE: dict[Locale, str] = {"es": "es_ES", "en": "en_US"}
 _OG_IMAGE_PATH = "/static/og.png"
 
 
-def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url: str) -> list[Any]:
+def _social_meta(
+    locale: Locale,
+    *,
+    full_title: str,
+    base_url: str,
+    current_url: str,
+    brand: TenantBrandingRead | None = None,
+) -> list[Any]:
     """Open Graph + Twitter Card ``<meta>`` tags (A7) — every url is absolute (``base_url``-
     prefixed) so a social unfurler (WhatsApp/email/Slack) fetched out-of-band still resolves them.
+
+    ``og:site_name`` follows the header (:func:`site_name`): when a guest pastes their booking link
+    into WhatsApp, the unfurl must name the BUSINESS. Naming the product there — while the page
+    itself is branded — is the same half-shipped feature, in the one place the guest sees first.
     """
     description = t(locale, "meta_description")
     image_url = f"{base_url}{_OG_IMAGE_PATH}"
@@ -275,7 +364,7 @@ def _social_meta(locale: Locale, *, full_title: str, base_url: str, current_url:
         Meta(property="og:title", content=full_title),
         Meta(property="og:description", content=description),
         Meta(property="og:type", content="website"),
-        Meta(property="og:site_name", content=t(locale, "app_name")),
+        Meta(property="og:site_name", content=site_name(locale, brand)),
         Meta(property="og:url", content=current_url),
         Meta(property="og:image", content=image_url),
         Meta(property="og:locale", content=_OG_LOCALE.get(locale, _OG_LOCALE[DEFAULT_LOCALE])),
@@ -293,8 +382,23 @@ def page(
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
+
+    ==``brand`` is where per-business identity enters the page, and it enters ONCE.== The shell is
+    the one thing every route renders, so putting the name, the mark and the colour here is what
+    makes them appear on the landing page, the slot picker, the confirmation, the cancel link a
+    guest opens from their inbox three weeks later, and the 404 — without any of those routes
+    knowing that branding exists.
+
+    ``None`` (the default) is the product's own chrome: an unbranded business, and also the
+    fallback when the API cannot say whose page this is. Every existing caller therefore keeps the
+    behaviour it had.
+
+    In the ``embed`` shell the header is absent by design (B1: the embedder brings its own chrome),
+    so the name and the mark are not rendered there — but the ACCENT still is, because the guest is
+    looking at the business's colours inside the business's own site.
 
     ``base_url`` mints the ABSOLUTE urls Open Graph/Twitter Card tags require (A7); callers that
     don't thread a real ``BookingSettings.base_url`` through still get the production default
@@ -306,12 +410,12 @@ def page(
     size the iframe to the guest's content. The skip-link is also omitted — with no header there
     is nothing before ``<main>`` to skip past.
     """
-    full_title = f"{title} · {t(locale, 'app_name')}"
+    full_title = f"{title} · {site_name(locale, brand)}"
     current_url = f"{base_url}{lang_urls.get(locale, '')}"
     body_children: list[Any] = []
     if not embed:
         body_children.append(A(t(locale, "skip_to_content"), href="#main", cls="skip-link"))
-        body_children.append(_header(locale, lang_urls))
+        body_children.append(_header(locale, lang_urls, brand))
     body_children.append(Main(*content, id="main"))
     if embed:
         body_children.append(_embed_resize_script())
@@ -324,12 +428,19 @@ def page(
             Meta(name="color-scheme", content="dark light"),
             Meta(name="description", content=t(locale, "meta_description")),
             *_social_meta(
-                locale, full_title=full_title, base_url=base_url, current_url=current_url
+                locale,
+                full_title=full_title,
+                base_url=base_url,
+                current_url=current_url,
+                brand=brand,
             ),
             Title(full_title),
             *_hreflang_links(lang_urls),
             Link(rel="icon", type="image/svg+xml", href="/static/favicon.svg"),
             Style(_CSS),
+            # AFTER the base stylesheet, so the business's accent wins on specificity-equal
+            # `:root` — and only ever those two variables.
+            *_brand_style(brand),
             Script(src=_HTMX_SRC, defer=True),
         ),
         Body(*body_children, cls="embed" if embed else None),
@@ -342,18 +453,28 @@ def page(
 # --------------------------------------------------------------------------------------
 
 
-def _duration_label(locale: Locale, event: EventTypeRead) -> str:
+def _duration_label(locale: Locale, event: PublicEventTypeRead) -> str:
     return t(locale, "duration_minutes", minutes=event.duration_seconds // 60)
 
 
 def index_page(
     locale: Locale,
     *,
-    event_types: Sequence[EventTypeRead],
+    event_types: Sequence[PublicEventTypeRead],
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    event_base: str = "/e",
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
-    """Landing page: the tenant's bookable meeting types, each linking into the booking flow."""
+    """Landing page: the tenant's bookable meeting types, each linking into the booking flow.
+
+    ``event_base`` is the route-scoped booking prefix the handler derives (``_booking_prefix``):
+    ``/e`` for the single-business self-hoster, ``/t/{slug}/e`` when the request arrived on a
+    business-scoped route. Every event link is built on it so the guest STAYS inside the business
+    whose page they are on. Hardcoding ``/e`` here dropped the route tenant and bounced a guest on
+    ``/t/{slug}`` onto the DEFAULT business's event — the same "links follow the route" rule the
+    event page already keeps via ``event_path``, applied to the index's links too.
+    """
     if not event_types:
         body: Any = P(t(locale, "index_empty"), cls="lead")
     else:
@@ -361,7 +482,7 @@ def index_page(
             Li(
                 A(
                     resolve_title(event, locale),
-                    href=_with_lang(f"/e/{event.slug}", locale),
+                    href=_with_lang(f"{event_base}/{event.slug}", locale),
                     cls="brand",
                 ),
                 Div(_duration_label(locale, event), cls="meta"),
@@ -377,10 +498,11 @@ def index_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 
-def _event_intro(locale: Locale, event: EventTypeRead) -> Any:
+def _event_intro(locale: Locale, event: PublicEventTypeRead) -> Any:
     meta_parts = [_duration_label(locale, event)]
     if event.location:
         meta_parts.append(event.location)
@@ -454,7 +576,7 @@ def _detect_script(tz_explicit: bool) -> Any:
 def event_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     tz: str,
     tz_options: Sequence[str],
     tz_explicit: bool,
@@ -466,6 +588,7 @@ def event_page(
     notice: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Step 1: the event details, a timezone control, and the (HTMX-swappable) slot list.
 
@@ -496,6 +619,7 @@ def event_page(
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
@@ -546,7 +670,7 @@ def slots_unavailable_fragment(locale: Locale) -> Any:
 def slots_section(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     groups: Sequence[DayGroup],
     availability: Availability,
     tz: str,
@@ -682,10 +806,98 @@ def _labelled_field(
     return Div(*parts, cls="field")
 
 
+def _phone_fields(locale: Locale, *, values: Mapping[str, str], error: str | None) -> list[Any]:
+    """The optional phone input + its EXPLICIT consent checkbox (RF-24).
+
+    Only ever called when ``event.collects_phone`` is true — i.e. when an active WhatsApp/SMS rule
+    would actually message the number. Where nothing would, this markup does not exist at all: the
+    guest is not asked, so there is no PII to protect (RNF-8).
+
+    Three properties this markup must never lose:
+
+    * the checkbox is **not** ``checked`` unless the person filling the form ticked it (``values``,
+      echoed back on a re-render). A pre-ticked box is a default nobody chose, and is not consent;
+    * neither control is ``required`` — booking without a phone has to keep working;
+    * the consent is a real ``<input type="checkbox">`` whose value is submitted and read. It is
+      the thing the server stamps into ``guest_phone_consent_at``, not decoration.
+
+    ⚠️ What this box can and cannot establish: it records that WHOEVER IS BOOKING ticked it. This is
+    a PUBLIC form, so that is not necessarily the owner of the number they typed — a third party can
+    book using someone else's phone. Possession of the number is verified nowhere in this product;
+    that is a declared gap (``docs/phone-channels.md``), not something this checkbox quietly solves.
+    The copy is therefore written in the first person about THIS booking, and promises nothing about
+    whom the number belongs to.
+    """
+    ticked = is_consent_ticked(values.get(PHONE_CONSENT_FIELD_NAME))
+    hint_id = f"{PHONE_FIELD_NAME}-hint"
+    error_id = f"{PHONE_FIELD_NAME}-error"
+    # The error (when present) is announced FIRST, then the "include the country code" hint — the
+    # order a screen reader reads them, and the order that is useful when you just got it wrong.
+    described_by = " ".join(([error_id] if error else []) + [hint_id])
+
+    phone_parts: list[Any] = [
+        Label(t(locale, "phone_label"), fr=PHONE_FIELD_NAME),
+        Input(
+            type="tel",
+            id=PHONE_FIELD_NAME,
+            name=PHONE_FIELD_NAME,
+            value=values.get(PHONE_FIELD_NAME, ""),
+            autocomplete="tel",
+            inputmode="tel",
+            aria_describedby=described_by,
+        ),
+    ]
+    if error:
+        phone_parts.append(P(error, id=error_id, cls="field-error"))
+    phone_parts.append(P(t(locale, "phone_hint"), id=hint_id, cls="hint"))
+
+    consent_hint_id = f"{PHONE_CONSENT_FIELD_NAME}-hint"
+    consent_box = Input(
+        type="checkbox",
+        id=PHONE_CONSENT_FIELD_NAME,
+        name=PHONE_CONSENT_FIELD_NAME,
+        value=CONSENT_SUBMITTED_VALUE,
+        aria_describedby=consent_hint_id,
+        # `checked` is emitted ONLY from the guest's own prior answer. FastHTML renders a boolean
+        # attribute only when truthy, so an unticked box carries no `checked` at all.
+        checked=ticked,
+    )
+    return [
+        Div(*phone_parts, cls="field"),
+        Div(
+            Label(consent_box, Span(t(locale, "phone_consent_label"))),
+            P(t(locale, "phone_consent_hint"), id=consent_hint_id, cls="hint"),
+            cls="field consent",
+        ),
+    ]
+
+
+TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+"""Cloudflare's widget loader. It is the ONE third-party script this page loads, and the CSP is
+widened for exactly this origin (``app.security_headers``) — never for scripts in general."""
+
+
+def _turnstile_widget(site_key: str | None) -> list[Any]:
+    """The captcha, or nothing at all.
+
+    ``None`` renders NOTHING — which is not a bypass, and cannot be turned into one. The check that
+    matters is the SERVER's: with the public API enabled the process refuses to boot without a
+    Turnstile secret, and every booking POST is verified against Cloudflare. A page with no site key
+    configured therefore submits no token, and the API refuses the booking. ==The page can fail to
+    ASK the question; it can never answer it.==
+    """
+    if not site_key:
+        return []
+    return [
+        Script(src=TURNSTILE_SCRIPT_URL, defer=True),
+        Div(cls="cf-turnstile field", data_sitekey=site_key),
+    ]
+
+
 def booking_form_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
+    event: PublicEventTypeRead,
     start_iso: str,
     tz: str,
     when_label: str,
@@ -694,8 +906,10 @@ def booking_form_page(
     errors: Sequence[FieldError],
     action: str,
     lang_urls: Mapping[Locale, str],
+    turnstile_site_key: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """Step 2: name, email, notes, and questions — re-renders inline errors on failure.
 
@@ -737,6 +951,13 @@ def booking_form_page(
                 error=field_errors.get(name),
             )
         )
+    # RF-24: asked ONLY where an active WhatsApp/SMS rule would actually use the number. Where none
+    # is active this block is absent entirely — the guest is never asked for a phone the system has
+    # no way to message (RNF-8: minimal data).
+    if event.collects_phone:
+        fields.extend(
+            _phone_fields(locale, values=values, error=field_errors.get(PHONE_FIELD_NAME))
+        )
     fields.append(
         _labelled_field(
             locale,
@@ -760,6 +981,9 @@ def booking_form_page(
         Input(type="hidden", name="lang", value=locale),
         _honeypot_field(),
         *fields,
+        # The honeypot stays, and the captcha joins it. The honeypot costs a bot nothing to defeat
+        # once it has been read; the captcha is the control that makes each attempt COST something.
+        *_turnstile_widget(turnstile_site_key),
         Button(t(locale, "confirm_booking"), type="submit", cls="btn"),
         method="post",
         action=action,
@@ -782,24 +1006,27 @@ def booking_form_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
 
-def _calendar_details(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
-    """A short plain-text body for the add-to-calendar links: the event description (if any),
-    plus the meeting link (if any) on its own line so it stays clickable in the guest's calendar
-    app."""
-    parts: list[str] = []
-    description = resolve_description(event, locale)
-    if description:
-        parts.append(description)
-    if booking.meeting_url:
-        parts.append(booking.meeting_url)
-    return "\n".join(parts)
+def _calendar_details(locale: Locale, event: PublicEventTypeRead) -> str:
+    """The plain-text body of the add-to-calendar links: the event's description, if it has one.
+
+    ==The meeting link is no longer in here, and that is a real cost, paid deliberately.== The
+    public
+    booking response is ``{id, start, end, status}`` and nothing else: an endpoint with no
+    authentication that hands out a meeting URL keyed by a booking id is an endpoint that hands out
+    meeting URLs. The link reaches the guest in the confirmation e-mail instead — the channel that
+    proves they own the address they typed into the form.
+    """
+    return resolve_description(event, locale) or ""
 
 
-def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+def _google_calendar_url(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> str:
     """A Google Calendar "quick add" deep link pre-filled with the confirmed booking (M-F3)."""
 
     def google_dt(instant: datetime) -> str:
@@ -809,14 +1036,16 @@ def _google_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingR
         "action": "TEMPLATE",
         "text": resolve_title(event, locale),
         "dates": f"{google_dt(booking.start)}/{google_dt(booking.end)}",
-        "details": _calendar_details(locale, event, booking),
+        "details": _calendar_details(locale, event),
     }
     if event.location:
         params["location"] = event.location
     return f"https://calendar.google.com/calendar/render?{urlencode(params)}"
 
 
-def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: BookingRead) -> str:
+def _outlook_calendar_url(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> str:
     """An Outlook Web "compose event" deep link pre-filled with the confirmed booking (M-F3)."""
 
     def outlook_dt(instant: datetime) -> str:
@@ -826,7 +1055,7 @@ def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: Booking
         "subject": resolve_title(event, locale),
         "startdt": outlook_dt(booking.start),
         "enddt": outlook_dt(booking.end),
-        "body": _calendar_details(locale, event, booking),
+        "body": _calendar_details(locale, event),
         "path": "/calendar/action/compose",
         "rru": "addevent",
     }
@@ -835,7 +1064,9 @@ def _outlook_calendar_url(locale: Locale, event: EventTypeRead, booking: Booking
     return f"https://outlook.live.com/calendar/0/deeplink/compose?{urlencode(params)}"
 
 
-def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: BookingRead) -> Any:
+def _add_to_calendar_section(
+    locale: Locale, event: PublicEventTypeRead, booking: PublicBookingRead
+) -> Any:
     """The "add to calendar" links (M-F3): Google + Outlook deep links, no server round-trip."""
     return Div(
         H2(t(locale, "add_to_calendar_heading")),
@@ -862,33 +1093,43 @@ def _add_to_calendar_section(locale: Locale, event: EventTypeRead, booking: Book
 def confirmation_page(
     locale: Locale,
     *,
-    event: EventTypeRead,
-    booking: BookingRead,
+    event: PublicEventTypeRead,
+    booking: PublicBookingRead,
+    guest_email: str,
     when_label: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
-    """Step 3: a clear confirmation with the essentials (when, meeting link, email note) plus
-    add-to-calendar links (M-F3). ``embed`` (B1) renders the compact, chrome-less shell."""
+    """Step 3: the confirmation (when, e-mail note) plus the add-to-calendar links (M-F3).
+
+    ``guest_email`` is passed IN, and it used to be read off the booking. The public API answers
+    with
+    four fields and no personal data at all — the guest's own address included — because a response
+    that echoed it back would make a booking id an oracle for a stranger's e-mail on an endpoint
+    that
+    asked for no credentials. The page does not need the API to tell it: the guest typed the address
+    into the form it is currently rendering the answer to.
+
+    The meeting link is gone from this page for the same reason, and reaches the guest by e-mail.
+    """
     summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
     if event.location:
         summary.append(Dd(event.location, cls="meta"))
-    if booking.meeting_url:
-        summary.append(Dt(t(locale, "confirmed_meeting_link")))
-        summary.append(Dd(A(booking.meeting_url, href=booking.meeting_url)))
     return page(
         locale,
         resolve_title(event, locale),
         Div(
             H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
             Dl(*summary, cls="summary"),
-            P(t(locale, "confirmed_email_note", email=booking.guest_email), cls="lead"),
+            P(t(locale, "confirmed_email_note", email=guest_email), cls="lead"),
             _add_to_calendar_section(locale, event, booking),
             cls="stack",
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
         embed=embed,
     )
 
@@ -909,6 +1150,7 @@ def message_page(
     is_error: bool = False,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """A minimal, friendly single-message page (errors, not-found, done states) — never leaks.
     ``embed`` (B1) renders the compact, chrome-less shell so a backend hiccup or a 404 inside an
@@ -917,7 +1159,13 @@ def message_page(
     if back_url and back_label:
         body.append(A(back_label, href=back_url, cls="btn secondary"))
     return page(
-        locale, title, Div(*body, cls="stack"), lang_urls=lang_urls, base_url=base_url, embed=embed
+        locale,
+        title,
+        Div(*body, cls="stack"),
+        lang_urls=lang_urls,
+        base_url=base_url,
+        embed=embed,
+        brand=brand,
     )
 
 
@@ -929,6 +1177,7 @@ def cancel_confirm_page(
     action: str,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The cancel confirmation: a POST form carrying the booking id + guest token."""
     form = Form(
@@ -951,6 +1200,7 @@ def cancel_confirm_page(
         ),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 
@@ -1010,6 +1260,7 @@ def reschedule_page(
     section: Any,
     lang_urls: Mapping[Locale, str],
     base_url: str = DEFAULT_BASE_URL,
+    brand: TenantBrandingRead | None = None,
 ) -> Any:
     """The reschedule flow: a timezone control plus the slot section (times POST ``new_start``)."""
     return page(
@@ -1025,6 +1276,7 @@ def reschedule_page(
         _detect_script(tz_explicit),
         lang_urls=lang_urls,
         base_url=base_url,
+        brand=brand,
     )
 
 

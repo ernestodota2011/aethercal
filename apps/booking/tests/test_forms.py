@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import UTC, datetime
 
 from aethercal.booking.forms import (
@@ -13,15 +12,17 @@ from aethercal.booking.forms import (
 )
 from aethercal.booking.i18n import Locale
 
-EVENT_TYPE_ID = uuid.uuid4()
 START_ISO = "2026-07-14T13:00:00+00:00"
 
 
 def _request(
     *, start_iso: str = START_ISO, guest_timezone: str = "UTC", locale: Locale = "es"
 ) -> BookingRequest:
+    # ==No ``event_type_id``.== The booking now goes to the PUBLIC route, which names the
+    # appointment
+    # in its path (/public/{tenant}/{event}/bookings) — a body field naming it too would be a second
+    # source of truth for one fact.
     return BookingRequest(
-        event_type_id=EVENT_TYPE_ID,
         start_iso=start_iso,
         guest_timezone=guest_timezone,
         locale=locale,
@@ -42,7 +43,7 @@ def test_valid_form_builds_booking_create() -> None:
     )
     assert not result.errors
     assert result.booking is not None
-    assert result.booking.event_type_id == EVENT_TYPE_ID
+    assert not hasattr(result.booking, "event_type_id")
     assert result.booking.start == datetime(2026, 7, 14, 13, 0, tzinfo=UTC)
     assert result.booking.guest_name == "Ada Lovelace"
     assert result.booking.guest_email == "ada@example.com"
@@ -308,6 +309,80 @@ def test_optional_typed_question_left_blank_does_not_trip_type_validation() -> N
     result = build_booking(_request(), questions=questions, form=_base_form())
     assert result.booking is not None
     assert result.booking.answers == {}
+
+
+# --------------------------------------------------------------------------------------
+# Guest phone + explicit consent (RF-24). The phone is asked for ONLY where an active WhatsApp/SMS
+# rule will use it (``collects_phone``), the consent is a box the guest ticks themselves, and the
+# answer has to reach ``BookingCreate`` — a checkbox whose answer is discarded is not consent.
+# --------------------------------------------------------------------------------------
+
+
+def test_no_phone_is_collected_when_the_event_does_not_message_phones() -> None:
+    """No active phone rule: a phone in the POST is DROPPED, not stored.
+
+    The form is public. A crafted POST — or a stale page cached before the tenant switched the rule
+    off — must not slip a phone number into a booking that will never message it. That is PII taken
+    from a stranger for nothing (RNF-8).
+    """
+    result = build_booking(
+        _request(),
+        questions=[],
+        form=_base_form(phone="+13054131728", phone_consent="on"),
+        collects_phone=False,
+    )
+    assert result.booking is not None
+    assert result.booking.guest_phone is None
+    assert result.booking.guest_phone_consent is False
+
+
+def test_a_consented_phone_reaches_the_booking_normalized() -> None:
+    result = build_booking(
+        _request(),
+        questions=[],
+        form=_base_form(phone="+1 (305) 413-1728", phone_consent="on"),
+        collects_phone=True,
+    )
+    assert result.booking is not None
+    assert result.booking.guest_phone == "+13054131728"
+    assert result.booking.guest_phone_consent is True
+
+
+def test_booking_without_a_phone_still_works_when_the_field_is_offered() -> None:
+    """The field is optional. Leaving it blank books normally — it never blocks the reservation."""
+    result = build_booking(_request(), questions=[], form=_base_form(), collects_phone=True)
+    assert result.booking is not None
+    assert result.booking.guest_phone is None
+    assert result.booking.guest_phone_consent is False
+
+
+def test_a_phone_without_the_consent_box_is_kept_but_not_consented() -> None:
+    """Unticked box = no consent. The number may be held; the outbox gate refuses to message it."""
+    result = build_booking(
+        _request(), questions=[], form=_base_form(phone="+13054131728"), collects_phone=True
+    )
+    assert result.booking is not None
+    assert result.booking.guest_phone == "+13054131728"
+    assert result.booking.guest_phone_consent is False
+
+
+def test_a_malformed_phone_is_a_friendly_field_error() -> None:
+    result = build_booking(
+        _request(), questions=[], form=_base_form(phone="305-413-1728"), collects_phone=True
+    )
+    assert result.booking is None
+    assert [error.field for error in result.errors] == ["phone"]
+    assert result.values["phone"] == "305-413-1728"  # the guest's input survives the re-render
+
+
+def test_consent_ticked_with_no_number_is_a_friendly_field_error() -> None:
+    """Never silently drop the tick, and never stamp a consent for a number nobody gave."""
+    result = build_booking(
+        _request(), questions=[], form=_base_form(phone_consent="on"), collects_phone=True
+    )
+    assert result.booking is None
+    assert [error.field for error in result.errors] == ["phone"]
+    assert result.values["phone_consent"] == "on"  # the tick survives the re-render
 
 
 def test_parse_questions_is_defensive_about_shapes() -> None:

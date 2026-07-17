@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from aethercal.server.admin.auth import authenticate
 from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.passwords import hash_password
+from aethercal.server.passwords import hash_password
 
 
 def _config(username: str = "operator", password: str = "hunter2") -> AdminConfig:

@@ -1,9 +1,27 @@
-# AetherCal — self-host stack: the app (single unit) + PostgreSQL. Configured entirely by ./.env.
+# AetherCal — self-host stack: PostgreSQL + a one-shot migrator + the API + the worker + the page.
 #
 #   cd deploy && cp .env.example .env && edit .env && docker compose up --build
 #
-# Migrations run on the app's boot (AETHERCAL_AUTO_MIGRATE=1); the app waits for Postgres to be
-# healthy first. The in-process scheduler runs inside the single `app` container (see README).
+# ==Three processes out of one image, and the split is not cosmetic.==
+#
+#   migrate  one-shot, as aethercal_owner. Migrations no longer run on the app's boot: the app holds
+#            aethercal_app, which owns no tables and cannot execute DDL. It runs to completion, and
+#            only then does `app` start (`condition: service_completed_successfully`).
+#   app      the API + admin, as aethercal_app, under row-level security. No scheduler, no DDL, and
+#            no engine with BYPASSRLS. It REFUSES to start if the schema is behind head.
+#   worker   ==replicas: 1, and that is load-bearing.== It drains the outbox, delivers the webhooks
+#            and refreshes the busy caches, on two pools (a BYPASSRLS one to FIND work whose business
+#            it cannot know yet; the app role to EXECUTE each item under RLS, bound to that item's own
+#            business). It also serves /metrics and the /health/ready that reports the backlog. The
+#            "no claim" design of the delivery and refresh passes rests on there being exactly one of
+#            it — see README.
+#
+# ==BEFORE THE FIRST `up`: create the three roles.== They cannot come from a migration (BYPASSRLS
+# needs superuser), and they must NOT come from the postgres image's init scripts: those only run on
+# an EMPTY volume, so they would work perfectly in CI and never run on the instance that matters.
+#
+#   psql "$SUPERUSER_URL" -v ON_ERROR_STOP=1 -v db=... \
+#        -v pw_owner=... -v pw_app=... -v pw_worker=... -f sql/provision_roles.sql
 
 name: aethercal
 
@@ -19,12 +37,42 @@ services:
     volumes:
       - aethercal-pgdata:/var/lib/postgresql/data
     healthcheck:
-      # `app` depends_on this being healthy, so migrations never race an unready database.
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      # `migrate` depends_on this being healthy, so the schema never races an unready database.
+      #
+      # ==`-h 127.0.0.1` is load-bearing, and it is the kind of thing somebody deletes as noise.==
+      # While the image INITIALISES a fresh volume it runs a temporary server with
+      # `listen_addresses=''` — reachable over the unix socket and over nothing else. A bare
+      # `pg_isready` talks to that socket and reports READY, while every TCP client (which is all of
+      # ours) is still refused — and any `docker-entrypoint-initdb.d/` script has not necessarily run
+      # yet. Dependents would start against a database whose roles do not exist, and `migrate` would
+      # fail to connect as an owner that had not been created.
+      #
+      # Over TCP it asks the question we actually mean: not "is a postmaster alive somewhere" but
+      # "can the process that is about to connect, connect".
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 10s
+
+  migrate:
+    # The one-shot migrator. Runs as the OWNER, to completion, and then exits — the app and the
+    # worker both wait for it (`service_completed_successfully`), so nothing ever serves or drains
+    # against a half-migrated schema.
+    #
+    # This replaces AETHERCAL_AUTO_MIGRATE=1, which ran Alembic INSIDE the web process on the web
+    # process's own URL — and that single fact is why the app had to be the table owner, and
+    # therefore why row-level security on this product would have been a placebo.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["aethercal-admin", "db", "upgrade"]
+    restart: "no"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   app:
     build:
@@ -32,20 +80,63 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
-    # Every AETHERCAL_* value (DATABASE_URL, APP_SECRET, SMTP, Google, ...) is injected from ./.env.
+    # Every AETHERCAL_* value is injected from ./.env — including the THREE database URLs. The app
+    # one must be aethercal_app: this process asserts `SELECT current_user` at boot and refuses to
+    # serve on anything else, because under RLS a mis-pointed URL produces no error at all — only a
+    # process that works perfectly and enforces nothing.
     env_file:
       - .env
-    environment:
-      # The container is the single scheduler process; migrations run on boot.
-      AETHERCAL_RUN_SCHEDULER: "1"
-      AETHERCAL_AUTO_MIGRATE: "1"
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       # Publish the API. Change the published (left) port via HOST_PORT in ./.env. Keep this bound to
       # an internal interface behind a reverse proxy — only the public booking page needs exposure.
       - "${HOST_PORT:-8000}:8000"
+
+  worker:
+    # ==EXACTLY ONE. `replicas: 1` is not a default here, it is an invariant.==
+    #
+    # `deliver_due` and `refresh_all_busy_caches` deliberately carry no claim/lease: no table but
+    # `outbox` has the columns for one, and adding them would have meant new DDL in the batch that
+    # every other wave is queued behind. What makes that safe is precisely this line. Two workers and
+    # those two passes would double-send.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["aethercal-worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Bind the operator surface (/metrics, /health/ready with the backlog) on all interfaces so it
+      # is reachable from the compose network. It is NOT published to the host below: it is the
+      # operator's view of every business on the instance, and it is guarded by AETHERCAL_METRICS_TOKEN
+      # (unset ⇒ the endpoint is CLOSED, 503 — never open).
+      AETHERCAL_WORKER_HOST: "0.0.0.0"
+      AETHERCAL_WORKER_PORT: "8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    healthcheck:
+      # The inherited image HEALTHCHECK probes :8000 (the API); this process serves :8001. `/health`
+      # is liveness only — deliberately DB-free, because a slow database must not get the drain killed
+      # and restarted into the same slow database.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/api/v1/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
   booking:
     # The public booking page (apps/booking, FastHTML) is a SEPARATE ASGI process that talks to the
@@ -66,10 +157,10 @@ services:
       # container — bind to all interfaces.
       AETHERCAL_BOOKING_HOST: "0.0.0.0"
       AETHERCAL_BOOKING_PORT: "5001"
-      # This is NOT the server process: never run the scheduler or migrations here (the image turns
-      # both on by default for the `app` service).
-      AETHERCAL_RUN_SCHEDULER: "0"
-      AETHERCAL_AUTO_MIGRATE: "0"
+      # AETHERCAL_RUN_SCHEDULER / _AUTO_MIGRATE used to be pinned to "0" here, to stop this process
+      # inheriting the image's own defaults. The image no longer HAS those defaults (both settings are
+      # retired tripwires that now fail the boot on a truthy value), and this process is an HTTP
+      # client that opens no database connection at all — so there is nothing left to switch off.
     depends_on:
       app:
         condition: service_healthy

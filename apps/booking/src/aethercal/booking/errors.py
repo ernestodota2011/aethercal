@@ -13,6 +13,10 @@ from aethercal.client import AetherCalAPIError
 # Map the API's machine error codes (see the server's booking/slots routers) to our message keys.
 _CODE_TO_KEY: dict[str, str] = {
     "slot_unavailable": "error_slot_unavailable",
+    # RF-14. Without its own entry this collapses to `error_generic` ("something went wrong") — the
+    # one message that cannot tell a guest the thing they need to know: it is the DAY that is full,
+    # and the day is the part of their request they have to change.
+    "day_full": "error_day_full",
     "forbidden": "error_link_invalid",
     "not_active": "error_not_active",
     "availability_unavailable": "availability_unavailable",

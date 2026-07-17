@@ -1,67 +1,122 @@
-"""The transactional-outbox service: enqueue an effect intent in-txn, drain it post-commit (F1-05).
+"""The transactional outbox: enqueue an effect intent in-txn, drain it post-commit (F1-05 / R8).
 
-This is the post-commit half of the fix the booking service's inline best-effort wrapping could not
-make: a booking's external effects (the confirmation/cancellation/reschedule **email**, the **Google
-Calendar** sync) are no longer called inline before the caller commits — where an effect could fire
-for a booking whose transaction then rolls back. Instead the booking service persists an
-:class:`~aethercal.server.db.models.outbox.Outbox` *intent* row in the SAME transaction as the
-booking mutation (:func:`enqueue_effect`), and a scheduler-driven poller (:func:`drain_outbox`)
-executes the intent afterwards.
+The booking service persists an :class:`~aethercal.server.db.models.outbox.Outbox` *intent* row in
+the SAME transaction as the booking mutation (:func:`enqueue_effect`), so an external effect can
+never fire for a booking whose transaction later rolled back. A scheduler-driven worker
+(:func:`drain_outbox`) executes the intent afterwards. It doubles as the product's **durable
+scheduler**: an intent's ``next_retry_at`` is simply its send time, which is why RF-10's 24 h
+reminder no longer needs a second (APScheduler) scheduler carrying a second idempotency barrier.
 
-The design mirrors the durable webhook-delivery queue exactly:
+.. rubric:: claim / execute / settle (R8)
 
-* **enqueue** — an idempotent insert (unique ``dedupe_key`` per booking); a duplicate is a no-op.
-* **drain** — select the due rows (``pending``, or ``failed`` past ``next_retry_at``), *claim* them
-  with ``FOR UPDATE SKIP LOCKED`` (so two overlapping ticks never double-run one intent — a no-op on
-  SQLite, which serializes writers), and run each through an injected ``execute`` callable inside
-  its OWN ``SAVEPOINT`` (a failing effect rolls back only its own partial writes, isolated from the
-  of the batch and from the retry bookkeeping). Success marks ``delivered``; a failure retries with
-  exponential backoff until ``max_attempts``, then parks the row ``dead``.
+The drain used to ``SELECT ... FOR UPDATE SKIP LOCKED`` a whole batch and then run every SMTP and
+Google call **inside that still-open transaction** — so one tick held N row locks and a pool
+connection for the length of N network round-trips. With several workflow steps per booking across
+slow channels (WhatsApp, SMS) that is a pool-exhaustion bug waiting to happen. The drain now runs:
 
-Delivery is **at-least-once with best-effort dedup**, not exactly-once. The effect handlers reduce
-duplicates — the email handler reserves the :class:`~aethercal.server.db.models.SentNotification`
-ledger row (so a re-drain of an already-committed send is a no-op) and the Google handler reconciles
-to the booking's current state — but a crash in the narrow window AFTER an external effect succeeds
-and BEFORE its outbox row commits ``delivered`` will replay the effect (a duplicate email / calendar
-event). Closing that window fully needs provider-side idempotency (an SMTP idempotency key, a
-deterministic Google event id or search-before-create); until the providers are wired live that
-residual is accepted (a duplicate confirmation is safer than a missing one) and documented, matching
-the webhook queue's at-least-once contract. ``execute`` is fully injected so the mechanism is
-unit-testable offline with a fake; :func:`make_booking_effect_executor` builds the live dispatcher
-(email → SMTP, Google → the calendar client).
+1. **recover** — any row whose lease elapsed (a worker died mid-send) returns to ``pending``,
+   WITHOUT consuming an attempt: the worker failed, the effect did not.
+2. **claim** — one short transaction takes the due batch with ``FOR UPDATE SKIP LOCKED``, marks it
+   ``claimed`` with a ``claimed_by`` + ``lease_expires_at``, and **commits**. Every row lock is
+   released here. From now on it is ``status='claimed'``, not a held lock, that keeps a second
+   worker off these rows.
+3. **execute** — the network I/O runs with **no transaction open at all**. Each handler is phased
+   (read → send → record) precisely so that holds.
+4. **settle** — a second short transaction records the outcome (``delivered`` / ``failed`` + backoff
+   / ``dead``) — but **only if the lease is still ours**. The write is a conditional update gated on
+   ``status = 'claimed' AND claimed_by = <this worker>``. A lease is not a lock, so it can be lost:
+   if our send overran the TTL, the recovery pass has already handed the row back and another worker
+   owns it. Then our result is stale, and we DISCARD it loudly instead of stomping theirs. Writing
+   where you no longer have the right is the same silent no-op, just pointed the other way. To keep
+   that from happening at all, every provider call is bounded by
+   :data:`PROVIDER_TIMEOUT_CEILING` < :data:`DEFAULT_LEASE`.
 
-Ops residual: an intent that exhausts ``max_attempts`` is parked ``dead`` (a distinct ``error`` log
-marks it) and is NOT retried automatically. Metrics/alerting on the ``dead`` state and a safe
-requeue/replay operation are the remaining operational surface (deferred), so a dead intent is
-visible in logs today but needs a human to replay it.
-"""
+Delivery stays **at-least-once**: a crash after a provider accepts but before the settle commits
+replays the effect. That errs toward a duplicate rather than a lost message, which is the deliberate
+choice — and the handlers reduce duplicates anyway (the email checks its ledger, the Google handler
+reconciles to the booking's current state).
+
+.. rubric:: The staleness contract
+
+An effect that is queued and then overtaken by a later transition (a cancel, a reschedule) must
+usually be DROPPED — nobody should get a "confirmed" email for a booking that has since been
+replaced. That is :func:`_is_chain_current`. But it is a **trap** for the terminal effects, because
+``_is_chain_current`` is False for a CANCELLED booking *by construction* (its id is never in the
+chain's active set) — and a cancellation notice acts on a cancelled booking BY DEFINITION. Wire an
+``on_cancel`` workflow step into the same guard the informational steps use and its message is
+marked delivered and **never sent**: the guest is never told that their booking was cancelled.
+
+So the guard is not a scattered ``if``. :data:`_STALENESS` is an explicit table, and for a workflow
+step it classifies **by trigger** (:func:`trigger_staleness`), exhaustively — ``assert_never`` makes
+a newly added trigger a type error rather than a silent default.
+
+A step whose booking is replaced is not "moved" by an upsert (that would match zero rows — a
+reschedule opens a NEW booking id): it is retired with :func:`void_pending_steps`, driven by the
+transition table in ``services/workflows.py``."""
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import logging
+import os
+import socket
+import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import TYPE_CHECKING, Any, NoReturn, assert_never, cast
 
-from sqlalchemy import case, or_, select, text
+from sqlalchemy import CursorResult, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aethercal.core.model import BookingStatus
-from aethercal.server.db.models import Booking, ExternalConnection, Outbox
+from aethercal.server.channels import Channel
+from aethercal.server.db.guc import tenant_scope
+from aethercal.server.db.models import Booking, ExternalConnection, Outbox, Workflow
+from aethercal.server.db.models.outbox import OutboxStatus, due_filter
+from aethercal.server.db.models.workflows import WorkflowTrigger
+from aethercal.server.db.pools import BypassReason, WorkerPools
 from aethercal.server.integrations.google.parse import MeetEventRequest
+from aethercal.server.integrations.messaging.guard import (
+    ChannelUnavailable,
+    PhoneChannelSender,
+    SendOutcomeUnknown,
+    SendRefused,
+    enforce_ip_cap,
+    enforce_phone_cap,
+)
 from aethercal.server.integrations.smtp.compose import NotificationKind
 from aethercal.server.integrations.smtp.sender import EmailSender
+from aethercal.server.observability import observe_drain
 from aethercal.server.services.calendars import (
+    CalendarTarget,
+    CalendarTargetMissingError,
     ServiceFactory,
     create_event_for_booking,
     delete_event_for_booking,
     reschedule_event_for_booking,
+    resolve_calendar_target,
 )
-from aethercal.server.services.notifications import send_booking_notification
+from aethercal.server.services.notifications import (
+    compose_booking_notification,
+    notification_already_sent,
+    record_booking_notification,
+)
+from aethercal.server.services.templates import (
+    TemplateError,
+    build_template_context,
+    load_template,
+    render_template,
+)
+
+if TYPE_CHECKING:
+    # Type-only: this module names a business's senders, it never builds one. Keeping the import
+    # out of the runtime is what stops the funnel's dependency arrow from pointing back at the
+    # queue that consumes it.
+    from aethercal.server.services.tenant_senders import TenantSenders
 
 _logger = logging.getLogger(__name__)
 
@@ -75,14 +130,72 @@ DEFAULT_MAX_ATTEMPTS = 6
 """Attempts before an intent is parked as ``dead``."""
 
 DEFAULT_DRAIN_BATCH_SIZE = 100
-"""Max intents one drain pass claims + processes, so a tick's open transaction (and its external
-I/O) is bounded; the next tick picks up the rest. ``FOR UPDATE SKIP LOCKED`` lets extra workers run
-disjoint batches concurrently."""
+"""Max intents one drain pass claims + processes."""
 
-_PENDING = "pending"
-_FAILED = "failed"
-_DELIVERED = "delivered"
-_DEAD = "dead"
+PROVIDER_TIMEOUT_CEILING = timedelta(minutes=2)
+"""The hard ceiling on every provider call: **strictly less than** :data:`DEFAULT_LEASE`, and
+ENFORCED — :func:`drain_outbox` runs every effect inside an ``asyncio.timeout`` of exactly this, and
+overrunning it is a retryable failure.
+
+The enforcement IS the point. A ceiling that is only a constant, a comment and a test of its own
+arithmetic is a **declared invariant that nothing applies**, and the code goes on doing precisely
+what the invariant forbids. Here that is not academic: an unbounded send outlives its lease, the
+recovery pass hands the row to another worker, and the guest is messaged twice.
+
+The lease is not self-renewing. A worker whose send outlives the TTL loses its claim, and its result
+is discarded at settle (see :func:`_settle`) — after the provider has already done the work, so the
+guest can be messaged twice. The only two ways out are lease RENEWAL or provider timeouts bounded
+below the TTL, and this codebase takes the second: it is one number to get right instead of a
+heartbeat to keep alive, and every client here already takes a timeout.
+
+2 min vs a 5 min TTL leaves a 3 min margin for the DB round-trips either side of the call. The
+``lost`` counter on :class:`OutboxReport` is what proves the assumption in production: if it is ever
+non-zero, this ceiling (or the TTL) is wrong.
+"""
+
+DEFAULT_LEASE = timedelta(minutes=5)
+"""The lease TTL: how long a claim is honoured before another worker may take the row over.
+
+Bounded from BELOW by the slowest single provider round-trip — a lease shorter than a send lets a
+second worker take a row a healthy worker is still working on, and the message goes out twice. That
+bound is not left to hope: :data:`PROVIDER_TIMEOUT_CEILING` (2 min) is the contract every provider
+call must honour, and it is strictly under this TTL.
+
+Bounded from ABOVE by how long a dead worker's rows may sit idle. Which is why the recovery pass
+runs
+at the top of EVERY drain (see :func:`drain_outbox`), i.e. once per
+``DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS`` (60 s) — far shorter than the lease.
+Get that relationship backwards and a crashed worker turns into hours of silence: the rows stay
+``claimed``, nothing is due, and no alarm fires. So the invariant is ``recovery interval << lease
+TTL``, and the worst-case delay a crash can add is ``lease TTL + one drain interval`` ≈ 6 minutes.
+"""
+
+# The status vocabulary is DECLARED ONCE, on the row itself (``db/models/outbox.OutboxStatus``), and
+# merely re-bound here for terse internal use. It used to be seven private literals living only in
+# this module, which left every other reader of these rows — the metrics endpoint, the readiness
+# probe, the replay CLI — free to re-type them and drift.
+_PENDING = OutboxStatus.PENDING.value
+_CLAIMED = OutboxStatus.CLAIMED.value
+_FAILED = OutboxStatus.FAILED.value
+_DELIVERED = OutboxStatus.DELIVERED.value
+_DEAD = OutboxStatus.DEAD.value
+_SKIPPED = OutboxStatus.SKIPPED.value
+"""Terminal, and NOT a failure: the step could never run, so retrying it is pointless.
+
+A channel with no credentials is a DISABLED FEATURE, not an error. Treat it as a failure and every
+reminder on that channel burns six attempts of exponential backoff and lands in the dead-letter —
+noise in the backlog, and the message still does not arrive. The step is retired with its reason
+instead, loudly in the log and visibly in the row. """
+_UNKNOWN = OutboxStatus.UNKNOWN.value
+"""Handed to the provider; the answer was lost. Terminal, and NOT retried — see OutboxStatus."""
+_VOIDED = OutboxStatus.VOIDED.value
+"""Retired before it ever ran: the booking's life changed under it (see
+:func:`void_pending_steps`)."""
+
+# A claimed row is NOT terminal — it is mid-flight. Anything waiting on a sibling intent (an email
+# waiting for its Meet link; a calendar delete waiting for the create that will produce the event id
+# it must remove) has to treat it as still coming, or it acts on a half-written world.
+_NON_TERMINAL = (_PENDING, _CLAIMED, _FAILED)
 
 
 class OutboxEffect(StrEnum):
@@ -90,6 +203,16 @@ class OutboxEffect(StrEnum):
 
     EMAIL = "email"
     GOOGLE = "google"
+    NOTIFY = "notify"
+    """One workflow step, on one channel (RF-24). Handler: the workflow-engine cut."""
+    REFUND = "refund"
+    """Return a guest's money (B-05b). ==Acts on a booking that is unpaid/cancelled BY DEFINITION==,
+    so it is EXEMPT from both the confirmation gate and the staleness guard, and it is NON-VOIDABLE:
+    a cancel that killed a refund in flight is money that never comes back."""
+    EXPIRE_HOLD = "expire_hold"
+    """Cancel an unpaid hold whose TTL has passed, freeing its slot (B-05b). No external I/O, so any
+    failure is anomalous by definition — a dead EXPIRE_HOLD is a slot blocked for ever. Same exempt,
+    non-voidable treatment as REFUND."""
 
 
 class GoogleOperation(StrEnum):
@@ -100,10 +223,468 @@ class GoogleOperation(StrEnum):
     DELETE = "delete"
 
 
-# The injected effect runner: given the drain's session, an intent row, and the tick's ``now``, it
-# performs the side-effect (or raises to trigger a retry). Injected so the drain is testable offline
-# with a fake.
-OutboxExecutor = Callable[[AsyncSession, Outbox, datetime], Awaitable[None]]
+class Staleness(StrEnum):
+    """Whether an effect is dropped when its booking is no longer the chain's live member."""
+
+    SUBJECT = "subject"
+    """Informational. A later transition overtook it → do not send it."""
+    EXEMPT = "exempt"
+    """Terminal. It acts on a booking that is *supposed* to be gone → always run it."""
+
+
+# The staleness contract. EXHAUSTIVE by construction: staleness_policy() raises for an effect that
+# has not declared itself, so a new handler must state its intent instead of inheriting a default.
+#
+# EMAIL SUBJECT, except a CANCELLATION (terminal - it IS the transition). GOOGLE SUBJECT, except a
+# DELETE (terminal - it removes a cancelled booking's event). NOTIFY classified BY TRIGGER (below),
+# never by eyeballing "informational vs terminal".
+_TERMINAL_EMAIL_KINDS = frozenset({NotificationKind.CANCELLATION})
+_TERMINAL_GOOGLE_OPERATIONS = frozenset({GoogleOperation.DELETE})
+
+
+def trigger_staleness(trigger: WorkflowTrigger) -> Staleness:
+    """Whether a workflow step fired by ``trigger`` survives its booking being overtaken.
+
+    Classified by TRIGGER, never by a hand-waved "informational vs terminal" judgement. The reason
+    is
+    exact: an ``on_cancel`` step acts on a booking that is CANCELLED, and :func:`_is_chain_current`
+    is False for a cancelled booking *by construction*. Gate an ``on_cancel`` notice on staleness
+    and the cancellation message is marked delivered and **never sent** - the guest is never told
+    that their booking was cancelled.
+
+    ``assert_never`` makes the mapping exhaustive at TYPE-CHECK time: adding a trigger without
+    classifying it here fails pyright, instead of silently inheriting a default that drops messages.
+
+    * ``on_booking`` / ``before_start`` -> **SUBJECT**. They speak about an appointment still
+      supposed to happen; if the chain moved on, the message is wrong and must not go out.
+    * ``after_end`` / ``on_cancel`` / ``on_no_show`` -> **EXEMPT**. The appointment is over or gone.
+      "The chain moved on" is not a reason to suppress them - it is the very thing they report.
+    """
+    match trigger:
+        case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.BEFORE_START:
+            return Staleness.SUBJECT
+        case WorkflowTrigger.AFTER_END | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
+            return Staleness.EXEMPT
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+_STALENESS: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], Staleness]] = {
+    OutboxEffect.EMAIL: lambda payload: (
+        Staleness.EXEMPT
+        if NotificationKind(payload["kind"]) in _TERMINAL_EMAIL_KINDS
+        else Staleness.SUBJECT
+    ),
+    OutboxEffect.GOOGLE: lambda payload: (
+        Staleness.EXEMPT
+        if GoogleOperation(payload["operation"]) in _TERMINAL_GOOGLE_OPERATIONS
+        else Staleness.SUBJECT
+    ),
+    OutboxEffect.NOTIFY: lambda payload: trigger_staleness(WorkflowTrigger(payload["trigger"])),
+    # ==Both EXEMPT, and it MUST be a conscious choice.== A refund acts on a booking that is
+    # cancelled by definition, and ``_is_chain_current`` is False for a cancelled booking BY
+    # CONSTRUCTION — so a SUBJECT refund would be marked ``delivered`` and never sent, and the
+    # guest's money would never come back. EXPIRE_HOLD acts on a hold nobody paid for, same story.
+    OutboxEffect.REFUND: lambda _payload: Staleness.EXEMPT,
+    OutboxEffect.EXPIRE_HOLD: lambda _payload: Staleness.EXEMPT,
+}
+
+
+class Confirmation(StrEnum):
+    """Whether an effect may only ever speak for a booking that was ACTUALLY confirmed."""
+
+    REQUIRES_CONFIRMATION = "requires_confirmation"
+    """It announces an appointment — and an appointment nobody confirmed must not be announced."""
+    EXEMPT = "exempt"
+    """It acts ON an unconfirmed or cancelled booking; that is the whole reason it exists."""
+
+
+def confirmation_policy(effect: OutboxEffect) -> Confirmation:
+    """Whether ``effect`` may be queued for a booking that has never been ``CONFIRMED``.
+
+    EXHAUSTIVE by construction, exactly like :func:`staleness_policy` and the dispatch in
+    :func:`make_booking_effect_executor`: an effect that inherits a default is an effect nobody ever
+    decided about, and the default is always wrong for somebody. ``assert_never`` makes it a TYPE
+    error to add an effect without choosing — the build fails, and nobody has to remember that this
+    function exists.
+
+    * every effect today (``EMAIL`` / ``GOOGLE`` / ``NOTIFY``) **REQUIRES_CONFIRMATION**. Each tells
+      a human being about an appointment: an email, a WhatsApp, an SMS — or a Google Calendar event,
+      which is the one that looks harmless and is not. An event carrying the guest as an attendee
+      makes GOOGLE mail them the invitation, so an unpaid hold that syncs to a calendar
+      ==announces itself==, through a channel we do not even own.
+    * ``REFUND`` and ``EXPIRE_HOLD`` (B-05b) will be **EXEMPT**, and that choice has to be a
+      conscious one: they act on bookings that are unpaid or cancelled BY DEFINITION. A belt that
+      silenced them would be a belt that ==keeps the guest's money== and leaves the slot blocked for
+      ever.
+
+    ==The question here is NOT the one :func:`staleness_policy` answers.== Staleness asks *"did a
+    later transition overtake this booking?"*; this asks *"was this appointment ever REAL?"*. A
+    cancellation notice is staleness-EXEMPT (it has to survive the very cancellation it reports) and
+    still requires confirmation (an expired hold's cancellation must never be announced, because its
+    creation never was). Collapse the two questions into one and one of those two guests gets the
+    wrong message.
+    """
+    match effect:
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Confirmation.REQUIRES_CONFIRMATION
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            # They act on bookings that are unpaid or cancelled BY DEFINITION — a refund returns the
+            # money for one that never became live; an expiry cancels the hold itself. A belt that
+            # silenced them would KEEP the guest's money and leave the slot blocked for ever. So the
+            # silence gate lets them straight through, and this arm is what makes that a decision.
+            return Confirmation.EXEMPT
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+class Voidability(StrEnum):
+    """Whether a booking transition (cancel / reschedule / no-show) may RETIRE a queued intent."""
+
+    VOIDABLE = "voidable"
+    """A booking's life changed, so this queued intent is now wrong and is retired before it
+    runs."""
+    NON_VOIDABLE = "non_voidable"
+    """==Once queued, it MUST run.== Cancelling the booking does not recall it — for a REFUND that
+    would be money that never comes back."""
+
+
+def voidability_policy(effect: OutboxEffect) -> Voidability:
+    """Whether :func:`void_pending_steps` may retire ``effect`` when a booking's life changes.
+
+    ==EXHAUSTIVE, with ``assert_never``, exactly like the staleness and confirmation tables.== Today
+    ``void_pending_steps`` retires only ``NOTIFY`` (workflow) steps — what it always did, and
+    this table makes it a DECISION rather than an accident of one ``WHERE effect = 'notify'`` clause
+    that the next person to touch could widen without noticing.
+
+    * ``NOTIFY`` → **VOIDABLE**. A reschedule opens a new booking id, so the predecessor's queued
+      steps must be retired or they fire at the hour of a meeting that never happened.
+    * ``EMAIL`` / ``GOOGLE`` → **NON_VOIDABLE** by this belt. They are governed by their own dedupe
+      and staleness (a cancellation email is *supposed* to survive the cancellation), never by this
+      per-trigger sweep — which is why the sweep never selected them.
+    * ==``REFUND`` / ``EXPIRE_HOLD`` → **NON_VOIDABLE**, the load-bearing one.== A cancel
+      must NOT be able to kill a refund already in the queue: ``void_pending_steps`` filtered
+      ``NOTIFY`` and so did not — but *"did not, by accident"* is one edit from *"does, and keeps
+      the guest's money"*. The table makes it impossible to add that edit without failing the type
+      check.
+    """
+    match effect:
+        case OutboxEffect.NOTIFY:
+            return Voidability.VOIDABLE
+        case (
+            OutboxEffect.EMAIL
+            | OutboxEffect.GOOGLE
+            | OutboxEffect.REFUND
+            | OutboxEffect.EXPIRE_HOLD
+        ):
+            return Voidability.NON_VOIDABLE
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+_VOIDABLE_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if voidability_policy(effect) is Voidability.VOIDABLE
+)
+"""The effect values :func:`void_pending_steps` may retire — DERIVED from the table above, never a
+literal. Add a VOIDABLE effect and the sweep learns it for free; a NON_VOIDABLE one can never slip
+in, because it is filtered out at the source of truth rather than by a hand-written ``WHERE``."""
+
+
+class Purgeability(StrEnum):
+    """Whether the GUEST ERASURE (``services/privacy.py``) may delete a queued intent."""
+
+    PURGEABLE = "purgeable"
+    """It exists ONLY in order to message this person. After the erasure there is nobody to message,
+    and the payload would still carry their address to a provider, so the row goes."""
+    RETAINED = "retained"
+    """==It is not a message.== It moves MONEY or frees a SLOT, it names nobody, and deleting it
+    would take something from the very person the erasure is supposed to serve."""
+
+
+def purge_policy(effect: OutboxEffect) -> Purgeability:
+    """Whether :func:`purge_guest` may delete a queued ``effect`` when erasing its guest.
+
+    ==EXHAUSTIVE, with ``assert_never``, exactly like the staleness, confirmation and voidability
+    tables.== The purge used to delete every outbox row of a booking on one sentence of
+    justification — *"each of these exists ONLY in order to message this person"* — which was true
+    of every effect that existed when it was written, and false of the two that arrived with B-05b.
+
+    * ``EMAIL`` / ``GOOGLE`` / ``NOTIFY`` → **PURGEABLE**. The original argument, and it still
+      holds: each exists to message the guest, and its payload carries their address to a provider.
+      After an erasure there is nobody left to send them to.
+    * ==``REFUND`` → **RETAINED**, the load-bearing one.== It is not a message; it is money the
+      guest is OWED, and its payload (``{provider, provider_ref}``) names no person. Deleted before
+      the drain reaches it, the intent vanishes and the refund never executes: the guest is erased
+      **and** out of pocket — silently, with the purge reporting success. That is "keeping a paying
+      guest's money", the other half of what the payments header says cannot be got wrong. It is
+      also the discriminator :func:`we_queued_this_refund` reads, so deleting it re-opens r8 too.
+    * ``EXPIRE_HOLD`` → **RETAINED**. It carries ``{booking_id}`` and no person. It is slot state,
+      not a message: delete it and the hold never lapses, so the slot stays blocked for ever — a
+      loss inflicted on the HOST by a guest's erasure.
+
+    .. rubric:: This is NOT the question :func:`voidability_policy` answers
+
+    That one asks *"may a booking transition retire this?"*; this asks *"may an ERASURE delete
+    this?"*. The two tables agree today by coincidence and must never be collapsed: ``EMAIL`` and
+    ``GOOGLE`` are ``NON_VOIDABLE`` (a cancellation notice must survive the cancellation it
+    reports) and PURGEABLE all the same (an erased guest is told nothing at all). Collapse them and
+    the first effect whose two answers differ gets one of them wrong, in silence.
+    """
+    match effect:
+        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+            return Purgeability.PURGEABLE
+        case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
+            return Purgeability.RETAINED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+PURGEABLE_EFFECTS: tuple[str, ...] = tuple(
+    effect.value for effect in OutboxEffect if purge_policy(effect) is Purgeability.PURGEABLE
+)
+"""The effect values the guest erasure DELETES — derived from the table above, never a literal.
+
+``services/privacy.py`` filters its outbox delete on this, so the declaration and the mechanism are
+one object: classify an effect ``PURGEABLE`` and the purge sweeps it for free; classify it
+``RETAINED`` and there is no hand-written ``WHERE`` anywhere that somebody has to remember."""
+
+RETAINED_PAYLOAD_KEYS: Mapping[OutboxEffect, frozenset[str]] = {
+    # `enqueue_refund` (services/payments.py): which provider to call, and the charge reference to
+    # refund. No name, no address, no notes, no answers.
+    OutboxEffect.REFUND: frozenset({"provider", "provider_ref"}),
+    # `enqueue_expire_hold` (services/payments.py): the booking whose hold lapses — an id of OURS,
+    # pointing at a row the erasure redacts in place rather than deletes.
+    OutboxEffect.EXPIRE_HOLD: frozenset({"booking_id"}),
+}
+"""What a RETAINED effect's payload may contain — the OTHER half of retaining a row.
+
+==An effect is RETAINED because its payload names nobody, and that is a claim about the PAYLOAD.==
+A claim nobody checks decays: add ``guest_email`` to the refund payload tomorrow and the purge
+would faithfully retain it — erasure reported complete, the address still sitting in the table. So
+the keys are declared, the suite asserts the declaration holds no PII key, and
+:func:`enqueue_effect` — the one place an ``Outbox`` row is constructed — refuses an undeclared one.
+
+Exhaustiveness is asserted against :func:`purge_policy` (``test_privacy``): a newly RETAINED effect
+has to say what it carries before anything will keep it."""
+
+
+@dataclass(frozen=True, slots=True)
+class Suppressed:
+    """The intent was REFUSED rather than queued: its booking has never been ``CONFIRMED``.
+
+    ==A distinct answer from ``None``, and that distinction is the entire point.== ``None`` already
+    means something exact in this funnel — *a TERMINAL row already owns this dedupe key* — and
+    :func:`reconcile_workflow_steps` reads it that way, in writing, to decide it must not re-send a
+    message that has already had its moment.
+
+    Collapse a suppression into ``None`` and the two facts become one: *"we refused to announce an
+    unpaid hold"* would be recorded as *"the guest already got it"*, ``report.materialised`` would
+    lie about both, and a silent no-op would be living **inside the funnel that exists to prevent
+    silent no-ops**.
+    """
+
+    booking_id: uuid.UUID
+    effect: OutboxEffect
+
+
+def staleness_policy(effect: OutboxEffect, payload: Mapping[str, Any]) -> Staleness:
+    """Whether ``effect`` is dropped when its booking is no longer the chain's live member.
+
+    Raises :class:`KeyError` for an effect that has not declared itself in :data:`_STALENESS`. That
+    is the whole point: a terminal effect silently inheriting SUBJECT is a message that gets marked
+    delivered and never sent."""
+    try:
+        rule = _STALENESS[effect]
+    except KeyError as exc:  # pragma: no cover - guarded by test_every_effect_declares_a_staleness
+        raise KeyError(
+            f"outbox effect {effect.value!r} has not declared a staleness policy; "
+            "add it to _STALENESS (SUBJECT for informational, EXEMPT for terminal)"
+        ) from exc
+    return rule(payload)
+
+
+DEFER_DELAY_SECONDS = 30
+"""How soon a deferred (dependency-waiting) intent is retried."""
+
+PAUSED_RULE_RECHECK = timedelta(minutes=15)
+"""How often a step PAUSED by a switched-off rule asks again whether that rule has come back.
+
+Not :data:`DEFER_DELAY_SECONDS`: a sibling intent lands in seconds, whereas a tenant re-enables a
+rule in minutes, or never. Polling a disabled rule's whole backlog every 30 s would be a hot loop
+waiting on a condition that only a human can change."""
+
+TERMINAL_MESSAGE_GRACE = timedelta(days=7)
+"""How long a TERMINAL message (a follow-up, a cancellation notice) is still worth sending after its
+moment. Unlike a reminder it remains TRUE afterwards — but a row cannot wait for ever."""
+
+
+class OutboxDeferred(Exception):
+    """Raised by an effect handler to POSTPONE its intent without consuming an attempt.
+
+    The effect is not failing — it is WAITING. Two kinds of wait, and they are not the same:
+
+    * on a SIBLING INTENT (an email waiting for its booking's Google Meet link; a calendar delete
+      waiting for the create that will produce the event id it must remove) — seconds;
+    * on a HUMAN: the step's workflow rule is switched off, and the tenant may switch it back on —
+      minutes, or never (:data:`PAUSED_RULE_RECHECK`).
+
+    Hence ``retry_after``. The drain returns the row to ``pending`` at that distance and leaves
+    ``attempts`` alone, so a legitimate wait never counts toward the dead-letter budget.
+
+    ==This is the ONLY non-terminal way for a handler to decline to send.== The distinction from
+    :class:`OutboxSkipped` is not stylistic: a TEMPORARY condition must never produce a TERMINAL
+    outcome, or the message is destroyed by a state the tenant can simply undo."""
+
+    def __init__(self, message: str, *, retry_after: timedelta | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = (
+            timedelta(seconds=DEFER_DELAY_SECONDS) if retry_after is None else retry_after
+        )
+
+
+class OutboxUnknownOutcome(Exception):
+    """The provider was given this message and we never learned whether it went out.
+
+    Raised either by the sender (a lost answer, mid-flight) or by the READ phase of a LATER drain,
+    which finds the in-flight marker still set on a row whose ledger entry never landed — i.e. the
+    worker died in the window between "the provider accepted" and "the ledger committed".
+
+    The drain parks it as :attr:`OutboxStatus.UNKNOWN`: no retry, an error log, a metric. ==It is
+    never re-sent blind.=="""
+
+
+class OutboxSkipped(Exception):
+    """Raised by a handler when its effect can NEVER run, so retrying it is meaningless.
+
+    The distinction from a failure is the whole point. A WhatsApp step on an instance with no
+    WhatsApp credentials is not "broken" — it is switched off. Retried like a failure it would burn
+    the entire backoff budget and dead-letter, filling the queue with noise while still delivering
+    nothing. Terminal, recorded with its reason, and it consumes no attempt.
+
+    ==Terminal means IRREVERSIBLE, so it may only carry a condition that cannot be undone.== A rule
+    that is merely switched OFF is not one of those — the tenant can switch it back on, and a step
+    retired while it was off could never be delivered afterwards. That is a wait, and it belongs in
+    :class:`OutboxDeferred`."""
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxWork:
+    """A claimed intent, DETACHED from any session.
+
+    The whole point of R8 is that a handler runs its network I/O with no session and no transaction.
+    Handing it a live ORM row would make that impossible to enforce — any attribute access could
+    emit a lazy SELECT and silently reopen a transaction — so the claim snapshots what the handler
+    needs into a frozen value."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    booking_id: uuid.UUID
+    effect: OutboxEffect
+    dedupe_key: str
+    payload: dict[str, Any]
+    attempts: int
+    claimed_by: str
+    """The worker holding this row's lease. The settle REFUSES to write without it.
+
+    Without this, the lease is only half a mechanism. A worker claims a row, its network I/O
+    overruns the TTL, the recovery pass hands the row back to ``pending``, a SECOND worker claims it
+    — and then the first worker settles its own stale result on top, marking ``delivered`` an intent
+    the second worker is still executing. So the settle is a CONDITIONAL update, gated on this
+    value. """
+
+
+# The injected effect runner. It receives NO session: it opens its own short-lived ones around the
+# I/O. Injected so the drain is testable offline with a fake.
+OutboxExecutor = Callable[[OutboxWork, datetime], Awaitable[None]]
+
+SenderResolver = Callable[[uuid.UUID], Awaitable["TenantSenders"]]
+"""==Ask for a business's senders BY NAME. The only way to obtain one (B-03bis).==
+
+The ``uuid.UUID`` is not decoration: it is the whole argument. The retired shape handed
+:func:`make_booking_effect_executor` a sender built at boot from the instance's environment, and the
+drain — a loop over a batch spanning several businesses — sent everybody's messages through it. A
+business's WhatsApp went out from the operator's number.
+
+Typed as a plain callable so the offline suite injects a fake without a database. The live
+implementation is ``functools.partial`` over
+:func:`~aethercal.server.services.tenant_senders.resolve_tenant_senders`, wired in
+``scheduler.make_outbox_drain_tick``."""
+
+Sessionmaker = async_sessionmaker[AsyncSession]
+
+Clock = Callable[[], datetime]
+"""Reads the wall clock. A lease is a wall-clock deadline, so the drain needs REAL elapsed time."""
+
+
+def _elapsed_clock(now: datetime) -> Clock:
+    """A clock anchored at ``now`` and advanced by the real time that has elapsed since.
+
+    NOT ``lambda: now``. A frozen clock would stamp every item's lease with the same deadline no
+    matter how long the batch actually took — which is precisely the bug that per-item claiming
+    exists to remove. ``monotonic`` because this measures a DURATION, and the wall clock can step
+    backwards (NTP, DST) while a duration cannot.
+    """
+    started = time.monotonic()
+    return lambda: now + timedelta(seconds=time.monotonic() - started)
+
+
+@dataclass
+class OutboxReport:
+    """The outcome of one :func:`drain_outbox` pass: the intent ids by terminal/retry bucket."""
+
+    delivered: list[uuid.UUID] = field(default_factory=list)
+    failed: list[uuid.UUID] = field(default_factory=list)
+    dead: list[uuid.UUID] = field(default_factory=list)
+    deferred: list[uuid.UUID] = field(default_factory=list)
+    recovered: list[uuid.UUID] = field(default_factory=list)
+    """Rows a dead worker had claimed, returned to ``pending`` by this pass's lease recovery."""
+    unclaimed: list[uuid.UUID] = field(default_factory=list)
+    """Planned, but claimed by somebody else (or voided) before we reached them.
+
+    Not ours, and not errors.
+    """
+    unknown: list[uuid.UUID] = field(default_factory=list)
+    """Handed to the provider; the answer was lost. ==THE bucket to alarm on.==
+
+    Each one is a message that may or may not have reached a real person, and which this system will
+    NOT resend on its own. It is neither noise nor routine: a non-empty ``unknown`` is a human task,
+    and the entire point of the state is that it cannot be ignored quietly.
+    """
+    skipped: list[uuid.UUID] = field(default_factory=list)
+    """Steps that could never run (an unconfigured channel, a kind with no template).
+
+    NOT failures. """
+    voided_midflight: list[uuid.UUID] = field(default_factory=list)
+    """Retired by a booking transition WHILE we were sending them. Routine, expected, and NOT lost.
+
+    Kept out of :attr:`lost` deliberately: that counter exists to alert on a broken timing
+    assumption, and an alarm that also fires on every ordinary cancellation is one nobody reads.
+    """
+    purged_midflight: list[uuid.UUID] = field(default_factory=list)
+    """DELETED by a guest erasure WHILE we were sending them. Routine, expected, and NOT lost.
+
+    ==The third cause of a vanished row, and it earns its own bucket for the same reason
+    :attr:`voided_midflight` did.== ``purge_guest`` filters on effect, never on status, so a message
+    intent a worker is mid-send on is as deletable as an idle one — and at settle time that looks
+    EXACTLY like a lost lease: the row is not ours any more. Filed as :attr:`lost` it would fire the
+    duplicate-send alarm on every erasure that happened to land during a drain, and send an operator
+    off to re-tune lease timings that are working perfectly.
+
+    Nothing was sent twice and nothing timed out: somebody exercised their right to be forgotten.
+    """
+    lost: list[uuid.UUID] = field(default_factory=list)
+    """Rows whose LEASE EXPIRED mid-send, so this worker's result was DISCARDED at settle time.
+
+    Never silent: each one is an error-level log line. A non-empty ``lost`` means a provider call
+    outran its lease despite :data:`PROVIDER_TIMEOUT_CEILING`, and the effect may well have been
+    executed twice. It is THE metric to alert on — which is exactly why a step retired by a routine
+    cancellation goes to :attr:`voided_midflight` instead, and never in here.
+    """
+
+    @property
+    def attempted(self) -> int:
+        """How many intents this pass actually tried to run to completion (excludes deferrals)."""
+        return len(self.delivered) + len(self.failed) + len(self.dead)
 
 
 def backoff_delay(
@@ -114,8 +695,7 @@ def backoff_delay(
 ) -> timedelta:
     """Exponential backoff after the ``attempts``-th failure (1-based): ``base * 2**(attempts-1)``.
 
-    Capped at ``cap`` seconds so a long-broken effect never schedules an absurd retry.
-    """
+    Capped at ``cap`` seconds so a long-broken effect never schedules an absurd retry."""
     exponent = max(attempts - 1, 0)
     return timedelta(seconds=min(base * (2**exponent), cap))
 
@@ -130,59 +710,226 @@ def google_dedupe_key(operation: GoogleOperation) -> str:
     return f"{OutboxEffect.GOOGLE.value}:{operation.value}"
 
 
-class OutboxDeferred(Exception):
-    """Raised by an effect handler to POSTPONE its intent without consuming an attempt.
+def refund_dedupe_key(provider_ref: str) -> str:
+    """The idempotency key for a refund intent — ==keyed on ``provider_ref``, never the booking.==
 
-    The effect is not failing — it waits on a sibling intent to run first (e.g. an email waiting on
-    its booking's Google Meet link). The drain reschedules it soon and leaves ``attempts`` alone, so
-    a legitimate wait never counts toward the dead-letter budget.
+    A refund has TWO enqueue paths (``cancel_booking`` and the arbiter's late-webhook branch), and
+    both must collapse to ONE row: ``UniqueConstraint(tenant_id, booking_id, dedupe_key)`` on the
+    outbox is what does it. Keyed on the payment's ``provider_ref`` so that a double payment (two
+    ``provider_ref``s on one booking) produces two DISTINCT refund intents — each charge is refunded
+    exactly once — while a single charge reached by both paths produces exactly one."""
+    return f"{OutboxEffect.REFUND.value}:{provider_ref}"
+
+
+def expire_hold_dedupe_key(booking_id: uuid.UUID) -> str:
+    """The idempotency key for a hold-expiry intent (one per booking: a hold IS one booking)."""
+    return f"{OutboxEffect.EXPIRE_HOLD.value}:{booking_id}"
+
+
+RETAINED_DEDUPE_KEY: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], str]] = {
+    # `enqueue_refund` keys on the charge, and puts that same charge in the payload.
+    OutboxEffect.REFUND: lambda payload: refund_dedupe_key(str(payload["provider_ref"])),
+    # `enqueue_expire_hold` keys on the booking, and puts that same booking in the payload.
+    OutboxEffect.EXPIRE_HOLD: lambda payload: expire_hold_dedupe_key(
+        uuid.UUID(str(payload["booking_id"]))
+    ),
+}
+"""How to rebuild a RETAINED effect's ``dedupe_key`` from its own payload.
+
+==The other half of retaining a row: ``payload`` was never the only column.== Three rounds hardened
+the payload — an allowlist, a shape, a vocabulary — while ``dedupe_key``, a free-form
+``VARCHAR(128)``, rode along untouched on every retained row and nothing had ever looked at it.
+
+It cannot be redacted the way a payload can. :func:`we_queued_this_refund` matches on
+``(tenant_id, dedupe_key)``, so this column IS the r8 discriminator — the committed fact that tells
+our own refund from an operator's — and rewriting it would stop the money already on the wire from
+being recognised as ours, re-opening the bug this cut opened with. It survives verbatim, or the
+refund breaks.
+
+Something that survives verbatim has to be PII-free BY CONSTRUCTION, and that is what this makes
+checkable rather than hoped for: ==a retained row's dedupe_key must be REBUILDABLE from its own
+retained payload.== The payload is already proven to name nobody (:data:`RETAINED_PAYLOAD_KEYS` plus
+the funnel guard), so a key derived from nothing else can carry nothing else — and one that does not
+rebuild came from somewhere nothing can vouch for. ``refund:ada@example.com`` is not a hypothetical
+shape: it is what :func:`refund_dedupe_key` yields the day a ``provider_ref`` is an address, or a
+future caller keys a retained intent on "the person this is about".
+
+Exhaustive over the RETAINED effects (asserted in ``test_privacy``), and enforced at the funnel."""
+
+
+def workflow_step_dedupe_key(workflow_id: uuid.UUID, step_id: uuid.UUID, channel: Channel) -> str:
+    """The idempotency key for one workflow step on one channel (RF-24's exactly-once guarantee).
+
+    The existing ``UniqueConstraint(tenant_id, booking_id, dedupe_key)`` turns a double-enqueue into
+    a silent no-op. Nothing invents a second idempotency mechanism."""
+    return f"wf:{workflow_id}:{step_id}:{channel.value}"
+
+
+def new_worker_id() -> str:
+    """A stable-enough identity for a drain worker: who holds a lease (host:pid:nonce)."""
+    return f"{socket.gethostname()[:24]}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def as_utc(moment: datetime) -> datetime:
+    """SQLite drops tzinfo on the round-trip; normalise before doing arithmetic on a stored instant.
+
+    Lives HERE, in the layer everything else sits on, because both the send-time arithmetic
+    (``services/workflows.py``) and the deadline arithmetic (:func:`message_deadline`) need it — and
+    two copies of "what does a naive timestamp from the database mean" is how two answers appear."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _refuse_underivable_retained_dedupe_key(
+    effect: OutboxEffect, dedupe_key: str, payload: Mapping[str, object]
+) -> None:
+    """Refuse a RETAINED intent whose ``dedupe_key`` cannot be rebuilt from its own payload.
+
+    ==The column the payload guard never looked at.== See :data:`RETAINED_DEDUPE_KEY` for why this
+    one cannot be redacted after the fact (it is the r8 discriminator) and therefore has to be
+    PII-free at the door instead.
+
+    Same funnel, same reasoning as the payload keys beside it: the rule lands on the enqueue path
+    nobody has written yet. It raises for the same reason too — a dedupe_key that does not rebuild
+    is a programming error, met by the suite long before a guest meets it.
     """
+    rebuild = RETAINED_DEDUPE_KEY.get(effect)
+    if rebuild is None:  # PURGEABLE: the whole row goes on a purge, so its key outlives nothing.
+        return
+    try:
+        expected = rebuild(payload)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            f"and must be rebuildable from its (PII-free) payload — and it cannot be rebuilt at "
+            f"all: {exc!r}. Its payload must carry what its key is derived from."
+        ) from exc
+    if dedupe_key != expected:
+        # The KEY itself is never echoed: if it carries the guest, this message would too.
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge, so its dedupe_key outlives an erasure "
+            "verbatim — and this one is not the key its own payload rebuilds. It was derived from "
+            "something nothing has vouched for, which may be the person. Key it on the payload "
+            "(see RETAINED_DEDUPE_KEY), or this effect cannot be retained as it stands."
+        )
 
 
-DEFER_DELAY_SECONDS = 30
-"""How soon a deferred (dependency-waiting) intent is retried."""
+def _refuse_undeclared_retained_keys(effect: OutboxEffect, payload: Mapping[str, object]) -> None:
+    """Refuse a RETAINED effect carrying a payload key nobody classified (B-05c).
 
+    ==Gate the FUNNEL, not the callers.== :func:`enqueue_effect` is the only place an ``Outbox`` row
+    is constructed in the source tree, so the rule lands on the enqueue path nobody has written yet,
+    without its author ever learning this rule exists. A list of the call sites that matter today is
+    a photograph; this is the door they all come through.
 
-@dataclass
-class OutboxReport:
-    """The outcome of one :func:`drain_outbox` pass: the intent ids by terminal/retry bucket."""
+    A RETAINED intent OUTLIVES a guest erasure. Whether it may is decided entirely by what is inside
+    it — so a key nobody classified cannot ride along on the assumption that it is harmless, because
+    the erasure would keep it, faithfully, address and all.
 
-    delivered: list[uuid.UUID] = field(default_factory=list)
-    failed: list[uuid.UUID] = field(default_factory=list)
-    dead: list[uuid.UUID] = field(default_factory=list)
-    deferred: list[uuid.UUID] = field(default_factory=list)
-
-    @property
-    def attempted(self) -> int:
-        """How many intents this pass actually tried to run to completion (excludes deferrals)."""
-        return len(self.delivered) + len(self.failed) + len(self.dead)
+    Raises rather than warns, and that is deliberate: an undeclared key is a PROGRAMMING error, not
+    a runtime condition, and it is one the suite meets long before a guest does — every test that
+    queues a refund runs this. The alternative is a log line nobody reads, on the one path where
+    being wrong means an erasure that did not erase.
+    """
+    allowed = RETAINED_PAYLOAD_KEYS.get(effect)
+    if allowed is None:  # PURGEABLE: the whole row goes on a purge, so its keys need no vetting.
+        return
+    undeclared = set(payload) - allowed
+    if undeclared:
+        raise ValueError(
+            f"{effect.value} is RETAINED by the guest purge (services/privacy.py), so its payload "
+            f"outlives an erasure — and it carries undeclared payload key(s) {sorted(undeclared)}. "
+            "Either add them to RETAINED_PAYLOAD_KEYS (having checked they name nobody), or, if "
+            "they do name somebody, this effect cannot be retained as it stands."
+        )
 
 
 async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are the keyword contract
     session: AsyncSession,
     *,
-    tenant_id: uuid.UUID,
-    booking_id: uuid.UUID,
+    booking: Booking,
     effect: OutboxEffect,
     dedupe_key: str,
     payload: dict[str, object],
-) -> Outbox | None:
+    next_retry_at: datetime | None = None,
+) -> Outbox | Suppressed | None:
     """Persist a ``pending`` effect intent for a booking, INSIDE the caller's transaction (F1-05).
+
+    ==THE FUNNEL.== ``Outbox(...)`` is constructed here and **nowhere else in the source tree**, so
+    every outbound effect the product will ever have — today's confirmation email, WhatsApp reminder
+    and Google sync; tomorrow's refund — passes through this one function. That is what makes the
+    guard below a BELT rather than an etiquette: a new enqueue path nobody foresaw is silenced by
+    it the day it is written, without its author knowing this rule exists.
+
+    .. rubric:: It takes the BOOKING, not a ``booking_id``
+
+    Deliberately, and it is the load-bearing half of the guard. The gate has to ask *"was this
+    appointment ever confirmed?"*, and a funnel handed only an id would have to go and LOAD the row
+    to find out — which under row-level security returns ``None`` for a session whose business is
+    not bound, silently. The gate would then have to choose between failing open (announcing unpaid
+    holds — the bug) and failing closed (silencing everything — an outage), from inside a function
+    that cannot tell the two situations apart. Taking the object the caller already has in hand
+    removes the question: every caller of this function has the booking, because it is enqueueing an
+    effect ABOUT that booking.
+
+    .. rubric:: The guard
+
+    ==A booking that has never been ``CONFIRMED`` produces no outbound at all== — unless the effect
+    is declared EXEMPT by :func:`confirmation_policy` (a refund, a hold expiry: they exist precisely
+    to act on bookings nobody paid for). ``confirmed_at`` is the switch, never ``status``: a
+    cancelled booking that WAS confirmed must still send its cancellation notice, while an expired
+    hold must not — and both read ``cancelled``.
 
     Idempotent on ``(tenant_id, booking_id, dedupe_key)``: the insert runs in a ``SAVEPOINT`` and a
     unique-constraint conflict (the same transition already enqueued this exact intent) returns
     ``None`` without poisoning the transaction. Flushes; the caller owns the commit, so the intent
-    commits atomically with the booking, or rolls back with it (never fires for a booking
-    that never persisted). Returns the created row, or ``None`` when it was already queued.
-    """
+    commits atomically with the booking, or rolls back with it (and never fires for a booking that
+    never persisted).
+
+    Three outcomes, and they are three because collapsing any two of them loses a fact somebody
+    needs: the created :class:`Outbox` row · :class:`Suppressed` (*refused: nobody confirmed this
+    appointment*) · ``None`` (*a terminal row already owns this key — it has had its moment*).
+
+    ``next_retry_at`` is the intent's earliest send time. ``None`` means "as soon as the next drain
+    runs"; a future instant is how the outbox doubles as the durable SCHEDULER — a 24 h reminder is
+    just an intent that is not due until ``start - 24h``.
+
+    **What happens on a conflict is decided by** :func:`conflict_policy`, per effect — it is not
+    always "do nothing". For a time-bearing effect (a workflow step: ``before_start`` + an offset) a
+    silent no-op is a BUG: re-materialising the step for a booking whose start has MOVED would leave
+    the queued row on its old ``next_retry_at``, and the reminder would fire 24 h before the OLD
+    start. Those effects RE-TIME the existing row instead — but only while it is still ``pending``,
+    so
+    a message that already went out is never re-sent, and a mid-flight (``claimed``) row is not
+    yanked out from under its worker."""
+    if (
+        confirmation_policy(effect) is Confirmation.REQUIRES_CONFIRMATION
+        and booking.confirmed_at is None
+    ):
+        # Never confirmed: nobody has been told this appointment exists, and nobody may be. Loud in
+        # the log, because a message that is silently absent is exactly what nobody ever notices —
+        # and this is the branch that will be doing the most work the day holds start being written.
+        _logger.info(
+            "outbox %s intent for booking %s SUPPRESSED: the booking has never been confirmed "
+            "(confirmed_at is NULL), so nothing may be announced for it",
+            effect.value,
+            booking.id,
+        )
+        return Suppressed(booking_id=booking.id, effect=effect)
+
+    # Everything a RETAINED row will still be carrying after an erasure, vetted at the one door it
+    # comes through: the payload's keys, and the dedupe_key those keys must rebuild.
+    _refuse_undeclared_retained_keys(effect, payload)
+    _refuse_underivable_retained_dedupe_key(effect, dedupe_key, payload)
+
     row = Outbox(
-        tenant_id=tenant_id,
-        booking_id=booking_id,
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
         effect=effect.value,
         dedupe_key=dedupe_key,
         payload=payload,
         status=_PENDING,
         attempts=0,
+        next_retry_at=next_retry_at,
     )
     try:
         async with session.begin_nested():
@@ -193,265 +940,838 @@ async def enqueue_effect(  # noqa: PLR0913 - the intent's identity + payload are
     return row
 
 
-async def drain_outbox(
+async def void_pending_steps(
     session: AsyncSession,
     *,
-    now: datetime,
-    execute: OutboxExecutor,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    batch_size: int = DEFAULT_DRAIN_BATCH_SIZE,
-) -> OutboxReport:
-    """Run one bounded batch of due intents through ``execute`` and record the outcome. Returns an
-    :class:`OutboxReport`.
+    tenant_id: uuid.UUID,
+    booking_id: uuid.UUID,
+    triggers: Collection[WorkflowTrigger],
+) -> list[uuid.UUID]:
+    """Retire this booking's LIVE workflow steps for ``triggers``. Returns the ids voided.
 
-    "Due" = status ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now``. At most
-    ``batch_size`` rows are claimed per pass (so a tick's open transaction and its external I/O stay
-    bounded; the next tick drains the rest), each with ``FOR UPDATE SKIP LOCKED`` (so a concurrent
-    tick never double-runs it — and can drain a disjoint batch; harmless no-op on SQLite) and
-    executed inside its own ``SAVEPOINT``: a raising effect rolls back only its own partial writes
-    (e.g. an email ledger reservation), leaving the rest of the batch and the retry bookkeeping
-    intact, and is retried with exponential backoff until ``max_attempts`` (then ``dead``). Flushes
-    the updated rows; the caller owns the commit.
-    """
-    due = (
+    This — not an upsert — is how a booking's queued steps are corrected when its life changes.
+    ``reschedule_booking`` does NOT mutate a booking: it opens a NEW row (the successor inherits the
+    ``ical_uid``; the predecessor is marked cancelled). Outbox uniqueness keys on ``booking_id``, so
+    a successor's steps can never collide with the predecessor's — an ``ON CONFLICT ... DO UPDATE``
+    that tried to "move" a step would match ZERO rows, raise nothing, and pass every test. That is
+    the silent no-op this whole design exists to kill, so the predecessor's steps are voided
+    explicitly instead.
+
+    Voiding covers the staleness-EXEMPT steps too, which is the entire point: an ``after_end``
+    follow-up is exempt (the appointment is over — "the chain moved on" is not a reason to suppress
+    it), so a predecessor's copy left alive WILL be delivered, at the hour of a meeting that never
+    happened.
+
+    .. rubric:: "Live" means ``pending`` AND ``failed`` AND ``claimed``
+
+    Retiring only ``pending`` rows is a bug with a real victim. A step whose provider was down sits
+    in ``failed`` with a ``next_retry_at`` in the future, and it is **completely alive**: cancel the
+    booking and that step retries an hour later, messaging a guest about an appointment that no
+    longer exists. Reschedule, and the predecessor's failed steps fire at the OLD time. So the void
+    covers every non-terminal state:
+
+    * ``pending`` / ``failed`` → voided outright. They had not started; now they never will.
+    * ``claimed`` → voided as well. This is the case whose policy has to be WRITTEN DOWN, because a
+      claimed step may be in the provider's hands right now, and there is no such thing as
+      un-sending. The policy: ==**we do not try to recall it; we guarantee it is never RETRIED; and
+      we refuse to let its worker write the outcome.**== Marking it ``voided`` does all three — the
+      row becomes terminal, and the worker's settle (gated on ``status='claimed' AND
+      claimed_by=<me>``, see :func:`_settle`) no longer matches, so its result is discarded and
+      logged. The message may still reach the guest: that is the honest, unavoidable residual of an
+      at-least-once queue, and it is RECORDED rather than pretended away.
+
+    ``FOR UPDATE`` makes this atomic against :func:`claim_one`. A concurrent drain about to claim
+    one of these rows blocks on the lock until the booking transition commits, and its conditional
+    UPDATE
+    then finds ``status='voided'`` and matches nothing. A step cannot slip from ``pending`` into a
+    worker's hands *while* the cancellation that retires it is committing."""
+    wanted = {trigger.value for trigger in triggers}
+    if not wanted:
+        return []
+    rows = (
         await session.scalars(
             select(Outbox)
             .where(
-                Outbox.status.in_((_PENDING, _FAILED)),
-                or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
+                Outbox.tenant_id == tenant_id,
+                Outbox.booking_id == booking_id,
+                # ==Only the VOIDABLE effects (derived from ``voidability_policy``, today just
+                # NOTIFY).== A REFUND/EXPIRE_HOLD queued for this booking is NON_VOIDABLE and must
+                # never be swept up by a cancel — the table is what guarantees it, not this clause.
+                Outbox.effect.in_(_VOIDABLE_EFFECTS),
+                Outbox.status.in_(_NON_TERMINAL),
             )
-            .order_by(
-                Outbox.created_at,
-                # Within one instant (intents enqueued in the same transaction share a stamp), run
-                # the Google sync BEFORE the email — so the confirmation/reschedule notice carries
-                # the Meet link the sync just wrote onto the booking: a deterministic causal order,
-                # not the non-deterministic tie-break the created_at stamp alone would leave.
-                case((Outbox.effect == OutboxEffect.GOOGLE.value, 0), else_=1),
+            .with_for_update()
+        )
+    ).all()
+    voided = _retire([row for row in rows if row.payload.get("trigger") in wanted])
+    await session.flush()
+    return voided
+
+
+def _retire(rows: Collection[Outbox]) -> list[uuid.UUID]:
+    """Mark every row ``voided`` — the ONE place a live step is retired. Returns the ids.
+
+    Extracted rather than repeated: :func:`void_pending_steps` (the BOOKING's life changed) and
+    :func:`reconcile_workflow_steps` (the RULE changed) both need it, and a second copy of "which
+    fields have to be cleared" is how a claimed row keeps its lease and gets silently retried later.
+    """
+    voided: list[uuid.UUID] = []
+    for row in rows:
+        if row.status == _CLAIMED:
+            # In flight. We cannot un-send it — we can only guarantee it is never retried, and that
+            # its worker's result is discarded rather than written. Say so, out loud.
+            _logger.warning(
+                "outbox intent %s (booking %s) was VOIDED while a worker held it: the send may "
+                "already have reached the provider and cannot be recalled. It will NOT be retried, "
+                "and the worker's result will be discarded",
+                row.id,
+                row.booking_id,
             )
-            .limit(batch_size)
-            .with_for_update(skip_locked=True)
+        row.status = _VOIDED
+        row.next_retry_at = None
+        row.claimed_by = None
+        row.lease_expires_at = None
+        voided.append(row.id)
+    return voided
+
+
+def workflow_key_prefix(workflow_id: uuid.UUID) -> str:
+    """The dedupe-key prefix every step of ``workflow_id`` shares (see
+    :func:`workflow_step_dedupe_key`).
+
+    A UUID carries no LIKE wildcard, so the prefix match is exact — and it finds a rule's queued
+    rows without querying INSIDE the payload JSON, which SQLite and PostgreSQL spell
+    differently."""
+    return f"wf:{workflow_id}:"
+
+
+@dataclass(frozen=True, slots=True)
+class StepSchedule:
+    """What ONE workflow step's queued row ought to look like, per the rule as it stands NOW.
+
+    Produced by ``services/workflow_rules.py`` (which owns what a rule MEANS) and executed by
+    :func:`reconcile_workflow_steps` (which owns what an outbox row may DO). ``send_at`` is ``None``
+    for the event-shaped triggers — they fire on the next drain, so there is nothing to re-time."""
+
+    dedupe_key: str
+    payload: dict[str, Any]
+    send_at: datetime | None
+
+
+@dataclass
+class ReconcileReport:
+    """What a rule change did to one booking's queue."""
+
+    materialised: list[uuid.UUID] = field(default_factory=list)
+    retimed: list[uuid.UUID] = field(default_factory=list)
+    voided: list[uuid.UUID] = field(default_factory=list)
+    left: list[uuid.UUID] = field(default_factory=list)
+    """Mid-flight (``claimed``), or event-shaped: not a rule edit's business to move."""
+    suppressed: list[uuid.UUID] = field(default_factory=list)
+    """Bookings the funnel refused to speak for: never confirmed, so never to be announced.
+
+    Kept OUT of :attr:`materialised` on purpose. ``materialised`` is the count of messages this edit
+    armed, and a suppressed step armed nothing — folding the two together would make the report
+    claim it had queued a reminder for an appointment nobody paid for."""
+
+
+async def reconcile_workflow_steps(  # noqa: PLR0913 - the row's identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    workflow_id: uuid.UUID,
+    wanted: Collection[StepSchedule],
+    now: datetime,
+    timing_changed: bool,
+) -> ReconcileReport:
+    """Bring ONE booking's queued steps for ONE workflow in line with ``wanted``.
+
+    This is what makes an edit to a rule TRUE. Without it, changing "remind 24 h before" to "2 h
+    before" rewrites a row in ``workflows`` and changes nothing a guest can perceive: every booking
+    already on the books keeps its step queued at ``start - 24h``, because the send time lives in
+    the outbox row's ``next_retry_at``, not in the rule. The rule would say one thing and the queue
+    would do another, with no error anywhere — the silent no-op, one layer up.
+
+    It is emphatically **not an upsert**. ``ON CONFLICT ... DO UPDATE`` expresses none of the
+    outcomes below, and the UNIQUE constraint on ``(tenant_id, booking_id, dedupe_key)`` is also why
+    a naive "just re-materialise it" fails: a key that already exists — even on a ``voided`` or
+    ``delivered`` row — makes :func:`enqueue_effect` return ``None``, silently. So every row is
+    decided explicitly:
+
+    * **not in** ``wanted`` → **voided**. The step was removed from the rule; its message must not
+      still arrive next Tuesday.
+    * **in** ``wanted``, live, send time **in the future** → **re-timed in place**: the SAME row
+      (so the message stays exactly-once), carrying the rule's new instant and payload.
+    * **in** ``wanted``, but its send time is **in the past** → it depends on ``timing_changed``,
+      and the difference is a message's life:
+
+      - ``timing_changed`` (the EDIT dragged it backwards into the past — say -60 became -1440 for a
+        booking three hours out) → **voided**. That message's moment never existed; a
+        ``next_retry_at`` in the past drains IMMEDIATELY, so re-timing it there would fire the
+        "reminder" at once, after the fact.
+      - **not** ``timing_changed`` (the rule's clock did not move; the row is simply OVERDUE — it
+        was PAUSED while the tenant had the rule switched off) → **made due now**. Voiding it here
+        would destroy, on re-activation, exactly the message the re-activation exists to deliver.
+
+    * **in** ``wanted``, with **no live row** → **materialised**, but only when its send time is a
+      real future instant. An event-shaped step (``send_at is None``) is never back-filled: it
+      reports something that has already happened, and queueing it now would tell somebody who
+      booked last week that their booking is confirmed.
+
+    A ``claimed`` row is left alone: a worker is sending it right now, and re-timing a message that
+    is already in the provider's hands is meaningless.
+
+    Nothing here needs to ask whether the message is still *worth* sending — an overdue step made
+    due
+    now is re-checked against :func:`message_deadline` at the send, so a rule switched back on a
+    week
+    late still cannot fire a reminder for a meeting that has already happened.
+    """
+    by_key = {schedule.dedupe_key: schedule for schedule in wanted}
+    rows = (
+        await session.scalars(
+            select(Outbox)
+            .where(
+                Outbox.tenant_id == booking.tenant_id,
+                Outbox.booking_id == booking.id,
+                Outbox.effect == OutboxEffect.NOTIFY.value,
+                Outbox.status.in_(_NON_TERMINAL),
+                Outbox.dedupe_key.startswith(workflow_key_prefix(workflow_id)),
+            )
+            .with_for_update()
         )
     ).all()
 
-    report = OutboxReport()
-    for row in due:
-        try:
-            # The effect's own SAVEPOINT: on failure it rolls back to here (undoing any partial
-            # write such as a reserved notification-ledger row), so a retry starts clean and one
-            # poisoned effect never aborts the sibling intents or the bookkeeping below.
-            async with session.begin_nested():
-                await execute(session, row, now)
-        except OutboxDeferred:
-            # Waiting on a dependency (e.g. an email waiting for its Google Meet link): reschedule
-            # soon WITHOUT counting an attempt, so a legitimate wait never dead-letters.
-            row.next_retry_at = now + timedelta(seconds=DEFER_DELAY_SECONDS)
-            report.deferred.append(row.id)
-            continue
-        except Exception:
-            row.attempts += 1
-            row.last_attempt_at = now
-            if row.attempts >= max_attempts:
-                row.status = _DEAD
-                row.next_retry_at = None
-                report.dead.append(row.id)
-                # A distinct, louder line: this intent is PARKED — no further automatic retry. It
-                # needs operator attention (metrics/alerting on the ``dead`` state + a safe replay
-                # are the remaining ops surface; see the module residual note).
-                _logger.error(
-                    "outbox intent %s (%s) for booking %s DEAD after %d attempts; parked, no retry",
-                    row.id,
-                    row.effect,
-                    row.booking_id,
-                    row.attempts,
-                )
-            else:
-                row.status = _FAILED
-                row.next_retry_at = now + backoff_delay(row.attempts)
-                report.failed.append(row.id)
-                _logger.exception(
-                    "outbox intent %s (%s) for booking %s failed; will retry",
-                    row.id,
-                    row.effect,
-                    row.booking_id,
-                )
-            continue
+    report = ReconcileReport()
+    to_void: list[Outbox] = []
+    seen: set[str] = set()
+    for row in rows:
+        seen.add(row.dedupe_key)
+        schedule = by_key.get(row.dedupe_key)
+        if schedule is None:
+            to_void.append(row)  # this step is gone from the rule
+        elif row.status == _CLAIMED or schedule.send_at is None:
+            # Mid-flight, or event-shaped (due on the next drain anyway). Nothing to move.
+            report.left.append(row.id)
+        elif schedule.send_at <= now and timing_changed:
+            _logger.info(
+                "outbox intent %s (booking %s): the rule moved its send time to %s, which is "
+                "already past — retiring it rather than firing it late",
+                row.id,
+                booking.id,
+                schedule.send_at.isoformat(),
+            )
+            to_void.append(row)
+        elif schedule.send_at <= now:
+            # OVERDUE, not mistimed: the rule's clock never moved, so this is the step that was
+            # PAUSED while the rule was switched off. Make it due NOW. Voiding it — the branch above
+            # — would destroy, at the very moment of re-activation, the message that re-activation
+            # exists to deliver. Whether it is still worth sending is the SEND's question
+            # (``message_deadline``), not this one's.
+            row.next_retry_at = now
+            report.retimed.append(row.id)
+        else:
+            row.payload = dict(schedule.payload)
+            row.next_retry_at = schedule.send_at
+            report.retimed.append(row.id)
+    report.voided.extend(_retire(to_void))
 
-        row.attempts += 1
-        row.last_attempt_at = now
-        row.status = _DELIVERED
-        row.next_retry_at = None
-        report.delivered.append(row.id)
-
+    for schedule in by_key.values():
+        if schedule.dedupe_key in seen or schedule.send_at is None or schedule.send_at <= now:
+            continue
+        created = await enqueue_effect(
+            session,
+            booking=booking,
+            effect=OutboxEffect.NOTIFY,
+            dedupe_key=schedule.dedupe_key,
+            payload=dict(schedule.payload),
+            next_retry_at=schedule.send_at,
+        )
+        # Three answers, kept three. ``None`` = a TERMINAL row already owns this key (delivered /
+        # skipped / voided): that message has had its moment, and the UNIQUE constraint is what
+        # stops a rule edit re-sending it — deliberately not an error, since reconciling a rule is
+        # not a request to re-send anything. :class:`Suppressed` = the booking was never confirmed,
+        # nothing may be announced for it; unreachable from here today (a rule only governs LIVE
+        # bookings, and a hold is not one), and counted as ``suppressed`` rather than folded into
+        # either of the others precisely so it cannot become a lie if that ever changes.
+        if isinstance(created, Outbox):
+            report.materialised.append(created.id)
+        elif isinstance(created, Suppressed):
+            report.suppressed.append(booking.id)
     await session.flush()
     return report
 
 
 # --------------------------------------------------------------------------------------
-# Live effect handlers + the dispatcher the scheduler tick injects as ``execute``.
+# The drain: recover → claim → execute (no txn) → settle.
 # --------------------------------------------------------------------------------------
 
 
-async def run_email_effect(
-    session: AsyncSession, outbox: Outbox, now: datetime, *, sender: EmailSender
-) -> None:
-    """Execute an email intent: send the ``kind`` notification for its booking (idempotent).
+async def recover_expired_leases(
+    session: AsyncSession, *, now: datetime, limit: int = DEFAULT_DRAIN_BATCH_SIZE
+) -> list[uuid.UUID]:
+    """Return rows whose lease elapsed to ``pending`` so another worker can pick them up.
 
-    Reloads the booking (a vanished one — e.g. a cascade delete — is a silent no-op) and delegates
-    to :func:`send_booking_notification`, whose reserve-first ledger makes a re-drain never mail
-    twice. ``cancel_url`` / ``reschedule_url`` / ``locale`` ride in the intent payload (the guest
-    tokens were minted in-txn at enqueue time); the persisted booking ``sequence`` drives SEQUENCE.
-
-    DISCARDS a STALE notification: with at-least-once retries a confirmation/reschedule that kept
-    failing could otherwise deliver AFTER a later cancellation or reschedule already went out — the
-    guest must never receive a "confirmed"/"rescheduled" once the chain has moved on. So a
-    confirmation/reschedule whose booking is no longer the chain's live member (superseded → its row
-    is cancelled) is dropped (marked delivered, never sent). A CANCELLATION is the terminal, legit
-    transition and is ALWAYS sent — it is never discarded as stale.
-
-    DEFERS (raising :class:`OutboxDeferred`, no attempt consumed) while the booking still has an
-    undelivered Google sync that will produce its Meet link — so the notice carries the link even if
-    the sync only succeeds on a later retry, not only when it drains first. Once the sync delivers
-    (link set) or dead-letters (no longer pending), the email proceeds.
-    """
-    booking = await session.get(Booking, outbox.booking_id)
-    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return
-    payload = outbox.payload
-    kind = NotificationKind(payload["kind"])
-    if kind in (NotificationKind.CONFIRMATION, NotificationKind.RESCHEDULE) and not (
-        await _is_chain_current(session, booking)
-    ):
-        # A later transition superseded this booking: drop the stale notice (never mail a
-        # "confirmed" after a "cancelled" / for a replaced slot). Cancellation still sends below.
-        return
-    if booking.meeting_url is None and await _awaiting_meeting_sync(session, booking.id):
-        raise OutboxDeferred(f"email for booking {booking.id} awaits its Google Meet link")
-    await send_booking_notification(
-        session,
-        kind=kind,
-        booking=booking,
-        cancel_url=payload.get("cancel_url"),
-        reschedule_url=payload.get("reschedule_url"),
-        sender=sender,
-        now=now,
-        locale=payload.get("locale", "es"),
-        # Use the sequence snapshotted at the transition, not the booking's live (possibly later-
-        # bumped) value, so the chain's emails stay strictly increasing per UID (F1-08).
-        sequence=payload.get("sequence"),
-    )
-
-
-async def _awaiting_meeting_sync(session: AsyncSession, booking_id: uuid.UUID) -> bool:
-    """True while a non-terminal Google intent that WOULD write the booking's Meet link is queued.
-
-    Only an ``upsert``/``reschedule`` (which set ``meeting_url``) counts — a ``delete`` never blocks
-    an email. A dead-lettered sync no longer counts, so a permanently-failing Google never wedges an
-    email forever (it goes out without the link, degraded but not lost).
+    A claimed row whose lease has passed means the worker holding it died (or was killed) mid-send.
+    Its ``attempts`` is deliberately NOT bumped: the WORKER failed, the effect never got its turn,
+    so charging it an attempt would push a perfectly healthy intent toward the dead-letter for
+    somebody
+    else's crash. The row is simply due again.
     """
     rows = (
         await session.scalars(
-            select(Outbox).where(
-                Outbox.booking_id == booking_id,
-                Outbox.effect == OutboxEffect.GOOGLE.value,
-                Outbox.status.in_((_PENDING, _FAILED)),
+            select(Outbox)
+            .where(
+                Outbox.status == _CLAIMED,
+                Outbox.lease_expires_at.is_not(None),
+                Outbox.lease_expires_at <= now,
             )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
         )
     ).all()
-    producing = {GoogleOperation.UPSERT.value, GoogleOperation.RESCHEDULE.value}
-    return any(row.payload.get("operation") in producing for row in rows)
+    for row in rows:
+        _logger.warning(
+            "outbox intent %s (%s): the lease held by %s expired; returning it to pending",
+            row.id,
+            row.effect,
+            row.claimed_by,
+        )
+        row.status = _PENDING
+        row.claimed_by = None
+        row.lease_expires_at = None
+    await session.flush()
+    return [row.id for row in rows]
 
 
-def _chain_lock_key(ical_uid: str) -> int:
-    """A stable signed 64-bit advisory-lock key for a booking chain (its shared ``ical_uid``)."""
-    digest = hashlib.blake2b(ical_uid.encode(), digest_size=8).digest()
-    return int.from_bytes(digest, "big", signed=True)
+async def select_due(
+    session: AsyncSession, *, now: datetime, limit: int = DEFAULT_DRAIN_BATCH_SIZE
+) -> list[uuid.UUID]:
+    """The ids of the intents that are due, in the order they must run. It claims NOTHING.
 
+    "Due" = ``pending``, or ``failed`` with ``next_retry_at`` unset or ``<= now`` — the predicate is
+    :func:`due_filter`, declared once on the model, because observability COUNTS the same rows and
+    two hand-written copies of the rule would drift invisibly (the drain would go on sending exactly
+    the right intents while the backlog alarm quietly measured something else).
 
-async def _serialize_google_chain(session: AsyncSession, ical_uid: str) -> None:
-    """Serialize a booking chain's Google effects across drain workers (PostgreSQL only).
-
-    ``FOR UPDATE SKIP LOCKED`` lets two workers claim DIFFERENT rows of the same booking (its create
-    and its cancel) at once, which could race an event's create against its delete and orphan it. A
-    transaction-scoped advisory lock keyed by the chain's ``ical_uid`` makes those effects run
-    one-after-another (the loser re-reads the committed state and reconciles). No-op on SQLite (the
-    offline backend serializes writers), so the single-process deployment and tests are unaffected.
-    """
-    if session.get_bind().dialect.name != "postgresql":  # pragma: no cover - offline is SQLite
-        return
-    await session.execute(  # pragma: no cover - live: exercised only against a real PostgreSQL
-        text("SELECT pg_advisory_xact_lock(:key)"), {"key": _chain_lock_key(ical_uid)}
+    Deliberately no lock and no claim: this is a *plan*, and a plan made now can already be stale by
+    the time the tenth item of it actually runs. :func:`claim_one` is what arbitrates, item by item,
+    at the moment each one begins."""
+    return list(
+        (
+            await session.scalars(
+                select(Outbox.id)
+                .where(due_filter(now))
+                .order_by(
+                    # ==MONEY FIRST, ahead of everything.== A refund waiting behind a backlog of
+                    # notifications is a guest's money withheld for hours; a late EXPIRE_HOLD is a
+                    # slot blocked. So these outrank even ``created_at`` — a refund now must
+                    # not queue behind a reminder enqueued a week ago for a booking three weeks out.
+                    case(
+                        (
+                            Outbox.effect.in_(
+                                (OutboxEffect.REFUND.value, OutboxEffect.EXPIRE_HOLD.value)
+                            ),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    Outbox.created_at,
+                    # Within one instant (intents enqueued in the same transaction share a stamp),
+                    # run the Google sync BEFORE the email — so the confirmation/reschedule notice
+                    # carries the Meet link the sync just wrote onto the booking: a deterministic
+                    # causal order, not the non-deterministic tie-break created_at alone would
+                    # leave.
+                    case((Outbox.effect == OutboxEffect.GOOGLE.value, 0), else_=1),
+                )
+                .limit(limit)
+            )
+        ).all()
     )
 
 
-async def run_google_effect(
-    session: AsyncSession, outbox: Outbox, now: datetime, *, service_factory: ServiceFactory
-) -> None:
-    """Execute a Google-sync intent: create / reschedule / delete the booking's calendar event.
+async def claim_one(
+    session: AsyncSession,
+    *,
+    intent_id: uuid.UUID,
+    now: datetime,
+    worker_id: str,
+    lease: timedelta = DEFAULT_LEASE,
+) -> OutboxWork | None:
+    """Claim ONE intent, at the instant it is about to run. ``None`` = somebody else got there.
 
-    Rebuilds the live client from the connection referenced in the payload (via ``service_factory``,
-    exactly as the busy-cache refresh does) and writes the resulting ``external_event_id`` /
-    ``meeting_url`` back onto the booking. A missing booking or connection is a no-op; a Google
-    failure raises (:class:`CalendarSyncError`) so the intent retries. All Google effects of one
-    booking chain are serialized by a per-``ical_uid`` advisory lock (multi-worker safety), and the
-    booking is re-read under it so the reconciliation below sees the committed state.
-    """
-    booking = await session.get(Booking, outbox.booking_id)
-    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return
-    await _serialize_google_chain(session, booking.ical_uid)
-    await session.refresh(booking)
-    payload = outbox.payload
-    connection = await session.get(ExternalConnection, uuid.UUID(str(payload["connection_id"])))
-    if (
-        connection is None
-    ):  # pragma: no cover - defensive: a revoked connection between enqueue+drain
-        return
-    service = service_factory(connection)
-    operation = GoogleOperation(payload["operation"])
-    # Resolve the target event id at DRAIN time from current DB state, never from the enqueue-time
-    # snapshot: an intent enqueued before the booking's CREATE drained would have captured a NULL id
-    # (the event did not exist yet); the create having run first (or the reschedule predecessor) has
-    # populated ``external_event_id`` by then.
-    external_event_id = await _resolve_event_id(session, booking, payload)
+    ==Claimed per ITEM, on purpose. This is the fix for a real duplicate-send bug.==
 
-    if operation is GoogleOperation.DELETE:
-        if external_event_id is not None:
-            await delete_event_for_booking(
-                connection=connection, external_event_id=external_event_id, service=service
+    The obvious design claims the whole batch up front and then works through it serially. But a
+    lease is a WALL-CLOCK deadline: stamp all fifty rows with ``now + 5 min``, then spend six
+    minutes on the first forty, and rows 41-50 have leases that expired **while they were still
+    waiting their turn**. The recovery pass hands them to a second worker, the second worker sends
+    them, and this worker then sends them again. A duplicate email to a real guest — and the lease
+    never protected against it, because the lease was built for a worker that DIED, not for one that
+    is merely slow
+    with a long batch. Slow-with-a-long-batch is the NORMAL case.
+
+    Claiming each item as it begins makes the lease cover exactly what it was meant to cover: the
+    execution of THIS item. Together with ``PROVIDER_TIMEOUT_CEILING`` < ``DEFAULT_LEASE``, an
+    item's own send can no longer outlive its own claim.
+
+    The claim is a conditional UPDATE, so of N workers racing for one row exactly one wins; the
+    losers get ``None`` and move on. Due-ness is re-checked HERE, never trusted from the plan."""
+    # A CursorResult, because only that carries `rowcount` — and `rowcount` IS the arbitration here:
+    # it is how we learn whether WE won the claim or somebody else did.
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            update(Outbox)
+            .where(
+                Outbox.id == intent_id,
+                Outbox.status.in_((_PENDING, _FAILED)),
+                or_(Outbox.next_retry_at.is_(None), Outbox.next_retry_at <= now),
             )
-        return
+            .values(status=_CLAIMED, claimed_by=worker_id, lease_expires_at=now + lease)
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if result.rowcount != 1:
+        # Another worker claimed it, or a booking transition VOIDED it, between the plan and now.
+        return None
 
-    # Reconcile to the chain's CURRENT desired state rather than trusting drain order: a create/move
-    # runs ONLY for the booking that is the chain's live (non-cancelled) member. Any predecessor a
-    # reschedule already replaced is skipped — even if its own UPSERT/RESCHEDULE drains AFTER the
-    # successor's (two workers, inverted order) — so a replaced predecessor never (re)creates an
-    # event the chain moved on from. This is order-independent (no reliance on the ``created_at``
-    # tie-break) and, with the per-``ical_uid`` advisory lock above, multi-worker safe.
-    if not await _is_chain_current(session, booking):
-        return
+    row = await session.get(Outbox, intent_id)
+    if row is None:  # pragma: no cover - defensive: we just updated it
+        return None
+    await session.refresh(row)
+    return OutboxWork(
+        id=row.id,
+        tenant_id=row.tenant_id,
+        booking_id=row.booking_id,
+        effect=OutboxEffect(row.effect),
+        dedupe_key=row.dedupe_key,
+        payload=dict(row.payload),
+        attempts=row.attempts,
+        claimed_by=worker_id,
+    )
 
-    request = _meet_request_from_payload(payload)
-    if operation is GoogleOperation.RESCHEDULE and external_event_id is not None:
-        new_id, meeting_url = await reschedule_event_for_booking(
-            connection=connection,
-            external_event_id=external_event_id,
-            request=request,
-            service=service,
+
+class _Outcome(StrEnum):
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    DEFERRED = "deferred"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
+
+
+async def drain_outbox(  # noqa: PLR0913 - one keyword per knob of a single well-defined pass
+    pools: WorkerPools,
+    *,
+    now: datetime,
+    execute: OutboxExecutor,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    batch_size: int = DEFAULT_DRAIN_BATCH_SIZE,
+    worker_id: str | None = None,
+    lease: timedelta = DEFAULT_LEASE,
+    clock: Clock | None = None,
+    provider_timeout: timedelta = PROVIDER_TIMEOUT_CEILING,
+) -> OutboxReport:
+    """One drain pass: recover → plan → (claim → execute → settle) per item. Returns the report.
+
+    Takes the worker's :class:`~aethercal.server.db.pools.WorkerPools`, never a session, because the
+    whole design turns on owning the transaction BOUNDARIES: the claim commits before any network
+    call and the settle opens a fresh transaction after it. A caller that handed this one long-lived
+    session would reintroduce the very bug it replaces.
+
+    .. rubric:: ==Which pool — and why the first three queries are not like the fourth==
+
+    The drain is a **loop over a batch spanning several businesses**, and it cannot know whose work
+    is due until it has looked. Its first three queries therefore cannot run under RLS — not because
+    that would be inconvenient, but because each would silently match nothing:
+
+    * ``recover_expired_leases`` — a dead worker's rows belong to businesses nobody has named;
+    * ``select_due`` — *whose* intents are due is the answer, not the question;
+    * ==``claim_one`` — and this is the one that was nearly missed.== It is an ``UPDATE ... WHERE
+      id = :id AND status = 'pending'`` over a row whose ``tenant_id`` can only be learned by
+      READING
+      it. On the RLS pool, with no GUC bound yet, that UPDATE matches **zero rows** → ``work is
+      None`` → ``unclaimed`` → ``continue`` → ==the drainer reclaims NOTHING, ever, without one
+      exception being raised.==
+
+    Each goes through :meth:`~aethercal.server.db.pools.WorkerPools.scan_session`, naming its
+    reason.
+    Everything AFTER the claim knows the business — it came off the row — so it runs on the **exec**
+    pool, under RLS, inside a :func:`~aethercal.server.db.guc.tenant_scope` for that item and no
+    other.
+
+    .. rubric:: The scope is ONE ITEM, and both alternatives are silent disasters
+
+    Hold one binding for the whole loop and the batch's second business RAISES (the binding is
+    immutable inside a scope), so everything not belonging to the first business dies in the
+    dead-letter. Relax the immutability so the loop compiles, and an item of B executes under the
+    GUC
+    of A: its ``session.get(...)`` calls return ``None``, the handlers read that as
+    "cascade-deleted,
+    be defensive" and return quietly, and ==the intent settles ``delivered`` having sent nothing at
+    all.== Hence ``tenant_scope``, opened and closed around each item.
+
+    ``clock`` reads the wall clock. It defaults to ``now`` advanced by the REAL time elapsed since
+    the pass began, because a lease is a wall-clock deadline — a frozen clock would put the deadline
+    right back where the bug was.
+
+    ``provider_timeout`` is ENFORCED, not merely declared: every effect runs inside
+    ``asyncio.timeout``, and overrunning it is a retryable failure. That is what makes
+    ``PROVIDER_TIMEOUT_CEILING < DEFAULT_LEASE`` a fact about the running system instead of an
+    assertion in a docstring."""
+    tick = clock or _elapsed_clock(now)
+    worker = worker_id or new_worker_id()
+    report = OutboxReport()
+
+    async with pools.scan_session(BypassReason.RECOVER_LEASES) as session, session.begin():
+        report.recovered.extend(await recover_expired_leases(session, now=tick(), limit=batch_size))
+
+    async with pools.scan_session(BypassReason.PLAN_OUTBOX) as session:
+        planned = await select_due(session, now=tick(), limit=batch_size)
+
+    for intent_id in planned:
+        # The lease starts HERE, for THIS item — not back when the batch was planned.
+        item_now = tick()
+        async with pools.scan_session(BypassReason.CLAIM_OUTBOX) as session, session.begin():
+            work = await claim_one(
+                session, intent_id=intent_id, now=item_now, worker_id=worker, lease=lease
+            )
+        if work is None:
+            # Somebody else claimed it while we worked through the earlier items, or a booking
+            # transition voided it. Either way it is not ours: leave it alone.
+            report.unclaimed.append(intent_id)
+            continue
+
+        # The business is known from here on — it came off the row we just claimed — so the rest of
+        # this item runs under RLS, bound to that business and to no other. The scope closes on the
+        # way out, including when the effect raises: a failed item must not leave its business bound
+        # for the next one in the batch.
+        with tenant_scope(work.tenant_id):
+            await _run_one_item(
+                pools.exec_maker,
+                work,
+                execute=execute,
+                tick=tick,
+                item_now=item_now,
+                report=report,
+                max_attempts=max_attempts,
+                provider_timeout=provider_timeout,
+            )
+
+    # R9. Recorded HERE, not by the scheduler tick: a counter that only moves when the caller
+    # remembers to report it reads zero for whichever path somebody forgot — and a zero meaning
+    # "never measured" is indistinguishable from a zero meaning "nothing went wrong". `lost` is the
+    # signal that a send outran its lease and a guest may have been messaged twice; it is worth
+    # nothing if it can silently fail to be counted.
+    observe_drain(report)
+    return report
+
+
+async def _run_one_item(  # noqa: PLR0913 - the execution needs the work, both clocks and the knobs
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    *,
+    execute: OutboxExecutor,
+    tick: Clock,
+    item_now: datetime,
+    report: OutboxReport,
+    max_attempts: int,
+    provider_timeout: timedelta,
+) -> None:
+    """Execute ONE claimed intent and settle it. ==Always called inside that item's
+    ``tenant_scope``.
+
+    Lifted out of :func:`drain_outbox`'s body so the per-item binding has a function-shaped boundary
+    rather than an indented block. Everything in here — the executor's own short transactions
+    included, because they come from this same ``exec_maker`` and the GUC listener stamps whatever
+    the ContextVar holds — runs on the app role, under RLS, with this item's business bound.
+    """
+
+    # THE NETWORK I/O. No session, no transaction and no row lock is open across this line —
+    # that is the entire point of R8. Each handler opens its own short transactions around it.
+    #
+    # And it is BOUNDED. `PROVIDER_TIMEOUT_CEILING` is not a constant, a comment and a hopeful
+    # piece of arithmetic: the invariant "a send cannot outlive its own lease" is only TRUE if
+    # something actually stops the send. This is that something.
+    defer_for: timedelta | None = None
+    try:
+        async with asyncio.timeout(provider_timeout.total_seconds()):
+            await execute(work, item_now)
+    except TimeoutError:
+        # Retryable — and neither of the two things it could be mistaken for. NOT a success (we
+        # have no idea whether the provider acted). NOT a death (this worker is alive and still
+        # holds its lease, precisely because the timeout fired strictly INSIDE it). It goes back
+        # on the queue with backoff, exactly like any other transient provider failure.
+        _logger.error(
+            "outbox intent %s (%s) for booking %s: the provider call exceeded "
+            "PROVIDER_TIMEOUT_CEILING (%ss) and was ABORTED. It retries with backoff. This is "
+            "the guard that stops a send outliving its own lease — without it the row would be "
+            "recovered under us and delivered twice",
+            work.id,
+            work.effect,
+            work.booking_id,
+            provider_timeout.total_seconds(),
         )
+        outcome = _Outcome.FAILED
+    except OutboxDeferred as deferred:
+        _logger.debug("outbox intent %s deferred: %s", work.id, deferred)
+        outcome = _Outcome.DEFERRED
+        defer_for = deferred.retry_after
+    except OutboxUnknownOutcome as unknown:
+        # NOT a failure (a retry could duplicate) and NOT a skip (the guest may never have got
+        # it). It is the third thing, and it is the one a human has to resolve.
+        _logger.error(
+            "outbox intent %s (%s) for booking %s: OUTCOME UNKNOWN - %s",
+            work.id,
+            work.effect,
+            work.booking_id,
+            unknown,
+        )
+        outcome = _Outcome.UNKNOWN
+    except OutboxSkipped as skipped:
+        # NOT a failure: this effect can never run, so retrying it would only burn the backoff
+        # budget and dead-letter. Loud, terminal, and out of the queue.
+        _logger.warning(
+            "outbox intent %s (%s) for booking %s SKIPPED: %s",
+            work.id,
+            work.effect,
+            work.booking_id,
+            skipped,
+        )
+        outcome = _Outcome.SKIPPED
+    except Exception:
+        _logger.exception(
+            "outbox intent %s (%s) for booking %s failed", work.id, work.effect, work.booking_id
+        )
+        outcome = _Outcome.FAILED
     else:
-        new_id, meeting_url = await create_event_for_booking(
-            connection=connection, request=request, service=service
+        outcome = _Outcome.DELIVERED
+    await _settle(
+        sessionmaker,
+        work,
+        now=tick(),
+        outcome=outcome,
+        report=report,
+        max_attempts=max_attempts,
+        defer_for=defer_for,
+    )
+
+
+async def _settle(  # noqa: PLR0913 - the settle needs the work, the clock, the outcome, the report
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    *,
+    now: datetime,
+    outcome: _Outcome,
+    report: OutboxReport,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    defer_for: timedelta | None = None,
+) -> None:
+    """Record one intent's outcome in its OWN short transaction, releasing the lease.
+
+    ==Only if the lease is still OURS.== The write is gated on
+    ``status = 'claimed' AND claimed_by = <this worker>``, re-checked in this transaction. If the
+    row no longer matches, our lease expired mid-send, the recovery pass returned the row to
+    ``pending``, and somebody else now owns it — so our result is STALE. We discard it and say so;
+    applying it would let us mark ``delivered`` an intent another worker is still executing, or
+    stomp its bookkeeping. Writing where you no longer have the right is the same silent no-op as
+    before, just pointed the other way."""
+    async with sessionmaker() as session, session.begin():
+        row = await _lock_if_still_ours(session, work)
+        if row is None:
+            # WHY we lost it decides which bucket it lands in, and that matters: `lost` is the
+            # metric that proves in production whether the timeout assumption holds. Fill it with
+            # routine cancellations — or with routine ERASURES — and a real duplicate-send signal
+            # drowns in noise, and an alarm that always fires is an alarm nobody reads.
+            match await _why_it_vanished(session, work):
+                case Vanished.VOIDED:
+                    report.voided_midflight.append(work.id)
+                case Vanished.PURGED:
+                    report.purged_midflight.append(work.id)
+                case Vanished.LEASE_LOST:
+                    report.lost.append(work.id)
+                case _ as unreachable:
+                    assert_never(unreachable)
+            return
+        row.claimed_by = None
+        row.lease_expires_at = None
+
+        if outcome is _Outcome.DEFERRED:
+            # WAITING — on a sibling intent (seconds), or on a human who switched the rule off
+            # (minutes, or never). Rescheduled at the handler's own distance, WITHOUT counting an
+            # attempt, so a legitimate wait never dead-letters. The row stays ``pending``: the whole
+            # point is that a wait is REVERSIBLE, and the message survives it.
+            row.status = _PENDING
+            row.next_retry_at = now + (
+                timedelta(seconds=DEFER_DELAY_SECONDS) if defer_for is None else defer_for
+            )
+            report.deferred.append(row.id)
+            return
+
+        if outcome is _Outcome.SKIPPED:
+            # Terminal, and it costs no attempt: nothing was tried, so nothing failed.
+            row.status = _SKIPPED
+            row.next_retry_at = None
+            report.skipped.append(row.id)
+            return
+
+        if outcome is _Outcome.UNKNOWN:
+            # Terminal, and it DID cost an attempt: we really did call the provider. Parked for a
+            # human and never auto-retried - a retry could message the guest twice and under-count
+            # the cap protecting them. The in-flight marker is left standing on the row on purpose:
+            # it is the evidence of what happened, and `outbox resolve-unknown` is what clears it.
+            row.attempts += 1
+            row.last_attempt_at = now
+            row.status = _UNKNOWN
+            row.next_retry_at = None
+            report.unknown.append(row.id)
+            return
+
+        row.attempts += 1
+        row.last_attempt_at = now
+
+        if outcome is _Outcome.DELIVERED:
+            row.status = _DELIVERED
+            row.next_retry_at = None
+            report.delivered.append(row.id)
+            return
+
+        if outcome is _Outcome.FAILED:
+            if row.attempts >= max_attempts:
+                _park_dead(row)
+                report.dead.append(row.id)
+            else:
+                row.status = _FAILED
+                row.next_retry_at = now + backoff_delay(row.attempts)
+                report.failed.append(row.id)
+            return
+
+        assert_never(outcome)
+
+
+class Vanished(StrEnum):
+    """Why a row we held is no longer ours at settle time. Three causes, three buckets."""
+
+    VOIDED = "voided"
+    """A booking transition retired the step under us. Routine."""
+    PURGED = "purged"
+    """A guest erasure DELETED it under us. Routine."""
+    LEASE_LOST = "lease_lost"
+    """Our send outran its lease and somebody else owns the row. ==The one to alarm on.=="""
+
+
+async def _why_it_vanished(session: AsyncSession, work: OutboxWork) -> Vanished:
+    """Log why our result is being discarded, and say which of the three causes it was.
+
+    All three end in "we do not write", and they are three different facts. Two are the system
+    working as designed — a cancellation retired the step; a guest exercised their right to be
+    forgotten — and are routine, expected and harmless. The third is a real failure of our own
+    timing assumption: our send outran its lease, the row was recovered, and somebody else owns it
+    now — which means the effect may have been executed TWICE.
+
+    Collapsing any of them together files a routine event into the very counter that is supposed to
+    alert on duplicate sends. ``voided`` was split out for exactly that reason; ==``purged`` is the
+    third cause, and it was landing in the alarm bucket== — with an error line telling an operator
+    to re-tune lease timings that were working perfectly.
+
+    .. rubric:: ==Why "gone" means PURGED, and what keeps that true==
+
+    A deleted row leaves no marker to read — it is gone — so the cause has to be INFERRED, and the
+    inference is only sound because ``services/privacy.py`` holds the only ``DELETE`` against this
+    table in the whole source tree (nothing deletes ``bookings`` either, so the ``ON DELETE
+    CASCADE`` never fires). That is not a comment anybody has to keep true by remembering:
+    ``test_purge_drain_concurrency_pg`` walks the AST of every shipped module and fails the day a
+    second deleter appears — which is the day this classification would start lying.
+    """
+    current = await session.get(Outbox, work.id)
+
+    if current is None:
+        _logger.info(
+            "outbox intent %s (%s) for booking %s: PURGED mid-flight by a guest erasure (RNF-8). "
+            "Our result is discarded and the intent is gone for good — which is the point: it was "
+            "a message to somebody who asked to be forgotten. Routine, and NOT a lost lease",
+            work.id,
+            work.effect,
+            work.booking_id,
         )
-    booking.external_event_id = new_id
-    booking.meeting_url = meeting_url
-    await session.flush()
+        return Vanished.PURGED
+
+    if current.status == _VOIDED:
+        _logger.warning(
+            "outbox intent %s (%s) for booking %s: VOIDED mid-flight by a booking transition "
+            "(cancel / reschedule / no-show). Our result is discarded and the step will not be "
+            "retried. The send may already have reached the provider — it cannot be recalled",
+            work.id,
+            work.effect,
+            work.booking_id,
+        )
+        return Vanished.VOIDED
+
+    _logger.error(
+        "outbox intent %s (%s) for booking %s: LEASE LOST mid-flight (we held it as %s; it is now "
+        "%s). The result is discarded, not applied — somebody else owns this row. The send may "
+        "have happened, so it can be delivered twice: a provider call outran the lease. Shorten "
+        "PROVIDER_TIMEOUT_CEILING or lengthen DEFAULT_LEASE",
+        work.id,
+        work.effect,
+        work.booking_id,
+        work.claimed_by,
+        current.status,
+    )
+    return Vanished.LEASE_LOST
+
+
+async def _lock_if_still_ours(session: AsyncSession, work: OutboxWork) -> Outbox | None:
+    """Re-read the row under a row lock, but ONLY while this worker still holds its lease.
+
+    The predicate is the whole point: ``status = 'claimed' AND claimed_by = <us>``. A row that has
+    been recovered (back to ``pending``) or re-claimed by somebody else matches nothing, and we get
+    ``None`` — which the caller turns into "discard the result, loudly".
+
+    ``FOR UPDATE`` (a no-op on SQLite, which serialises writers) makes the check-then-write atomic:
+    without it, a recovery pass could slip between our SELECT and our UPDATE and we would be writing
+    on a row we had just proven was ours a moment ago."""
+    return (
+        await session.scalars(
+            select(Outbox)
+            .where(
+                Outbox.id == work.id,
+                Outbox.status == _CLAIMED,
+                Outbox.claimed_by == work.claimed_by,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+
+
+def _park_dead(row: Outbox) -> None:
+    """Park an exhausted intent as ``dead``: no further automatic retry, and a loud line for ops."""
+    row.status = _DEAD
+    row.next_retry_at = None
+    _logger.error(
+        "outbox intent %s (%s) for booking %s DEAD after %d attempts; parked, no retry",
+        row.id,
+        row.effect,
+        row.booking_id,
+        row.attempts,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Shared staleness / dependency reads (the handlers' READ phase leans on these).
+# --------------------------------------------------------------------------------------
 
 
 async def _is_chain_current(session: AsyncSession, booking: Booking) -> bool:
-    """True iff ``booking`` is the chain's single live (non-cancelled) member — the one a create or
-    move acts for. A reschedule successor inherits its predecessor's ``ical_uid``, so the chain has
-    one UID; the sole non-cancelled row is the current booking. A replaced predecessor (now
-    cancelled), or an ambiguous 0/>1-active state (a conservative skip), returns ``False``.
+    """True iff ``booking`` is the chain's single live (non-cancelled) member.
+
+    A reschedule successor inherits its predecessor's ``ical_uid``, so a chain has one UID and the
+    sole non-cancelled row is the current booking. A replaced predecessor (now cancelled), or an
+    ambiguous 0/>1-active state (a conservative skip), returns ``False``.
+
+    NOTE the trap: for a CANCELLED booking this is False *by construction*. Only an effect that
+    :func:`staleness_policy` calls SUBJECT may be gated on it — a terminal effect (a refund, a hold
+    expiry, a cancellation notice) acts on a cancelled booking on purpose.
     """
     active = (
         await session.scalars(
@@ -464,17 +1784,455 @@ async def _is_chain_current(session: AsyncSession, booking: Booking) -> bool:
     return set(active) == {booking.id}
 
 
+async def _should_skip_as_stale(session: AsyncSession, booking: Booking, work: OutboxWork) -> bool:
+    """Whether this intent must be dropped because a later transition overtook its booking."""
+    if staleness_policy(work.effect, work.payload) is Staleness.EXEMPT:
+        return False
+    return not await _is_chain_current(session, booking)
+
+
+def _should_skip_as_unconfirmed(booking: Booking, work: OutboxWork) -> bool:
+    """==DEFENCE IN DEPTH at the point of EXECUTION.== Whether to drop this intent because its
+    booking was never confirmed.
+
+    :func:`enqueue_effect` already refuses to QUEUE an effect for a booking with no confirmation,
+    so under today's paths nothing that requires confirmation ever reaches here for a hold. This is
+    the second belt, for the path nobody has written yet: a future caller that builds an intent some
+    other way, a bug that flips a status, a manual insert. The drainer re-checks at the last
+    moment — an intent whose booking has no confirmation, for an effect that REQUIRES_CONFIRMATION,
+    DIES here rather than reaching a provider.
+
+    ==It is NOT the same question as :func:`_should_skip_as_stale`.== Staleness asks *"did a later
+    transition overtake this booking?"* and leans on :func:`_is_chain_current`, which is False only
+    for a CANCELLED booking — a ``PENDING`` hold sails straight through it. This asks *"was this
+    appointment ever real?"*, and it is exactly the gap that guard cannot see.
+
+    EXEMPT effects (``REFUND`` / ``EXPIRE_HOLD``, B-05b) are let through: acting on an unpaid or
+    cancelled booking is their entire purpose. Same enum, same policy, same ``assert_never`` as the
+    funnel — one decision, enforced in two places.
+    """
+    if confirmation_policy(work.effect) is Confirmation.EXEMPT:
+        return False
+    return booking.confirmed_at is None
+
+
+async def _chain_awaits_meeting_link(session: AsyncSession, booking: Booking) -> bool:
+    """True while a non-terminal Google intent that WOULD write the chain's Meet link is queued.
+
+    Only an ``upsert``/``reschedule`` (which set ``meeting_url`` / ``external_event_id``) counts — a
+    ``delete`` never blocks anything. Scoped to the whole CHAIN (every booking sharing the
+    ``ical_uid``), not just this booking, because a reschedule successor's event id is produced by
+    its predecessor's intent. A dead-lettered sync no longer counts, so a permanently-failing Google
+    never wedges an email forever (it goes out without the link — degraded, not lost).
+    """
+    rows = (
+        await session.scalars(
+            select(Outbox)
+            .join(Booking, Booking.id == Outbox.booking_id)
+            .where(
+                Booking.ical_uid == booking.ical_uid,
+                Outbox.effect == OutboxEffect.GOOGLE.value,
+                Outbox.status.in_(_NON_TERMINAL),
+            )
+        )
+    ).all()
+    producing = {GoogleOperation.UPSERT.value, GoogleOperation.RESCHEDULE.value}
+    return any(row.payload.get("operation") in producing for row in rows)
+
+
+# --------------------------------------------------------------------------------------
+# The email effect — read (no send) → send (no txn) → record (txn).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _EmailPlan:
+    """What the email send needs, snapshotted so the I/O touches no session."""
+
+    booking_id: uuid.UUID
+    kind: NotificationKind
+    message: Any  # email.message.EmailMessage — kept loose so this stays a pure data carrier.
+
+
+async def run_email_effect(
+    sessionmaker: Sessionmaker, work: OutboxWork, now: datetime, *, sender: EmailSender
+) -> None:
+    """Execute an email intent: send the ``kind`` notification for its booking (idempotent).
+
+    Phase 1 (a read transaction) decides whether to send and composes the message; phase 2 sends it
+    with **no transaction open**; phase 3 records the ledger row. The notice is dropped when the
+    booking has been overtaken (per :func:`staleness_policy` — a cancellation is exempt and always
+    sends), and it DEFERS (no attempt consumed) while the chain still has an undelivered Google sync
+    that will produce its Meet link, so the notice carries the link even when the sync only succeeds
+    on a later retry."""
+    async with sessionmaker() as session:
+        plan = await _prepare_email(session, work)
+        await session.rollback()  # a pure read: release the connection before any network call
+    if plan is None:
+        return
+
+    await sender.send(plan.message)
+
+    async with sessionmaker() as session, session.begin():
+        booking = await session.get(Booking, plan.booking_id)
+        if booking is None:  # pragma: no cover - defensive: cascade-deleted mid-send
+            return
+        await record_booking_notification(
+            session, booking=booking, kind=plan.kind, now=now, channel=Channel.EMAIL
+        )
+
+
+async def _prepare_email(session: AsyncSession, work: OutboxWork) -> _EmailPlan | None:
+    """The email's READ phase: decide, then compose. ``None`` = there is nothing to send."""
+    booking = await session.get(Booking, work.booking_id)
+    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+    payload = work.payload
+    kind = NotificationKind(payload["kind"])
+
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth: an intent for a booking that was never confirmed (a hold) must not be
+        # sent, even if some path the funnel does not guard managed to queue it. It dies here.
+        return None
+    if await _should_skip_as_stale(session, booking, work):
+        # A later transition superseded this booking: drop the notice (never mail a "confirmed"
+        # after a "cancelled", nor a reminder for a slot that was rescheduled away).
+        return None
+    if booking.meeting_url is None and await _chain_awaits_meeting_link(session, booking):
+        raise OutboxDeferred(f"email for booking {booking.id} awaits its Google Meet link")
+    if await notification_already_sent(session, booking=booking, kind=kind, channel=Channel.EMAIL):
+        # A replay of an intent whose send already landed (the settle crashed after the ledger row
+        # committed). The ledger is the proof; do not mail the guest twice.
+        return None
+
+    message = await compose_booking_notification(
+        session,
+        kind=kind,
+        booking=booking,
+        cancel_url=payload.get("cancel_url"),
+        reschedule_url=payload.get("reschedule_url"),
+        locale=payload.get("locale", "es"),
+        # Use the sequence snapshotted at the transition, not the booking's live (possibly
+        # later-bumped) value, so the chain's emails stay strictly increasing per UID (F1-08).
+        sequence=payload.get("sequence"),
+    )
+    return _EmailPlan(booking_id=booking.id, kind=kind, message=message)
+
+
+# --------------------------------------------------------------------------------------
+# The Google effect — read (no call) → call (no txn) → write back (txn).
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GooglePlan:
+    """What the Google call needs, snapshotted so the I/O touches no session.
+
+    TWO calendars, deliberately, because they are not always the same one (RF-11):
+
+    * ``home`` — where the chain's event ACTUALLY lives, read from the columns the create wrote onto
+      the booking. A delete or a move must act HERE, on the calendar the event really went to.
+    * ``target`` — where a NEW event belongs, resolved from the host's configuration right now.
+
+    They diverge the moment an operator re-designates the booking calendar between the confirmation
+    and the cancellation. Aiming the delete at ``target`` would hit a calendar the event was never
+    written to: Google answers 404, the (correct) idempotent delete counts that as a success, and
+    the real event sits in the host's original calendar forever while the system reports it gone.
+    """
+
+    booking_id: uuid.UUID
+    operation: GoogleOperation
+    external_event_id: str | None
+    request: MeetEventRequest | None
+    # PRIMITIVES ONLY across the I/O boundary. The plan outlives its session (the connection is
+    # released before the network call, R8), so an ORM object here would be detached and reading
+    # even its id — in a write-back, or merely to name it in an error — would raise
+    # DetachedInstanceError instead of the CalendarSyncError the retry logic expects.
+    #
+    # Where the event LIVES; a delete/move acts here. ``None`` = the chain has no event yet.
+    home_calendar_id: str | None
+    home_service: Any
+    # Where a NEW event goes; a create/move lands here. ``None`` only for a DELETE.
+    target_connection_id: uuid.UUID | None
+    target_calendar_id: str | None
+    target_service: Any
+
+
+async def run_google_effect(
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    service_factory: ServiceFactory,
+) -> None:
+    """Execute a Google-sync intent: create / reschedule / delete the booking's calendar event.
+
+    The per-``ical_uid`` advisory lock that used to serialise a chain's Google effects is **gone**,
+    deliberately: it was a lock held across network I/O — the exact thing R8 forbids — and it
+    existed
+    only to stop a DELETE running before the CREATE that produces the event id it must remove (which
+    would leave an orphaned event in the host's calendar). That is a *causal dependency*, not a
+    mutual exclusion, and the outbox already has a first-class way to express one: a DELETE that
+    cannot resolve an event id while the chain still has a live create/reschedule intent now DEFERS
+    (see :func:`_prepare_google`). Lock-free, correct across processes, and it holds no connection.
+    """
+    async with sessionmaker() as session:
+        plan = await _prepare_google(session, work, service_factory)
+        await session.rollback()  # a pure read: release the connection before any network call
+    if plan is None:
+        return
+
+    if plan.operation is GoogleOperation.DELETE:
+        if plan.home_calendar_id is not None and plan.external_event_id is not None:
+            # Delete where the event LIVES, never where the host is configured now.
+            await delete_event_for_booking(
+                calendar_id=plan.home_calendar_id,
+                external_event_id=plan.external_event_id,
+                service=plan.home_service,
+            )
+        return
+
+    request = plan.request
+    target_calendar_id = plan.target_calendar_id
+    if request is None or target_calendar_id is None:  # pragma: no cover - prepare builds both
+        return
+    if (
+        plan.operation is GoogleOperation.RESCHEDULE
+        and plan.home_calendar_id is not None
+        and plan.external_event_id is not None
+    ):
+        new_id, meeting_url = await reschedule_event_for_booking(
+            source_calendar_id=plan.home_calendar_id,
+            source_service=plan.home_service,
+            target_calendar_id=target_calendar_id,
+            target_service=plan.target_service,
+            external_event_id=plan.external_event_id,
+            request=request,
+        )
+    else:
+        new_id, meeting_url = await create_event_for_booking(
+            calendar_id=target_calendar_id, request=request, service=plan.target_service
+        )
+
+    async with sessionmaker() as session, session.begin():
+        booking = await session.get(Booking, plan.booking_id)
+        if booking is None:  # pragma: no cover - defensive: cascade-deleted mid-call
+            return
+        booking.external_event_id = new_id
+        booking.meeting_url = meeting_url
+        # WHERE it landed, written in the SAME transaction as the id itself. Without this pair a
+        # later cancel can only guess the calendar, and a guess that misses is indistinguishable
+        # from an event that was already deleted — a silent orphan (RF-11).
+        booking.external_connection_id = plan.target_connection_id
+        booking.external_calendar_id = target_calendar_id
+
+
+async def _prepare_google(
+    session: AsyncSession, work: OutboxWork, service_factory: ServiceFactory
+) -> _GooglePlan | None:
+    """The Google effect's READ phase: resolve, decide, build the client. ``None`` = skip.
+
+    The intent names the HOST, not a connection: the calendar is resolved HERE, from the live
+    configuration, so there is one source of truth for "where does this event go" rather than a
+    snapshot taken at enqueue time that can rot before the drain.
+
+    This raises rather than skipping when the host's calendar cannot be resolved, and the difference
+    matters: the intent exists ONLY because the host had an active connection when the booking was
+    taken (:func:`aethercal.server.services.bookings._enqueue_google` enqueues nothing otherwise).
+    So "no calendar now" is not the self-hoster — it is a real failure with a real victim: the guest
+    is confirmed and the host's calendar is empty. It retries, then dead-letters into the visible
+    backlog, instead of passing as a delivered no-op.
+    """
+    booking = await session.get(Booking, work.booking_id)
+    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a booking that was never
+        # confirmed must not sync to a calendar — a Google event with the guest as an attendee makes
+        # Google mail them the invitation, so this is how a hold would announce itself.
+        # Dropped BEFORE the host/target machinery, which is irrelevant for something that will
+        # never be sent.
+        return None
+    payload = work.payload
+    host_id = await _payload_host_id(session, payload)
+    if host_id is None:
+        raise CalendarTargetMissingError(
+            f"booking {booking.id}: the Google intent names neither a host nor a resolvable "
+            "connection"
+        )
+    operation = GoogleOperation(payload["operation"])
+
+    # Resolve the event id from CURRENT DB state, never from the enqueue-time snapshot: an intent
+    # queued before the booking's CREATE drained captured nothing (the event did not exist yet); by
+    # now the create — or the reschedule predecessor — has populated ``external_event_id``.
+    external_event_id = await _resolve_event_id(session, booking, payload)
+    home = (
+        await _event_home(session, booking, host_id=host_id)
+        if external_event_id is not None
+        else None
+    )
+
+    if operation is GoogleOperation.DELETE:
+        if external_event_id is None and await _chain_awaits_meeting_link(session, booking):
+            # The event this delete must remove is still being CREATED by a sibling intent. Running
+            # now would resolve a NULL id, no-op, and leave the created event orphaned in the host's
+            # calendar forever. Wait for the create to settle — a causal dependency, expressed as a
+            # deferral instead of as a lock held across the network call.
+            raise OutboxDeferred(
+                f"calendar delete for booking {booking.id} awaits the chain's pending create"
+            )
+        return _GooglePlan(
+            booking_id=booking.id,
+            operation=operation,
+            external_event_id=external_event_id,
+            request=None,
+            home_calendar_id=home.calendar_id if home is not None else None,
+            home_service=service_factory(home.connection) if home is not None else None,
+            target_connection_id=None,
+            target_calendar_id=None,
+            target_service=None,
+        )
+
+    # Reconcile to the chain's CURRENT desired state rather than trusting drain order: a create/move
+    # runs ONLY for the booking that is the chain's live member. A predecessor that a reschedule has
+    # already replaced is skipped even if its own intent drains AFTER the successor's (two workers,
+    # inverted order), so it never (re)creates an event the chain has moved on from.
+    if await _should_skip_as_stale(session, booking, work):
+        return None
+    if operation is GoogleOperation.UPSERT and booking.external_event_id is not None:
+        # A replay of an upsert whose event was already created (the settle crashed after the
+        # write-back committed). Creating again would duplicate the event in the host's calendar.
+        return None
+
+    target = await _require_calendar_target(session, booking=booking, host_id=host_id)
+    return _GooglePlan(
+        booking_id=booking.id,
+        operation=operation,
+        external_event_id=external_event_id,
+        request=_meet_request_from_payload(payload),
+        home_calendar_id=home.calendar_id if home is not None else None,
+        home_service=service_factory(home.connection) if home is not None else None,
+        target_connection_id=target.connection.id,
+        target_calendar_id=target.calendar_id,
+        target_service=service_factory(target.connection),
+    )
+
+
+async def _payload_host_id(session: AsyncSession, payload: Mapping[str, Any]) -> uuid.UUID | None:
+    """The host a Google intent is for — accepting the PREVIOUS payload shape as well.
+
+    The intent used to name a ``connection_id``; it now names a ``host_id`` (the calendar is
+    resolved from live configuration at drain time, so there is one source of truth rather
+    than a snapshot that can rot). Rows queued by the previous build are sitting in the outbox
+    the moment the new code deploys. A reader that cannot understand them fails them six times
+    each and dead-letters the lot — a self-inflicted outage, on every upgrade, over a change
+    that is purely internal.
+
+    So the reader accepts both shapes and derives the host from the old connection. Migrating the
+    rows instead would work too, but only if it ran BEFORE the new consumer; tolerating both formats
+    does not depend on getting a deploy order right.
+    """
+    raw_host = payload.get("host_id")
+    if isinstance(raw_host, str):
+        return uuid.UUID(raw_host)
+    raw_connection = payload.get("connection_id")
+    if not isinstance(raw_connection, str):
+        return None
+    connection = await session.get(ExternalConnection, uuid.UUID(raw_connection))
+    if connection is None:
+        return None
+    _logger.info(
+        "google intent carries the legacy connection_id payload; resolved host %s from "
+        "connection %s",
+        connection.user_id,
+        connection.id,
+    )
+    return connection.user_id
+
+
+async def _require_calendar_target(
+    session: AsyncSession, *, booking: Booking, host_id: uuid.UUID
+) -> CalendarTarget:
+    """The host's booking calendar, or a LOUD failure — never a silent skip.
+
+    ``resolve_calendar_target`` itself raises :class:`AmbiguousCalendarTargetError` when the host's
+    configuration does not name exactly ONE calendar (several connected accounts, or several linked
+    calendars, with no designated target). Guessing there is what the old ``.first()`` did: it wrote
+    a real client's meeting into an arbitrary calendar and reported success.
+    """
+    target = await resolve_calendar_target(session, tenant_id=booking.tenant_id, user_id=host_id)
+    if target is None:
+        _logger.error(
+            "booking %s: host %s had a connected calendar when the booking was taken and none "
+            "resolves now; the event was NOT synced",
+            booking.id,
+            host_id,
+        )
+        raise CalendarTargetMissingError(
+            f"booking {booking.id}: no active calendar connection for host {host_id}"
+        )
+    return target
+
+
+async def _event_home(
+    session: AsyncSession, booking: Booking, *, host_id: uuid.UUID
+) -> CalendarTarget:
+    """The calendar the chain's existing event ACTUALLY lives in — read, never guessed.
+
+    The create wrote ``external_connection_id`` / ``external_calendar_id`` in the same transaction
+    as the event id, and this reads them back (walking the ``rescheduled_from_id`` chain, because a
+    successor whose own sync has not drained yet inherits its predecessor's event).
+
+    Two edge cases, kept apart:
+
+    * **No recorded calendar** — reachable only for a booking whose event predates these columns.
+      There is no other information to act on, so it falls back to the host's current target —
+      EXPLICITLY, with a warning naming the booking, because it IS a guess: if the host has since
+      moved their booking calendar, the legacy event is not there. An operator can act on a log
+      line; they cannot act on a guess made quietly.
+    * **The recorded connection row is gone** — the calendar the event lives in is unreachable by
+      definition, and guessing another would report success while the event lives on. Raise.
+    """
+    owner = booking
+    seen: set[uuid.UUID] = set()
+    while owner.external_event_id is None and owner.rescheduled_from_id is not None:
+        if owner.id in seen:  # pragma: no cover - defensive: the chain is acyclic by construction
+            break
+        seen.add(owner.id)
+        ancestor = await session.get(Booking, owner.rescheduled_from_id)
+        if ancestor is None:  # pragma: no cover - defensive: SET NULL only on a parent-row delete
+            break
+        owner = ancestor
+
+    if owner.external_connection_id is None or owner.external_calendar_id is None:
+        _logger.warning(
+            "booking %s holds external event %s but no recorded calendar (it predates the column); "
+            "falling back to host %s's currently configured booking calendar",
+            owner.id,
+            owner.external_event_id,
+            host_id,
+        )
+        return await _require_calendar_target(session, booking=booking, host_id=host_id)
+
+    connection = await session.get(ExternalConnection, owner.external_connection_id)
+    if connection is None:
+        raise CalendarTargetMissingError(
+            f"booking {owner.id}: the connection its calendar event lives in is gone"
+        )
+    return CalendarTarget(connection=connection, calendar_id=owner.external_calendar_id)
+
+
 async def _resolve_event_id(
-    session: AsyncSession, booking: Booking, payload: dict[str, object]
+    session: AsyncSession, booking: Booking, payload: Mapping[str, Any]
 ) -> str | None:
     """The Google event id to act on, resolved at drain time (falls back to the payload snapshot).
 
-    Prefer live DB state over the enqueue-time snapshot (an intent queued before the create drained
-    captured a NULL id). The booking's own ``external_event_id`` wins; if it is unset — a successor
-    whose own create/move has not drained yet — walk the ``rescheduled_from_id`` chain to the live
-    event the chain already has. Without this, cancelling a not-yet-synced reschedule (the successor
-    has no id of its own) would resolve to NULL and orphan the predecessor's still-active event.
-    """
+    Prefer live DB state over the enqueue-time snapshot. The booking's own ``external_event_id``
+    wins; if it is unset — a successor whose own create/move has not drained yet — walk the
+    ``rescheduled_from_id`` chain to the live event the chain already has. Without this, cancelling
+    a
+    not-yet-synced reschedule (the successor has no id of its own) would resolve to NULL and orphan
+    the predecessor's still-active event."""
     if booking.external_event_id is not None:
         return booking.external_event_id
     ancestor_id = booking.rescheduled_from_id
@@ -491,7 +2249,7 @@ async def _resolve_event_id(
     return raw if isinstance(raw, str) else None
 
 
-def _meet_request_from_payload(payload: dict[str, object]) -> MeetEventRequest:
+def _meet_request_from_payload(payload: Mapping[str, Any]) -> MeetEventRequest:
     """Rebuild the Google Meet event request from a Google intent's stored primitives."""
     return MeetEventRequest(
         summary=str(payload["summary"]),
@@ -502,26 +2260,706 @@ def _meet_request_from_payload(payload: dict[str, object]) -> MeetEventRequest:
     )
 
 
-def make_booking_effect_executor(
-    *, sender: EmailSender | None, service_factory: ServiceFactory | None
-) -> OutboxExecutor:
-    """Build the live ``execute`` the drain tick injects: dispatch each intent to its handler.
+# --------------------------------------------------------------------------------------
+# The NOTIFY effect — one workflow step, on one channel.
+# --------------------------------------------------------------------------------------
 
-    ``sender`` / ``service_factory`` come from the app runtime (SMTP config + a Fernet-built Google
-    factory). An email intent with no ``sender`` (or a Google intent with no factory) raises, so the
-    misconfiguration surfaces as a retrying/dead-lettered row rather than a silently dropped effect.
+
+@dataclass(frozen=True, slots=True)
+class _NotifyPlan:
+    """What the step's send needs, snapshotted so the I/O touches no session."""
+
+    booking_id: uuid.UUID
+    kind: str
+    """The ledger key. A ``str``, not a :class:`NotificationKind`: ``workflow_steps.kind`` is
+    free-text BY DESIGN, so a tenant may define a ``follow_up`` step and give it a template."""
+    channel: Channel
+    step_id: uuid.UUID
+    message: Any  # an EmailMessage for the email channel; a rendered plain body for the others.
+    recipient: str
+
+
+PROVIDER_CALL_MARKER = "provider_call_started_at"
+"""Payload key: "this step was handed to a PHONE provider, and we have not recorded the answer yet".
+
+Committed BEFORE the network call and cleared only once the outcome is KNOWN. If a later drain finds
+it still set on a row whose ledger entry never landed, the worker died inside the window between
+"the provider accepted" and "the ledger committed" - so the message may already be with the guest,
+and re-sending it blind would both duplicate it AND under-count the daily cap that protects them
+(the cap is derived from the very ledger row we failed to write). See
+:class:`OutboxUnknownOutcome`.
+
+PHONE channels only, deliberately. Email keeps its long-standing at-least-once residual: its
+failure modes surface from ``aiosmtplib`` as an undifferentiated ``Exception``, so there is no
+honest way to tell "the relay never took it" from "the relay took it and we lost the answer".
+Marking email would park a step on every ordinary SMTP blip - a rare duplicate traded for a common
+outage,
+which is the worse deal.
+"""
+
+
+async def _mark_provider_call_started(
+    sessionmaker: Sessionmaker, work: OutboxWork, now: datetime
+) -> None:
+    """Record, in its OWN committed transaction, that this step is about to reach the provider.
+
+    It has to be committed BEFORE the I/O - that is the entire point. A marker written in the same
+    transaction as the result would vanish along with the crash it exists to detect."""
+    async with sessionmaker() as session, session.begin():
+        row = await session.get(Outbox, work.id)
+        if row is None:  # pragma: no cover - defensive: cascade-deleted mid-flight
+            return
+        # A NEW dict: SQLAlchemy does not track in-place mutation of a plain JSON column, so
+        # mutating the existing one would flush nothing and leave the marker unwritten - the silent
+        # no-op, sitting in the middle of the machinery built to catch one.
+        row.payload = {**row.payload, PROVIDER_CALL_MARKER: now.isoformat()}
+
+
+async def _clear_provider_call_marker(sessionmaker: Sessionmaker, work: OutboxWork) -> None:
+    """Drop the marker: the outcome is KNOWN, and it is "the guest did not get this message"."""
+    async with sessionmaker() as session, session.begin():
+        row = await session.get(Outbox, work.id)
+        if row is None:  # pragma: no cover - defensive
+            return
+        row.payload = {
+            key: value for key, value in row.payload.items() if key != PROVIDER_CALL_MARKER
+        }
+
+
+async def run_notify_effect(  # noqa: PLR0913 - one keyword per injected sending seam
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    sender: EmailSender | None,
+    channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
+) -> None:
+    """Execute one workflow step: send its message on its channel (RF-24).
+
+    The same three phases as every other handler — read, send with NO transaction open, record — so
+    the network call holds no row lock and no pool connection.
+
+    Two channel families, deliberately:
+
+    * **email** goes through the existing composer, not through the plain-body sender. That is what
+      carries the ``.ics`` invite, and it is what keeps the ledger key identical to the one the
+      retired scheduler wrote — which is exactly what stops a live booking being reminded twice.
+    * **whatsapp / sms** go through their :class:`PhoneChannelSender`, with the body RENDERED from
+      the tenant's ``workflow_templates`` row (or the built-in fallback). An unconfigured channel is
+      a DISABLED FEATURE, not an error: the step is SKIPPED with its reason, never failed.
+
+    A send that the provider will NEVER accept (:class:`SendRefused` — a malformed number, an
+    over-cap recipient) is turned into an :class:`OutboxSkipped`: terminal, no attempt consumed, out
+    of the queue. A transient one (:class:`ChannelUnavailable`, a 5xx, a timeout) is left to
+    propagate, so the drain fails it and retries with backoff. Collapsing the two would either fill
+    the dead-letter with numbers that can never work, or throw away a message the provider would
+    have accepted a minute later.
     """
+    async with sessionmaker() as session:
+        plan = await _prepare_notify(
+            session, work, now, sender=sender, channels=channels, channel_errors=channel_errors
+        )
+        await session.rollback()  # a pure read: release the connection before any network call
+    if plan is None:
+        return
 
-    async def _execute(session: AsyncSession, outbox: Outbox, now: datetime) -> None:
-        effect = OutboxEffect(outbox.effect)
+    if plan.channel is Channel.EMAIL:
+        if sender is None:  # pragma: no cover - _prepare_notify already skipped this case
+            raise RuntimeError("an email step reached the send with no configured SMTP sender")
+        try:
+            await sender.send(plan.message)
+        except SendRefused as refused:
+            raise OutboxSkipped(str(refused)) from refused
+        await _record_notify_sent(sessionmaker, work, plan, now)
+        return
+
+    # A PHONE send. Everything below exists because the window between "the provider accepted" and
+    # "the ledger committed" is not free: a crash inside it means the guest may already have the
+    # message while nothing records it - so a blind retry would send it TWICE and under-count the
+    # daily cap that protects them, because that cap is derived from the very ledger row we failed
+    # to write. The two failures compound. So the intent to call the provider is PERSISTED first.
+    await _mark_provider_call_started(sessionmaker, work, now)
+    try:
+        await channels[plan.channel].send(to=plan.recipient, subject=None, body=str(plan.message))
+    except SendOutcomeUnknown as unknown:
+        # The request left this machine and the answer was lost. LEAVE the marker standing: we do
+        # not know what happened, and the drain must park this rather than guess.
+        raise OutboxUnknownOutcome(
+            f"{_UNKNOWN_OUTCOME}: the {plan.channel.value} send for booking {plan.booking_id} "
+            f"reached the provider and the answer was lost ({unknown}). It is NOT retried - that "
+            "could message the guest twice and under-count the cap protecting them. A human checks "
+            "the provider, then runs: aethercal-admin outbox resolve-unknown"
+        ) from unknown
+    except (SendRefused, ChannelUnavailable):
+        # A KNOWN non-delivery: the provider answered, or we never connected at all. Nothing is in
+        # flight, so drop the marker and let the normal machinery retire it (SendRefused) or retry
+        # it (ChannelUnavailable).
+        await _clear_provider_call_marker(sessionmaker, work)
+        raise
+    except BaseException:
+        # Anything else - including the CancelledError raised when the drain's PROVIDER_TIMEOUT
+        # aborts the call mid-flight. We do NOT know whether the provider saw it, so the marker
+        # STAYS and the next drain treats it as unknown instead of re-sending blind.
+        raise
+
+    await _record_notify_sent(sessionmaker, work, plan, now, clear_marker=True)
+
+
+async def _record_notify_sent(
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    plan: _NotifyPlan,
+    now: datetime,
+    *,
+    clear_marker: bool = False,
+) -> None:
+    """Write the ledger row - and clear the in-flight marker in the SAME transaction.
+
+    Atomic on purpose. Clear the marker in a separate transaction and a crash between the two puts
+    the row straight back into the ambiguous state this whole mechanism exists to remove: no marker,
+    no ledger row, and a message that may well already be on the guest's phone."""
+    async with sessionmaker() as session, session.begin():
+        booking = await session.get(Booking, plan.booking_id)
+        if booking is None:  # pragma: no cover - defensive: cascade-deleted mid-send
+            return
+        await record_booking_notification(
+            session,
+            booking=booking,
+            kind=plan.kind,
+            now=now,
+            channel=plan.channel,
+            step_id=plan.step_id,
+        )
+        if clear_marker:
+            row = await session.get(Outbox, work.id)
+            if row is not None:
+                row.payload = {
+                    key: value for key, value in row.payload.items() if key != PROVIDER_CALL_MARKER
+                }
+
+
+# The skip reasons, as distinct machine-greppable prefixes. "We could not send" and "we were not
+# ALLOWED to send" are completely different facts about the world, and an operator reading the log
+# during an incident — or a regulator reading it afterwards — has to be able to tell them apart.
+_NO_PHONE = "no-phone"
+_NO_CONSENT = "no-phone-consent"
+_CHANNEL_UNCONFIGURED = "channel-unconfigured"
+_UNKNOWN_OUTCOME = "unknown-outcome"
+"""The provider was given the message and the answer was lost. NEVER re-sent blind."""
+_NO_TEMPLATE = "no-template"
+"""The kind has no body: no tenant ``workflow_templates`` row, and no built-in fallback for it."""
+_BAD_TEMPLATE = "bad-template"
+"""The body exists but will not render (an unknown variable, an expression). The TENANT fixes it."""
+_RULE_GONE = "workflow-gone"
+_RULE_PAUSED = "workflow-inactive"
+_TOO_LATE = "moment-passed"
+
+
+def message_deadline(trigger: WorkflowTrigger, booking: Booking) -> datetime:
+    """The last instant at which this step's message can still do its job.
+
+    Exhaustive over the trigger (``assert_never``), because "how late is too late" is not the same
+    question for every message and a silent default would answer it wrongly for four of the five:
+
+    * ``on_booking`` / ``before_start`` → the booking's **start**. They speak about a meeting that
+    is
+      still coming. "Your booking is confirmed" or "your meeting is tomorrow", delivered after it
+      began, is not a late message — it is a WRONG one. This is the same rule the materialiser
+      already obeys when it refuses to queue a reminder whose moment has gone.
+    * ``after_end`` / ``on_cancel`` / ``on_no_show`` → the **end** plus
+      :data:`TERMINAL_MESSAGE_GRACE`. These remain TRUE after their moment (a booking really was
+      cancelled; the meeting really did happen), so lateness does not falsify them — but a row may
+      not wait for ever.
+
+    It is what BOUNDS a pause: a step whose rule is switched off waits for the rule to come back,
+    and
+    stops waiting here. Without it, "pause instead of skip" would trade a message destroyed too
+    early
+    for a row that polls until the end of time — and for a "reminder" delivered after the
+    meeting."""
+    match trigger:
+        case WorkflowTrigger.ON_BOOKING | WorkflowTrigger.BEFORE_START:
+            return as_utc(booking.start_at)
+        case WorkflowTrigger.AFTER_END | WorkflowTrigger.ON_CANCEL | WorkflowTrigger.ON_NO_SHOW:
+            return as_utc(booking.end_at) + TERMINAL_MESSAGE_GRACE
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+async def _gate_on_the_rule(
+    session: AsyncSession,
+    work: OutboxWork,
+    booking: Booking,
+    trigger: WorkflowTrigger,
+    now: datetime,
+) -> None:
+    """Decide whether this step may be sent NOW — and, if not, whether that is a WAIT or an END.
+
+    ==That distinction is the whole function.== ``active`` is already honoured when a booking's
+    steps
+    are QUEUED (``_active_workflows``), and that is not enough: a step is queued days before it is
+    sent, so switching a rule off this afternoon would still send tomorrow's messages, and the
+    tenant
+    who turned it off would have no way to explain them. The flag has to govern at the SEND, which
+    is
+    the only moment anybody outside can observe.
+
+    But an inactive rule is a **TEMPORARY** condition — the tenant can switch it back on — so it may
+    NOT have a terminal outcome. Retiring the step (``OutboxSkipped``) would destroy the message a
+    tenant could still want, exactly like voiding the row would; the damage simply comes in through
+    the other door. So the step is **PAUSED** (:class:`OutboxDeferred`, still ``pending``, no
+    attempt
+    consumed) and asks again every :data:`PAUSED_RULE_RECHECK`. Switch the rule back on and the very
+    same row — same dedupe key, same exactly-once identity — is delivered.
+
+    The wait is bounded by :func:`message_deadline`, not by a counter: a paused step stops waiting
+    when its message could no longer do its job. That single check also protects the send itself, so
+    a rule re-enabled a week late cannot fire a "reminder" for a meeting that already happened.
+
+    Terminal, by contrast, are the two things that cannot be undone:
+
+    * the payload names no workflow at all — no rule can vouch for it (fail-closed);
+    * the workflow is GONE (an event type deleted with ``ON DELETE CASCADE`` takes its workflows
+      with it). Its queued steps would otherwise still be delivered — messages from a rule that
+      exists nowhere. A deleted rule is not coming back.
+    """
+    if now > message_deadline(trigger, booking):
+        raise OutboxSkipped(
+            f"{_TOO_LATE}: this {trigger.value} step's moment has passed (deadline "
+            f"{message_deadline(trigger, booking).isoformat()}); a message that arrives after the "
+            "fact is noise, so it is retired rather than delivered late"
+        )
+
+    raw = work.payload.get("workflow_id")
+    if raw is None:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: this workflow step carries no workflow_id, so no rule can vouch for it"
+        )
+    workflow = await session.get(Workflow, uuid.UUID(str(raw)))
+    if workflow is None or workflow.tenant_id != work.tenant_id:
+        raise OutboxSkipped(
+            f"{_RULE_GONE}: workflow {raw} no longer exists for this tenant, so the step it queued "
+            "must not be delivered"
+        )
+    if not workflow.active:
+        raise OutboxDeferred(
+            f"{_RULE_PAUSED}: workflow {raw} ({workflow.name!r}) is switched off, so this step is "
+            "PAUSED, not retired — it waits, and is delivered if the rule is switched back on "
+            f"before {message_deadline(trigger, booking).isoformat()}",
+            retry_after=PAUSED_RULE_RECHECK,
+        )
+
+
+def _require_phone_consent(booking: Booking, channel: Channel) -> None:
+    """Refuse to message a phone without BOTH a number and a ticked box. Legal, not cosmetic.
+
+    ``bookings.guest_phone_consent_at`` records **when the consent box on the booking form was
+    ticked**. Be exact about what that is, and what it is not:
+
+    * it IS evidence that whoever filled in this booking ticked the box, and when;
+    * it is **NOT** proof that the OWNER of the number agreed to anything. The number is typed into
+      a PUBLIC form by whoever is booking, and nothing in this product verifies they possess it. A
+      stranger can book with someone else's number and tick the box on their behalf. Possession of
+      the number is **not verified anywhere** — a declared gap, stated plainly to the operator in
+      ``docs/phone-channels.md``.
+
+    So this gate is NECESSARY and NOT SUFFICIENT. It closes the door on the case we can actually
+    detect — nobody ticked the box — and it is the only door into the WhatsApp/SMS path:
+
+    * no number at all → there is nothing to send to;
+    * a number but NO ``guest_phone_consent_at`` → the box was never ticked. Silence is not consent;
+    * consent WITHDRAWN (the stamp set back to NULL) → the same gate closes again, automatically.
+      Revocation needs no special code path: it IS the absence of the stamp.
+
+    Each case carries its OWN reason, never merged with "the channel is not configured"."""
+    if not booking.guest_phone:
+        raise OutboxSkipped(
+            f"{_NO_PHONE}: the guest gave no phone number, so the {channel.value} step cannot run"
+        )
+    if booking.guest_phone_consent_at is None:
+        raise OutboxSkipped(
+            f"{_NO_CONSENT}: the guest has not consented to be messaged on their phone, so the "
+            f"{channel.value} step must not run (consent is recorded, or it did not happen)"
+        )
+
+
+def _refuse_channel(
+    channel: Channel, channel_errors: Mapping[Channel, Exception], *, when_off: Exception
+) -> NoReturn:
+    """There is no sender for ``channel``. ==The ONE place that decides what that costs.==
+
+    Two states arrive here and they are opposites. Collapsing them is a bug in either direction:
+
+    * a channel the business never configured is **OFF** — a disabled feature. Terminal, and right:
+      nothing is broken, so retrying is noise the dead-letter has to carry;
+    * a channel that IS configured and could not be built (a relay host pointing inside our network,
+      DNS down, a field that will not parse) is **BROKEN**. A human undoes it with one
+      ``credentials set``, and terminal "may only carry a condition that cannot be undone" — so it
+      fails, retries, and the message outlives the fix.
+
+    .. rubric:: ==Why a function and not three ``if``s==
+
+    It WAS three. Two of them consulted ``channel_errors`` and the third — the email branch of a
+    workflow step — did not, so a business whose SMTP relay was refused had its reminders retired as
+    "the channel is off" while the recorded reason sat unread two frames up. ==Emails failing
+    silently, in a product whose job is sending reminders.== The business believes its guest was
+    told. The guest was not.
+
+    Nobody wrote that on purpose: the rule was applied by hand in three places, and by the third the
+    hand slipped. So the hand stops. Every path with no sender comes through here, and
+    ``channel_errors`` is read in this function and nowhere else — ``tests/test_sender_belt.py``
+    walks the source and fails CI on a second reader.
+
+    ``when_off`` is the caller's, and that asymmetry is deliberate and narrow: what "off" COSTS
+    genuinely differs (see the two call sites). What "broken" costs does not, and that is the half
+    that was getting it wrong.
+    """
+    refused = channel_errors.get(channel)
+    if refused is not None:
+        raise refused
+    raise when_off
+
+
+async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending seam
+    session: AsyncSession,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    sender: EmailSender | None,
+    channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
+) -> _NotifyPlan | None:
+    """The step's READ phase: decide, then compose/render. ``None`` = nothing to send.
+
+    Raises :class:`OutboxSkipped` for anything that can NEVER work — an unconfigured channel, a
+    guest with no phone or no consent, a recipient over the channel's daily cap, a kind with no
+    template, a step whose moment has passed — so the step is retired with its reason instead of
+    being retried into the dead-letter. Raises :class:`OutboxDeferred` for anything that merely
+    cannot run YET — a rule the tenant has switched off — so the step WAITS instead of being
+    destroyed."""
+    booking = await session.get(Booking, work.booking_id)
+    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+
+    if _should_skip_as_unconfirmed(booking, work):
+        # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a workflow step — a WhatsApp
+        # or SMS to the guest — must not fire for a booking that was never confirmed, whatever path
+        # queued it. It dies here rather than reaching a provider.
+        return None
+
+    payload = work.payload
+    channel = Channel(payload["channel"])
+    step_id = uuid.UUID(str(payload["step_id"]))
+    kind = str(payload["kind"])
+    locale = str(payload.get("locale", "es"))
+    trigger = WorkflowTrigger(str(payload["trigger"]))
+
+    if await _should_skip_as_stale(session, booking, work):
+        # A later transition overtook the booking, and this step's trigger is not a terminal one.
+        return None
+
+    # May this step be sent NOW? The rule that queued it must still be switched on (else the step
+    # WAITS — it is not destroyed), and its own moment must not have passed (else it is retired,
+    # which is also what bounds the waiting). It gates BOTH channel families, and it runs before any
+    # body is composed or rendered: a step from a switched-off rule must not reach a provider, and a
+    # step whose moment has gone must not be built at all.
+    await _gate_on_the_rule(session, work, booking, trigger, now)
+
+    if await notification_already_sent(
+        session, booking=booking, kind=kind, channel=channel, step_id=step_id
+    ):
+        # Already on the ledger. For a reminder this is precisely what the migration's re-keying
+        # buys: a booking the retired scheduler already reminded is never reminded a second time.
+        return None
+
+    if channel is Channel.EMAIL:
+        return await _prepare_notify_email(
+            session,
+            booking=booking,
+            kind=kind,
+            step_id=step_id,
+            locale=locale,
+            sender=sender,
+            channel_errors=channel_errors,
+        )
+
+    # ==THE CRASH WE CANNOT SEE FROM ANYWHERE ELSE.== The marker was committed before the previous
+    # attempt called the provider, and the ledger check above says the send was never recorded. So a
+    # worker died (or its call was aborted) inside the window between "the provider accepted" and
+    # "the ledger committed" - and the guest may ALREADY have this message.
+    #
+    # Retrying is the intuitive move and it is wrong twice over: it can message a real person a
+    # second time, and because the per-phone daily cap is DERIVED from that same unwritten ledger
+    # row, it also under-counts the ceiling that protects them from exactly that. Park it, shout,
+    # and let a human look at the provider.
+    if work.payload.get(PROVIDER_CALL_MARKER):
+        raise OutboxUnknownOutcome(
+            f"{_UNKNOWN_OUTCOME}: a previous attempt handed this {channel.value} step to the "
+            f"provider at {work.payload[PROVIDER_CALL_MARKER]} and never recorded the outcome - "
+            "the worker died in the window between the provider accepting and the ledger "
+            "committing. The guest may already have this message, so it is NOT re-sent. A human "
+            "checks the provider, then runs: aethercal-admin outbox resolve-unknown"
+        )
+
+    # THE CONSENT GATE, and it comes FIRST — before the channel registry, before the cap, before the
+    # template. Not as a nicety of ordering: it must be impossible to reach a send plan for a phone
+    # we have no permission to message, however the checks below are later reordered.
+    _require_phone_consent(booking, channel)
+
+    phone_sender = channels.get(channel)
+    if phone_sender is None:
+        _refuse_channel(
+            channel,
+            channel_errors,
+            when_off=OutboxSkipped(
+                f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this "
+                "instance (a channel without credentials is a disabled feature, not an error)"
+            ),
+        )
+
+    # THE CAPS, before the render and long before the network call: an over-cap message is never
+    # built and never handed to a provider. The sender carries its own ceilings — a phone sender
+    # WITHOUT caps is unrepresentable (see PhoneChannelSender) — so there is no path through here
+    # that reaches a provider with no ceiling in force.
+    #
+    # ==BOTH of them, and the second is new.== `per_ip` has been required at boot since RF-24 and
+    # enforced NOTHING: no client address ever reached this line, because a booking did not record
+    # the one it came from. `bookings.source_ip` (migration 0011) + `enforce_ip_cap` close that —
+    # and
+    # the call belongs HERE, in the read phase, because this IS the send path. The column without
+    # this line would leave the cap *looking* applied while still denying nothing, which is worse
+    # than the gap it replaces.
+    #
+    # The two are asymmetric on a missing value, deliberately: no phone REFUSES the send (the
+    # missing
+    # value is the recipient), no address ALLOWS it (the missing value means this booking never came
+    # from the public form — it is the host's own, and a host must not be throttled by a stranger).
+    try:
+        await enforce_phone_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+        await enforce_ip_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+    except SendRefused as refused:
+        raise OutboxSkipped(str(refused)) from refused
+
+    template = await load_template(
+        session, tenant_id=booking.tenant_id, channel=channel, kind=kind, locale=locale
+    )
+    if template is None:
+        # A tenant-authored kind with no body anywhere — no template row, and no built-in for it.
+        # An empty message is worse than no message, so the step is retired, and it says why.
+        raise OutboxSkipped(
+            f"{_NO_TEMPLATE}: the {channel.value} step of kind {kind!r} has no template for locale "
+            f"{locale!r}, and there is no built-in fallback for that kind"
+        )
+
+    context = await build_template_context(session, booking=booking, locale=locale)
+    try:
+        rendered = render_template(
+            template.body, subject=template.subject, context=context, channel=channel
+        )
+    except TemplateError as exc:
+        # A malformed template will not render on the tenth attempt either. Retire it and NAME it,
+        # so the tenant learns their template is broken rather than watching messages quietly fail
+        # to arrive.
+        raise OutboxSkipped(
+            f"{_BAD_TEMPLATE}: the {template.source} {channel.value} template for kind {kind!r} "
+            f"cannot be rendered: {exc}"
+        ) from exc
+
+    phone = booking.guest_phone
+    if phone is None:  # pragma: no cover - _require_phone_consent proved this above
+        raise OutboxSkipped(f"{_NO_PHONE}: the booking lost its phone number mid-flight")
+
+    return _NotifyPlan(
+        booking_id=booking.id,
+        kind=kind,
+        channel=channel,
+        step_id=step_id,
+        message=rendered.body,
+        recipient=phone,
+    )
+
+
+async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    kind: str,
+    step_id: uuid.UUID,
+    locale: str,
+    sender: EmailSender | None,
+    channel_errors: Mapping[Channel, Exception],
+) -> _NotifyPlan | None:
+    """The EMAIL branch: the built-in composer, which is what carries the ``.ics`` invite.
+
+    An email step keeps going through :func:`compose_booking_notification` rather than the
+    plain-body template path, for two reasons that are not stylistic: it is what attaches the
+    calendar invite, and it keeps the ledger key identical to the retired reminder scheduler's —
+    which is the thing that stops a live booking being reminded a second time.
+
+    So an email step's ``kind`` must be one of the four built-in ones. A tenant's own kind has no
+    composer here, and is retired with that reason rather than mailing something empty."""
+    if sender is None:
+        _refuse_channel(
+            Channel.EMAIL,
+            channel_errors,
+            when_off=OutboxSkipped(
+                f"{_CHANNEL_UNCONFIGURED}: the email channel has no configured SMTP sender"
+            ),
+        )
+    try:
+        composer_kind = NotificationKind(kind)
+    except ValueError as exc:
+        raise OutboxSkipped(
+            f"{_NO_TEMPLATE}: the email step of kind {kind!r} has no built-in composer (the four "
+            "built-in kinds are the ones carrying the .ics invite); a custom kind is supported on "
+            "the phone channels, which render from workflow_templates"
+        ) from exc
+
+    message = await compose_booking_notification(
+        session,
+        kind=composer_kind,
+        booking=booking,
+        # A workflow step carries no guest links — the same shape the retired reminder job used.
+        cancel_url=None,
+        reschedule_url=None,
+        locale=locale,
+    )
+    return _NotifyPlan(
+        booking_id=booking.id,
+        kind=kind,
+        channel=Channel.EMAIL,
+        step_id=step_id,
+        message=message,
+        recipient=booking.guest_email,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# The dispatcher the scheduler tick injects as ``execute``.
+# --------------------------------------------------------------------------------------
+
+
+def make_booking_effect_executor(
+    *,
+    sessionmaker: Sessionmaker,
+    resolve_senders: SenderResolver,
+    service_factory: ServiceFactory | None,
+    refund_runner: OutboxExecutor | None = None,
+    expire_hold_runner: OutboxExecutor | None = None,
+) -> OutboxExecutor:
+    """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
+
+    The dispatch is **exhaustive over** :class:`OutboxEffect`, enforced by ``assert_never``: pyright
+    fails the build if an effect is added without a branch here. It used to be ``if EMAIL … else
+    GOOGLE``, where the ``else`` silently *assumed* Google — so every new effect would have been
+    executed as a Google Calendar call.
+
+    .. rubric:: ==It takes a RESOLVER, not senders. That signature IS the fix (B-03bis).==
+
+    This used to take ``sender=`` and ``channels=``: objects built once, at boot, from the
+    INSTANCE's environment — i.e. **bound before any business was known**. The drain then worked
+    through a batch spanning several businesses and pushed every one of their messages through that
+    single object. So a business's WhatsApp reminder went out from the ==instance operator's
+    number==, and its guest replied to a stranger.
+
+    A check could not have fixed that, because there was nothing to check: by the time an item
+    arrived, the only sender in existence was already the wrong one. So the senders are resolved
+    **per item**, from ``work.tenant_id``, by
+    :func:`~aethercal.server.services.tenant_senders.resolve_tenant_senders` — which cannot be
+    called without naming a business, and is the only place in the product that constructs a live
+    sender at all (``tests/test_sender_belt.py`` walks the source and fails CI otherwise).
+
+    The resolve happens INSIDE the drain's per-item ``tenant_scope``, on the RLS pool, so each
+    credential is decrypted under exactly that business's authority.
+
+    ==Only the branches that actually send resolve.== A Google sync carries its own per-connection
+    OAuth token and needs no messaging credential, so it costs no read and no decrypt.
+
+    ``refund_runner`` / ``expire_hold_runner`` are the money handlers (B-05b),
+    INJECTED rather than imported so this module never depends on ``services.payments`` (which
+    depends on it). The worker wires them; if a REFUND/EXPIRE_HOLD intent reaches an executor built
+    without them it raises loudly, like an EMAIL with no sender — a misconfiguration, never a
+    silent skip that would strand a guest's money.
+
+    An absent channel is not a gap: its steps SKIP with a reason, never fail."""
+
+    async def _resolve_for(work: OutboxWork) -> TenantSenders:
+        """This item's senders — and ==proof they are THIS item's==.
+
+        The resolver cannot be called without a business, and today it always stamps back the
+        ``tenant_id`` it was handed, so this check cannot currently fire. It is here for what comes
+        next rather than for what is here now: the obvious optimisation of this loop is to MEMOISE
+        the resolve (a batch is often several items of one business, each paying for its own read
+        and decrypt), and a cache keyed even slightly wrong hands business A's sender to business
+        B's item.
+
+        That failure is externally visible and cannot be taken back: a guest messaged from the wrong
+        company's number. The drain would never notice — a sender is a sender — so the item carries
+        its business, the senders carry theirs, and they are compared before either is used. ==One
+        comparison, against a leak nobody could undo.==
+        """
+        senders = await resolve_senders(work.tenant_id)
+        if senders.tenant_id != work.tenant_id:
+            raise RuntimeError(
+                f"the resolver returned senders for business {senders.tenant_id} while draining an "
+                f"intent belonging to {work.tenant_id}. Refusing to send: this business's guest "
+                "would be messaged from another business's account. If a cache was added to the "
+                "resolver, its key is wrong."
+            )
+        return senders
+
+    async def _execute(work: OutboxWork, now: datetime) -> None:
+        effect = work.effect
         if effect is OutboxEffect.EMAIL:
-            if sender is None:  # pragma: no cover - live misconfiguration guard
-                raise RuntimeError("outbox email intent has no configured SMTP sender")
-            await run_email_effect(session, outbox, now, sender=sender)
-        else:
+            senders = await _resolve_for(work)
+            if senders.email is None:
+                # ==Through the same door as every other sender-less channel.== It used to consult
+                # `channel_errors` by hand right here — correctly — while the workflow-step branch
+                # forgot to, which is precisely the divergence a hand-applied rule earns on its
+                # third copy.
+                #
+                # `when_off` differs from the workflow step's, and that is a real difference rather
+                # than an oversight: this is the booking's CONFIRMATION. An instance with no SMTP at
+                # all has not switched a feature off — it is misconfigured, and the receipt should
+                # still reach the guest once somebody fixes it. A workflow reminder is a feature,
+                # and a feature nobody configured is off.
+                _refuse_channel(
+                    Channel.EMAIL,
+                    senders.channel_errors,
+                    when_off=RuntimeError("outbox email intent has no configured SMTP sender"),
+                )
+            await run_email_effect(sessionmaker, work, now, sender=senders.email)
+        elif effect is OutboxEffect.GOOGLE:
             if service_factory is None:  # pragma: no cover - live misconfiguration guard
                 raise RuntimeError("outbox Google intent has no configured service factory")
-            await run_google_effect(session, outbox, now, service_factory=service_factory)
+            await run_google_effect(sessionmaker, work, now, service_factory=service_factory)
+        elif effect is OutboxEffect.NOTIFY:
+            senders = await _resolve_for(work)
+            await run_notify_effect(
+                sessionmaker,
+                work,
+                now,
+                sender=senders.email,
+                channels=senders.channels,
+                channel_errors=senders.channel_errors,
+            )
+        elif effect is OutboxEffect.REFUND:
+            if refund_runner is None:
+                raise RuntimeError("outbox REFUND intent reached an executor with no refund runner")
+            await refund_runner(work, now)
+        elif effect is OutboxEffect.EXPIRE_HOLD:
+            if expire_hold_runner is None:
+                raise RuntimeError(
+                    "outbox EXPIRE_HOLD intent reached an executor with no expire-hold runner"
+                )
+            await expire_hold_runner(work, now)
+        else:
+            assert_never(effect)
 
     return _execute
 
@@ -530,19 +2968,57 @@ __all__ = [
     "BACKOFF_BASE_SECONDS",
     "BACKOFF_CAP_SECONDS",
     "DEFAULT_DRAIN_BATCH_SIZE",
+    "DEFAULT_LEASE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFER_DELAY_SECONDS",
+    "PAUSED_RULE_RECHECK",
+    "PROVIDER_CALL_MARKER",
+    "PROVIDER_TIMEOUT_CEILING",
+    "PURGEABLE_EFFECTS",
+    "RETAINED_DEDUPE_KEY",
+    "RETAINED_PAYLOAD_KEYS",
+    "TERMINAL_MESSAGE_GRACE",
+    "Clock",
+    "Confirmation",
     "GoogleOperation",
     "OutboxDeferred",
     "OutboxEffect",
     "OutboxExecutor",
     "OutboxReport",
+    "OutboxSkipped",
+    "OutboxUnknownOutcome",
+    "OutboxWork",
+    "Purgeability",
+    "ReconcileReport",
+    "Staleness",
+    "StepSchedule",
+    "Suppressed",
+    "Vanished",
+    "Voidability",
+    "as_utc",
     "backoff_delay",
+    "claim_one",
+    "confirmation_policy",
     "drain_outbox",
     "email_dedupe_key",
     "enqueue_effect",
+    "expire_hold_dedupe_key",
     "google_dedupe_key",
     "make_booking_effect_executor",
+    "message_deadline",
+    "new_worker_id",
+    "purge_policy",
+    "reconcile_workflow_steps",
+    "recover_expired_leases",
+    "refund_dedupe_key",
     "run_email_effect",
     "run_google_effect",
+    "run_notify_effect",
+    "select_due",
+    "staleness_policy",
+    "trigger_staleness",
+    "void_pending_steps",
+    "voidability_policy",
+    "workflow_key_prefix",
+    "workflow_step_dedupe_key",
 ]

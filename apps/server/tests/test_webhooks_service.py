@@ -5,14 +5,19 @@ All run against the offline in-memory ``sqlite_session`` (no Postgres).
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.core.model import BookingStatus
+from aethercal.schemas.event_types import EventTypeCreate
 from aethercal.schemas.webhooks import WebhookCreate, WebhookUpdate
 from aethercal.server.crypto import derive_fernet_key
-from aethercal.server.db.models import Tenant
+from aethercal.server.db.models import Booking, Schedule, Tenant, User
+from aethercal.server.services.event_types import create_event_type
 from aethercal.server.services.webhooks import (
     create_webhook,
     decrypt_webhook_secret,
@@ -31,6 +36,47 @@ NOW = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 
 def _create(url: str, events: list[str], secret: str | None = None) -> WebhookCreate:
     return WebhookCreate.model_validate({"url": url, "events": events, "secret": secret})
+
+
+async def _confirmed_booking(session: AsyncSession, tenant: Tenant) -> Booking:
+    """A REAL appointment for ``tenant``: confirmed, and stamped with when it became so.
+
+    ``enqueue_event`` takes the BOOKING now, not a bare ``tenant_id``, because it has to know
+    whether the appointment was ever confirmed before it tells a subscriber that it exists (B-05a).
+    A fixture that left ``confirmed_at`` NULL would be seeding an unpaid HOLD, the funnel would
+    correctly fan nothing out, and these tests would be asserting on a silence they never meant.
+    """
+    host = (await session.scalars(select(User).where(User.tenant_id == tenant.id))).first()
+    assert host is not None
+    schedule = Schedule(tenant_id=tenant.id, name="Weekly", timezone="UTC", rules={})
+    session.add(schedule)
+    await session.flush()
+    event_type = await create_event_type(
+        session,
+        tenant_id=tenant.id,
+        data=EventTypeCreate(
+            host_id=host.id,
+            schedule_id=schedule.id,
+            slug=f"intro-{uuid.uuid4().hex[:6]}",
+            title="Intro",
+            duration_seconds=1800,
+            max_advance_seconds=60 * 60 * 24 * 30,
+        ),
+    )
+    booking = Booking(
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        start_at=NOW + timedelta(days=1),
+        end_at=NOW + timedelta(days=1, minutes=30),
+        status=BookingStatus.CONFIRMED,
+        confirmed_at=NOW,
+        guest_name="Ada",
+        guest_email="ada@example.com",
+        guest_timezone="UTC",
+    )
+    session.add(booking)
+    await session.flush()
+    return booking
 
 
 async def test_create_returns_webhook_and_plaintext_secret(
@@ -223,9 +269,10 @@ async def test_enqueue_fans_out_only_to_matching_active_subscribers(
         fernet_key=KEY,
     )
 
+    booking = await _confirmed_booking(sqlite_session, tenant)
     deliveries = await enqueue_event(
         sqlite_session,
-        tenant_id=tenant.id,
+        booking=booking,
         event="booking.created",
         data={"booking_id": "bk_1"},
         now=NOW,
@@ -254,9 +301,10 @@ async def test_enqueue_with_no_matching_subscribers_returns_empty(
         params=_create("https://a.test/hook", ["booking.cancelled"]),
         fernet_key=KEY,
     )
+    booking = await _confirmed_booking(sqlite_session, tenant)
     deliveries = await enqueue_event(
         sqlite_session,
-        tenant_id=tenant.id,
+        booking=booking,
         event="booking.created",
         data={},
         now=NOW,

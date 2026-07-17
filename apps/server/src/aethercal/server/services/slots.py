@@ -28,8 +28,10 @@ while their external calendar cannot be established, which would risk a double-b
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +42,7 @@ from aethercal.core.slots.engine import available_slots
 from aethercal.schemas.slots import Availability
 from aethercal.server.db.models import Booking, DateOverride, EventType, Schedule
 from aethercal.server.services.calendars import BusyQuery, ServiceFactory, read_busy
-from aethercal.server.services.event_types import get_event_type, to_core_event_type
+from aethercal.server.services.event_types import get_bookable_event_type, to_core_event_type
 from aethercal.server.services.schedules import to_core_overrides, to_core_schedule
 
 # How long a cached external busy window is treated as time-fresh (RF-12). Past this, ``read_busy``
@@ -165,6 +167,123 @@ async def _internal_busy(
     return [TimeInterval(start=_as_utc(row.start_at), end=_as_utc(row.end_at)) for row in rows]
 
 
+# --------------------------------------------------------------------------------------
+# max_per_day (RF-14) — the tenant's daily capacity cap.
+# --------------------------------------------------------------------------------------
+
+
+async def _days_at_cap(  # noqa: PLR0913 — the window + the zone + the exclusion ARE the question
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_type: EventType,
+    zone: ZoneInfo,
+    window_from: date,
+    window_to: date,
+    exclude_booking_id: uuid.UUID | None,
+) -> frozenset[date]:
+    """The local dates on which ``event_type`` has already reached its ``max_per_day``.
+
+    .. rubric:: WHICH bookings count
+
+    Exactly the ones that OCCUPY the day: everything except ``cancelled``. This is not a new rule —
+    it is the same predicate ``uq_bookings_active_slot`` already uses (``status <> 'cancelled'``),
+    and reusing it is the point. ==A cancellation must give its place back==, or one guest who books
+    and cancels would close the business's whole day, forever, with nothing on the books. A
+    ``no_show`` still counts, for the same reason its slot stays occupied: the host held the hour
+    and nobody else could have it. It happened to the business, even though the guest never came.
+
+    .. rubric:: WHICH day a booking falls on
+
+    The **schedule's** local day (``Schedule.timezone``) — the day of the diary the cap is written
+    into. This is the question a daily cap must answer, and every wrong answer is silent:
+
+    * **The schedule's zone (chosen).** ``available_intervals`` already localizes every weekday's
+      open hours in ``Schedule.timezone``, so the diary's days are *already* drawn in that zone.
+      Counting in any other one charges a booking to a day whose boundaries the availability
+      engine does not share — the cap and the calendar would disagree about where Tuesday ends.
+    * **The guest's zone** — absurd on inspection: the day a booking consumes would then depend on
+      who booked it, so the same 09:00 appointment could fill Monday for one guest and Tuesday for
+      the next. A business's capacity cannot depend on its customers' travel plans.
+    * **The host's ``users.timezone``** — plausible, and still wrong: it is the host's *personal*
+      display zone, free to differ from the schedule that actually defines the opening hours (and a
+      shared, business-wide schedule has no single host at all — ``Schedule.user_id`` is nullable).
+    * **UTC** — wrong for everyone not on it, and invisibly so: for a shop at UTC+12 the cap would
+      cut across the middle of the afternoon.
+
+    ``exclude_booking_id`` drops one booking from the count. It exists for the RESCHEDULE path,
+    where the booking being moved is still ``confirmed`` while its new slot is validated: a
+    reschedule MOVES an appointment, it does not add one, so counting the predecessor against the
+    cap would make a full day impossible to reschedule *within* — the guest would be told the day is
+    full by the very booking they are trying to move.
+    """
+    cap = event_type.max_per_day
+    if cap is None:
+        return frozenset()  # NULL is a true absence of a cap, never a cap of zero.
+
+    # The same padded UTC window the busy sets use: it provably covers every local day in
+    # [window_from, window_to] for any zone, so no booking on a capped day can be missed.
+    window = _busy_window(window_from, window_to)
+    rows = (
+        await session.execute(
+            select(Booking.id, Booking.start_at).where(
+                Booking.tenant_id == tenant_id,
+                Booking.event_type_id == event_type.id,
+                Booking.status != BookingStatus.CANCELLED,
+                Booking.start_at >= window.start,
+                Booking.start_at < window.end,
+            )
+        )
+    ).all()
+
+    taken: Counter[date] = Counter()
+    for booking_id, start_at in rows:
+        if booking_id == exclude_booking_id:
+            continue
+        # A booking belongs to the day it STARTS on, in the schedule's zone.
+        taken[_as_utc(start_at).astimezone(zone).date()] += 1
+    return frozenset(day for day, count in taken.items() if count >= cap)
+
+
+async def day_is_at_cap(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    event_type: EventType,
+    moment: datetime,
+    exclude_booking_id: uuid.UUID | None = None,
+) -> bool:
+    """Whether ``moment``'s local day has already reached ``event_type.max_per_day`` (RF-14).
+
+    The write-side gate, used by ``create_booking`` / ``reschedule_booking``. It answers about ONE
+    day, but it counts through :func:`_days_at_cap` so the booking path and the slots path can never
+    drift into two different opinions of what "a day" is or which bookings fill it.
+
+    Returns ``False`` when no cap is declared, and when the schedule has vanished (a concurrent
+    delete): no schedule means no availability at all, so the caller's slot validation refuses on
+    its own — this gate must not be the thing that invents an error for it.
+    """
+    if event_type.max_per_day is None:
+        return False
+    schedule = await _load_schedule(
+        session, tenant_id=tenant_id, schedule_id=event_type.schedule_id
+    )
+    if schedule is None:
+        return False
+    zone = ZoneInfo(schedule.timezone)
+    day = _as_utc(moment).astimezone(zone).date()
+    full = await _days_at_cap(
+        session,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        zone=zone,
+        window_from=day,
+        window_to=day,
+        exclude_booking_id=exclude_booking_id,
+    )
+    return day in full
+
+
 async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-factory
     session: AsyncSession,
     *,
@@ -174,6 +293,7 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     window_to: date,
     now: datetime,
     service_factory: ServiceFactory | None = None,
+    exclude_booking_id: uuid.UUID | None = None,
 ) -> SlotsResult | None:
     """Bookable slots for a tenant's event type over ``[window_from, window_to]`` (RF-03).
 
@@ -184,8 +304,22 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     ``service_factory`` is forwarded to ``read_busy``; the request path passes ``None`` (RNF-6: read
     the cache only, never call Google in-band). Reused by F1-05 to validate a requested slot is on
     offer.
+
+    RF-14 daily cap: a day that has reached the event type's ``max_per_day`` STOPS BEING OFFERED —
+    the cap is applied here, not only at create time. ==Offering a slot and then refusing the
+    booking that takes it is a broken contract==: the guest is shown a time, picks it, and is handed
+    a 409. Showing fewer slots than are bookable is safe; showing more and rejecting is not.
+    ``exclude_booking_id`` omits one booking from that count for the reschedule path (see
+    :func:`_days_at_cap`) — it does NOT free that booking's interval, which still occupies the host,
+    so a booking can no more be rescheduled onto its own current slot than it could before.
     """
-    event_type = await get_event_type(session, tenant_id=tenant_id, event_type_id=event_type_id)
+    # The GUEST's lookup: a DEACTIVATED event type is not on sale, so it publishes no slots on any
+    # day, and is indistinguishable from one that never existed (``None`` → the router's 404). This
+    # used to be the unfiltered ``get_event_type``, so a "deleted" event type went on offering a
+    # full open week to anyone who asked — see :func:`get_bookable_event_type`.
+    event_type = await get_bookable_event_type(
+        session, tenant_id=tenant_id, event_type_id=event_type_id
+    )
     if event_type is None:
         return None
 
@@ -224,8 +358,26 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     )
     busy = internal + list(external.busy)
     slots = available_slots(available, busy, to_core_event_type(event_type), now=now)
+
+    # RF-14: drop every slot on a day that is already full. This runs AFTER the engine, not as a
+    # busy interval, because the cap is a property of the DAY, not of any hour in it — a full day
+    # has no conflicting interval to subtract, it simply has no room left.
+    if schedule is not None:
+        zone = ZoneInfo(schedule.timezone)
+        full = await _days_at_cap(
+            session,
+            tenant_id=tenant_id,
+            event_type=event_type,
+            zone=zone,
+            window_from=window_from,
+            window_to=window_to,
+            exclude_booking_id=exclude_booking_id,
+        )
+        if full:
+            slots = [slot for slot in slots if slot.start.astimezone(zone).date() not in full]
+
     availability: Availability = "degraded" if external.is_degraded else "ok"
     return SlotsResult(slots=slots, availability=availability)
 
 
-__all__ = ["SlotsResult", "compute_slots"]
+__all__ = ["SlotsResult", "compute_slots", "day_is_at_cap"]

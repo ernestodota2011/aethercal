@@ -37,11 +37,10 @@ _SCRIPT_TAG_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.IGNORECASE | 
 
 
 def _event_json(*, event_id: str, slug: str, title: str, questions: list[Any]) -> dict[str, Any]:
+    # The PUBLIC projection the page consumes now: no internal ids, no `active` flag (the public
+    # listing is active-only by construction). `event_id` stays in the signature so callers compile.
+    del event_id
     return {
-        "id": event_id,
-        "tenant_id": str(uuid.uuid4()),
-        "host_id": str(uuid.uuid4()),
-        "schedule_id": str(uuid.uuid4()),
         "slug": slug,
         "title": title,
         "description": "Let's talk.",
@@ -49,33 +48,19 @@ def _event_json(*, event_id: str, slug: str, title: str, questions: list[Any]) -
         "description_translations": {},
         "location": "Google Meet",
         "duration_seconds": 1800,
-        "buffer_before_seconds": 0,
-        "buffer_after_seconds": 0,
-        "min_notice_seconds": 0,
-        "max_advance_seconds": 2592000,
-        "increment_seconds": None,
-        "max_per_day": None,
         "questions": questions,
-        "active": True,
+        "collects_phone": False,
     }
 
 
 def _booking_json() -> dict[str, Any]:
+    # ==Four fields.== The public POST answers {id, start, end, status} — no guest PII, no
+    # meeting_url.
     return {
         "id": BOOKING_ID,
-        "event_type_id": INTRO_ID,
         "start": "2026-07-14T13:00:00Z",
         "end": "2026-07-14T13:30:00Z",
         "status": "confirmed",
-        "guest_name": "Ada Lovelace",
-        "guest_email": "ada@example.com",
-        "guest_timezone": "America/New_York",
-        "guest_notes": None,
-        "answers": {},
-        "meeting_url": "https://meet.example/xyz",
-        "rescheduled_from_id": None,
-        "cancelled_at": None,
-        "created_at": "2026-07-01T00:00:00Z",
     }
 
 
@@ -113,12 +98,11 @@ class FakeAPI:
             )
         return httpx.Response(201, json=_booking_json())
 
-    def _slots(self, request: httpx.Request) -> httpx.Response:
-        event_type = request.url.params.get("event_type", INTRO_ID)
+    def _slots(self, request: httpx.Request, event_slug: str) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "event_type_id": event_type,
+                "event_slug": event_slug,
                 "timezone": request.url.params.get("tz", "UTC"),
                 "availability": "ok",
                 "slots": [
@@ -130,13 +114,15 @@ class FakeAPI:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path, method = request.url.path, request.method
-        if method == "GET" and path == "/api/v1/event-types/":
+        # ==The PUBLIC surface — no API key on any of these.==
+        if method == "GET" and re.fullmatch(r"/api/v1/public/[^/]+/event-types", path):
             if self.fail_event_types:
                 return httpx.Response(500, json={"error": "internal", "message": "boom"})
             return self._event_types()
-        if method == "GET" and path == "/api/v1/slots/":
-            return self._slots(request)
-        if method == "POST" and path == "/api/v1/bookings/":
+        public_slots = re.fullmatch(r"/api/v1/public/[^/]+/([^/]+)/slots", path)
+        if method == "GET" and public_slots:
+            return self._slots(request, public_slots.group(1))
+        if method == "POST" and re.fullmatch(r"/api/v1/public/[^/]+/[^/]+/bookings", path):
             return self._create_booking(request)
         return httpx.Response(404, json={"error": "not_found", "message": "Unknown"})
 
@@ -260,14 +246,16 @@ def _make_embed_client(
     fake = FakeAPI()
     settings = BookingSettings(
         api_url="http://api.test",
-        api_key=API_KEY,
+        tenant_slug="acme",
+        turnstile_site_key=None,
         default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
         embed_allowed_origins=embed_allowed_origins,
     )
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory)
     return TestClient(app), fake
@@ -391,11 +379,17 @@ def test_embed_unknown_event_still_renders_the_compact_branded_404() -> None:
 def test_embed_rate_limit_applies_to_book_submit_too() -> None:
     limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
     fake = FakeAPI()
-    settings = BookingSettings(api_url="http://api.test", api_key=API_KEY, default_locale="es")
+    settings = BookingSettings(
+        api_url="http://api.test",
+        tenant_slug="acme",
+        turnstile_site_key=None,
+        default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
+    )
     transport = httpx.MockTransport(fake.handler)
 
     def client_factory() -> AetherCalClient:
-        return AetherCalClient(settings.api_url, api_key=settings.api_key, transport=transport)
+        return AetherCalClient(settings.api_url, transport=transport)
 
     app = create_app(settings=settings, client_factory=client_factory, rate_limiter=limiter)
     client = TestClient(app, client=("203.0.113.5", 50000))
