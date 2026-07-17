@@ -68,6 +68,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
     run_google_effect,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 
 
 def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
@@ -252,7 +253,9 @@ async def test_a_booking_creates_the_event_in_the_hosts_calendar(
         sqlite_session,
         sqlite_maker,
         make_booking_effect_executor(
-            sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: google,
         ),
     )
 
@@ -288,7 +291,9 @@ async def test_the_event_lands_in_the_dedicated_calendar_when_one_is_designated(
         sqlite_session,
         sqlite_maker,
         make_booking_effect_executor(
-            sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: google,
         ),
     )
 
@@ -309,7 +314,9 @@ async def test_cancelling_deletes_the_event_from_the_calendar_it_lives_in(
     await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     booking = await _book(sqlite_session, tenant, event_type)
@@ -334,7 +341,9 @@ async def test_rescheduling_moves_the_event(
     await _connect(sqlite_session, tenant, host, fernet=fernet)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     first = await _book(sqlite_session, tenant, event_type)
@@ -381,7 +390,9 @@ async def test_cancelling_after_the_write_target_moved_deletes_from_the_original
     await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     booking = await _book(sqlite_session, tenant, event_type)
@@ -418,7 +429,9 @@ async def test_rescheduling_after_the_write_target_moved_deletes_old_and_creates
     await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     first = await _book(sqlite_session, tenant, event_type)
@@ -458,7 +471,9 @@ async def test_a_booking_from_before_the_columns_existed_falls_back_and_says_so(
     await _refreshed(sqlite_session, connection)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     booking = await _book(sqlite_session, tenant, event_type)
@@ -519,7 +534,9 @@ async def test_a_connection_that_vanishes_before_the_drain_fails_loudly(
         sqlite_session,
         sqlite_maker,
         make_booking_effect_executor(
-            sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: google,
         ),
     )
 
@@ -547,7 +564,9 @@ async def test_an_ambiguous_calendar_configuration_fails_loudly(
         sqlite_session,
         sqlite_maker,
         make_booking_effect_executor(
-            sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: google,
         ),
     )
 
@@ -600,7 +619,9 @@ async def test_cancelling_after_the_host_revoked_the_connection_still_removes_th
     connection = await _connect(sqlite_session, tenant, host, fernet=fernet)
     google = FakeGoogle()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_Sender(), service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+        service_factory=lambda _c: google,
     )
 
     booking = await _book(sqlite_session, tenant, event_type)

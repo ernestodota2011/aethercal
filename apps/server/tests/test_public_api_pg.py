@@ -65,6 +65,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.settings import Settings
 
 pytestmark = pytest.mark.db
@@ -670,9 +671,10 @@ async def test_the_per_ip_cap_denies_a_REAL_send(
     whatsapp = _RecordingWhatsAppSender(per_ip=1)
     execute = make_booking_effect_executor(
         sessionmaker=worker_pools.exec_maker,
-        sender=_RecordingEmailSender(),
+        resolve_senders=TenantSenders.for_offline_tests(
+            email=_RecordingEmailSender(), channels={Channel.WHATSAPP: whatsapp}
+        ),
         service_factory=None,
-        channels={Channel.WHATSAPP: whatsapp},
     )
     # Drain at the LATER booking's reminder time, so BOTH reminders are due in one pass (the two
     # bookings sit on different slots). The earlier one sends; the second, from the same address,
@@ -720,9 +722,10 @@ async def test_a_booking_from_ANOTHER_address_still_gets_its_message(
     whatsapp = _RecordingWhatsAppSender(per_ip=1)
     execute = make_booking_effect_executor(
         sessionmaker=worker_pools.exec_maker,
-        sender=_RecordingEmailSender(),
+        resolve_senders=TenantSenders.for_offline_tests(
+            email=_RecordingEmailSender(), channels={Channel.WHATSAPP: whatsapp}
+        ),
         service_factory=None,
-        channels={Channel.WHATSAPP: whatsapp},
     )
     # Later reminder time so both bookings' reminders are due together; they are from DIFFERENT
     # addresses, so both are under the cap and both send.

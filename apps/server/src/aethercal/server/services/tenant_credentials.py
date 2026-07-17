@@ -500,13 +500,26 @@ async def resolve_infra_credential(
     """The business's own SENDING credential if it has one, else the instance's. ==Precedence.==
 
     Returns ``None`` when there is neither — which is what "this channel is switched off" has always
-    meant here (``build_channel_senders``: the channel is absent from the registry and its steps
-    skip with a reason). An unconfigured WhatsApp must not 500 a booking.
+    meant here: the channel is absent from the drain's registry and its steps skip with a reason. An
+    unconfigured WhatsApp must not 500 a booking.
 
     Raises :class:`WrongCredentialClassError` when handed a MONEY provider. ==That refusal is what
     keeps criterion 41 from being one careless call away from a bypass==: this is the only function
     in the product that can return the INSTANCE's own credentials, so it is the one place a payment
     provider must never be allowed to arrive.
+
+    .. rubric:: ==Whether an instance default EXISTS is not decided here (B-03bis)==
+
+    ``instance_default`` is a parameter, and this function trusts it. That is deliberate: whether
+    the operator's configuration may stand in for a business at all depends on what kind of thing
+    that configuration IS, and this module cannot know. An SMTP relay is a pipe (the ``From``
+    travels per message, so a business's mail goes through it AS the business); a WhatsApp number is
+    an identity (there is no per-message ``From``, so lending it sends the message AS THE OPERATOR).
+
+    :func:`~aethercal.server.services.tenant_senders.instance_fallback` makes that call, per
+    provider and exhaustively, and passes ``None`` here for a provider whose default must not be
+    reachable. So the precedence lives in one place — this one — and the question of what may be
+    offered to it lives in the module that knows.
     """
     if credential_class(provider) is not CredentialClass.INFRA:
         raise WrongCredentialClassError(

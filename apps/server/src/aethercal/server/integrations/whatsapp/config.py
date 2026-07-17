@@ -16,9 +16,25 @@ Three states, and the middle one is the whole point:
   the symptom of the missing cap would be the bill, not an error;
 * **configured** → an :class:`EvolutionConfig`, caps included.
 
-``base_url`` is **operator configuration, read only from the environment.** It is never derived from
-inbound data, which is exactly why it does not go through the SSRF guard that protects the
-user-configured webhook URLs: there is no user in this loop, only the operator who runs the process.
+.. rubric:: ==``base_url`` is no longer only the operator's. Read this before trusting it.==
+
+This module used to say that ``base_url`` was "operator configuration, read only from the
+environment... there is no user in this loop, only the operator who runs the process", and concluded
+that it therefore needed no SSRF guard. **B-03bis made that false.** A business now brings its own
+WhatsApp credential, ``base_url`` included, so the value can arrive from a THIRD PARTY — and a
+config this server obeys, supplied by somebody else, is exactly what the webhook URLs are guarded
+for.
+
+So the guard is applied where the value becomes a client, and only to the values that need it:
+:func:`~aethercal.server.services.tenant_senders._assert_target_reachable` puts a
+``CredentialSource.TENANT`` URL through ``webhooks.ssrf.assert_target_allowed`` (https, public
+address, validated by RESOLVED IP), and leaves a ``CredentialSource.INSTANCE`` URL — the env read
+here — untouched, because that one really is the operator configuring their own instance.
+==Provenance decides, not the field name.==
+
+A ``from_env`` value is therefore still trusted, and a self-hoster's Evolution on
+``http://192.168.1.50`` keeps working. That is why this file needs no guard of its own — and why it
+must not be read as evidence that the value is trusted wherever else it turns up.
 """
 
 from __future__ import annotations

@@ -58,6 +58,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_senders import TenantSenders
 
 pytestmark = pytest.mark.db
 
@@ -235,9 +236,10 @@ async def _drain(
     whatsapp = _RecordingWhatsAppSender()
     execute = make_booking_effect_executor(
         sessionmaker=pools.exec_maker,
-        sender=_RecordingEmailSender(),
+        resolve_senders=TenantSenders.for_offline_tests(
+            email=_RecordingEmailSender(), channels={Channel.WHATSAPP: whatsapp}
+        ),
         service_factory=None,
-        channels={Channel.WHATSAPP: whatsapp},
     )
     await drain_outbox(pools, now=start - timedelta(hours=24), execute=execute)
     async with owner_maker() as session:

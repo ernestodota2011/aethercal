@@ -9,6 +9,81 @@ Every package in the repository shares one version number.
 
 ## [Unreleased]
 
+### Changed
+
+**A business's messages now go out on that business's own account** — B-03 stored per-business
+credentials; nothing sent with them.
+
+> [!WARNING]
+> **Breaking for multi-business instances that rely on `AETHERCAL_WHATSAPP_*` / `AETHERCAL_SMS_*`.**
+> A business with no phone credential of its own used to send from the **instance operator's**
+> number, silently. It no longer does: those steps are now `skipped`, with a reason.
+>
+> To restore the old behaviour on a **single-business self-host** (where the operator *is* the
+> business), set `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY=true`. On an instance serving more than one
+> business, give each business its own credential instead —
+> `aethercal-admin credentials set --provider whatsapp`.
+
+- The senders are resolved **per business, per outbox item**, from that item's own `tenant_id`,
+  inside the drain's existing per-item `tenant_scope`. They used to be built once at boot from the
+  instance's environment and shared by every business the drain worked through.
+- **Email is unchanged.** An SMTP relay is a transport, not an identity — the `From` header travels
+  per message — so the instance relay is still lent to a business that has no SMTP of its own. A
+  single-business self-hoster who set `AETHERCAL_SMTP_HOST` once keeps working exactly as before.
+- The daily caps stay the **operator's** policy and now bound a business's own phone sender too: the
+  recipient comes from the operator's public booking form regardless of whose API key pays the bill.
+  A business that brings a phone credential to an instance with no caps declared keeps that channel
+  off, and the worker logs which variables would turn it on.
+- `AETHERCAL_LEND_OPERATOR_PHONE_IDENTITY` (default `false`) is warned about at boot when enabled.
+- **A business's `base_url` is now guarded on egress.** Moving it out of the environment and into a
+  per-business credential turned it from operator configuration into input a third party controls
+  and the server obeys — so a tenant-supplied endpoint must be `https` and must resolve to a
+  **public** address. Loopback, link-local (including `169.254.169.254`, the cloud metadata
+  service), RFC1918, CGNAT and reserved ranges are refused, checked by **resolved IP** rather than
+  hostname, with one bad record poisoning the whole target. The operator's own
+  `AETHERCAL_*_BASE_URL` is unaffected — provenance decides — and the operator's private-target
+  allowlist is deliberately not honoured for a tenant: it exists so the operator can reach their own
+  LAN, not so a business can.
+- **The egress guard is re-applied at connect, so DNS rebinding cannot move the socket.** A
+  build-time check is a TOCTOU window — httpx re-resolves when it opens the connection, so a tenant
+  controlling its own resolver could answer public for the guard and `127.0.0.1` for the socket. A
+  tenant's sender is now built on a client whose transport re-validates and pins the address at
+  connect (reusing the webhook path's `pinned_ip_for`), with `Host` and TLS certificate
+  verification still bound to the real hostname.
+- **Tenant egress keeps no idle connection.** Pinning rewrites the request's host to the validated
+  IP, and a connection pool is keyed by origin — so two businesses whose hostnames resolve to the
+  same address would collapse onto one pool key and could share a TLS connection established with
+  the other's certificate. Keep-alive is off for tenant egress (HTTP/2 stays off too, and is now
+  asserted): every send stands up its own connection, handshaked for its own hostname. The cost is
+  a TLS handshake per send.
+- **One broken channel no longer silences the others — whatever breaks it.** A failure while
+  resolving one channel escaped the resolver entirely, so a business with a bad WhatsApp `base_url`
+  (or simply a DNS outage on it) stopped receiving its *email*. Isolation is now scoped to the
+  operation — resolving one channel — rather than to a list of error types, so it holds for failures
+  nobody has enumerated. A channel that is configured and fails to resolve FAILS and retries,
+  carrying its own reason; one that was never configured is still skipped. A cancellation or
+  shutdown is not a channel failure and still rises.
+- **A workflow step on email sees its channel's fault.** A business whose SMTP relay was refused
+  had its email reminders retired as "the channel is off" — terminal — while the recorded reason
+  went unread: emails failing silently, in a product whose job is sending reminders. Every
+  sender-less path now goes through one door that tells OFF (terminal) from BROKEN (retryable).
+- **A phone credential with no declared caps is a fault, not a switched-off channel.** It made the
+  channel merely absent, which the drain reads as terminal — so a guest's reminder was discarded for
+  ever because an operator had not set `AETHERCAL_<CHANNEL>_DAILY_CAP_*`, and setting it afterwards
+  brought nothing back. The channel still cannot come up uncapped; it now fails and retries, so the
+  message outlives the fix.
+- **A tenant's SMTP relay host is guarded too, and pinned at connect.** `host: 127.0.0.1, port: 25`
+  relayed a business's mail through the operator's own local MTA — an open relay on the operator's
+  IP reputation. It is the same trust-boundary bug without the HTTP, and scoping it out was
+  classifying by protocol when the rule is declared by provenance. A business's relay is now dialed
+  through a connector that re-validates and pins the address at connect and hands the SMTP client an
+  already-connected socket, so it performs no lookup of its own; `hostname` still drives TLS
+  SNI/certificate verification. The operator's own `AETHERCAL_SMTP_HOST` is unaffected.
+- Removed `app.build_email_sender` / `app.build_channel_senders`, replaced by
+  `app.build_instance_sender_defaults` (configuration, not clients). The web process no longer
+  builds senders at all — it never read the ones it was building. Its half-configured-phone-channel
+  boot check is unchanged.
+
 ### Added
 
 **Per-business branding** — a business's booking page is now *theirs*, not the product's.

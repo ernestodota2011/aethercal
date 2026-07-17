@@ -42,6 +42,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.tenant_senders import TenantSenders
 
 pytestmark = pytest.mark.db
 
@@ -292,7 +293,7 @@ async def test_concurrent_drains_never_double_execute_a_bookings_google_sync(
     # Built over the APP-role pool, exactly as `make_outbox_drain_tick` builds it in the worker.
     execute = make_booking_effect_executor(
         sessionmaker=worker_pools.exec_maker,
-        sender=_RecordingSender(),
+        resolve_senders=TenantSenders.for_offline_tests(email=_RecordingSender()),
         service_factory=lambda _c: google,
     )
     await asyncio.gather(
@@ -383,7 +384,7 @@ async def test_concurrent_reschedule_before_upsert_never_recreates_the_replaced_
     google = _FakeGoogle()
     execute = make_booking_effect_executor(
         sessionmaker=worker_pools.exec_maker,
-        sender=_RecordingSender(),
+        resolve_senders=TenantSenders.for_offline_tests(email=_RecordingSender()),
         service_factory=lambda _c: google,
     )
     await asyncio.gather(

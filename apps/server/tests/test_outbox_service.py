@@ -77,6 +77,7 @@ from aethercal.server.services.outbox import (
     trigger_staleness,
     voidability_policy,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.services.workflows import seed_default_workflows
 
 
@@ -732,7 +733,9 @@ async def test_a_notify_step_never_falls_through_into_the_google_handler(
     google = _FakeGoogleService(insert_result={"id": "evt-1", "hangoutLink": "https://meet/x"})
     sender = _RecordingEmailSender()
     execute = make_booking_effect_executor(
-        sessionmaker=maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
     work = OutboxWork(
         id=uuid.uuid4(),

@@ -5,10 +5,19 @@ off); half-configured → :class:`RuntimeError` (==never *sending* but *uncapped
 :class:`TwilioConfig` with its caps. See :mod:`aethercal.server.integrations.whatsapp.config` for
 the reasoning in full.
 
-``base_url`` defaults to Twilio's public API and is otherwise **operator configuration read only
-from the environment** — the override exists so an operator can point at a regional edge or a local
-mock. It is never derived from inbound data, which is why it legitimately bypasses the SSRF guard
-that protects the *user*-configured webhook URLs.
+``base_url`` defaults to Twilio's public API; the override exists so an operator can point at a
+regional edge or a local mock.
+
+.. rubric:: ==It is no longer only the operator's, and this used to say otherwise==
+
+This module used to state that ``base_url`` "is never derived from inbound data, which is why it
+legitimately bypasses the SSRF guard". **B-03bis made that false**: a business now brings its own
+SMS credential, and may set ``base_url`` with it. See
+:mod:`aethercal.server.integrations.whatsapp.config` for the reasoning in full. The short version:
+a ``CredentialSource.TENANT`` URL goes through the egress guard
+(:func:`~aethercal.server.services.tenant_senders._assert_target_reachable`) and a
+``CredentialSource.INSTANCE`` one does not, because provenance decides and the operator is not
+their own threat model.
 """
 
 from __future__ import annotations

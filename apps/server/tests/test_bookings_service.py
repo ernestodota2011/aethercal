@@ -91,6 +91,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
     run_google_effect,
 )
+from aethercal.server.services.tenant_senders import TenantSenders
 
 
 def _pools(maker: async_sessionmaker[AsyncSession]) -> WorkerPools:
@@ -985,7 +986,9 @@ async def test_email_intent_is_enqueued_and_retryable_even_without_a_configured_
 
     # Draining with no sender configured fails the intent retryably (not delivered, not dropped).
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=None, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=None),
+        service_factory=None,
     )
     report = await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
     assert report.failed == [rows[0].id]
@@ -1009,7 +1012,9 @@ async def test_draining_the_outbox_sends_the_confirmation_once_and_re_drain_is_i
     )
 
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     report = await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1039,7 +1044,9 @@ async def test_a_failing_send_marks_the_intent_for_retry_without_touching_the_bo
     )
 
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_FailingSender(), service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_FailingSender()),
+        service_factory=None,
     )
     report = await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1108,7 +1115,9 @@ async def test_confirmation_and_cancellation_drained_together_only_sends_the_can
 
     # Drain BOTH email intents in one pass.
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1145,7 +1154,9 @@ async def test_a_confirmation_retried_after_cancellation_is_discarded_as_stale(
 
     # Pass 1: the confirmation send FAILS (SMTP down) → parked failed for a backoff retry.
     failing = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_FailingSender(), service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_FailingSender()),
+        service_factory=None,
     )
     await _drain(sqlite_session, sqlite_maker, failing, now=_BEFORE)
 
@@ -1157,7 +1168,9 @@ async def test_a_confirmation_retried_after_cancellation_is_discarded_as_stale(
     # Pass 2 (past the confirmation's retry): a WORKING sender drains both due intents.
     sender = _RecordingSender()
     working = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     await _drain(sqlite_session, sqlite_maker, working, now=_BEFORE + backoff_delay(1))
 
@@ -1194,7 +1207,9 @@ async def test_a_reschedule_email_retried_after_a_further_reschedule_is_discarde
 
     # Pass 1: b2's reschedule send FAILS (b1's now-stale confirmation is silently discarded).
     failing = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=_FailingSender(), service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=_FailingSender()),
+        service_factory=None,
     )
     await _drain(sqlite_session, sqlite_maker, failing, now=_BEFORE)
 
@@ -1212,7 +1227,9 @@ async def test_a_reschedule_email_retried_after_a_further_reschedule_is_discarde
     # Pass 2 (past the retry): the stale b2 reschedule is discarded; only b3's reschedule is sent.
     sender = _RecordingSender()
     working = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
     await _drain(sqlite_session, sqlite_maker, working, now=_BEFORE + backoff_delay(1))
 
@@ -1234,7 +1251,9 @@ async def test_persisted_sequence_strictly_increases_across_reschedules_and_canc
     tenant, event_type = await _seed(sqlite_session, tenant_factory)
     sender = _RecordingSender()
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=None
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=None,
     )
 
     async def _pass() -> None:
@@ -1314,7 +1333,9 @@ async def test_create_then_cancel_before_drain_leaves_no_orphaned_google_event(
     )
 
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
     await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1355,7 +1376,9 @@ async def test_create_then_reschedule_before_drain_yields_one_event_for_the_surv
     )
 
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
     await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1382,7 +1405,9 @@ async def test_cancelling_a_not_yet_synced_reschedule_deletes_the_original_event
     google = _FakeGoogle()
     effects = await _google_effects(sqlite_session, tenant)
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
 
     b1 = await create_booking(
@@ -1506,7 +1531,9 @@ async def test_google_sync_runs_before_the_email_so_the_notice_carries_the_meet_
     )
 
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
     await _drain(sqlite_session, sqlite_maker, execute, now=_BEFORE)
 
@@ -1537,7 +1564,9 @@ async def test_email_defers_without_consuming_attempts_until_google_delivers_the
         effects=effects,
     )
     execute = make_booking_effect_executor(
-        sessionmaker=sqlite_maker, sender=sender, service_factory=lambda _c: google
+        sessionmaker=sqlite_maker,
+        resolve_senders=TenantSenders.for_offline_tests(email=sender),
+        service_factory=lambda _c: google,
     )
     rows = await _outbox_rows(sqlite_session, booking_id=booking.id)
     email = next(r for r in rows if r.effect == OutboxEffect.EMAIL.value)
