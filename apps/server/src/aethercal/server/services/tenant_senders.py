@@ -662,6 +662,17 @@ class _SmtpTarget:
     ``None`` — meaning "resolve as you always did", which is right for the operator's own relay and
     for nothing else."""
 
+    use_tls: bool
+    """Whether the session is encrypted. ==On the witness because the answer needs the PROVENANCE.==
+
+    Deciding this from ``secrets`` alone is impossible: ``use_tls: false`` is the operator's
+    prerogative on their own LAN relay, and is a password on the open internet when a TENANT says it
+    (see :func:`_assert_smtp_host_reachable`). Only the function that knows the
+    :class:`CredentialSource` can answer, so only it decides — and :func:`_smtp_from_secrets` reads
+    the answer off here rather than re-deriving it from the raw field, exactly as it does for
+    ``host``. The same rule applied by hand in two places is the rule that gets applied differently
+    in two places."""
+
 
 def _as_literal_ip(host: str) -> str | None:
     """The host as an IP literal, or ``None`` when it is a name that needs DNS.
@@ -772,13 +783,50 @@ async def _assert_smtp_host_reachable(
 
     ``CredentialSource.INSTANCE`` is exempt for the reason it is exempt on the HTTP side: that host
     is the operator's own relay, configured by the person running the process.
+
+    .. rubric:: ==And it decides ``use_tls``, because that also turns on provenance (B-09)==
+
+    A TENANT credential with ``use_tls: false`` is REFUSED. B-03bis left this, reading it as the
+    confidentiality of the tenant's own secret and therefore theirs to spend. That reading is
+    incomplete twice over: the plaintext session carries ==the GUEST's name, address and booking==,
+    and the guest is not party to the business's configuration choice — and the check above has
+    already forced a tenant's host to be PUBLIC, so there is no "it is on my LAN" case left. It
+    means, exactly and only, the AUTH exchange and the message crossing the open internet in the
+    clear, sent by us.
+
+    The asymmetry was the tell: a tenant's ``base_url`` must be https because "it carries its API
+    key off this network" (:func:`_assert_target_reachable`), while its relay could be plaintext.
+    Same provenance, same secret in flight, opposite rule — only one of them derived.
+
+    ==No opt-out flag==, deliberately. The https rule has no escape hatch and needs none; every real
+    relay has spoken STARTTLS on 587 or implicit TLS on 465 for a decade. The
+    :data:`LEND_OPERATOR_PHONE_IDENTITY_ENV` lesson was that a dangerous thing must not happen by
+    OMISSION — not that every refusal owes the world a switch to turn it back on.
     """
     host = secrets["host"].strip()
+    # Parsed BEFORE the branch so a malformed value is a legible error for the operator's own relay
+    # too, and so the answer is derived exactly once. `_credential_bool` names `use_tls` itself and
+    # never echoes the value.
+    use_tls = _credential_bool(secrets.get("use_tls"), field="use_tls", default=True)
     if source is not CredentialSource.TENANT:
-        # The operator's own relay: `aiosmtplib` resolves it as it always has. Pinning it to public
-        # addresses would break the self-hoster whose relay sits on their LAN — which is not a
-        # threat model, it is their deployment.
-        return _SmtpTarget(host=host, connect=None)
+        # The operator's own relay: `aiosmtplib` resolves it as it always has, and speaks whatever
+        # the operator configured. Pinning it to public addresses — or forcing TLS onto it — would
+        # break the self-hoster whose MTA sits on their LAN, which is not a threat model, it is
+        # their deployment.
+        return _SmtpTarget(host=host, connect=None, use_tls=use_tls)
+    if not use_tls:
+        raise UnusableCredentialError(
+            _unusable_message(
+                CredentialProvider.SMTP,
+                field="use_tls",
+                expected=(
+                    "true. This relay is on the public internet — a tenant's host is required to "
+                    "be — so an unencrypted session puts this credential's password, and the "
+                    "guest's name and email address, in the clear across it. The guest never chose "
+                    "that, and this server is the one that would send it"
+                ),
+            )
+        )
     try:
         await _assert_host_public(host, resolver=resolver)
     except BlockedUrlError as exc:
@@ -808,6 +856,10 @@ async def _assert_smtp_host_reachable(
             _credential_port(secrets.get("port")),
             resolver=resolver,
         ),
+        # Not `use_tls`: a tenant target that reached here IS encrypted — the refusal above is the
+        # only other way out. Writing the literal is what makes that unconditional rather than a
+        # value somebody could later thread a `false` through.
+        use_tls=True,
     )
 
 
@@ -818,9 +870,12 @@ def _smtp_from_secrets(secrets: Mapping[str, str], *, target: _SmtpTarget) -> Sm
     ``store_credential`` enforces at the door. The OPTIONAL fields are not guaranteed anything, and
     that is exactly where :class:`UnusableCredentialError` lives.
 
-    ==The host comes off the witness, never back out of ``secrets``==, for the same reason the phone
-    builder takes its URL off :class:`_EgressTarget`: validating one string and dialing another is
-    not a guard, it is a comment.
+    ==The host AND ``use_tls`` come off the witness, never back out of ``secrets``==, for the same
+    reason the phone builder takes its URL off :class:`_EgressTarget`: validating one string and
+    dialing another is not a guard, it is a comment. ``use_tls`` joined it in B-09 — whether
+    plaintext is allowed depends on the credential's PROVENANCE, which this function does not know
+    and :func:`_assert_smtp_host_reachable` does. Re-reading the raw field here would put the same
+    decision in two places, and the one without the provenance would get it wrong.
     """
     return SmtpConfig(
         host=target.host,
@@ -828,7 +883,7 @@ def _smtp_from_secrets(secrets: Mapping[str, str], *, target: _SmtpTarget) -> Sm
         port=_credential_port(secrets.get("port")),
         username=secrets.get("username") or None,
         password=secrets.get("password") or None,
-        use_tls=_credential_bool(secrets.get("use_tls"), field="use_tls", default=True),
+        use_tls=target.use_tls,
     )
 
 
