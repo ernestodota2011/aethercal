@@ -14,11 +14,19 @@ from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, 
 
 # Stored as its string value (native_enum=False → VARCHAR + CHECK), reusing the core vocabulary so
 # the DB and the domain model never disagree on the set of statuses.
+#
+# ``create_constraint=True`` is NOT decoration. SQLAlchemy 1.4+ defaults it to **False**, so this
+# column has been a bare ``VARCHAR(16)`` with no validation at all since 0001 — the database would
+# have accepted ``status = 'banana'``. The comment above claimed "VARCHAR + CHECK" and the CHECK was
+# never emitted (verified against both the live PostgreSQL 16 schema and the SQLite one). Migration
+# 0005 creates the constraint that should always have been there, over the full four-status
+# vocabulary. Found while adding ``no_show``; fixed at the root rather than worked around.
 _BOOKING_STATUS = sa.Enum(
     BookingStatus,
     name="booking_status",
     native_enum=False,
     length=16,
+    create_constraint=True,
     values_callable=lambda enum: [member.value for member in enum],
 )
 
@@ -44,6 +52,21 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     )
     guest_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     guest_email: Mapped[str] = mapped_column(sa.String(320), nullable=False)
+    # NULL = the guest gave no phone. Validated as E.164 at the SCHEMA layer (``BookingCreate``),
+    # not here: the column is storage, and a WhatsApp/SMS step simply skips a booking without one.
+    guest_phone: Mapped[str | None] = mapped_column(sa.String(20))
+    # WHEN THE CONSENT BOX ON THE BOOKING FORM WAS TICKED. NULL = it was not. Read that precisely:
+    # this is a stamp that the box was ticked. It is NOT verified consent.
+    #
+    # It IS evidence that whoever filled in this booking ticked the box, and when. It is NOT proof
+    # that the OWNER of the number agreed to anything: the number is typed into a PUBLIC form by
+    # whoever is booking, and nothing in this product verifies they possess it. Verifying possession
+    # (an OTP, or a confirmation link) is a DECLARED GAP — see ``docs/phone-channels.md``.
+    #
+    # Persist the tick, or it did not happen: a checkbox whose answer is thrown away is not consent
+    # and cannot be evidenced at all. A WhatsApp/SMS step asks this column "was the box ticked?",
+    # and that is the honest limit of the answer it gets back.
+    guest_phone_consent_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     guest_timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     guest_notes: Mapped[str | None] = mapped_column(sa.Text)
     answers: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)
@@ -55,11 +78,69 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
         sa.String(255), server_default=sa.text("''"), default=_new_ical_uid, nullable=False
     )
     external_event_id: Mapped[str | None] = mapped_column(sa.String(255))
+    # WHERE that external event actually lives. The booking knew the event's ID but not its home, so
+    # a cancel could only GUESS the calendar. Re-designate the booking target and the delete goes to
+    # the wrong calendar, Google answers 404, and the original event is left orphaned in the host's
+    # calendar — in silence. Recording the connection + calendar at write time is what makes the
+    # delete address the same place the create wrote to.
+    #
+    # SET NULL, not CASCADE: revoking a Google connection must never delete the BOOKING. The guest
+    # still has an appointment; all that is lost is our handle on the mirrored calendar event.
+    external_connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("external_connections.id", ondelete="SET NULL")
+    )
+    external_calendar_id: Mapped[str | None] = mapped_column(sa.String(255))
     meeting_url: Mapped[str | None] = mapped_column(sa.String(1024))
     rescheduled_from_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("bookings.id", ondelete="SET NULL")
     )
+    # WHEN THIS BOOKING FIRST BECAME ``CONFIRMED`` — and NULL means it never did. This is the switch
+    # the whole outbound belt reads (B-05a): ==a booking that has never been confirmed emits not one
+    # outbound== — no email, no WhatsApp, no SMS, no webhook, and no Google Calendar event (an event
+    # carrying the guest as an attendee makes GOOGLE mail them the invitation, so an unpaid hold
+    # would announce itself).
+    #
+    # ``status`` cannot be that switch, and the reason is exact: a booking cancelled AFTER being
+    # confirmed must still send its cancellation notice, while an expired unpaid HOLD must not — and
+    # both rows read ``cancelled``. Only a stamp of the FIRST confirmation tells them apart. Read it
+    # as a fact about the PAST — "this appointment was announced" — which is the question every
+    # outbound actually has to answer, rather than as a fact about the present.
+    #
+    # Write-once, and never cleared: cancelling does not un-confirm anything. It moves together with
+    # ``status = 'confirmed'``, in the same statement, everywhere — a confirmed booking left without
+    # this stamp is a booking the belt below would SILENCE, with nothing raised anywhere. A
+    # reschedule successor INHERITS its predecessor's stamp (the same appointment, moved), which is
+    # also the chain B-05b hangs the payment on.
+    confirmed_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # WHEN an unpaid hold self-cancels if nobody pays (B-05b). NULL for every booking that is not a
+    # hold — the free ones, the admin's and the API key's direct confirmations. Deliberately NOT a
+    # new ``BookingStatus``: a ``PENDING`` hold already occupies its slot through the
+    # ``status <> 'cancelled'`` partial index, and when the hold lapses the booking simply moves to
+    # ``CANCELLED`` and the same index frees the slot. No status the enum does not already have.
+    hold_expires_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # ==THE DISCRIMINATOR OF THE WINNER.== Which payment confirmed this booking — so the arbiter can
+    # tell "I am the payment that confirmed it" (a replay → NO-OP) from "I confirmed it, but some
+    # OTHER payment did" (a double payment → refund me). Without it the two are indistinguishable
+    # a paying guest's second card is either kept or their first is refunded. NULL until a payment
+    # wins the conditional UPDATE (or forever, for a free/admin/API-key booking nobody paid for).
+    #
+    # ``use_alter`` breaks the create-order cycle (``payments.booking_id`` → ``bookings`` and this
+    # one → ``payments``): SQLAlchemy emits the constraint after both tables exist, and skips it on
+    # SQLite, where the offline suite only compares columns. SET NULL, never CASCADE: deleting a
+    # payment row must never delete the appointment a guest is holding.
+    confirmed_by_payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey(
+            "payments.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_bookings_confirmed_by_payment_id_payments",
+        ),
+    )
     cancelled_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # When the host marked the guest a no-show (RF-25). Only ever set from ``confirmed``, and only
+    # after the appointment has ENDED. The booking keeps occupying its slot (see BookingStatus).
+    no_show_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     # The persisted iCal SEQUENCE for this booking's UID (RFC 5545, F1-08). Starts at 0 (the
     # confirmation), and every mutation that emits an updated ``.ics`` bumps it — a cancellation
     # bumps it, a reschedule carries the predecessor + 1 — so successive updates strictly increase
@@ -67,6 +148,29 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     sequence: Mapped[int] = mapped_column(
         sa.Integer, server_default=sa.text("0"), default=0, nullable=False
     )
+    # ==THE ADDRESS THE BOOKING CAME FROM — the column a boot-time cap has been demanding since
+    # RF-24.== ``DailyCaps.per_ip`` failed the boot when unset and enforced NOTHING, for the one
+    # reason its own docstring spelled out: no client IP ever reached the send path, because a
+    # booking did not record the address it was made from. A ceiling with nothing to count is not a
+    # ceiling — it is a knob that everybody downstream believes in.
+    #
+    # NULL = this booking did NOT come through the public form. The admin's own booking and the
+    # tenant's API key carry no client address, and neither may be throttled by a stranger's traffic
+    # (:func:`~aethercal.server.integrations.messaging.guard.enforce_ip_cap`). So NULL means "not
+    # capped", never "capped at zero" — the exact opposite of the per-PHONE rule, where a missing
+    # number REFUSES the send, because there the missing value is the thing being messaged.
+    #
+    # ==It is PERSONAL DATA== (roughly: where a person was), so ``guest purge`` erases it —
+    # ``services/privacy.BOOKING_PII_COLUMNS``. It is deliberately NOT named ``guest_*``: that
+    # prefix
+    # drives :func:`guest_columns`, which is the reschedule's copy list, and this is an observation
+    # the SERVER made about a request, not a value the guest supplied. Both seams that must carry it
+    # (the reschedule successor, and the purge) therefore name it explicitly, with a test each.
+    #
+    # 45 characters: the longest IPv6 text form (the IPv4-mapped ``::ffff:255.255.255.255``, at 45).
+    # Whatever lands here has already been through ``ipaddress.ip_address`` — a header value that is
+    # not an address never becomes one on the way in.
+    source_ip: Mapped[str | None] = mapped_column(sa.String(45))
 
     __table_args__ = (
         sa.Index(
@@ -75,14 +179,75 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
             "event_type_id",
             "start_at",
             unique=True,
-            # The partial predicate (cancelled bookings free their slot, RF-04) is declared for
-            # BOTH PostgreSQL (production) and SQLite (the offline test backend) so ``create_all``
-            # builds a genuinely partial index everywhere. Without ``sqlite_where`` SQLite emits a
-            # FULL unique index and a cancelled row keeps occupying its slot, so the offline suite
-            # could not prove the freed-slot semantics. The initial migration stays PostgreSQL-only.
+            # The partial predicate (cancelled bookings free their slot, RF-04) is declared for BOTH
+            # PostgreSQL (production) and SQLite (the offline test backend) so ``create_all`` builds
+            # a genuinely partial index everywhere. Without ``sqlite_where`` SQLite emits a FULL
+            # unique index and a cancelled row keeps occupying its slot, so the offline suite could
+            # not prove the freed-slot semantics. The initial migration stays PostgreSQL-only.
+            #
+            # The predicate is UNCHANGED by the no-show work (RF-25), and that is deliberate rather
+            # than an oversight: the appointment already happened, so freeing its slot would corrupt
+            # history and let a booking be written retroactively over it. "Everything except
+            # cancelled occupies" is the safe default, and ``no_show`` inherits it for free.
             postgresql_where=sa.text("status <> 'cancelled'"),
             sqlite_where=sa.text("status <> 'cancelled'"),
         ),
+    )
+
+
+def guest_columns() -> tuple[str, ...]:
+    """Every column carrying the GUEST's own data — DERIVED from the table, never hand-listed.
+
+    A reschedule does not create a new customer. It moves ONE appointment for ONE person, so the
+    successor row must carry that person over intact. It used to do that by naming each field in a
+    literal at the call site — and a hand-written list of fields is a SECOND declaration of the
+    model, kept in agreement with the first by memory alone.
+
+    They drifted, as that always ends. RF-24 added ``guest_phone`` and ``guest_phone_consent_at``;
+    the copy list never learned about them; so every reschedule dropped the guest's phone number and
+    their consent stamp. Nothing raised, nothing logged, every test passed — and the WhatsApp/SMS
+    steps then skipped that booking forever (``no-phone``), so the reminder for the appointment the
+    guest had *just moved* was the one that never arrived.
+
+    Deriving the set from ``Booking.__table__`` collapses the two declarations into one: the next
+    ``guest_*`` column is carried the day it is added, with nobody having to remember anything.
+
+    ``answers`` is guest data too and is deliberately NOT here: it is a mutable ``dict`` that must
+    be COPIED, not aliased onto both rows, so the caller carries it explicitly (``dict(...)``).
+    """
+    return tuple(col.name for col in Booking.__table__.columns if col.name.startswith("guest_"))
+
+
+def held_filter(now: _dt.datetime) -> sa.ColumnElement[bool]:
+    """The appointments that ALREADY SHOULD HAVE HAPPENED — the denominator of the no-show rate.
+
+    Declared ONCE, on the model, for exactly the reason
+    :func:`~aethercal.server.db.models.outbox.due_filter` is: ==two readers must agree.== The
+    operator's Prometheus gauge (``observability.collect_metrics``) and the tenant's health panel
+    (``admin.metrics_view``) both publish this rate, and written out separately they were already
+    wrong in the same way — each counted ``no_show + confirmed``, with no clock in the predicate at
+    all.
+
+    .. rubric:: Why ``confirmed`` alone is the wrong denominator
+
+    ``CONFIRMED`` is every booking still IN THE DIARY, including every one nobody has attended yet
+    because it has not happened. Count those and a business with one real no-show and ninety-nine
+    appointments next week reads **1 %** when the truth is **100 %**.
+
+    And it is worse than a wrong number: ==the rate FALLS every time a booking is taken.== A metric
+    that improves on its own when business is good is not measuring anything — and this is the
+    number the notification engine is meant to be judged by, so a reminder rule that does not work
+    would look like a success on any week the diary filled up.
+
+    The boundary is therefore the END of the appointment, not its start: a meeting under way right
+    now cannot yet be a no-show. A ``confirmed`` booking whose hour has passed counts as ATTENDED —
+    nobody marked the guest absent, and silence from a host who was in the room is the only evidence
+    there is. ``cancelled`` and ``pending`` are absent by construction: nobody was ever expected to
+    attend them.
+    """
+    return sa.and_(
+        Booking.status.in_((BookingStatus.NO_SHOW.value, BookingStatus.CONFIRMED.value)),
+        Booking.end_at <= now,
     )
 
 
@@ -101,4 +266,4 @@ class GuestToken(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     used_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
 
-__all__ = ["Booking", "GuestToken"]
+__all__ = ["Booking", "GuestToken", "guest_columns", "held_filter"]

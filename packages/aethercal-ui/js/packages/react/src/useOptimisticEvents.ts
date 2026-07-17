@@ -37,6 +37,11 @@ export interface MutationResult {
   start: string;
   end: string;
   revision: number;
+  /**
+   * The resource row the server confirmed (RF-28). Optional: omit it and the optimistically applied
+   * row stands — an acceptance that simply does not restate the resource is not a move back.
+   */
+  resourceId?: string;
 }
 
 export interface UseOptimisticEventsOptions {
@@ -141,6 +146,11 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
         start: payload.start,
         end: payload.end,
         ...(base?.revision !== undefined ? { baseRevision: base.revision } : {}),
+        // A timeline drop carries the target row; forwarding it is what keeps the bar in the row the
+        // user dropped it on while the mutation is in flight, instead of snapping back (RF-28).
+        ...("resourceId" in payload && payload.resourceId !== undefined
+          ? { resourceId: payload.resourceId }
+          : {}),
       });
 
       timers.set(
@@ -189,6 +199,7 @@ export function useOptimisticEvents(options: UseOptimisticEventsOptions): UseOpt
             start: result.start,
             end: result.end,
             revision: result.revision,
+            ...(result.resourceId !== undefined ? { resourceId: result.resourceId } : {}),
           });
         })
         .catch(rollback);

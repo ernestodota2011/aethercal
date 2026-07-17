@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       # No third-party JS setup action: ubuntu-latest ships Node 20 + npm, so we install a
       # pinned pnpm with the preinstalled npm. This keeps the CI supply-chain surface to the
-      # single already-SHA-pinned action above (CLAUDE.md agentic-security).
+      # single already-SHA-pinned action above (house security policy: pin actions by SHA).
       - name: Install pnpm (Node preinstalled on the runner)
         working-directory: ${{ github.workspace }}
         run: npm install -g pnpm@10.32.1
@@ -129,12 +129,186 @@ jobs:
           enable-cache: true
       - name: Sync workspace (locked)
         run: uv sync --locked
-      # Runs only the db-marked tests (autogenerate/type parity + the advisory-lock concurrency
-      # and partial-index enforcement) against a real PostgreSQL; the default matrix skips them.
+      # ==The three roles. Without them, the isolation suite is theatre.==
+      #
+      # `CREATE ROLE ... BYPASSRLS` needs SUPERUSER, so it cannot come from an Alembic migration (which
+      # runs as the owner) — and it must not come from the postgres image's init scripts either: those
+      # only fire on an EMPTY volume, so they would work perfectly here, in CI, and never run on the
+      # instance that actually matters. It is provisioning, and it is explicit.
+      #
+      # The password is a literal because this database is ephemeral, bound to localhost, and destroyed
+      # with the job — exactly like the `postgres:postgres` above it, which has been committed to this
+      # public repository since the day this job was written.
+      - name: Provision the three database roles (superuser; BYPASSRLS demands it)
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d aethercal_test -v ON_ERROR_STOP=1 \
+               -v db=aethercal_test \
+               -v pw_owner=aethercal_ci -v pw_app=aethercal_ci -v pw_worker=aethercal_ci \
+               -f deploy/sql/provision_roles.sql
+          # The per-run schemas the harness creates are OWNED BY aethercal_owner, so the role it
+          # bootstraps with has to be a member of that one. (Production needs none of this: there, the
+          # owner creates its own schema.)
+          psql -h localhost -U postgres -d aethercal_test -v ON_ERROR_STOP=1 -c \
+               "GRANT aethercal_owner, aethercal_app, aethercal_worker TO postgres"
+      # Runs only the db-marked tests (autogenerate/type parity, the advisory-lock concurrency, the
+      # partial-index enforcement — and the isolation belt: three real roles, a really-migrated schema,
+      # the seeding on the OWNER engine and the system under test on the APP engine) against a real
+      # PostgreSQL. The default matrix skips them.
       - name: Test (pytest, db-marked)
         env:
           AETHERCAL_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aethercal_test
-        run: uv run pytest -m db
+          # Absent, the isolation suite ERRORS — it does not skip. A skipped isolation suite exits 0,
+          # and a green run that proved nothing about isolation is the exact silent no-op this whole
+          # batch exists to end.
+          AETHERCAL_TEST_ROLE_PASSWORD: aethercal_ci
+        run: uv run pytest -m db -rs --junitxml=db-results.xml
+      # Each run takes a PostgreSQL SCHEMA of its own (apps/server/tests/conftest.py::pg_url), so
+      # this job is safe to run beside any other `-m db` run — two of them sharing one database is
+      # what used to make them drop each other's tables mid-flight.
+      #
+      # THE GATE MUST NOT PASS ON AN EMPTY RUN. The db-marked tests skip themselves when
+      # AETHERCAL_TEST_DATABASE_URL is unset (apps/server/tests/conftest.py::pg_url), and a
+      # `pytest -m db` that skips everything exits 0 — so a typo in the variable name, a dropped
+      # `services:` block, or a renamed marker would turn this job GREEN having executed not one
+      # test against PostgreSQL. That is the silent no-op, aimed at our own safety net. So we read
+      # the report back and fail unless the tests actually RAN.
+      - name: Assert the db-marked tests really ran (a skipped suite must FAIL, not pass)
+        run: |
+          uv run python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("db-results.xml")
+          if not report.exists():
+              sys.exit("::error::pytest wrote no JUnit report — the db-marked suite never ran.")
+
+          root = ET.parse(report).getroot()
+          total = skipped = failures = errors = 0
+          for suite in root.iter("testsuite"):
+              total += int(suite.get("tests") or 0)
+              skipped += int(suite.get("skipped") or 0)
+              failures += int(suite.get("failures") or 0)
+              errors += int(suite.get("errors") or 0)
+
+          print(f"db-marked: {total} collected, {total - skipped} ran, {skipped} skipped, "
+                f"{failures} failed, {errors} errored")
+
+          # Every decline, named out loud: a skip nobody reads is how one quietly becomes a habit.
+          for case in root.iter("testcase"):
+              for skip in case.iter("skipped"):
+                  print(f"  declined: {case.get('classname')}::{case.get('name')}\n"
+                        f"      {skip.get('message')}")
+
+          if total == 0:
+              sys.exit(
+                  "::error::No db-marked test ran. A `pytest -m db` that collects nothing still "
+                  "exits 0 — the gate would be green having tested nothing against PostgreSQL."
+              )
+
+          # ==Did the suite reach PostgreSQL? That is this job's ONE question.==
+          #
+          # It used to ask "were there zero skips?", treating ANY skip as "PostgreSQL was
+          # unreachable or AETHERCAL_TEST_DATABASE_URL was unset". That proxy was exact only while
+          # no db-marked test could legitimately decline — and it stopped being exact the moment one
+          # could: `test_the_database_reaches_its_tailnet_host_through_the_floor` needs a database
+          # the network guard would REFUSE, and a loopback service container is not one, so here it
+          # declines instead of passing while proving nothing. A guard must answer its own question;
+          # inheriting a neighbour's classification is how it comes to fail the wrong thing.
+          #
+          # The condition this job exists for is unmissable and unchanged: with no database,
+          # `pg_admin_url` skips at the FIXTURE, so every db-marked test skips and nothing runs at
+          # all. That is what is checked below. A suite in which anything ran did reach PostgreSQL —
+          # which is the whole claim this job defends. Individual declines are the deciding test's
+          # own business, and it must justify each one in its docstring; they are printed above so
+          # the justification is visible rather than assumed.
+          if total == skipped:
+              sys.exit(
+                  f"::error::All {total} db-marked test(s) SKIPPED — PostgreSQL was unreachable or "
+                  "AETHERCAL_TEST_DATABASE_URL was unset. A skipped suite exits 0; this job exists "
+                  "precisely so that cannot pass."
+              )
+          PY
+
+  docker-build:
+    name: Docker image (deploy/Dockerfile builds)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # The deploy image is the shipping artifact for BOTH compose services — the API (`app`) and the
+      # public booking page (`booking`), which reuse the same image with a different command — so a
+      # broken Dockerfile breaks the entire self-host path. Build it exactly the way deploy/README.md
+      # documents: from the REPOSITORY ROOT, because the context needs uv.lock + every workspace
+      # member. Docker is preinstalled on ubuntu-latest, so a plain `docker build` keeps the CI
+      # supply-chain surface to the single SHA-pinned action above (no buildx / build-push actions),
+      # the same rationale as the calendar-js job. Precondition for the E2E job that follows.
+      - name: Build the deploy image
+        run: docker build -f deploy/Dockerfile -t aethercal-server .
+
+  # The end-to-end gate (F1-13). Two independent runners over the SAME shipping stack
+  # (deploy/docker-compose.yml + e2e/compose.e2e.yml):
+  #
+  #   * golden — a guest books in a real browser on the public page; the API, the outbound webhook
+  #     (HMAC-verified over the exact bytes) and the confirmation email are then made to agree; the
+  #     booking is rescheduled and cancelled, and the slot grid is checked to move with it (RF-23).
+  #   * a11y   — axe-core over every step of the booking flow, in both locales. This used to be a
+  #     manual, unrepeatable run; the contrast bug it once caught could have come straight back.
+  #
+  # `needs: docker-build` so a broken image fails ONCE, loudly, instead of three times obscurely.
+  # The suite never boots the app itself: it points at the artifact users deploy. It cannot pass
+  # without a live stack (e2e/src/stack.ts + global-setup.ts fail closed).
+  e2e:
+    name: E2E — ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    needs: docker-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: golden
+            label: golden flow (book → webhook → email → reschedule → cancel)
+          - suite: a11y
+            label: accessibility (axe on the booking page)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Node is preinstalled on the runner; a pinned pnpm keeps the CI supply-chain surface to the
+      # SHA-pinned actions only — the same rationale as the calendar-js job.
+      - name: Install pnpm (Node preinstalled on the runner)
+        run: npm install -g pnpm@10.32.1
+      - name: Install the E2E suite (frozen lockfile)
+        working-directory: e2e
+        run: pnpm install --frozen-lockfile
+      - name: Install the browser
+        working-directory: e2e
+        run: pnpm exec playwright install --with-deps chromium
+      # Docker + Compose are preinstalled on ubuntu-latest. This builds the deploy image, migrates
+      # on boot, creates the tenant with the admin CLI, and only then starts the booking page —
+      # the sequence deploy/README.md prescribes, so a broken quickstart breaks this job.
+      - name: Bring up the shipping stack (+ mailbox + webhook sink)
+        run: bash e2e/scripts/stack-up.sh
+      - name: Run the suite
+        working-directory: e2e
+        run: pnpm run test:${{ matrix.suite }}
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          docker compose -f deploy/docker-compose.yml -f e2e/compose.e2e.yml logs --tail 200
+      - name: Upload the Playwright report (trace + video)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-${{ matrix.suite }}-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+      - name: Tear the stack down
+        if: always()
+        run: bash e2e/scripts/stack-down.sh
 
   calendar-release:
     name: Calendar release (wheel ships the JS bundle)

@@ -142,8 +142,14 @@ _EN = _Copy(
 _COPY: Mapping[str, _Copy] = {"es": _ES, "en": _EN}
 
 
-def _normalize_locale(locale: str) -> str:
-    """Reduce a locale tag to ``"en"`` or (the primary) ``"es"`` (RNF-1)."""
+def normalize_locale(locale: str) -> str:
+    """Reduce a locale tag to ``"en"`` or (the primary) ``"es"`` (RNF-1).
+
+    Public because the TITLE lookup must be normalised by exactly the same rule as the surrounding
+    COPY. A browser sends ``en-US`` while the tenant stored its override under ``en``; normalising
+    in one place and not the other serves an English speaker English scaffolding wrapped around a
+    Spanish title — which is precisely the shape the defect took.
+    """
     primary = locale.split("-", 1)[0].strip().lower()
     return "en" if primary == "en" else "es"
 
@@ -190,7 +196,7 @@ def build_notification_email(
     :class:`~aethercal.server.integrations.smtp.sender.SmtpEmailSender` stamps it from its config so
     the composer stays free of any environment/secret.
     """
-    copy = _COPY[_normalize_locale(locale)]
+    copy = _COPY[normalize_locale(locale)]
 
     message = EmailMessage()
     message["Subject"] = copy.subjects[kind].format(title=context.event_title)
@@ -223,4 +229,9 @@ def build_notification_email(
     return message
 
 
-__all__ = ["BookingEmailContext", "NotificationKind", "build_notification_email"]
+__all__ = [
+    "BookingEmailContext",
+    "NotificationKind",
+    "build_notification_email",
+    "normalize_locale",
+]

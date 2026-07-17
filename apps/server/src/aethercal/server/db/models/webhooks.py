@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aethercal.server.db.base import Base, CreatedAt, TenantScoped, Timestamps, UUIDPrimaryKey
+from aethercal.server.db.encrypted import FERNET_AT_REST
 
 
 class Webhook(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
@@ -18,7 +19,14 @@ class Webhook(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     __tablename__ = "webhooks"
 
     url: Mapped[str] = mapped_column(sa.String(2048), nullable=False)
-    secret: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
+    # The HMAC secret shared with the subscriber, held as a Fernet token (services/webhooks.py). The
+    # `info` marker is what enrols this column in `db.encrypted.encrypted_columns`, and therefore in
+    # the key rotation. A rotation that missed it would leave every webhook secret encrypted under a
+    # secret the operator has just retired — and the symptom would arrive weeks later, as an
+    # InvalidToken in the delivery worker, on data nothing can decrypt any more.
+    secret: Mapped[bytes] = mapped_column(
+        sa.LargeBinary, nullable=False, info={FERNET_AT_REST: True}
+    )
     events: Mapped[list[Any]] = mapped_column(sa.JSON, default=list, nullable=False)
     active: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("true"), nullable=False)
 
@@ -40,6 +48,17 @@ class WebhookDelivery(UUIDPrimaryKey, TenantScoped, CreatedAt, Base):
     last_attempt_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     next_retry_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     response_code: Mapped[int | None] = mapped_column(sa.Integer)
+    error_reason: Mapped[str | None] = mapped_column(sa.String(32))
+    """WHY the last attempt did not succeed — one of
+    :data:`~aethercal.server.webhooks.delivery.DELIVERY_FAILURE_REASONS`, or ``NULL`` on success (a
+    recovered row clears it, so the column never keeps a stale reason).
+
+    ==Without it, ``dead`` was the answer to four different questions.== An SSRF attempt, a
+    self-hoster's own LAN address with no allowlist declared, a DNS blip, and a subscriber that
+    5xx'd six times all produced the same row — ``dead``, ``response_code = NULL``, nothing else —
+    so an operator whose n8n was receiving nothing had no way to tell which had happened. Persisted
+    rather than merely logged or counted: the operator reads the TABLE, a process counter resets on
+    restart, and a log line is gone by the time anybody asks."""
 
     __table_args__ = (sa.Index("ix_webhook_deliveries_due", "status", "next_retry_at"),)
 

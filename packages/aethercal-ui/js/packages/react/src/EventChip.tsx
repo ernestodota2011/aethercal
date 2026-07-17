@@ -9,6 +9,13 @@ interface EventChipProps {
   /** Pre-formatted, locale-aware time label, or null for all-day events. */
   timeLabel: string | null;
   onDragStart: (eventId: string) => void;
+  /**
+   * Whether a drag can actually land anywhere — i.e. the host wired `onEventDrop`. Without it the
+   * chip must NOT advertise itself as draggable: the user would drag it, drop it, and nothing would
+   * happen. A silent no-op is worse than no affordance at all. Defaults to true so a standalone
+   * consumer that drives the drag itself is unaffected.
+   */
+  canDrag?: boolean;
   onDragEnd: () => void;
   /** An optimistic mutation is in flight for this event (pending affordance). */
   isPending?: boolean;
@@ -49,6 +56,7 @@ export function EventChip({
   timeLabel,
   onDragStart,
   onDragEnd,
+  canDrag = true,
   isPending,
   isRolledBack,
   onClick,
@@ -59,6 +67,8 @@ export function EventChip({
   isGrabbed,
 }: EventChipProps): React.JSX.Element {
   const editable = event.editable !== false;
+  // A drag is only offered when the event may move AND the host can receive the drop.
+  const draggable = editable && canDrag;
   const style: StyleWithVars | undefined = event.color
     ? { "--ac-event-accent": event.color }
     : undefined;
@@ -76,12 +86,17 @@ export function EventChip({
       )}
       {...(id ? { id } : {})}
       {...(interactive ? { role: "button" } : {})}
-      draggable={editable}
+      draggable={draggable}
       data-event-id={event.id}
       aria-label={accessibleLabel}
       title={event.title}
       style={style}
       onDragStart={(e) => {
+        // Belt and braces: never let a gesture start that has nowhere to land.
+        if (!draggable) {
+          e.preventDefault();
+          return;
+        }
         e.dataTransfer.setData("text/plain", event.id);
         e.dataTransfer.effectAllowed = "move";
         onDragStart(event.id);

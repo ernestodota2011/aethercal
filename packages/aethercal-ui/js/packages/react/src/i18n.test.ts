@@ -53,7 +53,7 @@ describe("resolveMessages", () => {
     expect(resolveMessages("fr-CA", undefined, registry).noEvents).toBe("Aucun événement");
   });
 
-  it("Spanish never uses voseo (CLAUDE.md hard rule)", () => {
+  it("Spanish never uses voseo (house style: neutral Latin American Spanish)", () => {
     const m = resolveMessages("es");
     const samples = [
       m.allDay,

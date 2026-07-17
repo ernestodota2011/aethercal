@@ -87,8 +87,9 @@ def test_light_secondary_and_tertiary_text_meet_aa() -> None:
 @pytest.mark.parametrize("name", ["dark", "midnight"])
 def test_dark_secondary_and_tertiary_text_meet_aa(name: str) -> None:
     # The dark presets were held to AA only for the primary body text (fg-on-bg); their secondary
-    # (`muted`) and tertiary (`faint`) text must clear WCAG AA (>= 4.5:1) too — a real-browser axe run
-    # caught `faint` failing on the dark surfaces (hour axis, "all day" rowheader, legends, footer).
+    # (`muted`) and tertiary (`faint`) text must clear WCAG AA (>= 4.5:1) too — a real-browser axe
+    # run caught `faint` failing on the dark surfaces (hour axis, "all day" rowheader, legends,
+    # footer).
     # Assert each token against every dark surface it renders on, mirroring the light-preset guard.
     theme = PRESETS[name]
     muted_surfaces = (theme.bg, theme.cell_bg, theme.event_bg, theme.cell_bg_outside)

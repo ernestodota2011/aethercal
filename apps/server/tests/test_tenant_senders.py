@@ -1,0 +1,1721 @@
+"""The per-business SENDING funnel: whose credential a message actually goes out on (B-03bis).
+
+B-03 built the machinery — encrypted per-business credentials, and the two doors
+(:func:`resolve_money_credential` / :func:`resolve_infra_credential`) that read them. It did not
+wire the SENDERS to it. Until this cut, ``app.build_email_sender`` / ``app.build_channel_senders``
+read the instance's environment ONCE at boot, and the drain pushed every business's message through
+that one object: ==a business's WhatsApp went out from the INSTANCE OPERATOR's number.==
+
+These tests pin the two halves of the fix:
+
+* the instance default survives exactly where it is legitimate (SMTP), and
+* it does not exist at all where the account IS the identity (WhatsApp/SMS).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import uuid
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from email.message import EmailMessage
+from unittest import mock
+
+import httpx
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from aethercal.server.channels import Channel
+from aethercal.server.crypto import derive_fernet_key
+from aethercal.server.db.models import Tenant
+from aethercal.server.integrations.messaging.status import is_definitely_undelivered
+from aethercal.server.integrations.smtp.config import SmtpConfig
+from aethercal.server.integrations.smtp.sender import SmtpEmailSender
+from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
+from aethercal.server.services.outbox import (
+    OutboxDeferred,
+    OutboxEffect,
+    OutboxSkipped,
+    OutboxWork,
+    _refuse_channel,
+    make_booking_effect_executor,
+)
+from aethercal.server.services.tenant_credentials import (
+    CredentialClass,
+    CredentialProvider,
+    CredentialSource,
+    WrongCredentialClassError,
+    credential_class,
+    required_fields,
+    store_credential,
+)
+from aethercal.server.services.tenant_senders import (
+    _SPECS,
+    LEND_OPERATOR_PHONE_IDENTITY_ENV,
+    EgressBlocked,
+    EgressGuardedTransport,
+    InstanceFallback,
+    InstanceSenderDefaults,
+    SenderClients,
+    TenantSenders,
+    UncappedChannelError,
+    UnusableCredentialError,
+    _assert_smtp_host_reachable,
+    _open_pinned_socket,
+    _smtp_from_secrets,
+    _SmtpTarget,
+    channel_for,
+    instance_fallback,
+    resolve_tenant_senders,
+)
+from aethercal.server.webhooks.ssrf import BlockedUrlError, TargetUnresolvable
+
+TenantFactory = Callable[..., Awaitable[Tenant]]
+
+_NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+
+
+def _email_work(tenant_id: uuid.UUID) -> OutboxWork:
+    """One claimed EMAIL intent belonging to ``tenant_id``."""
+    return OutboxWork(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        booking_id=uuid.uuid4(),
+        effect=OutboxEffect.EMAIL,
+        dedupe_key="email:confirmation",
+        payload={"kind": "confirmation"},
+        attempts=0,
+        claimed_by="test-worker",
+    )
+
+
+KEY = derive_fernet_key("offline-test-app-secret")
+
+# Every value below is synthetic, and obviously so. Nothing here redacts anything real.
+_OPERATOR_ENV = {
+    "AETHERCAL_SMTP_HOST": "smtp.instance.example",
+    "AETHERCAL_SMTP_FROM": "noreply@instance.example",
+    "AETHERCAL_WHATSAPP_BASE_URL": "https://evolution.instance.example",
+    "AETHERCAL_WHATSAPP_INSTANCE": "operator-instance",
+    "AETHERCAL_WHATSAPP_API_KEY": "NOT_A_REAL_OPERATOR_KEY",
+    "AETHERCAL_WHATSAPP_DAILY_CAP_PER_PHONE": "3",
+    "AETHERCAL_WHATSAPP_DAILY_CAP_PER_IP": "5",
+    # The SMS CAPS but not the SMS credentials: the operator runs no Twilio of their own, and a
+    # business may still bring one. The caps are read independently of the credentials precisely so
+    # that case has a ceiling — without them the channel is refused before the egress guard is even
+    # reached, which would make every SSRF case below pass for the wrong reason.
+    "AETHERCAL_SMS_DAILY_CAP_PER_PHONE": "3",
+    "AETHERCAL_SMS_DAILY_CAP_PER_IP": "5",
+}
+
+_TENANT_WHATSAPP = {
+    "base_url": "https://evolution.business.example",
+    "instance": "the-business-instance",
+    "api_key": "NOT_A_REAL_BUSINESS_KEY",
+}
+_TENANT_SMTP = {"host": "smtp.business.example", "from_addr": "hello@business.example"}
+
+
+class TestWhatTheInstanceDefaultActuallyIs:
+    """==The whole product decision, in one classification.==
+
+    ``credential_class`` answers *"does it move money?"*. That is not the question a SENDER asks.
+    Both SMTP and WhatsApp are INFRA, and their instance defaults are not the same kind of object:
+
+    * an SMTP relay is a **pipe**. The identity travels per message, in the ``From`` header, which
+      ``SmtpEmailSender.send`` stamps only when it is unset — so a business's mail can go through
+      the operator's relay *as the business*. Lending it is infrastructure, and a single-business
+      self-hoster who set ``AETHERCAL_SMTP_*`` once is entitled to have it keep working;
+    * a WhatsApp/Twilio account is an **identity**. There is no per-message From: the number IS
+      what the recipient sees, and what they reply to. Lending it does not send the business's
+      message through the operator's pipe — it sends it AS the operator.
+    """
+
+    def test_smtp_lends_a_transport_and_whatsapp_and_sms_lend_an_identity(self) -> None:
+        assert instance_fallback(CredentialProvider.SMTP) is InstanceFallback.LENT_TRANSPORT
+        assert instance_fallback(CredentialProvider.WHATSAPP) is InstanceFallback.OPERATOR_IDENTITY
+        assert instance_fallback(CredentialProvider.SMS) is InstanceFallback.OPERATOR_IDENTITY
+
+    def test_every_infra_provider_is_classified(self) -> None:
+        """==A new sending provider does not get a default by inheriting one.==
+
+        The ``assert_never`` in :func:`instance_fallback` is the real gate — a new member with no
+        branch fails pyright. This costs one loop and catches the day somebody silences the type
+        error instead of thinking about the branch. Same belt-and-braces shape as
+        ``test_every_declared_reason_is_handled``.
+        """
+        infra = [
+            provider
+            for provider in CredentialProvider
+            if credential_class(provider) is CredentialClass.INFRA
+        ]
+        assert infra, "the walk found no INFRA provider at all — the guard is vacuous"
+        for provider in infra:
+            assert instance_fallback(provider) in InstanceFallback
+
+    def test_a_money_provider_has_no_answer_here_at_all(self) -> None:
+        """Routing Stripe through the sending classifier must not quietly return a fallback.
+
+        The money path's whole guarantee is that no code path exists which could hand it an
+        instance default. This function is a *classifier of defaults*, so a money provider arriving
+        here is a bug, and it says so rather than answering.
+        """
+        for provider in (CredentialProvider.STRIPE, CredentialProvider.MERCADO_PAGO):
+            with pytest.raises(WrongCredentialClassError):
+                instance_fallback(provider)
+
+
+class TestTheChannelVocabularyLinesUp:
+    def test_every_infra_provider_maps_to_a_channel(self) -> None:
+        """The sending providers are exactly the delivery channels.
+
+        Not decoration: the drain's registry is keyed by :class:`Channel`, and the credential
+        vocabulary is keyed by :class:`CredentialProvider`. If those two ever stop lining up, a
+        business could configure a credential for a channel nothing reads — a credential that looks
+        configured and sends nothing.
+        """
+        assert channel_for(CredentialProvider.WHATSAPP) is Channel.WHATSAPP
+        assert channel_for(CredentialProvider.SMS) is Channel.SMS
+        assert channel_for(CredentialProvider.SMTP) is Channel.EMAIL
+
+
+async def _business(session: AsyncSession, tenant_factory: TenantFactory, slug: str) -> Tenant:
+    return await tenant_factory(session, slug=slug, email=f"{slug}@example.com")
+
+
+def _defaults(**overrides: str) -> InstanceSenderDefaults:
+    return InstanceSenderDefaults.from_env({**_OPERATOR_ENV, **overrides})
+
+
+def _clients(client: object) -> SenderClients:
+    """Both clients pointing at the same test double.
+
+    ==The PAIRING is what these tests assert, not the transport.== Whether the guarded client really
+    re-pins at connect is `TestTheGuardedTransportClosesRebinding`'s job, against the real
+    `EgressGuardedTransport`. Here what matters is that `_assert_target_reachable` hands a TENANT
+    target the `.tenant` client and an INSTANCE target the `.operator` one — so the doubles are
+    distinguishable by identity, and nothing else.
+    """
+    return SenderClients(operator=client, tenant=client)  # type: ignore[arg-type]
+
+
+def _refusal_for(senders: object, provider: CredentialProvider) -> Exception:
+    """The error recorded for ``provider``'s channel. ==Asserts it is THERE, not that it escaped.==
+
+    A refused credential used to blow the whole resolve up, which is what took a business's EMAIL
+    down along with its bad WhatsApp. It is now scoped to its own channel — so the assertion moves
+    from "the function raised" to "this channel, and only this channel, carries the reason".
+    """
+    channel = channel_for(provider)
+    errors = senders.channel_errors  # type: ignore[attr-defined]
+    assert channel in errors, (
+        f"the {channel.value} channel was refused and recorded no reason. Silently absent is "
+        "indistinguishable from never configured — that is the no-op, not a fix for it."
+    )
+    return errors[channel]
+
+
+async def _public_dns(host: str) -> list[str]:
+    """A resolver that answers with one ordinary public address.
+
+    Injected everywhere below, because the egress guard now does REAL DNS on a tenant's `base_url`
+    and these fixtures use `.example` names that resolve to nothing. That is the guard working, not
+    a nuisance: a test that reached the real resolver would be asserting against whatever the CI
+    box's DNS happened to say today.
+    """
+    return ["93.184.216.34"]
+
+
+async def _senders(
+    session: AsyncSession,
+    tenant: Tenant,
+    *,
+    defaults: InstanceSenderDefaults,
+    client: httpx.AsyncClient,
+    resolver: object = _public_dns,
+) -> object:
+    return await resolve_tenant_senders(
+        session,
+        tenant_id=tenant.id,
+        fernet_key=KEY,
+        defaults=defaults,
+        clients=_clients(client),
+        resolver=resolver,  # type: ignore[arg-type]
+    )
+
+
+class TestABusinessSendsOnItsOwnPhoneAccountOrOnNoneAtAll:
+    """==The bug this whole cut exists to close.==
+
+    The instance HAS a WhatsApp number configured throughout this class (``_OPERATOR_ENV``). Before
+    B-03bis every business on the instance sent through it.
+    """
+
+    async def test_a_business_with_no_whatsapp_credential_does_not_get_the_operators_number(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The leak, pinned.==
+
+        The operator's Evolution instance is fully configured. This business has brought no
+        credential. It must get NO WhatsApp channel at all — not the operator's.
+
+        The alternative is not "a degraded mode": it is this business's guest receiving a message
+        from, and replying to, a number that belongs to somebody else entirely.
+        """
+        business = await _business(sqlite_session, tenant_factory, "no-creds")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert Channel.WHATSAPP not in senders.channels, (
+            "a business with no WhatsApp credential of its own was handed the OPERATOR's number. "
+            "Its guest would be messaged by a stranger."
+        )
+
+    async def test_a_business_with_its_own_whatsapp_credential_sends_on_that_one(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The business's own wins — and it is really ITS values in the live client, not the
+        operator's."""
+        business = await _business(sqlite_session, tenant_factory, "own-creds")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        sender = senders.channels[Channel.WHATSAPP]
+        assert isinstance(sender, EvolutionWhatsAppSender)
+        config = sender._config
+        assert config.instance == _TENANT_WHATSAPP["instance"]
+        assert config.base_url == _TENANT_WHATSAPP["base_url"]
+
+    async def test_two_businesses_resolve_to_two_different_accounts(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The isolation, stated as the thing an operator would actually check.==
+
+        One business brought a credential; the other did not. The one that did sends on its own; the
+        one that did not sends on nothing. Neither one ever touches the other's account, and neither
+        touches the operator's.
+        """
+        first = await _business(sqlite_session, tenant_factory, "biz-a")
+        second = await _business(sqlite_session, tenant_factory, "biz-b")
+        await store_credential(
+            sqlite_session,
+            tenant_id=first.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            defaults = _defaults()
+            first_senders = await _senders(sqlite_session, first, defaults=defaults, client=client)
+            second_senders = await _senders(
+                sqlite_session, second, defaults=defaults, client=client
+            )
+
+        assert (
+            first_senders.channels[Channel.WHATSAPP]._config.instance
+            == (_TENANT_WHATSAPP["instance"])
+        )
+        assert Channel.WHATSAPP not in second_senders.channels
+
+    async def test_the_operators_number_is_lent_only_when_the_operator_says_so(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The self-hoster's escape hatch — and it takes a DECLARATION to open.
+
+        One business on one instance IS the operator, so their own ``AETHERCAL_WHATSAPP_*`` is
+        their own number. That case is real and must keep working. It is opt-in because the bug
+        being fixed is that it used to happen by omission.
+        """
+        business = await _business(sqlite_session, tenant_factory, "self-host")
+
+        async with httpx.AsyncClient() as client:
+            lent = await _senders(
+                sqlite_session,
+                business,
+                defaults=_defaults(**{LEND_OPERATOR_PHONE_IDENTITY_ENV: "true"}),
+                client=client,
+            )
+
+        sender = lent.channels[Channel.WHATSAPP]
+        assert sender._config.instance == _OPERATOR_ENV["AETHERCAL_WHATSAPP_INSTANCE"]
+
+
+class TestEmailKeepsTheRelayItAlwaysHad:
+    """==The half that must NOT change.==
+
+    An SMTP relay is a pipe: ``SmtpEmailSender.send`` stamps ``From`` only when it is unset, so a
+    business's mail goes through the operator's relay AS the business. The agency's own instance
+    runs with WhatsApp off and its reminders on email through exactly this default. Breaking it
+    would be a self-inflicted outage in the name of a rule that does not apply to a transport.
+    """
+
+    async def test_a_business_with_no_smtp_credential_still_uses_the_instance_relay(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "mail-default")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert isinstance(senders.email, SmtpEmailSender)
+        assert senders.email._config.host == _OPERATOR_ENV["AETHERCAL_SMTP_HOST"]
+
+    async def test_a_business_with_its_own_smtp_credential_uses_that_one(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "mail-own")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets=_TENANT_SMTP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email._config.host == _TENANT_SMTP["host"]
+        assert senders.email._config.from_addr == _TENANT_SMTP["from_addr"]
+
+    async def test_an_instance_with_no_smtp_at_all_simply_sends_no_email(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """No relay and no credential is "off", exactly as ``build_email_sender`` always meant —
+        never a boot failure and never a 500 on the booking flow."""
+        business = await _business(sqlite_session, tenant_factory, "mail-none")
+        bare = InstanceSenderDefaults.from_env({})
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=bare, client=client)
+
+        assert senders.email is None
+        assert senders.channels == {}
+
+
+class TestACredentialWithNoCeilingIsNotACeilingAtAll:
+    async def test_a_business_whose_channel_has_no_declared_caps_stays_off(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Fail-closed where it would be easiest to fail open.==
+
+        The business HAS its own WhatsApp credential. The operator has declared no daily caps for
+        the channel (they run no WhatsApp themselves, so ``EvolutionConfig.from_env`` never reads
+        them). Building the sender anyway would put an UNCAPPED phone channel behind a PUBLIC
+        booking form — the one state ``PhoneChannelSender`` exists to make unrepresentable.
+
+        So the channel stays off. Not silently: the resolver logs which variables would turn it on.
+        """
+        business = await _business(sqlite_session, tenant_factory, "no-caps")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+        capless = InstanceSenderDefaults.from_env(
+            {
+                "AETHERCAL_SMTP_HOST": "smtp.instance.example",
+                "AETHERCAL_SMTP_FROM": "noreply@instance.example",
+            }
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=capless, client=client)
+
+        assert Channel.WHATSAPP not in senders.channels
+        # ==And RETRYABLE, not discarded.== The business HAS a credential, so this is a FAULT, not
+        # "the channel is off". It used to be silently absent — which the drain reads as terminal —
+        # so a guest's reminder was destroyed for ever over a variable the operator sets in a
+        # minute, and setting it afterwards brought nothing back.
+        assert isinstance(senders.channel_errors[Channel.WHATSAPP], UncappedChannelError), (
+            "a credential with no caps was treated as 'the channel is off'. Off is terminal; this "
+            "is undone by one line in an env file, so it cannot be."
+        )
+        assert "DAILY_CAP_PER_PHONE" in str(senders.channel_errors[Channel.WHATSAPP])
+
+    async def test_a_businesss_own_sender_is_capped_by_the_operators_declared_ceiling(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The ceiling is the OPERATOR's policy even on the business's own account.
+
+        The cap protects the stranger whose number somebody typed into the operator's public form,
+        and that harm does not change owner along with the API key. (The COUNTING was already
+        per-business — ``phone_sends_in_window`` filters by ``tenant_id``; only the ceiling's value
+        is instance-wide.)
+        """
+        business = await _business(sqlite_session, tenant_factory, "capped")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        caps = senders.channels[Channel.WHATSAPP].caps
+        assert caps.per_phone == 3
+        assert caps.per_ip == 5
+
+
+# The forbidden destinations as LITERAL addresses — each one a real attack, not a category. A tenant
+# sets its own `base_url`; the SERVER makes the request, with the SERVER's reachability.
+#
+# Literals only, deliberately: `assert_target_allowed` short-circuits an IP literal without DNS, so
+# these need no resolver to be meaningful. A forbidden destination reached by NAME is a different
+# mechanism and has its own test below (`..._RESOLVES_inward_...`) — folding the two together would
+# let an injected resolver quietly decide the answer to both.
+_INTERNAL_TARGETS = {
+    "cloud metadata": "https://169.254.169.254/latest/meta-data/",
+    "loopback": "https://127.0.0.1:8080/",
+    "RFC1918 private (192.168/16)": "https://192.168.1.23/",
+    "RFC1918 private (10/8)": "https://10.0.0.5/",
+    "RFC1918 private (172.16/12)": "https://172.16.0.9/",
+    "link-local": "https://169.254.10.10/",
+    "CGNAT shared": "https://100.64.0.1/",
+    "unspecified": "https://0.0.0.0/",
+    "IPv6 loopback": "https://[::1]:8080/",
+}
+
+
+def _phone_providers() -> list[CredentialProvider]:
+    """Every phone provider the funnel knows — ==derived from ``_SPECS``, not typed out here.==
+
+    A fourth phone provider must add a spec (``test_every_sending_provider_has_a_spec``), and the
+    day it does, every SSRF case below runs against it without anybody remembering this file. An
+    enumeration would have covered WhatsApp and SMS and missed the one that arrives next.
+    """
+    return [
+        provider
+        for provider in _SPECS
+        if instance_fallback(provider) is InstanceFallback.OPERATOR_IDENTITY
+    ]
+
+
+def _secrets_pointing_at(provider: CredentialProvider, url: str) -> dict[str, str]:
+    """This provider's minimal credential, aimed at ``url``. Derived from ``required_fields``."""
+    return {field: "x" for field in required_fields(provider)} | {"base_url": url}
+
+
+class TestATenantsBaseUrlCannotReachTheInternalNetwork:
+    """==The structural price of this whole cut, and it has to be paid here.==
+
+    Before B-03bis, ``base_url`` came from the instance's environment: **operator configuration,
+    trusted by construction**. Moving it into a per-business credential turned it into ==input a
+    third party controls and the server obeys==. The cut that closes the isolation leak opens, in
+    the same movement, a door onto the internal network: a business (or whoever compromises its
+    account) points ``base_url`` at the cloud metadata service, at loopback, or at the operator's
+    LAN, and **our server makes the request for them** — with our reachability, not theirs.
+
+    So the tenant's target is validated like the third-party input it now is, with the guard this
+    repository already built for user-configured webhook URLs. Not a new one.
+    """
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    @pytest.mark.parametrize("target", _INTERNAL_TARGETS.values(), ids=_INTERNAL_TARGETS.keys())
+    async def test_an_internal_target_is_refused_for_every_phone_provider(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+        target: str,
+    ) -> None:
+        """==The finding, closed, across every provider the funnel will ever have.==
+
+        ``169.254.169.254`` is the one to read twice: the cloud metadata service hands out the
+        instance's own IAM credentials to anything that can reach it, and a tenant would be reaching
+        it *through us*.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"ssrf-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, target),
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert channel_for(provider) not in senders.channels
+        message = str(_refusal_for(senders, provider))
+        assert "base_url" in message, "the error must name the field a human has to go and fix"
+        assert target not in message, "the stored value is never echoed — not even a URL"
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_a_public_hostname_that_RESOLVES_inward_is_refused(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """==Validating the hostname would be theatre. The RESOLVED address is the destination.==
+
+        ``evil.example`` is a perfectly ordinary public name. It resolves to ``127.0.0.1``. A filter
+        that reads the URL and approves it has checked a string, not a target.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"dns-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "https://evil.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _resolves_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_resolves_inward,
+            )
+        _refusal_for(senders, provider)
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_one_poisoned_record_in_a_mixed_answer_refuses_the_whole_target(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """No shopping for a good IP in a mixed answer — one forbidden record poisons the target.
+
+        This is ``assert_target_allowed``'s rule, and inheriting it is the reason to reuse that
+        function rather than write a second guard that would have to rediscover it.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"mix-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "https://mixed.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _mixed(host: str) -> list[str]:
+            return ["93.184.216.34", "10.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_mixed,
+            )
+        _refusal_for(senders, provider)
+
+    @pytest.mark.parametrize("provider", _phone_providers(), ids=lambda p: p.value)
+    async def test_plaintext_http_is_refused_for_a_tenant_supplied_target(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        provider: CredentialProvider,
+    ) -> None:
+        """==https, because the api_key travels on that wire.==
+
+        The instance's OWN configuration may still be http (below) — a self-hoster's Evolution on
+        their LAN is a real deployment. A TENANT's target is a different object: it is third-party
+        input, it leaves the operator's network, and it carries that business's API key in a header.
+        """
+        business = await _business(sqlite_session, tenant_factory, f"http-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=provider,
+            secrets=_secrets_pointing_at(provider, "http://evolution.public.example/"),
+            fernet_key=KEY,
+        )
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_public,
+            )
+        assert "https" in str(_refusal_for(senders, provider))
+
+    async def test_a_public_https_target_is_allowed(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Anti-vacuity: the guard must not simply refuse everything.==
+
+        Every test above asserts a refusal. Without this one they would all pass against a guard
+        that had broken BYOK entirely — no business could send at all, and the suite would be green
+        about it.
+        """
+        business = await _business(sqlite_session, tenant_factory, "ssrf-ok")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=_clients(client),
+                resolver=_public,
+            )
+
+        assert senders.channels[Channel.WHATSAPP]._config.instance == (_TENANT_WHATSAPP["instance"])
+
+    async def test_the_OPERATORS_own_target_is_not_put_through_the_tenant_guard(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The trust boundary is PROVENANCE, and that is the whole distinction being drawn.==
+
+        The env is the operator configuring their own instance — the same hands that hold the app
+        secret. A self-hoster running Evolution on ``http://192.168.1.50`` is not attacking
+        themselves, and refusing them would be treating the operator as their own threat model. A
+        TENANT's URL is third-party input. Same field, different provenance, different rule.
+        """
+        business = await _business(sqlite_session, tenant_factory, "lent-lan")
+        lan = InstanceSenderDefaults.from_env(
+            {
+                **_OPERATOR_ENV,
+                "AETHERCAL_WHATSAPP_BASE_URL": "http://192.168.1.50:8080",
+                LEND_OPERATOR_PHONE_IDENTITY_ENV: "true",
+            }
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=lan, client=client)
+
+        assert senders.channels[Channel.WHATSAPP]._config.base_url == ("http://192.168.1.50:8080")
+
+
+class TestATenantsSmtpRelayCannotBeInternalEither:
+    """==The same trust-boundary bug with the H stripped off.==
+
+    The first cut of this guard covered the HTTP providers because the finding named HTTP. That was
+    classifying by **protocol** when the rule is declared by **provenance** — and a tenant's
+    ``host: 127.0.0.1, port: 25`` makes this server connect to the operator's own local MTA and
+    relay on their behalf. ==An open relay wearing the operator's IP reputation==, which is the one
+    thing a mail sender cannot buy back.
+
+    Here the guard is genuinely the only defence: there is no certificate check to fall back on,
+    because ``use_tls`` is the tenant's own field and port 25 on loopback talks plaintext happily.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1", "169.254.169.254", "192.168.1.25", "10.0.0.1", "::1"],
+        ids=["loopback", "metadata", "rfc1918", "rfc1918-10", "ipv6-loopback"],
+    )
+    async def test_an_internal_relay_host_is_refused(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory, host: str
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, f"mta-{uuid.uuid4().hex[:6]}")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": host, "from_addr": "a@x.example", "port": "25"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is None
+        message = str(_refusal_for(senders, CredentialProvider.SMTP))
+        assert "host" in message
+        assert host not in message, "the stored value is never echoed"
+
+    async def test_a_relay_hostname_that_RESOLVES_inward_is_refused(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The resolved address is the destination here too — a name is only a string."""
+        business = await _business(sqlite_session, tenant_factory, "mta-dns")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "relay.evil.example", "from_addr": "a@x.example"},
+            fernet_key=KEY,
+        )
+
+        async def _inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(
+                sqlite_session, business, defaults=_defaults(), client=client, resolver=_inward
+            )
+        assert senders.email is None
+        _refusal_for(senders, CredentialProvider.SMTP)
+
+    async def test_a_public_relay_is_allowed(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Anti-vacuity.== Without this, a guard that refused every relay would pass the lot."""
+        business = await _business(sqlite_session, tenant_factory, "mta-ok")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets=_TENANT_SMTP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email._config.host == _TENANT_SMTP["host"]
+
+    async def test_the_OPERATORS_own_relay_is_not_guarded(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """A self-hoster's relay on their own LAN keeps working. Provenance, not protocol."""
+        business = await _business(sqlite_session, tenant_factory, "mta-lan")
+        lan = InstanceSenderDefaults.from_env(
+            {**_OPERATOR_ENV, "AETHERCAL_SMTP_HOST": "192.168.1.25"}
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=lan, client=client)
+
+        assert senders.email._config.host == "192.168.1.25"
+
+
+class TestTheWitnessPairsTheUrlWithTheClientThatMayDialIt:
+    """==The half a build-time guard cannot give you, and the half that matters.==
+
+    A witness saying *"this URL passed the guard"* can be TRUE while the socket goes somewhere else
+    entirely: DNS re-resolves at connect. So the witness pairs the URL with the client permitted to
+    dial it — a TENANT url with the re-pinning client, an INSTANCE url with the plain one — and
+    these tests assert that pairing with **distinguishable** clients.
+
+    ==Without them the whole rebinding fix is untested.== Pairing a tenant's target with the
+    operator's unguarded client compiles, reads as a tidy simplification, silently restores the
+    TOCTOU window — and every other test in this file passes, because they hand both slots the same
+    double. That is not hypothetical: it is what happened here, and it is why these exist.
+    """
+
+    async def test_a_tenants_sender_is_built_on_the_GUARDED_client(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "paired-tenant")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+        operator, tenant = httpx.AsyncClient(), httpx.AsyncClient()
+        try:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=_defaults(),
+                clients=SenderClients(operator=operator, tenant=tenant),
+                resolver=_public_dns,
+            )
+            assert senders.channels[Channel.WHATSAPP]._http is tenant, (
+                "a business's own endpoint was given the UNGUARDED client. The build-time guard "
+                "would still pass and DNS could then rebind the socket into our network — which is "
+                "the entire attack the guarded transport exists to stop."
+            )
+        finally:
+            await operator.aclose()
+            await tenant.aclose()
+
+    async def test_the_operators_own_sender_is_built_on_the_PLAIN_client(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The mirror, and it is not symmetry for its own sake.
+
+        The operator's LAN Evolution is a private address by design. Put it behind the public-only
+        pin and a self-hoster's WhatsApp stops working — the guard would be protecting the operator
+        from themselves, which is exactly the mistake the provenance rule exists to avoid.
+        """
+        business = await _business(sqlite_session, tenant_factory, "paired-operator")
+        lent = _defaults(**{LEND_OPERATOR_PHONE_IDENTITY_ENV: "true"})
+        operator, tenant = httpx.AsyncClient(), httpx.AsyncClient()
+        try:
+            senders = await resolve_tenant_senders(
+                sqlite_session,
+                tenant_id=business.id,
+                fernet_key=KEY,
+                defaults=lent,
+                clients=SenderClients(operator=operator, tenant=tenant),
+                resolver=_public_dns,
+            )
+            assert senders.channels[Channel.WHATSAPP]._http is operator, (
+                "the operator's own account was put behind the tenant's public-only pin; a "
+                "self-hoster's LAN relay would stop working."
+            )
+        finally:
+            await operator.aclose()
+            await tenant.aclose()
+
+
+class TestTheSmtpConnectorClosesRebinding:
+    """==The last flippable path — and the one with no certificate to fall back on.==
+
+    Pinning the HTTP path made SMTP the only one a resolver could still turn. An attacker does not
+    use the average path; they use the weakest — and this was the weakest **and** the one with no
+    backstop: ``use_tls`` is the business's own field, and port 25 on loopback talks plaintext.
+
+    So a business's relay is dialed through a connector that re-validates and pins at connect, and
+    ``aiosmtplib`` is handed the socket. These prove the connector refuses a rebind, that the
+    witness
+    carries it for a tenant and not for the operator, and that the sender actually uses it.
+    """
+
+    async def test_the_connector_refuses_a_rebind_and_opens_no_socket(self) -> None:
+        """==The attack, executed.== The build-time guard already said yes; DNS changes its mind."""
+
+        async def _rebinds_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        with pytest.raises(BlockedUrlError):
+            await _open_pinned_socket("relay.business.example", 587, resolver=_rebinds_inward)
+
+    async def test_a_tenants_witness_carries_a_connector_and_the_operators_does_not(self) -> None:
+        """==The pairing — and the test must be able to tell the two apart.==
+
+        A witness saying "this host passed the guard" can be true while ``aiosmtplib`` resolves the
+        name again and lands on loopback. The connector is what makes it attest the CONNECTION, so
+        the assertion is that a TENANT gets one and the OPERATOR does not.
+        """
+        own = await _assert_smtp_host_reachable(
+            _TENANT_SMTP, source=CredentialSource.TENANT, resolver=_public_dns
+        )
+        lent = await _assert_smtp_host_reachable(
+            {"host": "smtp.operator.example", "from_addr": "a@b.example"},
+            source=CredentialSource.INSTANCE,
+            resolver=_public_dns,
+        )
+
+        assert own.connect is not None, (
+            "a business's own relay was left to aiosmtplib's own DNS. The build-time guard would "
+            "still pass and the socket could still land on the operator's local MTA — which is the "
+            "open relay this exists to close."
+        )
+        assert lent.connect is None, (
+            "the operator's own relay was pinned to public addresses; a self-hoster's LAN relay "
+            "would stop working."
+        )
+
+    async def test_the_sender_dials_through_the_connector_and_closes_the_socket(self) -> None:
+        """==The sender really USES it, and owns the socket completely.==
+
+        A connector can be minted, carried, and never called — the witness would be true and the
+        socket would still be aiosmtplib's own. So this asserts the call happened, that
+        ``aiosmtplib`` was handed the socket with ``port=None`` (it refuses both), that ``hostname``
+        survived for TLS, and that the socket is closed.
+        """
+        opened = socket.socket()
+        calls: list[dict[str, object]] = []
+
+        async def _connector() -> socket.socket:
+            return opened
+
+        async def _fake_send(message: object, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        sender = SmtpEmailSender(
+            SmtpConfig(host="smtp.business.example", from_addr="a@b.example", port=587),
+            connect=_connector,
+        )
+        with mock.patch("aiosmtplib.send", side_effect=_fake_send):
+            await sender.send(EmailMessage())
+
+        assert calls[0]["sock"] is opened, "the pinned socket never reached aiosmtplib"
+        assert calls[0]["port"] is None, (
+            "aiosmtplib refuses `port` alongside `sock` — and a second opinion about the "
+            "destination is a second chance to disagree with the one we validated"
+        )
+        assert calls[0]["hostname"] == "smtp.business.example", (
+            "hostname is what aiosmtplib uses as the TLS server_hostname. Lose it and the "
+            "certificate is verified against nothing, or the send raises outright."
+        )
+        assert opened.fileno() == -1, "the socket was left open — a descriptor per drain item"
+
+    async def test_the_socket_is_closed_even_when_the_send_raises(self) -> None:
+        """Ownership is complete, or it is a leak. A relay hanging up must not cost a
+        descriptor."""
+        opened = socket.socket()
+
+        async def _connector() -> socket.socket:
+            return opened
+
+        sender = SmtpEmailSender(
+            SmtpConfig(host="smtp.business.example", from_addr="a@b.example"), connect=_connector
+        )
+        with (
+            mock.patch("aiosmtplib.send", side_effect=RuntimeError("the relay hung up")),
+            pytest.raises(RuntimeError),
+        ):
+            await sender.send(EmailMessage())
+
+        assert opened.fileno() == -1, "a failed send leaked its socket"
+
+    async def test_the_operators_sender_still_lets_aiosmtplib_dial(self) -> None:
+        """==Anti-vacuity.== Without it, a connector refusing everything would pass the lot."""
+        calls: list[dict[str, object]] = []
+
+        async def _fake_send(message: object, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        sender = SmtpEmailSender(SmtpConfig(host="smtp.operator.example", from_addr="a@b.example"))
+        with mock.patch("aiosmtplib.send", side_effect=_fake_send):
+            await sender.send(EmailMessage())
+
+        assert calls[0]["sock"] is None
+        assert calls[0]["port"] == 587, "the operator's relay lost its port along with its DNS"
+
+
+class TestTheGuardedTransportClosesRebinding:
+    """==The pre-flight guard is a TOCTOU window, and this is what shuts it.==
+
+    ``_assert_target_reachable`` resolves when the sender is BUILT. httpx resolves again when it
+    opens the SOCKET. A tenant that controls its own resolver answers public for the first and
+    ``127.0.0.1`` for the second: the guard passes, the socket lands inside our network, and every
+    other test in this file stays green. ==A guard DNS can flip is not a guard.==
+
+    So these drive the REAL :class:`EgressGuardedTransport` — the object the worker actually gives a
+    tenant's sender — with a resolver that rebinds.
+    """
+
+    async def test_a_rebind_to_loopback_is_refused_at_connect(self) -> None:
+        """==The attack, executed.== The guard already said yes; DNS then changes its mind."""
+        dialed: list[str] = []
+
+        class _Recording(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                dialed.append(str(request.url))
+                return httpx.Response(200)
+
+        async def _rebinds_inward(host: str) -> list[str]:
+            return ["127.0.0.1"]
+
+        transport = EgressGuardedTransport(_Recording(), resolver=_rebinds_inward)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(EgressBlocked):
+                await client.post("https://evolution.business.example/message/sendText/x")
+
+        assert dialed == [], "the request reached the socket despite resolving to loopback"
+
+    async def test_a_public_answer_is_pinned_and_dialed_with_TLS_bound_to_the_name(self) -> None:
+        """==Anti-vacuity, and the TLS half.==
+
+        The refusal above would pass against a transport that refused everything. This proves the
+        guarded client still WORKS — and that pinning does not silently downgrade TLS: the socket
+        goes to the IP while SNI and certificate verification stay bound to the hostname. Get that
+        wrong and the fix for rebinding becomes a break in certificate checking.
+        """
+        seen: list[httpx.Request] = []
+
+        class _Recording(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                seen.append(request)
+                return httpx.Response(200)
+
+        async def _public(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        transport = EgressGuardedTransport(_Recording(), resolver=_public)
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await client.post("https://evolution.business.example/send")
+
+        assert response.status_code == 200
+        request = seen[0]
+        assert request.url.host == "93.184.216.34", "the socket was not pinned to the checked IP"
+        assert request.headers["Host"] == "evolution.business.example", (
+            "the Host header lost the original authority — the provider's vhost routing would break"
+        )
+        assert request.extensions["sni_hostname"] == b"evolution.business.example", (
+            "SNI/cert verification is not bound to the real hostname. Pinning to an IP without it "
+            "verifies the certificate against the IP, which fails for every honest provider — and "
+            "would push somebody to disable verification to make it work."
+        )
+
+    async def test_the_refusal_is_typed_so_the_send_path_classifies_it_correctly(self) -> None:
+        """==The subtle half, and the expensive one to get wrong.==
+
+        The senders catch ``httpx.HTTPError`` and ask ``is_definitely_undelivered``. An exception
+        they do NOT recognise escapes their handlers with the provider-call marker still standing,
+        and the next drain reads that marker and parks the step as ``unknown`` — *"a human must go
+        and check whether the guest was messaged"* — about a message we never dialed.
+        """
+        assert isinstance(EgressBlocked("x"), httpx.ConnectError)
+        assert is_definitely_undelivered(EgressBlocked("x")), (
+            "a refused connection must classify as definitely-undelivered: nothing left this "
+            "machine, so the retry is safe and the in-flight marker must be cleared."
+        )
+
+
+class TestOneBrokenChannelDoesNotSilenceTheOthers:
+    """==A fail-closed applied per BUSINESS when the whole design says per CHANNEL.==
+
+    A refused credential escaped ``resolve_tenant_senders`` entirely, so a business whose WhatsApp
+    ``base_url`` pointed at the metadata service ==stopped receiving its EMAIL==. That is this
+    module's own rule broken by this module: the channel configured correctly cannot pay for the one
+    that is not.
+
+    The opposite extreme is the trap: a broken channel must not go quiet either. It stays a failure,
+    with its own reason — just its own.
+    """
+
+    async def test_a_refused_whatsapp_does_not_take_the_email_channel_with_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        business = await _business(sqlite_session, tenant_factory, "one-bad-channel")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets={"base_url": "https://169.254.169.254/", "instance": "i", "api_key": "k"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is not None, (
+            "the business lost its EMAIL because its WHATSAPP credential was bad. The channel that "
+            "is configured correctly does not pay for the one that is not."
+        )
+        assert Channel.WHATSAPP not in senders.channels
+        assert Channel.WHATSAPP in senders.channel_errors, (
+            "the broken channel went SILENT — no sender and no reason. That is the no-op this "
+            "codebase exists to refuse; it must stay a failure, just its own."
+        )
+
+    async def test_a_refused_smtp_does_not_take_the_phone_channels_with_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """The mirror. Isolation that only runs one way is half a fix."""
+        business = await _business(sqlite_session, tenant_factory, "bad-smtp")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "127.0.0.1", "from_addr": "a@b.example"},
+            fernet_key=KEY,
+        )
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is None
+        assert Channel.EMAIL in senders.channel_errors
+        assert Channel.WHATSAPP in senders.channels, (
+            "the business lost its WhatsApp because its SMTP relay host was bad"
+        )
+
+    async def test_a_DNS_failure_on_one_channel_does_not_take_the_others(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The finding, and it is the same bug through a different door.==
+
+        The first fix caught ``CredentialError``. A ``TargetUnresolvable`` — DNS down, a NETWORK
+        fault and not a credential one — is not in that family, so it walked straight past the
+        catch, escaped the resolver, and took the business's EMAIL down with its WhatsApp all over
+        again. The defect was never the missing branch; it was catching a LIST instead of scoping a
+        FAILURE.
+        """
+        business = await _business(sqlite_session, tenant_factory, "dns-down")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _dns_is_down(host: str) -> list[str]:
+            raise TargetUnresolvable(f"could not resolve {host!r}: the resolver is down")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(
+                sqlite_session, business, defaults=_defaults(), client=client, resolver=_dns_is_down
+            )
+
+        assert senders.email is not None, (
+            "a DNS outage on the WhatsApp endpoint stopped the business's EMAIL. DNS being down is "
+            "not a credential fault — which is exactly why enumerating credential errors missed it."
+        )
+        assert Channel.WHATSAPP not in senders.channels
+        assert Channel.WHATSAPP in senders.channel_errors
+
+    async def test_a_failure_NOBODY_ENUMERATED_still_stays_on_its_own_channel(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The real assertion: a class this codebase has never heard of.==
+
+        Every other test here uses a failure somebody already thought about — which is the same
+        photograph in test form. This invents one that exists nowhere in the product, because the
+        rule is not "the failures we listed stay put", it is ==resolving ONE channel cannot take
+        down the others, whatever happens==. If this needs a new branch to pass, the guard was a
+        list again.
+        """
+
+        class _AFailureNobodyForesaw(Exception):
+            """Not a CredentialError, not a TargetUnresolvable, not anything. That is the point."""
+
+        business = await _business(sqlite_session, tenant_factory, "novel-failure")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _explodes_oddly(host: str) -> list[str]:
+            raise _AFailureNobodyForesaw("something nobody wrote a branch for")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(
+                sqlite_session,
+                business,
+                defaults=_defaults(),
+                client=client,
+                resolver=_explodes_oddly,
+            )
+
+        assert senders.email is not None, (
+            "an unforeseen failure on one channel silenced the others. The rule must hold for "
+            "the exception nobody has written yet — otherwise it is an enumeration wearing a "
+            "rule's clothes."
+        )
+        # The reason survives, chained. `ssrf._resolve` translates ANY resolver failure into
+        # `TargetUnresolvable` — honest, since a resolver that raises IS a DNS failure — and keeps
+        # the original as `__cause__`. What must not happen is the channel going quiet, or the cause
+        # being flattened into something an operator cannot act on.
+        recorded = senders.channel_errors[Channel.WHATSAPP]
+        assert isinstance(recorded.__cause__, _AFailureNobodyForesaw), (
+            f"the channel recorded {recorded!r}, losing the real cause. A reason nobody can act on "
+            "is barely better than no reason at all."
+        )
+
+    async def test_a_shutdown_is_NOT_a_channel_error_and_keeps_rising(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==The other extreme, and it matters as much as the first.==
+
+        "Catch everything" is not the rule either. A cancellation is not "this channel failed", it
+        is the process being told to stop — swallowing it would turn a shutdown into a business
+        quietly losing a channel, and a worker that refuses to die. ``Exception`` and not
+        ``BaseException`` is what draws that line.
+        """
+        business = await _business(sqlite_session, tenant_factory, "shutdown")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.WHATSAPP,
+            secrets=_TENANT_WHATSAPP,
+            fernet_key=KEY,
+        )
+
+        async def _cancelled(host: str) -> list[str]:
+            raise asyncio.CancelledError
+
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(asyncio.CancelledError):
+                await _senders(
+                    sqlite_session,
+                    business,
+                    defaults=_defaults(),
+                    client=client,
+                    resolver=_cancelled,
+                )
+
+    async def test_a_refused_channels_step_still_FAILS_with_its_own_reason(self) -> None:
+        """==Not silent, and not somebody else's problem.==
+
+        The step whose channel was refused must still fail — retryably, carrying the reason — so the
+        misconfiguration is visible and the message survives long enough for the fix to land.
+        """
+
+        async def _resolver(tenant_id: uuid.UUID) -> TenantSenders:
+            return TenantSenders(
+                tenant_id=tenant_id,
+                email=None,
+                channels={},
+                channel_errors={Channel.EMAIL: UnusableCredentialError("the relay host is inward")},
+            )
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # the refusal precedes any use
+            resolve_senders=_resolver,
+            service_factory=None,
+        )
+        with pytest.raises(UnusableCredentialError, match="inward"):
+            await execute(_email_work(uuid.uuid4()), _NOW)
+
+
+class TestAChannelWithNoSenderIsRefusedByOneRule:
+    """==Emails failing silently, in a product whose job is sending reminders.==
+
+    Three sites had to answer "there is no sender for this channel — what now?". Two consulted
+    ``channel_errors``; the email branch of a workflow step did not. So a business whose SMTP relay
+    was REFUSED had its reminders retired as *"the channel is off"* — terminal — while the recorded
+    reason sat unread two frames up. The business believes its guest was told. The guest was not.
+
+    Nobody wrote that on purpose: the rule was applied by hand three times and by the third the hand
+    slipped. This pins the DECISION; ``test_sender_belt`` pins that every site consults it.
+    """
+
+    def test_a_refused_channel_raises_ITS_OWN_fault_and_not_the_off_outcome(self) -> None:
+        """==The finding.== The fault is raised, so the step retries and the fix can still land."""
+        broken = UnusableCredentialError("the relay host resolves inside this network")
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(UnusableCredentialError) as caught:
+            _refuse_channel(Channel.EMAIL, {Channel.EMAIL: broken}, when_off=off)
+
+        assert caught.value is broken, (
+            "a channel that is CONFIGURED and refused was retired as 'off'. Off is terminal: the "
+            "reminder is destroyed for ever and the recorded reason is never read — the message "
+            "silently never arrives, which is the whole bug."
+        )
+
+    def test_an_unconfigured_channel_still_gets_the_off_outcome(self) -> None:
+        """==Anti-vacuity, and the other half of the rule.==
+
+        Without this, "raise whatever you find" would pass while having destroyed the distinction.
+        A channel nobody configured is a decision, not a fault: terminal, because retrying it would
+        burn the dead-letter over a feature somebody chose not to switch on.
+        """
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(OutboxSkipped) as caught:
+            _refuse_channel(Channel.EMAIL, {}, when_off=off)
+
+        assert caught.value is off
+
+    def test_another_channels_fault_does_not_answer_for_this_one(self) -> None:
+        """The lookup is BY CHANNEL. A broken WhatsApp must not decide what email does."""
+        off = OutboxSkipped("the email channel has no configured SMTP sender")
+
+        with pytest.raises(OutboxSkipped):
+            _refuse_channel(
+                Channel.EMAIL,
+                {Channel.WHATSAPP: UnusableCredentialError("whatsapp is broken")},
+                when_off=off,
+            )
+
+
+class TestTheExecutorRefusesSendersThatAreNotTheItems:
+    """==A tripwire against the leak the obvious optimisation would cause.==
+
+    The resolver cannot be called without a business and always stamps back the id it was handed, so
+    nothing today can produce a mismatch — verified below rather than assumed. It is armed for what
+    comes next: the natural way to speed this loop up is to MEMOISE the resolve, and a cache keyed
+    even slightly wrong hands one business's sender to another's item. The drain would never notice
+    — a sender is a sender — and the result is a guest messaged from the wrong company's number,
+    which nobody can take back.
+    """
+
+    async def test_the_live_resolver_cannot_produce_a_mismatch_today(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Closed with proof, not opinion.== The tripwire guards a future, not a present."""
+        business = await _business(sqlite_session, tenant_factory, "identity-ok")
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.tenant_id == business.id, (
+            "the real resolver already stamps a business other than the one it was asked for — "
+            "then this is not a future risk, it is a live bug"
+        )
+
+    async def test_senders_belonging_to_another_business_are_refused(self) -> None:
+        """==The cache-keyed-wrong scenario, made unrepresentable rather than unlikely.==
+
+        A resolver that ignores the id it is given is exactly what a memoisation bug looks like from
+        the outside. The item must not send.
+        """
+        theirs = uuid.uuid4()
+
+        async def _confused_cache(tenant_id: uuid.UUID) -> TenantSenders:
+            # Hands back the FIRST business's senders to whoever asks — one wrong cache key.
+            return TenantSenders(tenant_id=theirs, email=None, channels={})
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # the refusal precedes any use
+            resolve_senders=_confused_cache,
+            service_factory=None,
+        )
+        with pytest.raises(RuntimeError, match="Refusing to send"):
+            await execute(_email_work(uuid.uuid4()), _NOW)
+
+
+class TestTheTenantClientCannotShareAConnectionBetweenBusinesses:
+    """==The price of pinning, and it landed on the leak this batch exists to close.==
+
+    Pinning rewrites the request's host to the validated IP — and a connection pool is keyed by
+    ORIGIN. So two businesses whose different hostnames resolve to the SAME address collapse onto
+    one pool key, and the second's request can ride a TLS connection handshaked with the FIRST's SNI
+    and certificate: that business's API key delivered to the other's server.
+    """
+
+    async def test_two_hostnames_on_one_ip_collapse_to_one_origin(self) -> None:
+        """==The mechanism, demonstrated.== This is WHY reuse must be off — not a hypothetical."""
+        seen: list[tuple[str, str | None, int | None]] = []
+
+        class _Spy(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                seen.append((request.url.scheme, request.url.host, request.url.port))
+                return httpx.Response(200)
+
+        async def _same_ip(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        transport = EgressGuardedTransport(_Spy(), resolver=_same_ip)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post("https://tenant-a.example/send")
+            await client.post("https://tenant-b.example/send")
+
+        assert seen[0] == seen[1], (
+            "the premise of this test no longer holds — the pin no longer collapses the origin, so "
+            "the keep-alive ban below may be guarding nothing. Re-derive it before deleting it."
+        )
+
+    def test_the_tenant_client_keeps_no_connection_to_reuse(self) -> None:
+        """==With no idle connection there is none to share.==
+
+        Asserted on the pool the real ``SenderClients.build`` produces, not on a value a test chose.
+        """
+        clients = SenderClients.build(timeout=10.0)
+        pool = clients.tenant._transport._inner._pool  # type: ignore[attr-defined]
+        assert pool._max_keepalive_connections == 0, (
+            "the tenant client keeps idle connections. After the pin their pool key is the IP, so "
+            "two businesses on one address can share a TLS connection established with the other's "
+            "certificate — one business's API key sent to the other's server."
+        )
+        assert clients.operator is not clients.tenant
+
+    def test_http2_stays_off_or_the_ban_buys_nothing(self) -> None:
+        """==The hole the keep-alive ban does not cover.==
+
+        HTTP/2 multiplexes CONCURRENT requests onto one connection. Turn it on and two businesses
+        drained at the same moment share a connection again, on the same collapsed origin, with no
+        idle connection ever involved. It is off by default in httpx — which is exactly why it gets
+        an assertion rather than a hope.
+        """
+        clients = SenderClients.build(timeout=10.0)
+        pool = clients.tenant._transport._inner._pool  # type: ignore[attr-defined]
+        assert pool._http2 is False, (
+            "HTTP/2 is on for tenant egress: concurrent sends would be multiplexed onto one "
+            "connection, putting the cross-tenant sharing back."
+        )
+
+
+class TestATenantsRelayCannotBeTalkedToInPlaintext:
+    """==``use_tls: false`` on a TENANT credential is a password on the open internet (B-09).==
+
+    .. rubric:: Why the "it is their own credential" framing is incomplete
+
+    B-03bis saw this and left it, on the grounds that it is the confidentiality of the tenant's own
+    secret and therefore theirs to spend. Two facts make that the wrong reading:
+
+    * ==the plaintext session carries the GUEST's data too== — their name, their email address, the
+      booking. The guest is not a party to the business's configuration choice and cannot consent to
+      it, and they are the one this product exists to protect;
+    * ==and the egress guard already forced the host PUBLIC.== So there is no "it is on my LAN, it
+      is fine" case left for a tenant: ``use_tls: false`` means, literally and only, the AUTH
+      exchange and the message crossing the open internet in the clear. ==And we are the ones
+      sending it.==
+
+    The asymmetry is the tell. A tenant's ``base_url`` MUST be https ("a tenant's endpoint carries
+    its API key off this network") while a tenant's SMTP relay could be plaintext: same provenance,
+    same secret in flight, opposite rule. Only one of them was derived.
+
+    .. rubric:: ==Provenance decides, exactly as it does for the host==
+
+    ``CredentialSource.INSTANCE`` is exempt, for the reason it is exempt from the public-host check
+    two functions up: that relay is the operator's own, configured by the person running the
+    process, and a self-hoster whose MTA sits on their LAN speaking plaintext is not attacking
+    themselves.
+
+    .. rubric:: And deliberately NO opt-out flag
+
+    ``base_url``'s https rule has no escape hatch and needs none. Adding one here would be a second
+    ``LEND_OPERATOR_PHONE_IDENTITY``-shaped knob for a case with no legitimate use — every real
+    relay has spoken STARTTLS on 587 or implicit TLS on 465 for a decade. The lesson from that flag
+    was that a dangerous thing must not happen by OMISSION; it was not that every refusal owes the
+    world a way to switch it back on.
+    """
+
+    async def test_a_tenants_plaintext_relay_is_refused(self) -> None:
+        """==The refusal, and it names the FIELD and never the value.==
+
+        Same rule as every other credential error here: the next field through this branch is a
+        password, so the rule cannot depend on which field somebody judged boring.
+        """
+        with pytest.raises(UnusableCredentialError) as caught:
+            await _assert_smtp_host_reachable(
+                {**_TENANT_SMTP, "use_tls": "false"},
+                source=CredentialSource.TENANT,
+                resolver=_public_dns,
+            )
+
+        message = str(caught.value)
+        assert "use_tls" in message, "the error must name the field a human has to go and fix"
+        assert "smtp.business.example" not in message, "the credential's fields are not echoed"
+
+    async def test_a_tenant_that_says_nothing_gets_tls(self) -> None:
+        """The default is TLS, and a credential predating this rule is not silently downgraded."""
+        target = await _assert_smtp_host_reachable(
+            _TENANT_SMTP, source=CredentialSource.TENANT, resolver=_public_dns
+        )
+        assert target.use_tls is True
+
+    async def test_the_operators_own_plaintext_relay_still_works(self) -> None:
+        """==Provenance decides. The self-hoster's LAN MTA is not a threat model, it is a
+        deployment.==
+
+        The anti-vacuity half of the pair: if this went red alongside the refusal above, the rule
+        would be "no plaintext ever" rather than "no plaintext for a TENANT", and a real deployment
+        would break for nothing.
+        """
+        target = await _assert_smtp_host_reachable(
+            {"host": "mta.internal", "from_addr": "a@b.example", "use_tls": "false"},
+            source=CredentialSource.INSTANCE,
+            resolver=_public_dns,
+        )
+        assert target.use_tls is False, (
+            "the operator's own relay was forced onto TLS. They configured it with the same hands "
+            "that hold the app secret; this guard is about third-party input."
+        )
+
+    async def test_an_unparseable_use_tls_still_names_itself_not_an_environment_variable(
+        self,
+    ) -> None:
+        """The misdirection guard, moved to the function that now owns the parse.
+
+        ``_parse_bool`` hardcodes ``LEND_OPERATOR_PHONE_IDENTITY_ENV`` in its error; reused for a
+        stored credential it blamed a variable on the other side of the product. That contract did
+        not move with the parse by accident — it is asserted at its new home.
+        """
+        with pytest.raises(UnusableCredentialError) as caught:
+            await _assert_smtp_host_reachable(
+                {**_TENANT_SMTP, "use_tls": "maybe"},
+                source=CredentialSource.TENANT,
+                resolver=_public_dns,
+            )
+
+        message = str(caught.value)
+        assert "use_tls" in message
+        assert LEND_OPERATOR_PHONE_IDENTITY_ENV not in message, (
+            "the error blames an environment variable that has nothing to do with this business's "
+            "stored credential."
+        )
+
+    def test_the_config_builder_cannot_re_derive_plaintext_from_the_raw_field(self) -> None:
+        """==The decision is consulted ONCE, and the code after it cannot express the other
+        answer.==
+
+        ``_smtp_from_secrets`` takes ``use_tls`` off the WITNESS, exactly as it takes ``host`` off
+        it. If it read ``secrets`` instead, the guard above would be a check somebody must remember
+        to run rather than the only way to obtain the value — and the same rule applied by hand in
+        two places is the rule that gets applied differently in two places.
+        """
+        config = _smtp_from_secrets(
+            {**_TENANT_SMTP, "use_tls": "false"},
+            target=_SmtpTarget(host="smtp.business.example", connect=None, use_tls=True),
+        )
+        assert config.use_tls is True, (
+            "the raw credential field overrode the witness, so the egress guard's decision about "
+            "plaintext can be bypassed by whoever calls this with the secrets in hand."
+        )
+
+
+class TestAStoredCredentialWhoseValueCannotBeUsed:
+    """==A credential can be complete and still be unusable, and that difference decides the
+    outcome.==
+
+    ``store_credential`` refuses a credential MISSING a required field. It does not — and cannot
+    usefully — validate the *shape of every value*: ``port`` is optional for SMTP, so
+    ``{"host": …, "from_addr": …, "port": "abc"}`` is stored happily and only detonates at the send,
+    inside the worker, as a bare ``ValueError`` out of ``int()``.
+
+    A raw crash is the wrong answer twice over: it is unreadable in a log, and it names neither the
+    business, nor the provider, nor the field a human has to go and fix.
+    """
+
+    def test_a_non_numeric_port_is_a_legible_domain_error_naming_the_field(self) -> None:
+        with pytest.raises(UnusableCredentialError) as caught:
+            _smtp_from_secrets(
+                {"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
+                target=_SmtpTarget(host="smtp.x.example", connect=None, use_tls=True),
+            )
+
+        message = str(caught.value)
+        assert "port" in message, "the error must name the field a human has to go and fix"
+        assert "abc" not in message, (
+            "the offending VALUE is not echoed. A credential's fields are secret whether or not "
+            "this particular one looks harmless — the rule does not get to depend on the field."
+        )
+
+    # The ``use_tls`` half of this pair moved to `TestATenantsRelayCannotBeTalkedToInPlaintext`
+    # along with the parse itself (B-09): `_assert_smtp_host_reachable` now owns that field,
+    # because deciding whether plaintext is allowed needs the PROVENANCE, which only it has.
+    # `_smtp_from_secrets` reads the answer off the witness and cannot re-derive it — which is
+    # asserted there too, so the contract lost nothing by moving.
+
+    def test_the_flag_itself_still_names_itself_when_IT_is_malformed(self) -> None:
+        """The env-var error is still right where it IS the env var: fixing one must not break the
+        other."""
+        with pytest.raises(RuntimeError, match=LEND_OPERATOR_PHONE_IDENTITY_ENV):
+            InstanceSenderDefaults.from_env({LEND_OPERATOR_PHONE_IDENTITY_ENV: "perhaps"})
+
+    async def test_an_unusable_credential_FAILS_the_step_rather_than_retiring_it(
+        self, sqlite_session: AsyncSession, tenant_factory: TenantFactory
+    ) -> None:
+        """==Why ``failed`` and not ``skipped`` — the codebase's own rule decides it.==
+
+        ``OutboxSkipped`` is TERMINAL, and its docstring says terminal "means IRREVERSIBLE, so it
+        may only carry a condition that cannot be undone". A broken credential is emphatically
+        undoable: a human runs ``credentials set`` and it is fixed. Retire the step and that
+        reminder could never be delivered afterwards — the trap the paused-rule case documents.
+
+        So it fails, backs off, and dead-letters after six attempts. Each of those is a chance for
+        the fix to land in time, and the dead-letter is this product's channel for "a human is
+        needed" — which is true here, and is NOT true of a channel the operator simply never
+        configured.
+        """
+        business = await _business(sqlite_session, tenant_factory, "bad-port")
+        await store_credential(
+            sqlite_session,
+            tenant_id=business.id,
+            provider=CredentialProvider.SMTP,
+            secrets={"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
+            fernet_key=KEY,
+        )
+
+        async with httpx.AsyncClient() as client:
+            senders = await _senders(sqlite_session, business, defaults=_defaults(), client=client)
+
+        assert senders.email is None
+        _refusal_for(senders, CredentialProvider.SMTP)
+
+        # ...and the drain turns exactly that into a RETRYABLE failure, never a terminal skip:
+        # `_run_one_item` names OutboxSkipped / OutboxDeferred / OutboxUnknownOutcome explicitly,
+        # and everything else lands in `except Exception` -> _Outcome.FAILED -> backoff.
+        assert not issubclass(UnusableCredentialError, OutboxSkipped | OutboxDeferred)
+
+
+class TestTheExecutorResolvesPerItemAndNotPerProcess:
+    """==The root cause, pinned at the seam where it lived.==
+
+    ``make_booking_effect_executor`` used to take ``sender=`` / ``channels=`` — values bound at
+    boot, before any business was known — and the drain pushed a batch spanning several businesses
+    through them. The executor now takes a RESOLVER, and asks it per item.
+
+    A test that only checked "the right sender was used" for one business would have passed against
+    the old code too. So this drives TWO businesses through ONE executor and asserts each was asked
+    for by name.
+    """
+
+    async def test_the_executor_asks_for_each_items_own_business(self) -> None:
+        asked: list[uuid.UUID] = []
+
+        async def _resolver(tenant_id: uuid.UUID) -> TenantSenders:
+            asked.append(tenant_id)
+            # No email sender for anybody: the EMAIL branch then refuses, AFTER the resolve. What
+            # is under test is WHO was asked for, not what the handler did next.
+            return TenantSenders(tenant_id=tenant_id, email=None, channels={})
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # unreached: the refusal precedes any use
+            resolve_senders=_resolver,
+            service_factory=None,
+        )
+
+        first, second = uuid.uuid4(), uuid.uuid4()
+        for tenant_id in (first, second):
+            with pytest.raises(RuntimeError):
+                await execute(_email_work(tenant_id), _NOW)
+
+        assert asked == [first, second], (
+            "the executor did not resolve senders per item. A batch spanning two businesses must "
+            "ask for each one BY NAME — one sender bound before the loop is the bug this cut "
+            f"exists to close. Asked: {asked}"
+        )
+
+    async def test_each_business_gets_its_own_sender_object(self) -> None:
+        """==The assertion the old shape could not have passed.==
+
+        Two businesses, ONE executor, two different SMTP relays. Under the retired shape both
+        messages went through the single object bound at boot, so this is the difference between
+        the bug and the fix stated as a value a reader can check.
+        """
+        first, second = uuid.uuid4(), uuid.uuid4()
+        relays = {
+            first: SmtpEmailSender(SmtpConfig(host="a.example", from_addr="a@example")),
+            second: SmtpEmailSender(SmtpConfig(host="b.example", from_addr="b@example")),
+        }
+        used: list[str] = []
+
+        async def _resolver(tenant_id: uuid.UUID) -> TenantSenders:
+            return TenantSenders(tenant_id=tenant_id, email=relays[tenant_id], channels={})
+
+        async def _capture(
+            sessionmaker: object, work: OutboxWork, now: object, *, sender: object
+        ) -> None:
+            used.append(sender._config.host)  # type: ignore[attr-defined]
+
+        execute = make_booking_effect_executor(
+            sessionmaker=None,  # type: ignore[arg-type]  # the handler is stubbed out below
+            resolve_senders=_resolver,
+            service_factory=None,
+        )
+        with mock.patch("aethercal.server.services.outbox.run_email_effect", side_effect=_capture):
+            await execute(_email_work(first), _NOW)
+            await execute(_email_work(second), _NOW)
+
+        assert used == ["a.example", "b.example"]

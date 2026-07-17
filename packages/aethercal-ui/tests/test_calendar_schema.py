@@ -55,6 +55,28 @@ def test_schema_events_are_all_wired_as_wrapper_event_triggers() -> None:
     assert {"on_view_change", "on_range_change"} <= triggers
 
 
+def test_resource_timeline_shapes_are_in_the_contract() -> None:
+    # RF-28: the timeline adds a resource dimension. The schema must carry the resource type itself
+    # AND the `resourceId` that lets a drop / a range-select name the resource row it landed on —
+    # otherwise the backend cannot tell WHICH host an event was dragged onto.
+    gen = _load_generator()
+    defs = gen.build_schema()["$defs"]
+
+    resource = defs["CalendarResource"]
+    assert set(resource["properties"]) == {"id", "title", "groupId", "color"}
+    assert resource["required"] == ["id", "title"]  # groupId/color are optional
+
+    # `resourceId` is OPTIONAL everywhere: the other four views have no resource dimension, and an
+    # event may legitimately be unassigned.
+    for name in ("CalendarEvent", "EventDropPayload", "RangeSelectPayload"):
+        assert "resourceId" in defs[name]["properties"], name
+        assert defs[name]["properties"]["resourceId"]["type"] == "string", name
+        assert "resourceId" not in defs[name].get("required", []), name
+
+    # A resize never changes the resource row, so it must NOT carry one (no misleading field).
+    assert "resourceId" not in defs["EventResizePayload"]["properties"]
+
+
 def test_context_menu_at_least_one_is_enforced_by_the_schema_not_the_flat_typeddict() -> None:
     # The Python TypedDict is intentionally permissive ({} is a valid dict); the "at least one of
     # id/start" refinement is imposed by the schema (minProperties: 1), which is what both languages

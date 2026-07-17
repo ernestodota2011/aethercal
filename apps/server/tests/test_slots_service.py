@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
 from sqlalchemy import select
@@ -31,7 +32,7 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.services.calendars import GoogleCredential, store_google_connection
-from aethercal.server.services.event_types import create_event_type
+from aethercal.server.services.event_types import create_event_type, deactivate_event_type
 from aethercal.server.services.slots import SlotsResult, _load_overrides, compute_slots
 
 # Mon-Fri 09:00-17:00 in the schedule's own zone (Monday=0 .. Sunday=6).
@@ -108,6 +109,8 @@ async def _book(
         start_at=start,
         end_at=start + timedelta(minutes=30),
         status=status,
+        # Confirmed/cancelled ⇒ stamped; only an unpaid hold has no confirmation (B-05a).
+        confirmed_at=None if status is BookingStatus.PENDING else start - timedelta(days=1),
         guest_name="Guest",
         guest_email="guest@example.com",
         guest_timezone="UTC",
@@ -494,3 +497,207 @@ async def test_load_overrides_only_returns_overrides_inside_window(
     # Only the in-window override is loaded (the perf fix: no full-history scan per query).
     dates = [row.date for row in loaded]
     assert dates == [_WED]
+
+
+# --------------------------------------------------------------------------------------
+# max_per_day (RF-14): a day at its cap stops being offered.
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_day_at_its_cap_offers_no_further_slots(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """``max_per_day`` is enforced HERE, not only at create time.
+
+    Offering a slot and then refusing the booking that takes it is a broken contract: the guest is
+    shown a time, picks it, and gets a 409. Showing FEWER slots than are bookable is safe; showing
+    MORE and rejecting is not. So the capped day simply stops being on offer — and the other days
+    are untouched, because the cap is per DAY, not per window.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule, max_per_day=2)
+    await _book(sqlite_session, tenant, event_type, start=datetime(2026, 7, 6, 9, 0, tzinfo=UTC))
+    await _book(sqlite_session, tenant, event_type, start=datetime(2026, 7, 6, 11, 0, tzinfo=UTC))
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is not None
+    assert not [slot for slot in result.slots if slot.start.date() == _MON], (
+        "Monday reached its cap of 2 — it must offer nothing, not 14 more bookable slots"
+    )
+    assert len(result.slots) == _SLOTS_PER_DAY * 4  # the other four weekdays are untouched
+
+
+async def test_a_cancelled_booking_does_not_burn_the_days_cap(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """A guest who cancels must not keep the day's last place.
+
+    The cap counts what OCCUPIES the day, which is exactly what the ``status <> 'cancelled'``
+    partial index already means by "active". Counting cancellations would let one guest book and
+    cancel and thereby close the business's whole day, permanently, with nothing on the books.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule, max_per_day=1)
+    await _book(
+        sqlite_session,
+        tenant,
+        event_type,
+        start=datetime(2026, 7, 6, 9, 0, tzinfo=UTC),
+        status=BookingStatus.CANCELLED,
+    )
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is not None
+    # The cancelled booking frees BOTH its slot and its place in the day's count.
+    assert len([slot for slot in result.slots if slot.start.date() == _MON]) == _SLOTS_PER_DAY
+
+
+async def test_a_no_show_still_burns_the_days_cap(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """A no-show consumed the day. The host held the hour and nobody else could have it — which is
+    the same reason ``uq_bookings_active_slot`` keeps the slot occupied for a no-show."""
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule, max_per_day=1)
+    await _book(
+        sqlite_session,
+        tenant,
+        event_type,
+        start=datetime(2026, 7, 6, 9, 0, tzinfo=UTC),
+        status=BookingStatus.NO_SHOW,
+    )
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is not None
+    assert not [slot for slot in result.slots if slot.start.date() == _MON]
+
+
+async def test_the_capped_day_is_the_schedules_local_day_not_the_utc_one(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """ "A day" is the day of the DIARY the cap is written into — the schedule's local day (RF-14).
+
+    This is the whole question a daily cap has to answer, and the wrong answers are silent. The
+    availability engine already draws every weekday's open hours in ``Schedule.timezone``, so any
+    other zone would charge a booking to a day the host does not recognise as its day.
+
+    Auckland is UTC+12, so the shop's Tuesday 09:00 is *Monday* 21:00 UTC. Cap the type at one and
+    book that slot: the SCHEDULE's Tuesday is full and its Monday is untouched. Had the count used
+    UTC dates, the shop would have found Monday closed and Tuesday wide open — with no error
+    anywhere, just the wrong day shut.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant, timezone="Pacific/Auckland")
+    event_type = await _event_type(sqlite_session, tenant, host, schedule, max_per_day=1)
+    auckland = ZoneInfo("Pacific/Auckland")
+
+    tuesday_9am_local = datetime(2026, 7, 7, 9, 0, tzinfo=auckland)
+    assert tuesday_9am_local.astimezone(UTC) == datetime(2026, 7, 6, 21, 0, tzinfo=UTC)
+    await _book(sqlite_session, tenant, event_type, start=tuesday_9am_local.astimezone(UTC))
+
+    # NOT ``_BEFORE``: midnight UTC on the 6th is already NOON on Auckland's Monday, so that
+    # morning's slots would be retired as PAST — and "the cap took them" would be indistinguishable
+    # from "the clock did". The shop's whole week must still be ahead of us to measure the cap.
+    before_the_local_week = datetime(2026, 7, 5, 0, 0, tzinfo=UTC)
+    assert before_the_local_week < datetime(2026, 7, 6, 9, 0, tzinfo=auckland).astimezone(UTC)
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=before_the_local_week,
+    )
+
+    assert result is not None
+    local_days = [slot.start.astimezone(auckland).date() for slot in result.slots]
+    assert date(2026, 7, 7) not in local_days  # the shop's Tuesday is full
+    assert local_days.count(date(2026, 7, 6)) == _SLOTS_PER_DAY  # ...and its Monday is intact
+
+
+async def test_no_cap_declared_means_no_cap_applied(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """``max_per_day = NULL`` is the default and must stay a true absence, not a cap of zero."""
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule)
+    assert event_type.max_per_day is None
+    await _book(sqlite_session, tenant, event_type, start=datetime(2026, 7, 6, 9, 0, tzinfo=UTC))
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is not None
+    assert len(result.slots) == _SLOTS_PER_DAY * 5 - 1  # only the booked slot is gone
+
+
+async def test_a_deactivated_event_type_publishes_no_slots(
+    sqlite_session: AsyncSession, tenant_factory: Any
+) -> None:
+    """A withdrawn service is not on sale on ANY day (RF-14).
+
+    ``compute_slots`` never looked at ``active``, so a "deleted" event type went on publishing a
+    full open week to every guest who asked. The booking page filtered ``e.active`` in memory, which
+    is not a defence — that is the CLIENT, and the server must not depend on its client to enforce
+    what the business decided. Returning ``None`` (the router's 404) also declines to reveal that a
+    deactivated type exists at all.
+    """
+    tenant = await tenant_factory(sqlite_session)
+    host = await _first_user(sqlite_session, tenant)
+    schedule = await _schedule(sqlite_session, tenant)
+    event_type = await _event_type(sqlite_session, tenant, host, schedule)
+
+    assert await deactivate_event_type(
+        sqlite_session, tenant_id=tenant.id, event_type_id=event_type.id
+    )
+
+    result = await compute_slots(
+        sqlite_session,
+        tenant_id=tenant.id,
+        event_type_id=event_type.id,
+        window_from=_MON,
+        window_to=_FRI,
+        now=_BEFORE,
+    )
+
+    assert result is None

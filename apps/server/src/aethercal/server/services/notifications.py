@@ -1,30 +1,136 @@
-"""Booking notification service (RF-08 / RF-10).
+"""Booking notification service (RF-08 / RF-10 / RF-24).
 
-``send_booking_notification`` composes the email for a kind, sends it through the injected
-:class:`~aethercal.server.integrations.smtp.sender.EmailSender`, and records a
-:class:`~aethercal.server.db.models.SentNotification`. It is **idempotent** per
-``(tenant_id, booking_id, kind)`` and **concurrency-safe**: it *reserves* the ledger row (a guarded
-INSERT) BEFORE sending, so the unique constraint — not a racy read — arbitrates exactly-one send,
-and a retried job or a double-fired (even concurrent) event never mails the guest twice.
-Cancel/reschedule links are *passed in* — F1-05
-mints the signed guest tokens (via the F1-06 service) and builds the URLs; this module never mints a
-token. Like every service here it flushes but does not commit — the caller owns the transaction.
+The ledger (:class:`~aethercal.server.db.models.SentNotification`) holds one row per message
+identity — ``(tenant, booking, kind, channel, step_id)`` — so a message is never sent twice for the
+same identity. Cancel/reschedule links are *passed in*: the booking service mints the signed guest
+tokens and builds the URLs; this module never mints a token. Like every service here it flushes but
+does not commit — the caller owns the transaction.
+
+Two shapes, because an in-transaction caller and the outbox drain need different things:
+
+* :func:`send_booking_notification` — the **single-transaction, reserve-first** path. It INSERTs the
+  ledger row BEFORE sending, so the unique index (not a racy read) arbitrates exactly-one send even
+  under concurrency; if the send then raises, the caller's SAVEPOINT rolls the reservation back and
+  a retry re-sends. Correct whenever the send happens inside the transaction.
+
+* :func:`notification_already_sent` + :func:`compose_booking_notification` +
+  :func:`record_booking_notification` — the same work split into **read / compose / record**, so the
+  outbox drain can put the network send BETWEEN them with no transaction open at all (R8). There the
+  exclusion comes from the outbox row's own claim + lease — a strictly better place for it, since
+  the outbox row *is* the unit of work — and the ledger insert lands atomically with that row's
+  ``delivered`` bookkeeping. The residual is unchanged, and still errs toward a duplicate rather
+  than a loss: a crash after the provider accepted but before the settle commits replays the send.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
+from email.message import EmailMessage
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.schemas.event_types import resolve_translation
+from aethercal.server.channels import Channel
 from aethercal.server.db.models import Booking, EventType, SentNotification, User
 from aethercal.server.integrations.smtp.compose import (
     BookingEmailContext,
     NotificationKind,
     build_notification_email,
+    normalize_locale,
 )
 from aethercal.server.integrations.smtp.sender import EmailSender
+
+
+def ledger_kind(kind: NotificationKind | str) -> str:
+    """The ledger's ``kind`` key, from either the built-in vocabulary or a tenant's own.
+
+    ``workflow_steps.kind`` is a free-text column BY DESIGN — a tenant may define a step whose kind
+    is ``follow_up`` and give it a template. The four :class:`NotificationKind` values are the kinds
+    that have a built-in COMPOSER (they carry the ``.ics``), not the kinds that may exist. Forcing
+    the ledger through that enum would make a tenant's own kind unrepresentable, so a perfectly
+    well-configured step would be skipped forever with a message about a renderer that exists."""
+    return kind.value if isinstance(kind, NotificationKind) else kind
+
+
+async def notification_already_sent(
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    kind: NotificationKind | str,
+    channel: Channel = Channel.EMAIL,
+    step_id: uuid.UUID | None = None,
+) -> bool:
+    """True when this message identity is already in the ledger (so it must not be re-sent)."""
+    existing = await session.scalars(
+        select(SentNotification.id).where(
+            SentNotification.tenant_id == booking.tenant_id,
+            SentNotification.booking_id == booking.id,
+            SentNotification.kind == ledger_kind(kind),
+            SentNotification.channel == channel.value,
+            SentNotification.step_id == step_id,
+        )
+    )
+    return existing.first() is not None
+
+
+async def record_booking_notification(  # noqa: PLR0913 - the ledger identity IS the keyword contract
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    kind: NotificationKind | str,
+    now: datetime,
+    channel: Channel = Channel.EMAIL,
+    step_id: uuid.UUID | None = None,
+) -> bool:
+    """Write the ledger row for a message identity; ``False`` when it was already recorded.
+
+    The INSERT runs inside a ``SAVEPOINT`` so a unique-constraint conflict (another writer got there
+    first) returns ``False`` instead of poisoning the caller's transaction — the guarded pattern
+    ``services/event_types.py`` uses for a duplicate slug."""
+    row = SentNotification(
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
+        kind=ledger_kind(kind),
+        channel=channel.value,
+        step_id=step_id,
+        sent_at=now,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        return False
+    return True
+
+
+async def compose_booking_notification(  # noqa: PLR0913 - the composer needs the full booking context
+    session: AsyncSession,
+    *,
+    kind: NotificationKind,
+    booking: Booking,
+    cancel_url: str | None,
+    reschedule_url: str | None,
+    locale: str = "es",
+    sequence: int | None = None,
+) -> EmailMessage:
+    """Build the ``kind`` email for ``booking`` (a pure read + composition — it sends nothing).
+
+    ``sequence`` overrides the ``.ics`` SEQUENCE with the value snapshotted at the triggering
+    transition (F1-08); ``None`` falls back to the booking's current ``sequence``.
+    """
+    context = await _build_context(
+        session,
+        booking,
+        cancel_url=cancel_url,
+        reschedule_url=reschedule_url,
+        sequence=sequence,
+        locale=locale,
+    )
+    return build_notification_email(context, kind=kind, locale=locale)
 
 
 async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword contract (F1-05 caller)
@@ -39,62 +145,64 @@ async def send_booking_notification(  # noqa: PLR0913 - spec-mandated keyword co
     locale: str = "es",
     sequence: int | None = None,
 ) -> bool:
-    """Compose + send the ``kind`` email for ``booking`` and record it; return whether it sent.
+    """Reserve, compose and send the ``kind`` email for ``booking``; return whether it sent.
 
-    ``sequence`` overrides the ``.ics`` SEQUENCE with the value snapshotted at the triggering
-    transition (F1-08 outbox intent); ``None`` falls back to the booking's current ``sequence`` (the
-    reminder path, which re-states the live event).
+    The **reserve-first** path (RF-08/RF-10): the ledger row is INSERTed before the send, so the
+    unique index — not a racy ``SELECT`` — arbitrates exactly-one send, and two concurrent callers
+    can never both mail the guest. A rejected reservation means somebody else already owns this
+    message identity: this returns ``False`` and sends nothing. If the send then raises, the
+    caller's SAVEPOINT rolls the reservation back, so a retry re-sends rather than silently
+    swallowing it.
 
-    Reserve-first idempotency (RF-08/RF-10): before sending, it INSERTs the ``(tenant_id,
-    booking_id, kind)`` :class:`SentNotification` row inside a ``begin_nested`` SAVEPOINT (mirroring
-    the duplicate-slug guard in ``services/event_types.py``). If the unique constraint rejects it
-    (:class:`IntegrityError`) another caller already reserved that notification, so this returns
-    ``False`` and sends nothing — the database, not a racy ``SELECT``, arbitrates exactly-one send
-    under concurrency. Only when the reservation succeeds does it compose and hand the message to
-    ``sender`` and return ``True``. Flushes (inside the savepoint); the caller owns the commit.
-
-    Reserve-first closes the concurrent-duplicate hole (two callers both passing a pre-check and
-    both mailing the guest), which the prior SELECT-then-send-then-INSERT order left open. The
-    fires-for-a-rolled-back-booking hole is closed a layer up: F1-05 no longer calls this inline
-    pre-commit but enqueues a transactional-outbox intent that the post-commit drainer runs (so this
-    only ever executes for a booking that actually committed).
-    """
-    reservation = SentNotification(
-        tenant_id=booking.tenant_id, booking_id=booking.id, kind=kind.value, sent_at=now
-    )
-    try:
-        async with session.begin_nested():
-            session.add(reservation)
-            await session.flush()
-    except IntegrityError:
+    Use this when the send is inside your transaction. The outbox drain does NOT (it must not hold a
+    transaction across network I/O) — it drives the read/compose/record trio above and takes its
+    exclusion from the outbox row's claim + lease."""
+    if not await record_booking_notification(session, booking=booking, kind=kind, now=now):
         return False
-
-    context = await _build_context(
-        session, booking, cancel_url=cancel_url, reschedule_url=reschedule_url, sequence=sequence
+    message = await compose_booking_notification(
+        session,
+        kind=kind,
+        booking=booking,
+        cancel_url=cancel_url,
+        reschedule_url=reschedule_url,
+        locale=locale,
+        sequence=sequence,
     )
-    message = build_notification_email(context, kind=kind, locale=locale)
     await sender.send(message)
     return True
 
 
-async def _build_context(
+async def _build_context(  # noqa: PLR0913 - the context needs the booking, the links, and the locale
     session: AsyncSession,
     booking: Booking,
     *,
     cancel_url: str | None,
     reschedule_url: str | None,
     sequence: int | None = None,
+    locale: str = "es",
 ) -> BookingEmailContext:
     """Resolve the event title + host (organizer) from the booking's FKs into a composer context.
 
     The foreign keys guarantee the event type and its host exist; the fallbacks are purely defensive
     so a notification can never hard-fail a booking flow on an unexpectedly missing row.
-    """
+
+    ==The title is resolved for ``locale``==, through the same :func:`resolve_translation` rule the
+    booking page uses. It used to be a bare ``event_type.title`` — the tenant's base-locale text —
+    while the surrounding copy WAS localised, so an English guest got "Booking confirmed: Consulta
+    30 min", and the ``.ics`` SUMMARY carried the Spanish title into their calendar permanently. The
+    translations were in the database the whole time (migration 0004); this was the only surface
+    that never read them."""
     event_type = await session.get(EventType, booking.event_type_id)
     host = await session.get(User, event_type.host_id) if event_type is not None else None
+    # Normalised by the SAME rule as the copy: a browser sends "en-US", the tenant stored "en".
+    language = normalize_locale(locale)
     return BookingEmailContext(
         uid=booking.ical_uid,
-        event_title=event_type.title if event_type is not None else "",
+        event_title=(
+            resolve_translation(event_type.title, event_type.title_translations, language)
+            if event_type is not None
+            else ""
+        ),
         guest_name=booking.guest_name,
         guest_email=booking.guest_email,
         host_name=host.name if host is not None else "",
@@ -109,4 +217,10 @@ async def _build_context(
     )
 
 
-__all__ = ["send_booking_notification"]
+__all__ = [
+    "compose_booking_notification",
+    "ledger_kind",
+    "notification_already_sent",
+    "record_booking_notification",
+    "send_booking_notification",
+]

@@ -4,20 +4,29 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aethercal"
-version = "0.0.0"
-description = "AetherCal metapackage + CLI (serve / migrate / worker / create-admin)"
+version = "0.1.0"
+description = "AetherCal metapackage: installs the scheduling engine, the API contract, and the SDK"
 requires-python = ">=3.11"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "AetherLogik" }]
-classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
+classifiers = ["Development Status :: 4 - Beta", "Typing :: Typed"]
 dependencies = [
     "aethercal-core",
     "aethercal-schemas",
     "aethercal-client",
-    "typer>=0.12",
 ]
-# NOTE: the console_scripts entry point (`aethercal = ...`) is added when the CLI is built
-# test-first in F1. No untested entry point is wired during F0 scaffolding.
+# This package is an UMBRELLA, not a CLI: `pip install aethercal` gets you the engine + the contract
+# + the SDK in one line, and nothing else. The operator CLI (`aethercal-admin`, `aethercal-serve`)
+# is a console script of the SERVER, which ships in the self-host container — not on PyPI. An
+# earlier description promised a `serve / migrate / worker / create-admin` CLI here; no such entry
+# point was ever wired, so the promise is withdrawn rather than faked.
+
+[project.urls]
+Homepage = "https://github.com/ernestodota2011/aethercal"
+Repository = "https://github.com/ernestodota2011/aethercal"
+Issues = "https://github.com/ernestodota2011/aethercal/issues"
+Changelog = "https://github.com/ernestodota2011/aethercal/blob/main/CHANGELOG.md"
 
 [tool.uv.sources]
 aethercal-core = { workspace = true }

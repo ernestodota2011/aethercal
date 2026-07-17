@@ -50,6 +50,23 @@ function addLocalMinutes(dt: Date, minutes: number): Date {
 }
 
 /**
+ * Attach the target resource row to a payload — but ONLY when there is one (RF-28).
+ *
+ * The four non-timeline views have no resource axis, so their payloads must not carry the key at all
+ * rather than carry an empty/undefined one: an absent `resourceId` means "this gesture had nothing
+ * to say about resources", which is exactly true there. `null` means the same (a row with no
+ * resource), so it is treated identically.
+ */
+function withResource<T extends { resourceId?: string }>(
+  payload: T,
+  resourceId: string | null | undefined,
+): T {
+  if (resourceId === undefined || resourceId === null) return payload;
+  payload.resourceId = resourceId;
+  return payload;
+}
+
+/**
  * Map a fraction [0, 1] of the visible day window to an absolute minute-of-day, snapped to
  * `snapMinutes` and clamped to the window. The inverse of the `topFraction` the time grid renders,
  * so a pointer at a given vertical position resolves back to a wall-clock minute.
@@ -125,8 +142,11 @@ export function computeMovedRange(
   event: CalendarEvent,
   targetDateOnly: string,
   minuteOfDay: number | null,
+  targetResourceId?: string | null,
 ): EventDropPayload {
-  if (minuteOfDay === null) return computeDroppedRange(event, targetDateOnly);
+  if (minuteOfDay === null) {
+    return withResource(computeDroppedRange(event, targetDateOnly), targetResourceId);
+  }
 
   const originalStart = parseLocalDateTime(event.start);
   const originalEnd = parseLocalDateTime(event.end);
@@ -153,13 +173,16 @@ export function computeMovedRange(
     end: formatLocalDateTime(newEnd),
   };
   if (event.revision !== undefined) payload.revision = event.revision;
-  return payload;
+  return withResource(payload, targetResourceId);
 }
 
 /**
  * Recompute an event's range when one edge is dragged to `minuteOfDay` on `targetDateOnly`. The
  * opposite endpoint is held fixed and a minimum duration is enforced (dragging the end above the
  * start, or the start past the end, clamps to a `minDurationMinutes` slot instead of inverting).
+ *
+ * A resize NEVER changes the resource row (you are dragging an edge, not the bar), so — unlike
+ * `computeMovedRange` — its payload deliberately carries no `resourceId`.
  */
 export function computeResize(
   event: CalendarEvent,
@@ -198,6 +221,10 @@ export function computeResize(
  * of drag direction. A date-granular selection (`minuteOfDay === null`: month cell / all-day rail)
  * yields an all-day range spanning the covered days with an exclusive next-midnight end; a timed
  * selection yields the [earlier, later] instants, with a zero-length click widened to a minimum slot.
+ *
+ * On the timeline the payload also names the resource row the gesture STARTED on (RF-28). The anchor
+ * wins deliberately: one new event belongs to one resource, so a drag that strays across rows must
+ * not silently create the event against a host it merely passed over.
  */
 export function computeRangeSelection(
   anchor: GridPoint,
@@ -220,7 +247,12 @@ export function computeRangeSelection(
       laterMidnight.getMonth(),
       laterMidnight.getDate() + 1,
     );
-    return { start: formatLocalDateTime(startDate), end: formatLocalDateTime(endDate), allDay: true };
+    const allDayPayload: RangeSelectPayload = {
+      start: formatLocalDateTime(startDate),
+      end: formatLocalDateTime(endDate),
+      allDay: true,
+    };
+    return withResource(allDayPayload, anchor.resourceId);
   }
 
   const a = dateAtMinute(anchor.dateOnly, anchor.minuteOfDay ?? 0);
@@ -230,5 +262,10 @@ export function computeRangeSelection(
   if (endDate.getTime() === startDate.getTime()) {
     endDate = addLocalMinutes(startDate, minDurationMinutes);
   }
-  return { start: formatLocalDateTime(startDate), end: formatLocalDateTime(endDate), allDay: false };
+  const timedPayload: RangeSelectPayload = {
+    start: formatLocalDateTime(startDate),
+    end: formatLocalDateTime(endDate),
+    allDay: false,
+  };
+  return withResource(timedPayload, anchor.resourceId);
 }

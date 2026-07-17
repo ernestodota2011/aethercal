@@ -15,57 +15,41 @@ from fasthtml.common import to_xml
 
 from aethercal.booking import views
 from aethercal.booking.forms import FieldError, parse_questions
+from aethercal.booking.i18n import Locale
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, SlotChoice
-from aethercal.schemas.bookings import BookingRead
-from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 
 LANG_URLS = {"es": "/e/intro?lang=es", "en": "/e/intro?lang=en"}
 
 
-def _event(**overrides: Any) -> EventTypeRead:
+def _event(**overrides: Any) -> PublicEventTypeRead:
+    # The PUBLIC projection: what an anonymous guest sees. No tenant_id/host_id/schedule_id — those
+    # are a business's internal identifiers, and this is the endpoint that asks for no credentials.
     base: dict[str, Any] = {
-        "id": uuid.uuid4(),
-        "tenant_id": uuid.uuid4(),
-        "host_id": uuid.uuid4(),
-        "schedule_id": uuid.uuid4(),
         "slug": "intro",
         "title": "Intro Call",
         "description": "A quick chat.",
         "location": "Google Meet",
         "duration_seconds": 1800,
-        "buffer_before_seconds": 0,
-        "buffer_after_seconds": 0,
-        "min_notice_seconds": 0,
-        "max_advance_seconds": 2592000,
-        "increment_seconds": None,
-        "max_per_day": None,
         "questions": [],
-        "active": True,
     }
     base.update(overrides)
-    return EventTypeRead.model_validate(base)
+    return PublicEventTypeRead.model_validate(base)
 
 
-def _booking(**overrides: Any) -> BookingRead:
+def _booking(**overrides: Any) -> PublicBookingRead:
+    # Four fields, and there is no fifth. Not BookingRead — that model is the guest's own name,
+    # e-mail, notes and answers, and echoing it out of a keyless endpoint makes a booking id an
+    # oracle for a stranger's PII. No meeting_url either (it reaches the guest by e-mail).
     base: dict[str, Any] = {
         "id": uuid.uuid4(),
-        "event_type_id": uuid.uuid4(),
         "start_at": datetime(2026, 7, 14, 13, 0, tzinfo=UTC),
         "end_at": datetime(2026, 7, 14, 13, 30, tzinfo=UTC),
         "status": "confirmed",
-        "guest_name": "Ada Lovelace",
-        "guest_email": "ada@example.com",
-        "guest_timezone": "America/New_York",
-        "guest_notes": None,
-        "answers": {},
-        "meeting_url": "https://meet.example/xyz",
-        "rescheduled_from_id": None,
-        "cancelled_at": None,
-        "created_at": datetime(2026, 7, 1, tzinfo=UTC),
     }
     base.update(overrides)
-    return BookingRead.model_validate(base)
+    return PublicBookingRead.model_validate(base)
 
 
 def _group() -> DayGroup:
@@ -380,12 +364,13 @@ def test_booking_form_renders_inline_errors_accessibly() -> None:
     assert 'value="bad"' in html  # the bad value is preserved for correction
 
 
-def test_confirmation_shows_details_and_meeting_link() -> None:
+def test_confirmation_shows_details_and_no_meeting_link() -> None:
     html = to_xml(
         views.confirmation_page(
             "en",
             event=_event(title="Intro Call"),
             booking=_booking(),
+            guest_email="ada@example.com",
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
@@ -393,7 +378,10 @@ def test_confirmation_shows_details_and_meeting_link() -> None:
     assert "Intro Call" in html
     assert "Tuesday, July 14 at 9:00 AM" in html
     assert "ada@example.com" in html
-    assert "https://meet.example/xyz" in html
+    # ==No meeting link on this page any more.== The public booking response is {id, start, end,
+    # status}; the link reaches the guest by e-mail, off a keyless endpoint that must not hand out
+    # meeting URLs by booking id.
+    assert "https://meet.example/xyz" not in html
 
 
 def test_confirmation_includes_add_to_calendar_links_with_correct_dates() -> None:
@@ -403,7 +391,8 @@ def test_confirmation_includes_add_to_calendar_links_with_correct_dates() -> Non
         views.confirmation_page(
             "en",
             event=_event(title="Intro Call"),
-            booking=_booking(),  # start 13:00Z, end 13:30Z
+            booking=_booking(),
+            guest_email="ada@example.com",  # start 13:00Z, end 13:30Z
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
@@ -423,6 +412,7 @@ def test_confirmation_calendar_links_use_localized_event_title() -> None:
             "en",
             event=_localized_event(),
             booking=_booking(),
+            guest_email="ada@example.com",
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
@@ -435,14 +425,24 @@ def test_confirmation_calendar_links_use_localized_event_title() -> None:
 def test_confirmation_calendar_link_labels_are_localized() -> None:
     html_en = to_xml(
         views.confirmation_page(
-            "en", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+            "en",
+            event=_event(),
+            booking=_booking(),
+            guest_email="ada@example.com",
+            when_label="x",
+            lang_urls=LANG_URLS,
         )
     )
     assert "Add to Google Calendar" in html_en
     assert "Add to Outlook" in html_en
     html_es = to_xml(
         views.confirmation_page(
-            "es", event=_event(), booking=_booking(), when_label="x", lang_urls=LANG_URLS
+            "es",
+            event=_event(),
+            booking=_booking(),
+            guest_email="ada@example.com",
+            when_label="x",
+            lang_urls=LANG_URLS,
         )
     )
     assert "Agregar a Google Calendar" in html_es
@@ -560,7 +560,7 @@ _EN_TITLE = "Discovery call"
 _EN_DESC = "A quick 30-minute chat."
 
 
-def _localized_event(**overrides: Any) -> EventTypeRead:
+def _localized_event(**overrides: Any) -> PublicEventTypeRead:
     base: dict[str, Any] = {
         "title": _CANONICAL_TITLE,
         "description": _CANONICAL_DESC,
@@ -583,7 +583,7 @@ def test_index_page_falls_back_to_canonical_title_without_override() -> None:
     assert _CANONICAL_TITLE in html
 
 
-def _render_event_page(locale: str, event: EventTypeRead) -> str:
+def _render_event_page(locale: str, event: PublicEventTypeRead) -> str:
     return to_xml(
         views.event_page(
             locale,
@@ -706,6 +706,7 @@ def test_confirmation_page_localizes_heading_title() -> None:
             "en",
             event=_localized_event(),
             booking=_booking(),
+            guest_email="ada@example.com",
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
@@ -722,6 +723,7 @@ def test_confirmation_page_falls_back_to_canonical_without_override() -> None:
             "en",
             event=event,
             booking=_booking(),
+            guest_email="ada@example.com",
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
@@ -735,9 +737,94 @@ def test_confirmation_page_lang_switcher_marks_active_locale() -> None:
             "en",
             event=_localized_event(),
             booking=_booking(),
+            guest_email="ada@example.com",
             when_label="Tuesday, July 14 at 9:00 AM",
             lang_urls=LANG_URLS,
         )
     )
     assert f'href="{LANG_URLS["en"]}" aria-current="true"' in html
     assert f'href="{LANG_URLS["es"]}" aria-current="false"' in html
+
+
+# --------------------------------------------------------------------------------------
+# The phone field + consent checkbox (RF-24). Rendered ONLY where an active WhatsApp/SMS rule will
+# actually use the number; never pre-ticked; never required.
+# --------------------------------------------------------------------------------------
+
+
+def _form_html(locale: Locale = "es", **overrides: Any) -> str:
+    kwargs: dict[str, Any] = {
+        "event": _event(),
+        "start_iso": "2026-07-14T13:00:00+00:00",
+        "tz": "UTC",
+        "when_label": "martes 14 de julio, 13:00",
+        "questions": [],
+        "values": {},
+        "errors": [],
+        "action": "/e/intro/book",
+        "lang_urls": LANG_URLS,
+    }
+    kwargs.update(overrides)
+    return to_xml(views.booking_form_page(locale, **kwargs))
+
+
+def test_no_phone_field_when_nothing_would_message_it() -> None:
+    """No active WhatsApp/SMS rule: the guest is never even asked. NOT asking is the feature."""
+    html = _form_html(event=_event(collects_phone=False))
+    assert 'name="phone"' not in html
+    assert 'name="phone_consent"' not in html
+    assert "WhatsApp" not in html
+
+
+def test_phone_field_and_consent_box_appear_when_a_phone_rule_is_active() -> None:
+    html = _form_html(event=_event(collects_phone=True))
+    assert 'name="phone"' in html
+    assert 'type="tel"' in html
+    assert 'name="phone_consent"' in html
+    assert 'type="checkbox"' in html
+
+
+def test_the_consent_box_is_never_pre_ticked() -> None:
+    """A pre-ticked box is not consent — it is a default the guest never chose."""
+    html = _form_html(event=_event(collects_phone=True))
+    assert "checked" not in html
+
+
+def test_neither_the_phone_nor_the_consent_is_required() -> None:
+    """Booking without a phone must always work, so neither control may carry ``required``."""
+    html = _form_html(event=_event(collects_phone=True))
+    start = html.index('name="phone"')
+    assert "required" not in html[start : start + 220]
+
+
+def test_the_guests_own_tick_survives_a_re_render() -> None:
+    """A validation error elsewhere must not silently discard a consent the guest DID give."""
+    html = _form_html(
+        event=_event(collects_phone=True),
+        values={"phone": "+13054131728", "phone_consent": "on", "name": ""},
+        errors=[FieldError("name", "Escribe tu nombre.")],
+    )
+    assert "checked" in html
+    assert 'value="+13054131728"' in html
+
+
+def test_the_consent_copy_is_bilingual() -> None:
+    spanish = _form_html("es", event=_event(collects_phone=True))
+    english = _form_html("en", event=_event(collects_phone=True))
+    assert "acepto recibir recordatorios" in spanish
+    assert "I agree to receive reminders" in english
+
+
+def test_the_consent_box_asks_the_booker_to_claim_the_number_as_their_own() -> None:
+    """The box must state WHAT is being claimed, because nothing verifies it (RF-24 declared gap).
+
+    The number is typed into a PUBLIC form and possession of it is never checked, so a label that
+    only said "I agree to be messaged" would record nothing beyond the fact that somebody ticked a
+    box. Asking the booker to assert the number is theirs makes the stamp record the claim they
+    actually made. It is NOT verification (see ``docs/phone-channels.md``) — and this test exists so
+    that the claim cannot be quietly dropped from the copy later.
+    """
+    spanish = _form_html("es", event=_event(collects_phone=True))
+    english = _form_html("en", event=_event(collects_phone=True))
+    assert "Este número es mío" in spanish
+    assert "This is my own number" in english

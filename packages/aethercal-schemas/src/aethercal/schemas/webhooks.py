@@ -19,8 +19,23 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-WebhookEventName = Literal["booking.created", "booking.cancelled", "booking.rescheduled"]
-"""The events an AetherCal webhook can fan out. Kept in lockstep with the booking lifecycle."""
+WebhookEventName = Literal[
+    "booking.created",
+    "booking.cancelled",
+    "booking.rescheduled",
+    "booking.no_show",
+]
+"""The events an AetherCal webhook can fan out. Kept in lockstep with the booking lifecycle.
+
+This ``Literal`` is the SINGLE source: :data:`WEBHOOK_EVENTS`, the subscription validator
+(:data:`_EventList`), :class:`WebhookRead`, :class:`WebhookEnvelope` and the OpenAPI schema all
+derive from it, so an event is added here and nowhere else.
+
+``booking.no_show`` (RF-25) closes a real observability hole: a subscriber's CRM learned about a
+cancellation and about a reschedule, but a guest who simply never turned up was invisible to it.
+Widening the vocabulary needs NO data migration — ``Webhook.events`` is a JSON column, and nobody
+starts receiving the new event by accident, because an existing subscriber cannot have subscribed to
+an event that did not exist."""
 
 WEBHOOK_EVENTS: tuple[WebhookEventName, ...] = get_args(WebhookEventName)
 """The allowed event names as a tuple, for iteration/validation by callers."""
@@ -38,7 +53,11 @@ def _require_http_scheme(url: str) -> str:
     """Reject any non ``http``/``https`` webhook URL at registration (RF-17 / RNF-5).
 
     Scheme-only fast fail — the authoritative egress/IP check runs at send time in the delivery
-    worker (:func:`aethercal.server.webhooks.ssrf.assert_public_url`).
+    worker (:func:`aethercal.server.webhooks.ssrf.assert_target_allowed`), which is also where the
+    operator's private-target allowlist is applied. Deliberately NOT here: a URL that is legal on
+    one instance (an operator who declared their LAN) is illegal on another, so a registration-time
+    address check would either lie to the self-hoster or hard-code one deployment's policy into the
+    shared schema package.
     """
     if urlsplit(url).scheme not in _ALLOWED_URL_SCHEMES:
         raise ValueError("webhook url scheme must be http or https")

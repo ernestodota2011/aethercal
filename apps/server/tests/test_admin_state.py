@@ -9,25 +9,31 @@ state and asserting it is a no-op that never even reaches the runtime/service.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import threading
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from reflex.event import EventHandler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from aethercal.server.admin import runtime as runtime_mod
+from aethercal.server.admin import state as state_module
 from aethercal.server.admin.config import AdminConfig
-from aethercal.server.admin.passwords import hash_password
+from aethercal.server.admin.format import SHARED_SCHEDULE
 from aethercal.server.admin.ratelimit import LOGIN_LIMITER, PBKDF2_LIMITER
 from aethercal.server.admin.runtime import AdminRuntime, configure_runtime
 from aethercal.server.admin.state import AdminState
 from aethercal.server.db import Base
 from aethercal.server.db.models import Tenant, User
+from aethercal.server.passwords import hash_password
+from aethercal.server.services.rbac import PrincipalKind
 
 Sessionmaker = async_sessionmaker[AsyncSession]
 
@@ -35,6 +41,7 @@ Sessionmaker = async_sessionmaker[AsyncSession]
 _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.load_bookings.fn, ()),
     (AdminState.cancel.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.mark_no_show.fn, ("00000000-0000-0000-0000-000000000000",)),
     (AdminState.reschedule.fn, ({"booking_id": "x", "new_start": "x"},)),
     (AdminState.load_event_types.fn, ()),
     (AdminState.create_event_type.fn, ({},)),
@@ -44,6 +51,35 @@ _GUARDED: list[tuple[Callable[..., Awaitable[None]], tuple[object, ...]]] = [
     (AdminState.create_schedule.fn, ({},)),
     (AdminState.update_schedule.fn, ({},)),
     (AdminState.delete_schedule.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_metrics.fn, ()),
+    (AdminState.load_branding.fn, ()),
+    (AdminState.save_branding.fn, ({},)),
+    (AdminState.load_hosts.fn, ()),
+    (AdminState.create_host.fn, ({},)),
+    (AdminState.update_host.fn, ({},)),
+    (AdminState.delete_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.select_host.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.designate_calendar.fn, ({},)),
+    (AdminState.load_workflows.fn, ()),
+    (AdminState.create_workflow.fn, ({},)),
+    (AdminState.update_workflow.fn, ({},)),
+    (AdminState.activate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.deactivate_workflow.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.create_template.fn, ({},)),
+    (AdminState.update_template.fn, ({},)),
+    (AdminState.delete_template.fn, ("00000000-0000-0000-0000-000000000000",)),
+    # -- members + the business selector (B-02) -------------------------------------
+    # Each reads or writes tenant data, so each must refuse an unauthenticated caller. The runtime
+    # unconfigured in the sweep above, so a handler that skipped its guard would hit
+    # ``current_runtime()`` and RAISE — which is what proves the guard, not a mock that would
+    # prove only the mock.
+    (AdminState.load_members.fn, ()),
+    (AdminState.create_member.fn, ({},)),
+    (AdminState.update_member_role.fn, ({},)),
+    (AdminState.set_member_password.fn, ({},)),
+    (AdminState.delete_member.fn, ("00000000-0000-0000-0000-000000000000",)),
+    (AdminState.load_businesses.fn, ()),
+    (AdminState.select_business.fn, ("acme",)),
 ]
 
 
@@ -84,6 +120,18 @@ def _state() -> AdminState:
     return AdminState(_reflex_internal_init=True)
 
 
+async def _seeded_host_id(state: AdminState) -> str:
+    """The tenant's ONE host, as a form value.
+
+    RF-30 made the host an EXPLICIT field on the event-type form. It used to be injected by the
+    service — the tenant's first user — which is precisely why a business's second host could never
+    be given an event type. So every create now states which host it means, these tests included.
+    """
+    await AdminState.load_hosts.fn(state)
+    assert len(state.hosts) == 1, "these tests seed a single-host tenant"
+    return state.hosts[0]["id"]
+
+
 def test_authenticated_is_a_server_only_backend_var() -> None:
     # Not shipped to the frontend and no generated client setter → a client cannot flip it.
     assert "_authenticated" in AdminState.backend_vars
@@ -91,8 +139,65 @@ def test_authenticated_is_a_server_only_backend_var() -> None:
     assert "set__authenticated" not in dir(AdminState)
 
 
+#: Handlers that are PUBLIC by design: they are the auth surface itself. ``member_login`` (B-02) is
+#: one of them — it is a login, so an unauthenticated caller is the whole point; its own refusals
+#: (an unknown business/address/password, all one message) are proven in ``test_admin_rbac.py`` and
+#: against a real PostgreSQL in ``tests/rls/test_rbac_isolation.py``.
+_PUBLIC_HANDLERS = frozenset({"login", "member_login", "logout", "require_auth", "setvar"})
+
+#: Handlers that read and write NO tenant data — they only close a panel in the operator's own
+#: browser. They need no guard because there is nothing behind them to guard.
+_UI_ONLY_HANDLERS = frozenset({"clear_selection", "close_new_booking"})
+
+#: Calendar handlers whose unauthenticated no-op is proven in ``test_admin_calendar.py`` (they take
+#: gesture payloads, and two of them are async generators, so they are exercised there rather than
+#: in the parametrised sweep below).
+_GUARDED_ELSEWHERE = frozenset(
+    {
+        "on_calendar_event_drop",
+        "on_calendar_event_resize",
+        "on_calendar_range_select",
+        "on_calendar_event_click",
+        "on_calendar_range_change",
+        "on_calendar_view_change",
+        "set_calendar_view",
+        "create_booking",
+        "reschedule_selected",
+    }
+)
+
+
 def test_fresh_state_is_unauthenticated() -> None:
     assert _state()._authenticated is False
+
+
+def test_no_handler_can_skip_the_auth_census_unnoticed() -> None:
+    """==Every event handler on the state is CLASSIFIED, or this test fails.==
+
+    Reflex exposes each ``@rx.event`` over the websocket, so a client can invoke any of them
+    directly — a page's ``on_load`` guard protects nothing. The proof that a handler refuses an
+    unauthenticated caller therefore has to exist for EVERY handler, and until now the lists that
+    carry those proofs were maintained by hand: a handler added to ``state.py`` and forgotten was a
+    handler nobody had ever proven guarded, and nothing said so. The hole announced itself exactly
+    the way this project's defects always do — by being silent.
+
+    So the census is derived from the CLASS, not from a list somebody must remember to update. A new
+    handler is UNCLASSIFIED until its author decides which of the four it is, and an unclassified
+    handler fails here.
+    """
+    declared = {name for name, value in vars(AdminState).items() if isinstance(value, EventHandler)}
+    classified = (
+        {handler.__name__ for handler, _ in _GUARDED}
+        | _PUBLIC_HANDLERS
+        | _UI_ONLY_HANDLERS
+        | _GUARDED_ELSEWHERE
+    )
+    unclassified = declared - classified
+    assert unclassified == set(), (
+        f"event handlers with no auth-guard proof: {sorted(unclassified)}. Add each to _GUARDED "
+        "and prove it refuses an unauthenticated caller — or, if it touches no tenant data at all, "
+        "to _UI_ONLY_HANDLERS."
+    )
 
 
 @pytest.mark.parametrize("handler", [h for h, _ in _GUARDED], ids=lambda h: h.__name__)
@@ -156,6 +261,43 @@ async def test_login_lockout_survives_a_new_session(seeded_maker: Sessionmaker) 
     assert "Too many attempts" in fresh.error
 
 
+async def test_member_login_lockout_is_case_insensitive_on_the_email(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The login budget folds the address to lower case, so casing cannot reset it.==
+
+    ``users`` is unique on ``lower(email)`` and ``authenticate_member`` matches it that way, so
+    ``ana@x.com`` and ``ANA@x.com`` are ONE account. If the limiter keyed the budget by the RAW
+    address, that one account would get a fresh five-attempt budget per spelling
+    (``a@x``, ``A@x``, ``aA@x``, ...) — a per-email cap that caps nothing. Here the budget is
+    exhausted under one spelling and a DIFFERENT spelling of the same address is still locked out.
+    """
+    config = AdminConfig(
+        username="operator", password_hash=hash_password("s3cret"), tenant_slug=None
+    )
+    configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
+
+    # Exhaust the five-attempt budget under the lower-case spelling.
+    for _ in range(5):
+        await AdminState.member_login.fn(
+            _state(), {"tenant_slug": "acme", "email": "ana@x.com", "password": "wrong"}
+        )
+    # Clear ONLY the shared per-IP budget (locked by those same five failures), so the next attempt
+    # is gated by the EMAIL key alone — otherwise the IP lock would mask whether casing shares the
+    # account's budget. `_state()`'s client IP resolves to "unknown" (see the operator tests).
+    LOGIN_LIMITER.record_success("ip:unknown")
+
+    # A DIFFERENT casing of the same address is still refused as locked out: it shares the canonical
+    # budget. Before the fix, `ANA@x.com` keyed a fresh counter and sailed past the limiter.
+    state = _state()
+    redirect = await AdminState.member_login.fn(
+        state, {"tenant_slug": "acme", "email": "ANA@x.com", "password": "wrong"}
+    )
+    assert redirect is None
+    assert state._authenticated is False
+    assert "Too many attempts" in state.error
+
+
 async def test_authenticated_load_reaches_the_service(seeded_maker: Sessionmaker) -> None:
     config = AdminConfig(
         username="operator", password_hash=hash_password("s3cret"), tenant_slug=None
@@ -163,6 +305,7 @@ async def test_authenticated_load_reaches_the_service(seeded_maker: Sessionmaker
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     await AdminState.load_bookings.fn(state)
     # The (empty) tenant resolves cleanly: the query ran, no setup error surfaced.
@@ -179,6 +322,7 @@ async def test_reschedule_stamps_a_naive_datetime_local_as_utc(
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     captured: dict[str, datetime] = {}
 
@@ -236,6 +380,7 @@ async def test_deactivating_an_unknown_event_type_reports_not_found(
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
 
     await AdminState.deactivate_event_type.fn(state, str(uuid.uuid4()))
     assert state.error == "Event type not found"
@@ -261,6 +406,7 @@ async def _authenticated_state(seeded_maker: Sessionmaker) -> AdminState:
     configure_runtime(AdminRuntime(sessionmaker=seeded_maker, config=config))
     state = _state()
     state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
     return state
 
 
@@ -271,6 +417,7 @@ async def test_create_event_type_saves_the_en_translations(seeded_maker: Session
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -295,6 +442,7 @@ async def test_create_event_type_with_blank_en_fields_does_not_store_the_key(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -318,6 +466,7 @@ async def test_update_event_type_sets_the_en_translation_and_reload_populates_it
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -348,6 +497,7 @@ async def test_update_event_type_absent_en_field_leaves_the_existing_translation
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -372,6 +522,7 @@ async def _event_with_en_translations(seeded_maker: Sessionmaker) -> tuple[Admin
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -468,6 +619,7 @@ async def test_update_event_type_blank_canonical_title_is_omitted_not_cleared(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -497,6 +649,7 @@ async def test_update_event_type_with_only_id_is_a_true_no_op(
     await AdminState.create_event_type.fn(
         state,
         {
+            "host_id": await _seeded_host_id(state),
             "slug": "intro",
             "title": "Introducción",
             "schedule": "Weekly",
@@ -511,3 +664,349 @@ async def test_update_event_type_with_only_id_is_a_true_no_op(
     assert state.error == ""
     assert state.event_types[0]["title"] == "Introducción"
     assert state.event_types[0]["duration_min"] == "30"
+
+
+# --------------------------------------------------------------------------------------
+# A schedule's owner can be MOVED (RF-30). The column existed and nobody could touch it.
+# --------------------------------------------------------------------------------------
+
+
+async def _authed(maker: Sessionmaker) -> AdminState:
+    configure_runtime(
+        AdminRuntime(
+            sessionmaker=maker,
+            config=AdminConfig(
+                username="operator", password_hash=hash_password("s3cret"), tenant_slug=None
+            ),
+        )
+    )
+    state = _state()
+    state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
+    return state
+
+
+async def _schedule_owner(state: AdminState, name: str) -> str:
+    """The ``owner`` cell of the schedule called ``name`` — the id of its host, or the sentinel."""
+    await AdminState.load_schedules.fn(state)
+    return next(row["owner"] for row in state.schedules if row["name"] == name)
+
+
+async def _schedule_id_of(state: AdminState, name: str) -> str:
+    await AdminState.load_schedules.fn(state)
+    return next(row["id"] for row in state.schedules if row["name"] == name)
+
+
+async def test_a_schedule_can_be_handed_from_one_host_to_another(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The column existed and nobody could move it.==
+
+    ``schedules.user_id`` shipped with RF-30, and the EDIT form never exposed it — so a schedule
+    created with an owner could not be transferred, and a shared one could not be assigned. A field
+    the database has and the panel cannot reach is a field that does not exist.
+    """
+    state = await _authed(seeded_maker)
+    await AdminState.create_host.fn(
+        state, {"name": "Bruno", "email": "bruno@example.com", "timezone": "UTC"}
+    )
+    await AdminState.load_hosts.fn(state)
+    by_name = {row["name"]: row["id"] for row in state.hosts}
+    ana, bruno = by_name["Host"], by_name["Bruno"]
+
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    assert await _schedule_owner(state, "Weekly") == ana
+
+    await AdminState.update_schedule.fn(
+        state, {"id": await _schedule_id_of(state, "Weekly"), "owner_id": bruno}
+    )
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Weekly") == bruno
+
+
+async def test_a_schedule_can_be_handed_back_to_the_whole_business(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==The sentinel earns its keep here.==
+
+    "I did not touch the field" and "I want this to belong to nobody" cannot be the same value, so
+    an untouched (blank) select leaves the owner alone and the explicit ``(business)`` option is
+    what clears it. Otherwise editing a schedule's NAME would quietly take it from its host.
+    """
+    state = await _authed(seeded_maker)
+    await AdminState.load_hosts.fn(state)
+    ana = state.hosts[0]["id"]
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "owner_id": SHARED_SCHEDULE})
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE
+
+
+async def test_editing_only_the_name_never_takes_a_schedule_away_from_its_host(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """The blank field PRESERVES the owner. If it meant "shared", renaming a schedule would silently
+    hand it to the whole business — and two hosts would come to share a pattern nobody chose."""
+    state = await _authed(seeded_maker)
+    await AdminState.load_hosts.fn(state)
+    ana = state.hosts[0]["id"]
+    await AdminState.create_schedule.fn(state, {**_WEEKLY_SCHEDULE_FORM, "owner_id": ana})
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "name": "Renamed"})
+
+    assert state.error == ""
+    assert await _schedule_owner(state, "Renamed") == ana  # still hers
+
+
+async def test_a_schedule_cannot_be_given_to_another_businesss_host(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """The owner arrives from a form, so it is a cross-tenant write surface until it is checked."""
+    async with seeded_maker() as session, session.begin():
+        intruder_tenant = Tenant(slug="beta", name="Beta")
+        session.add(intruder_tenant)
+        await session.flush()
+        intruder = User(
+            tenant_id=intruder_tenant.id, email="b@example.com", name="Beto", timezone="UTC"
+        )
+        session.add(intruder)
+        await session.flush()
+        intruder_id = str(intruder.id)
+
+    # Two tenants now exist, so the admin must be told which one it administers.
+    configure_runtime(
+        AdminRuntime(
+            sessionmaker=seeded_maker,
+            config=AdminConfig(
+                username="operator", password_hash=hash_password("s3cret"), tenant_slug="acme"
+            ),
+        )
+    )
+    state = _state()
+    state._authenticated = True
+    state._principal_kind = PrincipalKind.BOOTSTRAP_OPERATOR.value
+    await AdminState.create_schedule.fn(state, _WEEKLY_SCHEDULE_FORM)
+    schedule_id = await _schedule_id_of(state, "Weekly")
+
+    await AdminState.update_schedule.fn(state, {"id": schedule_id, "owner_id": intruder_id})
+
+    assert state.error != ""
+    assert await _schedule_owner(state, "Weekly") == SHARED_SCHEDULE  # untouched
+
+
+# ======================================================================================
+# ==Switching business must not leave a panel holding the previous business's data.== (B-02)
+# ======================================================================================
+
+#: The state vars that SURVIVE an operator's business switch — because none of them is one
+#: business's data. Everything else is business-scoped and MUST be cleared, so a forgotten new panel
+#: var fails SAFE (cleared), not leaking A's rows under B. Named here so a var is added to the
+#: keep-list by a deliberate decision in a diff, never by a panel that quietly forgot to clear.
+_SURVIVES_BUSINESS_SWITCH = frozenset(
+    {
+        # The session's identity — who is signed in and (for the operator) which business they just
+        # picked. Clearing these would log the operator out on every switch.
+        "_authenticated",
+        "_principal_kind",
+        "_principal_role",
+        "_principal_user_id",
+        "_business_tenant_id",
+        "_business_slug",
+        # The operator's instance-wide selector list — every business on the box, not one's data.
+        "businesses",
+        # A view preference (month/week/...), not business data.
+        "calendar_view",
+        # Monotonic out-of-order guards for the async loads: they must NEVER rewind, or a stale
+        # in-flight response from business A could land after the switch.
+        "calendar_reload_seq",
+        "bookings_reload_seq",
+    }
+)
+
+
+def _declared_state_vars() -> set[str]:
+    """Every rx var declared on ``AdminState`` — read from the SOURCE, so a new one is seen here the
+    moment it is added, without importing the (asset-building) module."""
+    tree = ast.parse(Path(state_module.__file__).read_text(encoding="utf-8"))
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AdminState"
+    )
+    return {
+        stmt.target.id
+        for stmt in cls.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+
+
+def _vars_reset_by(func_name: str) -> set[str]:
+    """The ``state.<name>`` attributes assigned inside the module-level function ``func_name``."""
+    tree = ast.parse(Path(state_module.__file__).read_text(encoding="utf-8"))
+    func = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == func_name
+    )
+    assigned: set[str] = set()
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "state"
+            ):
+                assigned.add(target.attr)
+    return assigned
+
+
+def test_the_business_scoped_reset_covers_every_business_scoped_var() -> None:
+    """==The lock on the leak.== A new panel adds a state var; if the switch handler does not clear
+    it, business A's data shows under business B. So the fact is asserted about the TREE:
+    ``_reset_business_scoped_state`` assigns EVERY declared var not on the keep-list, or this
+    goes red. The next panel cannot forget to clear its var — it fails here until it is either reset
+    or deliberately declared to survive the switch.
+    """
+    declared = _declared_state_vars()
+    # The keep-list is real (a typo would silently exempt nothing / everything).
+    assert declared >= _SURVIVES_BUSINESS_SWITCH, sorted(_SURVIVES_BUSINESS_SWITCH - declared)
+
+    business_scoped = declared - _SURVIVES_BUSINESS_SWITCH
+    assert business_scoped, "canary: found no business-scoped vars at all — the parser missed them"
+
+    reset = _vars_reset_by("_reset_business_scoped_state")
+    assert business_scoped - reset == set(), (
+        "these business-scoped vars are NOT cleared on switch (A's data would show under "
+        f"B): {sorted(business_scoped - reset)}"
+    )
+    # And the reset never touches an identity/keep var — clearing those would break the session.
+    assert reset & _SURVIVES_BUSINESS_SWITCH == set(), sorted(reset & _SURVIVES_BUSINESS_SWITCH)
+
+
+async def test_select_business_clears_the_previous_businesss_panels(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==Not one datum of business A survives the switch.== The operator loads A's panels, switches
+    to another business, and every business-scoped list/selection comes back empty — while the
+    instance-wide selector and their view preference are untouched, because neither is A's data."""
+    state = await _authenticated_state(seeded_maker)
+
+    # Business A's panels, fully loaded.
+    state.members = [{"id": "a-owner", "role": "owner"}]
+    state.hosts = [{"id": "a-host"}]
+    state.event_types = [{"id": "a-et"}]
+    state.schedules = [{"id": "a-sched"}]
+    state.workflows = [{"id": "a-wf"}]
+    state.templates = [{"id": "a-tpl"}]
+    state.metrics = [{"k": "v"}]
+    state.connections = [{"id": "a-conn"}]
+    state.selected_host_id = "a-host"
+    state.selected_booking_id = "a-booking"
+    state.selected_booking_guest = "Guest A"
+    state.new_booking_start = "2026-01-01T10:00"
+    state.show_new_booking = True
+    state.error = "a stale message about business A"
+    # Kept across the switch: the operator's list of businesses, and their view preference.
+    state.businesses = [{"slug": "acme", "name": "Acme"}, {"slug": "globex", "name": "Globex"}]
+    state.calendar_view = "week"
+
+    await AdminState.select_business.fn(state, "acme")
+
+    assert state.members == []
+    assert state.hosts == []
+    assert state.event_types == []
+    assert state.schedules == []
+    assert state.workflows == []
+    assert state.templates == []
+    assert state.metrics == []
+    assert state.connections == []
+    assert state.selected_host_id == ""
+    assert state.selected_booking_id == ""
+    assert state.selected_booking_guest == ""
+    assert state.new_booking_start == ""
+    assert state.show_new_booking is False
+    assert state.error == ""
+    # The selector and the view preference are not one business's data — they survive.
+    assert state.businesses == [
+        {"slug": "acme", "name": "Acme"},
+        {"slug": "globex", "name": "Globex"},
+    ]
+    assert state.calendar_view == "week"
+
+
+# --------------------------------------------------------------------------------------
+# Branding panel (B-07 / RF-27) — at the STATE handler, not just the service.
+# --------------------------------------------------------------------------------------
+
+
+async def test_save_branding_keeps_the_validation_error_visible(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A refused save must leave the operator the sentence they can act on.==
+
+    The handler re-loads the form boxes on refusal so they show what is actually stored — but that
+    reload clears ``self.error`` the way every ``on_load`` does. Setting the error and THEN
+    reloading let the reload swallow it: the panel silently redrew and the operator never learned
+    why nothing saved. The error must survive the reload.
+    """
+    state = await _authenticated_state(seeded_maker)
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "Mars/Phobos",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # ...and the boxes show what is stored (the seed's UTC), not the rejected submission.
+    assert state.branding["timezone"] == "UTC"
+    assert state.branding["public_name"] == ""
+
+
+async def test_save_branding_refuses_a_blank_timezone_instead_of_silently_choosing_utc(
+    seeded_maker: Sessionmaker,
+) -> None:
+    """==A cleared timezone box is not consent to UTC — it is refused, and nothing is written.==
+
+    The handler used to coerce a blank with ``or "UTC"`` before the schema ever saw it, so the
+    operator's empty field was silently decided for them (a no-op the docstring's "NOTHING is
+    written" contract forbids). A blank must reach the validator and come back as an error, leaving
+    the stored zone untouched.
+    """
+    state = await _authenticated_state(seeded_maker)
+    # A known, non-UTC starting point, so "kept" and "silently set to UTC" cannot look the same.
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "America/New_York",
+        },
+    )
+    assert state.error == ""
+    assert state.branding["timezone"] == "America/New_York"
+
+    await AdminState.save_branding.fn(
+        state,
+        {
+            "public_name": "Acme",
+            "logo_url": "",
+            "accent_color": "",
+            "timezone": "",
+        },
+    )
+
+    assert state.error != ""
+    assert "timezone" in state.error
+    # Nothing was written: a fresh read still finds the zone from the successful save.
+    await AdminState.load_branding.fn(state)
+    assert state.branding["timezone"] == "America/New_York"

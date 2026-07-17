@@ -89,3 +89,26 @@ describe("buildSampleEvents", () => {
     expect(buildSampleEvents(new Date(2026, 6, 15, 12, 0))).toEqual(events);
   });
 });
+
+describe("the orphan event that fills the timeline's 'unassigned' row", () => {
+  it("is exactly one, and it is anchored inside the timeline's default window", () => {
+    // The timeline anchors on TODAY and shows `timelineDays` (7 by default) from there. An orphan
+    // pinned to a fixed day of the month therefore leaves the window on most days, the row it
+    // exists to demonstrate silently disappears, and the demo's own test starts failing by the
+    // calendar rather than by a code change. That is exactly what happened once; this is the guard.
+    const today = new Date();
+    const events = buildSampleEvents(today);
+    const orphans = events.filter((event) => event.resourceId === undefined);
+
+    expect(orphans).toHaveLength(1);
+
+    const start = new Date(orphans[0]!.start);
+    const windowStart = new Date(today);
+    windowStart.setHours(0, 0, 0, 0);
+    const windowEnd = new Date(windowStart);
+    windowEnd.setDate(windowEnd.getDate() + 7);
+
+    expect(start.getTime()).toBeGreaterThanOrEqual(windowStart.getTime());
+    expect(start.getTime()).toBeLessThan(windowEnd.getTime());
+  });
+});

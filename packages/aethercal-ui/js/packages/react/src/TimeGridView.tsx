@@ -789,6 +789,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                     isActive={isEvtActive}
                     isGrabbed={kbGrab?.eventId === event.id && col.dateOnly === activeDate}
                     timeLabel={null}
+                    canDrag={dropEnabled}
                     onDragStart={onDragStart}
                     onDragEnd={onDragEnd}
                     isPending={pendingIds.has(event.id)}
@@ -889,7 +890,10 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                         isGrabbed && "is-grabbed",
                       )}
                       {...(eventInteractive(event) ? { role: "button" } : {})}
-                      draggable={editable}
+                      // Draggable ONLY when the drop can land somewhere: an editable event whose
+                      // host wired `onEventDrop`. Advertising a drag the component will silently
+                      // swallow is a promise the UI cannot keep.
+                      draggable={editable && dropEnabled}
                       data-event-id={event.id}
                       data-lane={block.lane}
                       data-lane-count={block.laneCount}
@@ -897,7 +901,7 @@ export function TimeGridView(props: TimeGridViewProps): React.JSX.Element {
                       title={event.title}
                       style={style}
                       onDragStart={(e) => {
-                        if (gestureRef.current?.kind === "resize") {
+                        if (!dropEnabled || gestureRef.current?.kind === "resize") {
                           e.preventDefault();
                           return;
                         }

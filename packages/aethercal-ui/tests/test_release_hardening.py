@@ -181,13 +181,20 @@ def test_calendar_module_binds_the_reflex_base_field() -> None:
 # Bundle budget (item #2)
 # --------------------------------------------------------------------------------------
 
-# Hard ceiling for the committed, minified JS bundle. Current size ~24.7 KB (F2-A month + F2-B
-# week/day). The ceiling leaves generous headroom for the rest of v0.1 (list view, the
-# interaction/reconciliation machines, theming, i18n) while still tripping on the failure that
-# matters: an accidental React vendor (dropping the esbuild `external`) would add react-dom
-# (~130 KB minified) and blow straight past this. Raise deliberately, with a rebuild, if the real
-# feature set ever legitimately needs it — never to paper over a silently-bloated bundle.
-_BUNDLE_BUDGET_BYTES = 90_000
+# Hard ceiling for the committed, minified JS bundle. Current size ~88.7 KB: the four original
+# surfaces (month, week/day, list) plus the RF-28 resource timeline, with the interaction and
+# reconciliation machines, theming and i18n.
+#
+# Raised from 90 KB to 100 KB in RF-28 — deliberately, and with the growth accounted for. The
+# timeline is a FIFTH surface (its own core geometry, view, gestures and stylesheet) and took the
+# bundle from ~59.7 KB to ~88.7 KB. Confirmed at the time that React is still EXTERNAL (no React
+# internals in the output): this is feature growth, not the failure the guard exists for.
+#
+# The ceiling still trips on that failure: an accidental React vendor (dropping the esbuild
+# `external`) would add react-dom (~130 KB minified) and blow straight past this. Raise
+# deliberately, with a rebuild, if the real feature set ever legitimately needs it — never to paper
+# over a silently-bloated bundle.
+_BUNDLE_BUDGET_BYTES = 100_000
 
 
 def test_committed_bundle_exists_and_is_non_empty() -> None:

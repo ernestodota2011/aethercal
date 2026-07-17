@@ -1,0 +1,9 @@
+# Written by scripts/stack-up.sh and global-setup.ts — machine-local, never committed.
+.stack.json
+.run.json
+
+# Playwright output.
+playwright-report/
+test-results/
+blob-report/
+.playwright/

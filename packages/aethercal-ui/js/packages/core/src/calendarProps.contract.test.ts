@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import schemaJson from "./calendar-props.schema.json";
 import type {
   CalendarEvent,
+  CalendarResource,
   CalendarView,
   ContextMenuPayload,
   EventClickPayload,
@@ -81,18 +82,20 @@ function validate(node: JsonSchema, value: unknown, root: JsonSchema, path = "$"
 
 // Exhaustive samples — one per $def — each `satisfies` its TS type. `satisfies` makes the compiler
 // reject a sample with an unknown/misnamed field, so these are the TS-side field manifest.
-const drop = { id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 2, client_mutation_id: "cm" } satisfies EventDropPayload;
+const drop = { id: "e1", start: "2026-07-16T10:00:00", end: "2026-07-16T11:00:00", revision: 2, client_mutation_id: "cm", resourceId: "r1" } satisfies EventDropPayload;
 const resize = { id: "e1", start: "2026-07-15T10:00:00", end: "2026-07-15T12:30:00", revision: 3, client_mutation_id: "cm" } satisfies EventResizePayload;
-const range = { start: "2026-07-15T09:00:00", end: "2026-07-15T10:00:00", allDay: false } satisfies RangeSelectPayload;
+const range = { start: "2026-07-15T09:00:00", end: "2026-07-15T10:00:00", allDay: false, resourceId: "r1" } satisfies RangeSelectPayload;
 const click = { id: "e1" } satisfies EventClickPayload;
 const menu = { id: "e1", start: "2026-07-15T09:00:00" } satisfies ContextMenuPayload;
 const viewChange = { view: "week", from: "2026-07-13", to: "2026-07-19" } satisfies ViewChangePayload;
-const event = { id: "e1", title: "Consult", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", allDay: false, color: "#64748b", editable: true, revision: 1 } satisfies CalendarEvent;
+const event = { id: "e1", title: "Consult", start: "2026-07-15T10:00:00", end: "2026-07-15T11:00:00", allDay: false, color: "#64748b", editable: true, revision: 1, resourceId: "r1" } satisfies CalendarEvent;
+const resource = { id: "r1", title: "Dr. Rivas", groupId: "Clinic A", color: "#64748b" } satisfies CalendarResource;
 
 // Every $def with a TS-typed sample that carries all of its fields (so each field's runtime value
 // reflects its TS type). Used to lock field TYPES, not just names/optionality, against the schema.
 const SAMPLES: Record<string, Record<string, unknown>> = {
   CalendarEvent: event,
+  CalendarResource: resource,
   EventDropPayload: drop,
   EventResizePayload: resize,
   RangeSelectPayload: range,
@@ -118,14 +121,18 @@ type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 type Expect<T extends true> = T;
 const _exactTypeLocks: [
-  Expect<Equal<CalendarEvent, { id: string; title: string; start: string; end: string; allDay?: boolean; color?: string; editable?: boolean; revision?: number }>>,
-  Expect<Equal<EventDropPayload, { id: string; start: string; end: string; revision?: number; client_mutation_id?: string }>>,
+  Expect<Equal<CalendarEvent, { id: string; title: string; start: string; end: string; allDay?: boolean; color?: string; editable?: boolean; revision?: number; resourceId?: string }>>,
+  Expect<Equal<CalendarResource, { id: string; title: string; groupId?: string; color?: string }>>,
+  Expect<Equal<EventDropPayload, { id: string; start: string; end: string; revision?: number; client_mutation_id?: string; resourceId?: string }>>,
   Expect<Equal<EventResizePayload, { id: string; start: string; end: string; revision?: number; client_mutation_id?: string }>>,
-  Expect<Equal<RangeSelectPayload, { start: string; end: string; allDay: boolean }>>,
+  Expect<Equal<RangeSelectPayload, { start: string; end: string; allDay: boolean; resourceId?: string }>>,
   Expect<Equal<EventClickPayload, { id: string }>>,
   Expect<Equal<ContextMenuPayload, { id: string; start?: string } | { start: string; id?: string }>>,
   Expect<Equal<ViewChangePayload, { view: CalendarView; from: string; to: string }>>,
-] = [true, true, true, true, true, true, true];
+  // The view union itself is locked: adding a surface must be a deliberate, contract-visible change
+  // (it widens `_VALID_VIEWS` in Python and every `Record<CalendarView, ...>` in the React layer).
+  Expect<Equal<CalendarView, "month" | "week" | "day" | "list" | "timeline">>,
+] = [true, true, true, true, true, true, true, true, true];
 void _exactTypeLocks;
 
 /**
@@ -148,10 +155,11 @@ void keysOf<EventDropPayload>()(["id", "start", "end", "client_mutation_id"]);
 
 // Every payload type's full key set, exhaustively pinned by the compiler.
 const KEY_TUPLES: Record<string, readonly string[]> = {
-  CalendarEvent: keysOf<CalendarEvent>()(["id", "title", "start", "end", "allDay", "color", "editable", "revision"]),
-  EventDropPayload: keysOf<EventDropPayload>()(["id", "start", "end", "revision", "client_mutation_id"]),
+  CalendarEvent: keysOf<CalendarEvent>()(["id", "title", "start", "end", "allDay", "color", "editable", "revision", "resourceId"]),
+  CalendarResource: keysOf<CalendarResource>()(["id", "title", "groupId", "color"]),
+  EventDropPayload: keysOf<EventDropPayload>()(["id", "start", "end", "revision", "client_mutation_id", "resourceId"]),
   EventResizePayload: keysOf<EventResizePayload>()(["id", "start", "end", "revision", "client_mutation_id"]),
-  RangeSelectPayload: keysOf<RangeSelectPayload>()(["start", "end", "allDay"]),
+  RangeSelectPayload: keysOf<RangeSelectPayload>()(["start", "end", "allDay", "resourceId"]),
   EventClickPayload: keysOf<EventClickPayload>()(["id"]),
   ContextMenuPayload: keysOf<ContextMenuPayload>()(["id", "start"]),
   ViewChangePayload: keysOf<ViewChangePayload>()(["view", "from", "to"]),
@@ -177,6 +185,7 @@ void requiredKeysOf<EventDropPayload>()(["id", "start"]);
 // Which keys each payload requires — pinned by the compiler so TS optionality can't drift.
 const REQUIRED_TUPLES: Record<string, readonly string[]> = {
   CalendarEvent: requiredKeysOf<CalendarEvent>()(["id", "title", "start", "end"]),
+  CalendarResource: requiredKeysOf<CalendarResource>()(["id", "title"]),
   EventDropPayload: requiredKeysOf<EventDropPayload>()(["id", "start", "end"]),
   EventResizePayload: requiredKeysOf<EventResizePayload>()(["id", "start", "end"]),
   RangeSelectPayload: requiredKeysOf<RangeSelectPayload>()(["start", "end", "allDay"]),
@@ -198,6 +207,25 @@ describe("calendar-props contract — TS payloads validate against the generated
     expect(validate(schema.$defs.ContextMenuPayload, menu, schema)).toEqual([]);
     expect(validate(schema.$defs.ViewChangePayload, viewChange, schema)).toEqual([]);
     expect(validate(schema.$defs.CalendarEvent, event, schema)).toEqual([]);
+    expect(validate(schema.$defs.CalendarResource, resource, schema)).toEqual([]);
+  });
+
+  it("accepts a minimal resource (id + title only) and rejects one missing its title", () => {
+    const minimal = { id: "r1", title: "Dr. Rivas" } satisfies CalendarResource;
+    expect(validate(schema.$defs.CalendarResource, minimal, schema)).toEqual([]);
+    expect(validate(schema.$defs.CalendarResource, { id: "r1" }, schema).length).toBeGreaterThan(0);
+  });
+
+  it("carries resourceId on the payloads a timeline gesture must name a row with (RF-28)", () => {
+    // A drop and a range-select on the timeline are meaningless to the backend unless they say
+    // WHICH resource row they landed on; a resize never changes rows, so it must not claim to.
+    expect(schema.$defs.EventDropPayload.properties.resourceId.type).toBe("string");
+    expect(schema.$defs.RangeSelectPayload.properties.resourceId.type).toBe("string");
+    expect(schema.$defs.CalendarEvent.properties.resourceId.type).toBe("string");
+    expect(schema.$defs.EventResizePayload.properties.resourceId).toBeUndefined();
+    // Optional everywhere — the other four views have no resource dimension.
+    expect(schema.$defs.EventDropPayload.required).not.toContain("resourceId");
+    expect(schema.$defs.RangeSelectPayload.required).not.toContain("resourceId");
   });
 
   it("accepts a minimal payload that omits the optional fields", () => {

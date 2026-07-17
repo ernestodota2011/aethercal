@@ -18,14 +18,24 @@ from pydantic import ValidationError
 
 from aethercal.schemas import ErrorResponse
 from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingReschedule
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.event_types import EventTypeRead
+from aethercal.schemas.public import (
+    PublicBookingCreate,
+    PublicBookingRead,
+    PublicEventTypeRead,
+    PublicSlotsResponse,
+)
 from aethercal.schemas.slots import SlotsResponse
 
 DEFAULT_TIMEOUT = 10.0
 _HEALTH_PATH = "/api/v1/health"
+_BRANDING_PATH = "/api/v1/branding"
 _EVENT_TYPES_PATH = "/api/v1/event-types/"
 _SLOTS_PATH = "/api/v1/slots/"
 _BOOKINGS_PATH = "/api/v1/bookings/"
+_PUBLIC_PATH = "/api/v1/public/"
+_FORWARDED_FOR = "X-Forwarded-For"
 
 
 class AetherCalError(Exception):
@@ -150,6 +160,17 @@ class AetherCalClient:
 
     # -- v1 resource methods (public booking page + admin) ---------------------------------
 
+    def get_branding(self) -> TenantBrandingRead:
+        """The authenticated business's branding (``GET /api/v1/branding``) — B-07 / RF-27.
+
+        It takes no argument, and that is the contract: the business is the one the API key belongs
+        to, resolved server-side. There is nothing to pass, so there is nothing to point at somebody
+        else's brand.
+        """
+        response = self._send("GET", _BRANDING_PATH)
+        _raise_for_status(response)
+        return TenantBrandingRead.model_validate(response.json())
+
     def list_event_types(self) -> list[EventTypeRead]:
         """List the authenticated tenant's bookable event types (``GET /api/v1/event-types``)."""
         response = self._send("GET", _EVENT_TYPES_PATH)
@@ -163,21 +184,26 @@ class AetherCalClient:
         window_from: date,
         window_to: date,
         tz: str,
+        token: str | None = None,
     ) -> SlotsResponse:
         """Fetch bookable slots for an event type over ``[window_from, window_to]`` in ``tz``.
 
         ``tz`` is the IANA display zone echoed back on the response; the slot bounds are UTC.
+
+        ``token`` is a guest's signed RESCHEDULE token, and it is what keeps the emailed reschedule
+        links working now that the booking page holds no API key. Those links carry a token, a
+        booking id and an event-type ID — no business, no slug — so the picker cannot be rendered
+        through the public (slug-keyed) route. The token is verified, never consumed.
         """
-        response = self._send(
-            "GET",
-            _SLOTS_PATH,
-            params={
-                "event_type": str(event_type),
-                "from": window_from.isoformat(),
-                "to": window_to.isoformat(),
-                "tz": tz,
-            },
-        )
+        params = {
+            "event_type": str(event_type),
+            "from": window_from.isoformat(),
+            "to": window_to.isoformat(),
+            "tz": tz,
+        }
+        if token is not None:
+            params["token"] = token
+        response = self._send("GET", _SLOTS_PATH, params=params)
         _raise_for_status(response)
         return SlotsResponse.model_validate(response.json())
 
@@ -186,6 +212,83 @@ class AetherCalClient:
         response = self._send("POST", _BOOKINGS_PATH, json=booking.model_dump(mode="json"))
         _raise_for_status(response)
         return _booking_from_api(response.json())
+
+    # -- the PUBLIC surface: no API key, and the business named in the ROUTE -----------------
+    #
+    # ==This is what the booking page uses now, and the page holds no key at all.== It used to carry
+    # one with the tenant's FULL permissions, in the most exposed process in the system, and it
+    # could
+    # therefore serve exactly one business — because a key names exactly one. The key is not
+    # mitigated here: it is DELETED, and the business travels in the path instead.
+    #
+    # `forwarded_for` is the GUEST's real address, which the page has already resolved through its
+    # own trusted-proxy contract. The API believes it only when the page's own address sits inside
+    # the API's `AETHERCAL_TRUSTED_PROXIES` — a hop in a declared chain, never a header anybody may
+    # assert. Without it the API would see the PAGE's address for every guest on earth: one
+    # rate-limit bucket for all of them, one address stamped on every booking, and service denied to
+    # everybody the moment the per-IP cap was reached. A silent, self-inflicted outage.
+
+    def get_public_branding(self, tenant_slug: str) -> TenantBrandingRead:
+        """The business's branding with NO API key — ``GET /api/v1/public/{tenant_slug}/branding``.
+
+        ==The keyless twin of :meth:`get_branding`.== The business is named by the ``tenant_slug``
+        in the ROUTE, not by a key the page no longer holds: the page renders the business the path
+        names and can no more ask for another's brand than it can post a booking into another's
+        diary. Same ``TenantBrandingRead`` projection either way — four public fields, no PII.
+        """
+        response = self._send("GET", f"{_PUBLIC_PATH}{tenant_slug}/branding")
+        _raise_for_status(response)
+        return TenantBrandingRead.model_validate(response.json())
+
+    def list_public_event_types(self, tenant_slug: str) -> list[PublicEventTypeRead]:
+        """The business's bookable services — ``GET /api/v1/public/{tenant_slug}/event-types``."""
+        response = self._send("GET", f"{_PUBLIC_PATH}{tenant_slug}/event-types")
+        _raise_for_status(response)
+        return [PublicEventTypeRead.model_validate(item) for item in response.json()]
+
+    def get_public_slots(
+        self,
+        tenant_slug: str,
+        event_slug: str,
+        *,
+        window_from: date,
+        window_to: date,
+        tz: str,
+    ) -> PublicSlotsResponse:
+        """Bookable slots for one public event type over ``[window_from, window_to]`` in ``tz``."""
+        response = self._send(
+            "GET",
+            f"{_PUBLIC_PATH}{tenant_slug}/{event_slug}/slots",
+            params={"from": window_from.isoformat(), "to": window_to.isoformat(), "tz": tz},
+        )
+        _raise_for_status(response)
+        return PublicSlotsResponse.model_validate(response.json())
+
+    def create_public_booking(
+        self,
+        tenant_slug: str,
+        event_slug: str,
+        booking: PublicBookingCreate,
+        *,
+        forwarded_for: str | None = None,
+    ) -> PublicBookingRead:
+        """Book a slot with NO API key (409 if the time is taken; 403 if the captcha was not
+        passed).
+
+        The answer is four fields — ``{id, start, end, status}`` — and deliberately NOT
+        ``BookingRead``: that model carries the guest's name, e-mail, notes and answers, and echoing
+        it out of an endpoint that asked for no credentials would turn a booking id into an oracle
+        for a stranger's personal data.
+        """
+        headers = {_FORWARDED_FOR: forwarded_for} if forwarded_for else None
+        response = self._send(
+            "POST",
+            f"{_PUBLIC_PATH}{tenant_slug}/{event_slug}/bookings",
+            json=booking.model_dump(mode="json"),
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return PublicBookingRead.model_validate(response.json())
 
     def cancel_booking(self, booking_id: uuid.UUID, *, token: str) -> BookingRead:
         """Cancel a booking with a signed guest token (``POST /api/v1/bookings/{id}/cancel``)."""

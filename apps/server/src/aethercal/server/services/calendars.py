@@ -25,12 +25,28 @@ RF-12/13 freshness + degradation contract (``read_busy``): freshness is WINDOW-A
 usable for a query only if it is both time-fresh AND its synced coverage window fully contains the
 queried window -- a cache filled for one window never answers a query about another (that is how a
 double-booking slips through). The result is one of FRESH / STALE / UNAVAILABLE. ``FRESH`` = data
-from a covered + time-fresh cache or a successful refresh (or "no connection" -> empty; an
-empty-but-covered window is FRESH with no busy). ``STALE`` = a refresh failed and the prior coverage
-fully contained the window, so we serve the last-known (complete-for-this-window) copy
-(``is_degraded``); slots may still be offered. ``UNAVAILABLE`` = a refresh failed with partial or
-absent coverage and we cannot reach Google (``not is_available``) -- the slots engine MUST refuse to
-offer this host's slots rather than serve incomplete data as complete and risk a double-booking.
+from a covered + time-fresh cache or a successful refresh (an empty-but-covered window is FRESH with
+no busy). ``STALE`` = a refresh failed and the prior coverage fully contained the window, so we
+serve the last-known (complete-for-this-window) copy (``is_degraded``); slots may still be offered.
+``UNAVAILABLE`` = a refresh failed with partial or absent coverage and we cannot reach Google
+(``not is_available``) -- the slots engine MUST refuse to offer this host's slots rather than serve
+incomplete data as complete and risk a double-booking.
+
+==NO CALENDAR IS NOT A BROKEN CALENDAR (RF-13 vs RNF-9).== These two look alike (neither has usable
+busy data) and must never be conflated:
+
+* **The host has NO connected calendar at all** -- no ``ExternalConnection`` row. There is no
+  external busy set to miss, because there is no external calendar: ``FRESH`` with an empty busy
+  set, and their slots are offered normally (only INTERNAL bookings block them). This is the
+  self-hoster who never linked a Google account, and RNF-9 ("no core function depends on a
+  proprietary service") means the product must work perfectly for them. Refusing their slots because
+  "we could not read a calendar" would leave them with ZERO bookable slots -- dead on arrival.
+* **The host HAS a connected calendar we cannot read** -- a connection exists, the refresh failed
+  and no cached copy covers the window: ``UNAVAILABLE``. Here there IS an external busy set and we
+  do not know it, so an offered slot could double-book a real meeting. Offer nothing.
+
+The difference is the EXISTENCE OF THE CONNECTION, and it is decided before any cache/TTL logic
+runs (see :func:`read_busy`).
 
 CalendarSyncError contract (event lifecycle): a Google mutation that fails raises
 ``CalendarSyncError``. Booking success must NOT hard-depend on Google being reachable, so the caller
@@ -48,12 +64,17 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import TimeInterval
-from aethercal.server.db.models import BusyCache, ExternalConnection
+from aethercal.server.db.models import (
+    BusyCache,
+    ExternalCalendarLink,
+    ExternalConnection,
+    User,
+)
 from aethercal.server.integrations.google.calendar import (
     build_service,
     delete_event,
@@ -66,9 +87,17 @@ from aethercal.server.integrations.google.parse import MeetEventRequest
 _logger = logging.getLogger(__name__)
 
 GOOGLE_PROVIDER = "google"
-# F1-07 reads/writes the connected account's primary calendar; multi-calendar support (via the
-# ExternalCalendarLink rows) is a later wave, so the calendar id is an internal constant.
-_DEFAULT_CALENDAR_ID = "primary"
+# The calendar a connection uses when the operator has linked NONE explicitly: the account's own
+# default. It is a FALLBACK, not the policy — the calendar is configured per connection through the
+# ``ExternalCalendarLink`` rows (which is how a host books into a dedicated secondary calendar
+# instead of their primary). Until this wave it was a hard-coded constant, and the link table was
+# therefore written by nobody and read by nobody.
+DEFAULT_CALENDAR_ID = "primary"
+
+# The HTTP statuses that mean "the event Google was asked to delete is already gone". Deleting an
+# absent event is a SUCCESS: the desired state (no event) holds. Treating it as a failure makes a
+# retried cancellation — or the delete half of a reschedule that crashed after it — fail forever.
+_ALREADY_GONE_STATUSES = frozenset({404, 410})
 
 # Builds a live Google ``service`` for a connection. Injected into ``read_busy`` so the refresh path
 # is fully faked offline; the production factory is ``build_live_service`` (bound via partial).
@@ -81,6 +110,37 @@ class CalendarSyncError(RuntimeError):
     The booking caller (F1-05) catches this to confirm the booking anyway, flag the sync for retry,
     and log -- booking success must never hard-depend on Google being reachable (RF-13 for writes).
     """
+
+
+class CalendarTargetMissingError(RuntimeError):
+    """A booking EXPECTED the host to have a connected calendar, and none was found.
+
+    The distinction this class exists for: "this host has no calendar" (benign — the self-hoster,
+    nothing to sync, no intent is ever enqueued) is NOT the same as "the host HAD a calendar when
+    the booking was taken and the lookup now finds none" (a real failure — the guest is confirmed,
+    the host's calendar has no event, and without this error nobody would ever find out). The first
+    never reaches the outbox; the second raises here, so the intent retries, dead-letters, and shows
+    up in the ``dead`` backlog with a loud log line instead of passing as a delivered no-op.
+    """
+
+
+class AmbiguousCalendarTargetError(RuntimeError):
+    """The host's calendar configuration does not name ONE calendar to write bookings into.
+
+    Raised when a host has several active connections (or several linked calendars) and none is
+    flagged ``is_booking_target``, or when several are. The alternative — taking the first row — is
+    what the old ``.first()`` did: it wrote the event into an arbitrary calendar and reported
+    nothing. Refusing surfaces the misconfiguration as a retrying/dead-lettered outbox intent an
+    operator can see, instead of a booking that quietly never reached the host's calendar.
+    """
+
+
+@dataclass(frozen=True)
+class CalendarTarget:
+    """The exact calendar a booking's event is written to (or was written to): connection + id."""
+
+    connection: ExternalConnection
+    calendar_id: str
 
 
 @dataclass(frozen=True)
@@ -174,17 +234,155 @@ async def store_google_connection(
     return connection
 
 
-def load_credentials(connection: ExternalConnection, *, fernet: Fernet) -> str:
+async def link_booking_calendar(
+    session: AsyncSession, *, connection: ExternalConnection, calendar_id: str
+) -> ExternalCalendarLink:
+    """Point a connection's bookings at ONE named calendar, and read its freebusy (RF-11).
+
+    This is the write side of the table that used to be dead. It is what lets a host book into a
+    DEDICATED secondary calendar instead of the connected account's ``primary`` — the agency
+    credential rule, and simple good hygiene for anyone connecting a real account.
+
+    Idempotent: re-running it for the same calendar (a token refresh, a re-run of the connect
+    command) updates the existing link instead of piling up rows.
+
+    ONE TARGET PER HOST, not per connection. The partial unique index only guarantees one target per
+    CONNECTION, so a host with two connected accounts could end up with a write target in each — and
+    then :func:`resolve_calendar_target` refuses (rightly) and the operator is left with
+    dead-lettered bookings and no idea why. Designating a target is a CHOICE, so it gets written
+    down: every other target of this host, on ANY of their connections, is retired in the same
+    transaction.
+
+    IT INVALIDATES THE BUSY CACHE — but ONLY when the set of calendars actually being read changes.
+    The cache is keyed by connection, not by calendar, so switching which calendars are read leaves
+    it holding the previous calendar's occupancy while still stamped fresh and covering the window;
+    slots would then be offered against an occupancy that is no longer the host's — a double-book,
+    the one invariant this product exists to protect (RF-04). But invalidating when NOTHING changed
+    is its own bug: re-saving an identical configuration would blank the cache and stop the host
+    being offered any slots until the next refresh cycle. An operator who clicks "save" twice must
+    not switch themselves off.
+
+    CONCURRENCY: the choice is serialised on the HOST (:func:`_serialize_host_calendars`). Two
+    designations that interleave — two admin tabs, two API calls — would otherwise each read "nobody
+    holds the target", each promote their own, and leave the host with TWO write targets on two
+    different connections, which the per-connection unique index cannot catch. Every booking of that
+    host would then dead-letter on an ambiguity nobody chose.
+    """
+    await _serialize_host_calendars(
+        session, tenant_id=connection.tenant_id, user_id=connection.user_id
+    )
+    before = await busy_calendar_ids(session, connection=connection)
+
+    await _retire_other_targets(session, connection=connection, calendar_id=calendar_id)
+
+    links = await _links(session, connection=connection)
+    existing = next((link for link in links if link.external_calendar_id == calendar_id), None)
+    if existing is None:
+        existing = ExternalCalendarLink(
+            tenant_id=connection.tenant_id,
+            connection_id=connection.id,
+            external_calendar_id=calendar_id,
+        )
+        session.add(existing)
+    existing.is_booking_target = True
+    existing.busy = True
+    await session.flush()
+
+    after = await busy_calendar_ids(session, connection=connection)
+    if after != before:
+        await invalidate_busy_cache(session, connection=connection)
+    return existing
+
+
+async def _serialize_host_calendars(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    """Serialise the host's calendar-configuration writes on their ``users`` row (PostgreSQL only).
+
+    ``SELECT … FOR UPDATE`` on the host makes the read-then-promote of a designation atomic against
+    another one: the second transaction blocks until the first commits, then re-reads the committed
+    state and retires what the winner just wrote — so exactly one target survives. The lock is
+    transaction-scoped and released on commit.
+
+    Locking the HOST row rather than the connection is the whole point: the invariant being defended
+    ("one booking target per host") spans every connection that host owns, and a per-connection lock
+    would let two designations on two different connections run side by side — which IS the race.
+
+    A no-op on SQLite (the offline backend serialises writers anyway), so the offline suite is
+    unaffected and the guarantee is proven where it lives: against a real PostgreSQL.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    await session.execute(
+        select(User.id).where(User.id == user_id, User.tenant_id == tenant_id).with_for_update()
+    )
+
+
+async def _retire_other_targets(
+    session: AsyncSession, *, connection: ExternalConnection, calendar_id: str
+) -> None:
+    """Clear ``is_booking_target`` on every OTHER calendar of this host, across ALL connections."""
+    connections = await load_active_connections(
+        session, tenant_id=connection.tenant_id, user_id=connection.user_id
+    )
+    connection_ids = {row.id for row in connections} | {connection.id}
+    rows = (
+        await session.scalars(
+            select(ExternalCalendarLink).where(
+                ExternalCalendarLink.tenant_id == connection.tenant_id,
+                ExternalCalendarLink.connection_id.in_(connection_ids),
+                ExternalCalendarLink.is_booking_target.is_(True),
+            )
+        )
+    ).all()
+    for row in rows:
+        if row.connection_id != connection.id or row.external_calendar_id != calendar_id:
+            row.is_booking_target = False
+    # Flush the demotions BEFORE the promotion above returns: the partial unique index (one target
+    # per connection) would reject an intermediate state with two targets on the same connection.
+    await session.flush()
+
+
+async def invalidate_busy_cache(session: AsyncSession, *, connection: ExternalConnection) -> None:
+    """Drop a connection's cached busy set AND its coverage stamp, in the caller's transaction.
+
+    Call this whenever the SET OF CALENDARS being read changes. The cache is per connection, so it
+    cannot tell that the blocks it holds came from a calendar the host no longer uses: it keeps
+    reading as fresh and covering the window, and slots get computed against an occupancy that is no
+    longer the host's. Clearing the stamp makes :func:`read_busy` treat the window as uncovered,
+    which — with no refresh available in the request path (RNF-6) — reads UNAVAILABLE, so the host
+    is offered NO slots until the background refresher repopulates it. Offering nothing for a few
+    minutes is the safe side of that trade; a double-booking is not.
+    """
+    await session.execute(
+        delete(BusyCache).where(
+            BusyCache.tenant_id == connection.tenant_id,
+            BusyCache.connection_id == connection.id,
+        )
+    )
+    connection.busy_synced_from = None
+    connection.busy_synced_to = None
+    connection.busy_synced_at = None
+    await session.flush()
+
+
+def load_credentials(connection: ExternalConnection, *, fernet: Fernet | MultiFernet) -> str:
     """Decrypt and return a connection's stored OAuth token JSON (the serialized credentials).
 
     The connection row is already loaded by the caller, so this is a pure decrypt (no DB access).
     Build a live Google client from the result with :func:`build_live_service`.
+
+    ``fernet`` is a single :class:`~cryptography.fernet.Fernet` normally, and a
+    :class:`~cryptography.fernet.MultiFernet` built from ``Settings.decryption_fernet_keys()``
+    during a key rotation — so a connection stored before the rotation reached it, still on the
+    retiring key, is readable throughout the window and the ticks never write a token under the old
+    key.
     """
     return fernet.decrypt(connection.encrypted_credentials).decode("utf-8")
 
 
 def build_live_service(
-    connection: ExternalConnection, *, fernet: Fernet
+    connection: ExternalConnection, *, fernet: Fernet | MultiFernet
 ) -> Any:  # pragma: no cover - live wiring
     """Production ``ServiceFactory``: decrypt the connection's token and build a live Google client.
 
@@ -201,6 +399,110 @@ def build_live_service(
 # --------------------------------------------------------------------------------------
 
 
+async def load_active_connections(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> list[ExternalConnection]:
+    """ALL of the host's active (not revoked) Google connections, tenant-scoped, oldest first.
+
+    Deliberately plural. The predecessor of this function ended in ``.first()``, so a host with two
+    connected accounts had one of them silently ignored — and an ignored calendar is an ignored busy
+    set, which is a double-booking waiting to happen. Every read path unions the lot.
+    """
+    return list(
+        (
+            await session.scalars(
+                select(ExternalConnection)
+                .where(
+                    ExternalConnection.tenant_id == tenant_id,
+                    ExternalConnection.user_id == user_id,
+                    ExternalConnection.provider == GOOGLE_PROVIDER,
+                    ExternalConnection.revoked_at.is_(None),
+                )
+                .order_by(ExternalConnection.created_at, ExternalConnection.id)
+            )
+        ).all()
+    )
+
+
+async def _links(
+    session: AsyncSession, *, connection: ExternalConnection
+) -> list[ExternalCalendarLink]:
+    """The connection's linked calendars, tenant-scoped, in a stable order."""
+    return list(
+        (
+            await session.scalars(
+                select(ExternalCalendarLink)
+                .where(
+                    ExternalCalendarLink.tenant_id == connection.tenant_id,
+                    ExternalCalendarLink.connection_id == connection.id,
+                )
+                .order_by(ExternalCalendarLink.created_at, ExternalCalendarLink.id)
+            )
+        ).all()
+    )
+
+
+async def busy_calendar_ids(session: AsyncSession, *, connection: ExternalConnection) -> list[str]:
+    """The calendars of ``connection`` whose freebusy counts toward the host's busy set (RF-12).
+
+    No links at all → the account's default calendar (the zero-config path, and what the hard-coded
+    constant used to do for everyone). With links, only those flagged ``busy`` are read: an operator
+    who links a calendar and opts it out has said so explicitly, which is not the same thing as the
+    code quietly never looking at it.
+    """
+    links = await _links(session, connection=connection)
+    if not links:
+        return [DEFAULT_CALENDAR_ID]
+    return [link.external_calendar_id for link in links if link.busy]
+
+
+async def resolve_calendar_target(
+    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> CalendarTarget | None:
+    """The ONE calendar the host's bookings are written into — or a loud refusal (RF-11/RF-30).
+
+    ``None`` means the host has no connected calendar: there is genuinely nothing to sync. Otherwise
+    the target must be unambiguous:
+
+    * exactly one link flagged ``is_booking_target`` (across every active connection) → that one;
+    * no links at all and exactly one connection → that account's default calendar (zero-config);
+    * anything else (several connections, or several linked calendars, with no designated target —
+      or several designated) → :class:`AmbiguousCalendarTargetError`.
+
+    The refusal is the point. Guessing here writes a real client's meeting into an arbitrary
+    calendar and reports success, which is exactly the failure this system exists to prevent; a
+    raise turns it into a retrying, then dead-lettered, outbox intent an operator can actually see.
+    """
+    connections = await load_active_connections(session, tenant_id=tenant_id, user_id=user_id)
+    if not connections:
+        return None
+
+    designated: list[CalendarTarget] = []
+    linked_any = False
+    for connection in connections:
+        links = await _links(session, connection=connection)
+        linked_any = linked_any or bool(links)
+        designated.extend(
+            CalendarTarget(connection=connection, calendar_id=link.external_calendar_id)
+            for link in links
+            if link.is_booking_target
+        )
+
+    if len(designated) == 1:
+        return designated[0]
+    if len(designated) > 1:
+        raise AmbiguousCalendarTargetError(
+            f"host {user_id} has {len(designated)} calendars flagged as the booking target; "
+            "exactly one must be"
+        )
+    if len(connections) == 1 and not linked_any:
+        return CalendarTarget(connection=connections[0], calendar_id=DEFAULT_CALENDAR_ID)
+    raise AmbiguousCalendarTargetError(
+        f"host {user_id} has {len(connections)} active connection(s) and linked calendars but no "
+        "calendar flagged as the booking target; designate one (is_booking_target)"
+    )
+
+
 async def refresh_busy_cache(
     session: AsyncSession,
     *,
@@ -212,15 +514,19 @@ async def refresh_busy_cache(
     """Pull freebusy for ``connection`` over ``window`` and replace its cached rows (RF-12).
 
     ``service`` is an injected live Google client (built from ``build_service``); tests pass a fake.
-    All existing ``BusyCache`` rows for the connection are dropped and the freshly-fetched busy
-    blocks are written stamped ``fetched_at=now``. The connection's coverage stamp
-    (``busy_synced_from/to`` = the fetched ``window``, ``busy_synced_at=now``) is set in the same
-    flush so :func:`read_busy` can judge freshness by window coverage rather than a per-row age --
-    and so a fetched window with ZERO busy blocks is representable as covered-and-fresh (not
-    indistinguishable from "never synced"). Returns the busy intervals that were cached. The write
-    is flushed, not committed -- the caller owns the transaction.
+    Every calendar of the connection flagged ``busy`` is queried and their blocks are UNIONED (a
+    host is busy if ANY of their calendars is). All existing ``BusyCache`` rows for the connection
+    are dropped and the freshly-fetched busy blocks are written stamped ``fetched_at=now``. The
+    connection's coverage stamp (``busy_synced_from/to`` = the fetched ``window``,
+    ``busy_synced_at=now``) is set in the same flush so :func:`read_busy` can judge freshness by
+    window coverage rather than a per-row age -- and so a fetched window with ZERO busy blocks is
+    representable as covered-and-fresh (not indistinguishable from "never synced"). Returns the busy
+    intervals that were cached. The write is flushed, not committed -- the caller owns the
+    transaction.
     """
-    busy = query_busy(service, _DEFAULT_CALENDAR_ID, window)
+    busy: list[TimeInterval] = []
+    for calendar_id in await busy_calendar_ids(session, connection=connection):
+        busy.extend(query_busy(service, calendar_id, window))
     await session.execute(
         delete(BusyCache).where(
             BusyCache.tenant_id == connection.tenant_id,
@@ -284,11 +590,50 @@ async def read_busy(
     ``service_factory`` builds the live client for a connection; when ``None`` (or Google is
     unreachable) the function serves only what the cache can prove -- it never treats "unknown" as
     "free".
+
+    MULTI-CONNECTION (RF-30): a host may have several connected accounts, and they are ALL read --
+    their busy sets are unioned. The predecessor took the first row and dropped the rest, which
+    offered slots the host was already booked in. The statuses combine fail-closed: ONE connection
+    we cannot establish makes the whole host ``UNAVAILABLE`` (serving the readable calendars alone
+    would present incomplete data as complete); otherwise one degraded copy makes the result
+    ``STALE``.
     """
-    connection = await _load_active_connection(session, tenant_id=tenant_id, user_id=host_user_id)
-    if connection is None:
+    connections = await load_active_connections(session, tenant_id=tenant_id, user_id=host_user_id)
+    if not connections:
+        # NO CONNECTED CALENDAR — not a broken one (RNF-9). There is no external busy set to be
+        # ignorant of, so this is FRESH-and-empty and the host's slots are offered normally (only
+        # their internal bookings block them). This is the self-hoster who never linked a Google
+        # account: reading RF-13 literally here would offer them zero slots forever. The refusal
+        # below (UNAVAILABLE) is reserved for a calendar that EXISTS and cannot be read.
         return BusyReadResult(status=BusyStatus.FRESH, busy=())
 
+    busy: list[TimeInterval] = []
+    degraded = False
+    for connection in connections:
+        result = await _read_connection_busy(
+            session, connection=connection, query=query, service_factory=service_factory
+        )
+        if result.status is BusyStatus.UNAVAILABLE:
+            return BusyReadResult(status=BusyStatus.UNAVAILABLE, busy=())
+        degraded = degraded or result.is_degraded
+        busy.extend(result.busy)
+
+    status = BusyStatus.STALE if degraded else BusyStatus.FRESH
+    return BusyReadResult(status=status, busy=tuple(busy))
+
+
+async def _read_connection_busy(
+    session: AsyncSession,
+    *,
+    connection: ExternalConnection,
+    query: BusyQuery,
+    service_factory: ServiceFactory | None,
+) -> BusyReadResult:
+    """One connection's busy set over the window, with the RF-12/13 freshness + degradation rules.
+
+    The per-connection half of :func:`read_busy` (which unions these across every active connection
+    of the host); the decision table lives in that docstring and the module header.
+    """
     covered = _coverage_contains(connection, query.window)
     synced_at = (
         _as_utc(connection.busy_synced_at) if connection.busy_synced_at is not None else None
@@ -376,22 +721,6 @@ def _intersecting(
     return tuple(interval for interval in intervals if interval.overlaps(window))
 
 
-async def _load_active_connection(
-    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
-) -> ExternalConnection | None:
-    """The host's active (not revoked) Google connection, scoped to the tenant."""
-    return (
-        await session.scalars(
-            select(ExternalConnection).where(
-                ExternalConnection.tenant_id == tenant_id,
-                ExternalConnection.user_id == user_id,
-                ExternalConnection.provider == GOOGLE_PROVIDER,
-                ExternalConnection.revoked_at.is_(None),
-            )
-        )
-    ).first()
-
-
 async def _read_cache(session: AsyncSession, *, connection: ExternalConnection) -> list[BusyCache]:
     """All cached busy rows for a connection, tenant-scoped (belt-and-suspenders isolation)."""
     return list(
@@ -424,60 +753,103 @@ def _as_utc(moment: datetime) -> datetime:
 
 async def create_event_for_booking(
     *,
-    connection: ExternalConnection,
+    calendar_id: str,
     request: MeetEventRequest,
     service: Any,
 ) -> tuple[str, str | None]:
-    """Create the calendar event (with a Google Meet link) for a booking; return ``(id, meet_url)``.
+    """Create the calendar event (with a Google Meet link) in ``calendar_id``; ``(id, meet_url)``.
 
-    Does not touch the database -- the caller (F1-05) writes the returned ``external_event_id`` and
-    ``meeting_url`` onto the ``Booking`` row inside its own transaction (single writer). A Google
-    failure raises :class:`CalendarSyncError` so the caller can confirm the booking anyway and flag
-    the sync for retry.
+    PRIMITIVES, not a ``CalendarTarget``, and that is load-bearing: this runs with NO session open
+    (the outbox releases its connection before any network call, R8), so an ORM object reaching here
+    would be detached — and touching one of its attributes, even just to name it in an error,
+    raises ``DetachedInstanceError`` INSTEAD of the :class:`CalendarSyncError` the retry logic
+    reads. A resolver builds the target while a session lives; only primitives cross this line.
+
+    Does not touch the database -- the caller writes the returned ``external_event_id`` /
+    ``meeting_url``, and the calendar they landed in, onto the ``Booking`` row inside its own
+    transaction. A Google failure raises :class:`CalendarSyncError` so the intent retries.
     """
     try:
-        created = insert_event_with_meet(service, _DEFAULT_CALENDAR_ID, request)
+        created = insert_event_with_meet(service, calendar_id, request)
     except Exception as exc:
-        raise CalendarSyncError(
-            f"failed to create Google event for connection {connection.id}"
-        ) from exc
+        raise CalendarSyncError(f"failed to create Google event in calendar {calendar_id}") from exc
     return str(created["id"]), _extract_meet_url(created)
+
+
+def _is_already_gone(exc: Exception) -> bool:
+    """True when Google's error says the event is not there any more (404 / 410).
+
+    googleapiclient raises ``HttpError``, whose ``resp.status`` (newer builds also expose
+    ``status_code``) carries the code. Read defensively rather than importing the untyped error
+    class: the seam around the SDK stays intact, and a fake in the tests can model it exactly.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+    return isinstance(status, int) and status in _ALREADY_GONE_STATUSES
 
 
 async def delete_event_for_booking(
     *,
-    connection: ExternalConnection,
+    calendar_id: str,
     external_event_id: str,
     service: Any,
 ) -> None:
-    """Delete a booking's calendar event (cancel). Raises :class:`CalendarSyncError` on failure."""
+    """Delete a booking's calendar event from ``calendar_id`` (cancel). IDEMPOTENT.
+
+    An event Google no longer has (404 / 410) is a SUCCESS: the desired end state — no event — is
+    exactly what holds, and the outbox retries at-least-once, so a re-drained cancellation (or the
+    delete half of a reschedule that crashed right after it) must not fail forever and dead-letter
+    over an event it already removed. Any other failure raises :class:`CalendarSyncError` and the
+    intent retries.
+    """
     try:
-        delete_event(service, _DEFAULT_CALENDAR_ID, external_event_id)
+        delete_event(service, calendar_id, external_event_id)
     except Exception as exc:
+        if _is_already_gone(exc):
+            _logger.info(
+                "Google event %s already absent from calendar %s; delete is a no-op",
+                external_event_id,
+                calendar_id,
+            )
+            return
         raise CalendarSyncError(
-            f"failed to delete Google event {external_event_id} for connection {connection.id}"
+            f"failed to delete Google event {external_event_id} from calendar {calendar_id}"
         ) from exc
 
 
-async def reschedule_event_for_booking(
+async def reschedule_event_for_booking(  # noqa: PLR0913 - source/target + their clients + event
     *,
-    connection: ExternalConnection,
+    source_calendar_id: str,
+    source_service: Any,
+    target_calendar_id: str,
+    target_service: Any,
     external_event_id: str,
     request: MeetEventRequest,
-    service: Any,
 ) -> tuple[str, str | None]:
-    """Reschedule by removing the old event and inserting a new one (fresh Meet link).
+    """Move a booking's event: delete it where it LIVES (``source``), create it where it BELONGS.
+
+    ``source`` is the calendar the event was actually written to (persisted on the booking), which
+    is not necessarily the host's currently-configured ``target`` — a host who re-designates their
+    booking calendar between the confirmation and the reschedule would otherwise leave the old event
+    orphaned in the old calendar. They are usually the same, and the caller then passes the same
+    client twice.
 
     Delete-and-reinsert (rather than ``events.patch``) keeps the code path identical to create and
-    guarantees a clean conference for the new time. Returns the new ``(id, meet_url)``; any Google
-    failure raises :class:`CalendarSyncError` for the caller to confirm-and-retry.
+    guarantees a clean conference for the new time. Returns the new ``(id, meet_url)``; a Google
+    failure raises :class:`CalendarSyncError` for the intent to retry (the delete is idempotent, so
+    a retry after a partial move re-deletes harmlessly and re-creates).
     """
+    await delete_event_for_booking(
+        calendar_id=source_calendar_id,
+        external_event_id=external_event_id,
+        service=source_service,
+    )
     try:
-        delete_event(service, _DEFAULT_CALENDAR_ID, external_event_id)
-        created = insert_event_with_meet(service, _DEFAULT_CALENDAR_ID, request)
+        created = insert_event_with_meet(target_service, target_calendar_id, request)
     except Exception as exc:
         raise CalendarSyncError(
-            f"failed to reschedule Google event {external_event_id} for connection {connection.id}"
+            f"failed to re-create Google event {external_event_id} in calendar {target_calendar_id}"
         ) from exc
     return str(created["id"]), _extract_meet_url(created)
 
@@ -497,18 +869,28 @@ def _extract_meet_url(created: dict[str, Any]) -> str | None:
 
 
 __all__ = [
+    "DEFAULT_CALENDAR_ID",
+    "GOOGLE_PROVIDER",
+    "AmbiguousCalendarTargetError",
     "BusyQuery",
     "BusyReadResult",
     "BusyStatus",
     "CalendarSyncError",
+    "CalendarTarget",
+    "CalendarTargetMissingError",
     "GoogleCredential",
     "ServiceFactory",
     "build_live_service",
+    "busy_calendar_ids",
     "create_event_for_booking",
     "delete_event_for_booking",
+    "invalidate_busy_cache",
+    "link_booking_calendar",
+    "load_active_connections",
     "load_credentials",
     "read_busy",
     "refresh_busy_cache",
     "reschedule_event_for_booking",
+    "resolve_calendar_target",
     "store_google_connection",
 ]

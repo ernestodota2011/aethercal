@@ -86,6 +86,8 @@ async def _seed_booking(
         start_at=_START,
         end_at=_START + timedelta(minutes=30),
         status=status,
+        # Confirmed/cancelled ⇒ stamped; only an unpaid hold has no confirmation (B-05a).
+        confirmed_at=None if status is BookingStatus.PENDING else _START - timedelta(days=1),
         guest_name="Ada Guest",
         guest_email="guest@example.com",
         guest_timezone="America/New_York",

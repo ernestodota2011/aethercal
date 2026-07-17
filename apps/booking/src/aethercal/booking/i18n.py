@@ -45,10 +45,28 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "name_label": "Nombre completo",
         "email_label": "Correo electrónico",
         "notes_label": "Notas (opcional)",
+        "phone_label": "Teléfono (opcional)",
+        "phone_hint": "Incluye el código de país. Ejemplo: +1 305 413 1728.",
+        # The box asserts TWO things, and the first is deliberate: the person booking states the
+        # number is THEIRS. Nothing verifies that (docs/phone-channels.md) — but a box reading only
+        # "I agree to be messaged" records merely that somebody ticked it, whereas this one records
+        # what they actually claimed. It is the most an unverified checkbox can honestly do.
+        "phone_consent_label": (
+            "Este número es mío y acepto recibir recordatorios de esta cita por WhatsApp o SMS."
+        ),
+        "phone_consent_hint": (
+            "Puedes reservar sin dar tu teléfono. Solo te escribiremos si marcas esta casilla."
+        ),
         "required_mark": "obligatorio",
         "confirm_booking": "Confirmar reserva",
         "error_name_required": "Escribe tu nombre.",
         "error_email_invalid": "Escribe un correo electrónico válido.",
+        "error_phone_invalid": (
+            "Escribe un teléfono válido con el código de país. Ejemplo: +1 305 413 1728."
+        ),
+        "error_phone_consent_without_number": (
+            "Escribe tu teléfono o desmarca la casilla de recordatorios."
+        ),
         "error_start_invalid": "Ese horario ya no es válido. Elige otro.",
         "error_question_required": "Este campo es obligatorio.",
         "error_question_email": "Escribe un correo electrónico válido.",
@@ -78,6 +96,7 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "not_found_title": "No encontrado",
         "not_found_body": "No pudimos encontrar lo que buscas.",
         "error_slot_unavailable": "Ese horario ya no está disponible. Elige otro, por favor.",
+        "error_day_full": "Ese día ya está completo. Por favor, elige otro día.",
         "error_link_invalid": "Este enlace expiró o no es válido. Solicita uno nuevo.",
         "error_not_active": "Esta cita ya no se puede modificar.",
         "error_generic": "Algo salió mal. Vuelve a intentarlo en unos minutos.",
@@ -114,10 +133,26 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "name_label": "Full name",
         "email_label": "Email",
         "notes_label": "Notes (optional)",
+        "phone_label": "Phone (optional)",
+        "phone_hint": "Include the country code. Example: +1 305 413 1728.",
+        "phone_consent_label": (
+            "This is my own number, and I agree to receive reminders about this booking by "
+            "WhatsApp or SMS."
+        ),
+        "phone_consent_hint": (
+            "You can book without giving your phone. We'll only message you if you tick this box."
+        ),
         "required_mark": "required",
         "confirm_booking": "Confirm booking",
         "error_name_required": "Please enter your name.",
         "error_email_invalid": "Please enter a valid email address.",
+        "error_phone_invalid": (
+            "Please enter a valid phone number including the country code. "
+            "Example: +1 305 413 1728."
+        ),
+        "error_phone_consent_without_number": (
+            "Please enter your phone number, or untick the reminders box."
+        ),
         "error_start_invalid": "That time is no longer valid. Please pick another.",
         "error_question_required": "This field is required.",
         "error_question_email": "Please enter a valid email address.",
@@ -147,6 +182,7 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "not_found_title": "Not found",
         "not_found_body": "We couldn't find what you're looking for.",
         "error_slot_unavailable": "That time is no longer available. Please pick another.",
+        "error_day_full": "That day is fully booked. Please pick another day.",
         "error_link_invalid": "This link has expired or is invalid. Please request a new one.",
         "error_not_active": "This booking can no longer be changed.",
         "error_generic": "Something went wrong. Please try again in a few minutes.",

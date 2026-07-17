@@ -66,7 +66,7 @@ describe("App (demo shell)", () => {
     expect(container.querySelector('.aethercal-calendar[data-view="month"]')).toBeTruthy();
   });
 
-  it("switches between all four views", () => {
+  it("switches between all five views", () => {
     const { container } = render(<App />);
     clickControl(container, "Semana");
     expect(container.querySelector(".aethercal-timegrid")).toBeTruthy();
@@ -74,8 +74,35 @@ describe("App (demo shell)", () => {
     expect(container.querySelector('.aethercal-timegrid[data-view="day"]')).toBeTruthy();
     clickControl(container, "Agenda");
     expect(container.querySelector('.aethercal-calendar[data-view="list"]')).toBeTruthy();
+    clickControl(container, "Cronograma");
+    expect(container.querySelector('.aethercal-timeline[data-view="timeline"]')).toBeTruthy();
     clickControl(container, "Mes");
     expect(container.querySelector('.aethercal-calendar[data-view="month"]')).toBeTruthy();
+  });
+
+  it("shows the sample resources as timeline rows, including the unassigned one", () => {
+    // The demo leaves one event without a resource on purpose, so the row that catches orphans is
+    // visible in the playground rather than only described in a docstring.
+    const { container } = render(<App />);
+    clickControl(container, "Cronograma");
+    const rows = Array.from(container.querySelectorAll(".aethercal-tl-rowhead")).map(
+      (el) => el.textContent,
+    );
+    expect(rows).toContain("Ana Rivas");
+    expect(rows).toContain("Sala de juntas");
+    expect(rows).toContain("Sin asignar");
+  });
+
+  it("groups the timeline's resources under collapsible headers", () => {
+    const { container, getByRole } = render(<App />);
+    clickControl(container, "Cronograma");
+    const rowNames = (): (string | null)[] =>
+      Array.from(container.querySelectorAll(".aethercal-tl-rowhead")).map((el) => el.textContent);
+    expect(rowNames()).toContain("Ana Rivas");
+
+    fireEvent.click(getByRole("button", { name: /Consultoría/ }));
+    expect(rowNames()).not.toContain("Ana Rivas"); // collapsed away with its group
+    expect(rowNames()).toContain("Cami Duarte"); // the other group is untouched
   });
 
   it("navigates the visible period with the built-in prev/today/next toolbar", () => {

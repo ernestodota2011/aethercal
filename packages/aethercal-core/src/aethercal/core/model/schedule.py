@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import date
 from itertools import pairwise
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from aethercal.core.model.time_range import LocalTimeRange
 from aethercal.core.model.weekday import Weekday
+from aethercal.core.tz import require_iana_zone
 
 
 def _reject_overlaps(ranges: Iterable[LocalTimeRange], where: str) -> None:
@@ -37,10 +37,11 @@ class Schedule(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> Schedule:
-        try:
-            ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown IANA timezone: {self.timezone!r}") from exc
+        # One owner for "is this a real zone": `aethercal.core.tz.require_iana_zone` (see there).
+        # The copy that used to stand here asked the filesystem instead — so a tz-database DIRECTORY
+        # key crashed a host's availability with an `OSError`, and a case-insensitive volume let
+        # "utc" through on the developer's machine and nowhere else.
+        require_iana_zone(self.timezone)
         for weekday, ranges in self.by_weekday.items():
             _reject_overlaps(ranges, f"weekday {weekday.name}")
         return self
