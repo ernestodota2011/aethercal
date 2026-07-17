@@ -17,6 +17,11 @@ dependencies = [
     "python-fasthtml>=0.12",
     "aethercal-client",
     "aethercal-schemas",
+    # The published-placeholder guard (aethercal.core.placeholders) — the ONE place that answers
+    # "is this value one the repository prints?", shared with the server so the rule cannot drift.
+    # Declared directly rather than leaned on transitively through client -> schemas -> core: this
+    # page imports it in its own right, which is the same reasoning the server states for icalendar.
+    "aethercal-core",
 ]
 
 [tool.hatch.build.targets.wheel]

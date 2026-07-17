@@ -270,6 +270,7 @@ def _make_client(
         tenant_slug="acme",
         turnstile_site_key=None,
         default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
         trusted_proxies=trusted_proxies,
     )
     transport = httpx.MockTransport(fake.handler)
@@ -911,6 +912,7 @@ def test_og_meta_uses_the_configured_base_url_not_just_the_default() -> None:
         tenant_slug="acme",
         turnstile_site_key=None,
         default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
         base_url=custom_base_url,
     )
     transport = httpx.MockTransport(fake.handler)

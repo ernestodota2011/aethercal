@@ -145,6 +145,7 @@ def _make_client(default_slug: str = SOL_SLUG) -> tuple[TestClient, FakeAPI]:
         tenant_slug=default_slug,
         turnstile_site_key=None,
         default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
     )
     transport = httpx.MockTransport(fake.handler)
 

@@ -78,19 +78,31 @@ GRANT CREATE ON DATABASE :"db" TO aethercal_owner;
 GRANT USAGE ON SCHEMA public TO aethercal_app, aethercal_worker;
 GRANT CREATE, USAGE ON SCHEMA public TO aethercal_owner;
 
--- `alembic_version` is created by Alembic, not by Base.metadata, so it cannot be derived from the
--- models and the migration's metadata-driven GRANT loop does not reach it. The WEB process reads it
--- at boot to refuse a schema it has outgrown. Without this grant that refusal fails loudly instead
--- of working — survivable, but "loud and wrong" is still a support ticket. Grant it.
--- (It does not exist yet on a virgin database; the DO block keeps this file idempotent.)
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'alembic_version')
-    THEN
-        EXECUTE 'GRANT SELECT ON alembic_version TO aethercal_app, aethercal_worker';
-    END IF;
-END
-$$;
+-- ============================================================================================
+-- `alembic_version` IS NOT GRANTED HERE, AND IT CANNOT BE. Migration 0016 does it.
+-- ============================================================================================
+--
+-- Do not add it back to this file. Its absence is deliberate, and the bug it closes cost every
+-- fresh install its boot.
+--
+-- This file used to carry that grant, wrapped in `IF EXISTS ... THEN EXECUTE`, "to keep this file
+-- idempotent" — under a comment that admitted the fatal half in passing: "It does not exist yet on
+-- a virgin database." That sentence is the entire defect. This file is step 2 of the quickstart,
+-- `db upgrade` is step 3, and ALEMBIC is what creates `alembic_version`. So on every real install
+-- the IF EXISTS was FALSE, the GRANT silently did not happen, and nothing re-applied it afterwards.
+-- `app` and `worker` then crash-looped for ever against a perfectly migrated database, reporting
+-- that it "has never been migrated" and naming a remedy that answers "already at head".
+--
+-- ==A guarded statement whose guard is always false is not idempotent. It is a no-op.== It does
+-- nothing, it raises nothing, and it passes every test — the exact failure this file's own header
+-- spends thirty lines refusing, sitting ten lines further down the same file.
+--
+-- A migration cannot make that mistake: it runs AFTER Alembic has created the table, as the role
+-- that OWNS it, so the grant is unconditional. Nor can an operator skip it by running the steps out
+-- of order — the boot check refuses to serve below head, so a process that starts has necessarily
+-- applied it. The grant lives on the same rail as the check that needs it.
+--
+-- See `apps/server/src/aethercal/server/db/rls.py::grant_version_table` for the full argument.
 
 -- --------------------------------------------------------------------------------------------
 -- Backups. `pg_dump` over tables with RLS FAILS without BYPASSRLS — loudly, which is right, but it

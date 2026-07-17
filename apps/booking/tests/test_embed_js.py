@@ -25,7 +25,11 @@ _MAX_EMBED_JS_BYTES = 5 * 1024
 
 def _make_client() -> TestClient:
     settings = BookingSettings(
-        api_url="http://api.test", tenant_slug="acme", turnstile_site_key=None, default_locale="es"
+        api_url="http://api.test",
+        tenant_slug="acme",
+        turnstile_site_key=None,
+        default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
     )
     transport = httpx.MockTransport(lambda request: httpx.Response(404))
 
@@ -126,7 +130,11 @@ def test_embed_js_route_never_touches_the_backend() -> None:
         return httpx.Response(404)
 
     settings = BookingSettings(
-        api_url="http://api.test", tenant_slug="acme", turnstile_site_key=None, default_locale="es"
+        api_url="http://api.test",
+        tenant_slug="acme",
+        turnstile_site_key=None,
+        default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
     )
     transport = httpx.MockTransport(handler)
 

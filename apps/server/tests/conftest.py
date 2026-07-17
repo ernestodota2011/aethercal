@@ -480,20 +480,55 @@ def pg_role_urls(
         finally:
             owner_engine.dispose()
 
-        # `alembic_version` is created by Alembic, not by Base.metadata, so the migration's
-        # metadata-driven GRANT loop cannot reach it — the web process reads it at boot to refuse a
-        # stale schema. Mirrors deploy/sql/provision_roles.sql.
-        with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            conn.exec_driver_sql(
-                f'GRANT SELECT ON "{schema}".alembic_version '
-                f"TO {DbRole.APP.value}, {DbRole.WORKER.value}"
-            )
+        # ==Nothing is granted here, and the absence is the point.== This block used to run
+        # `GRANT SELECT ON alembic_version TO app, worker` unconditionally, over the comment
+        # "Mirrors deploy/sql/provision_roles.sql". It did not mirror that file: it INVERTED it.
+        # The shipped path granted under an `IF EXISTS` and then migrated, so on a virgin database
+        # the grant never happened; the harness migrated and then granted with no condition, so the
+        # harness always had it. The suite therefore could not feel a defect that put `app` and
+        # `worker` into a permanent crash-loop on the quickstart's own happy path.
+        #
+        # The grant now lives in migration 0016 — on the same rail as the check that needs it — so
+        # this schema gets it by running the migrations, exactly as production does.
 
         try:
             yield {
                 role: _url_scoped_to(pg_admin_url, schema, user=role.value, password=role_password)
                 for role in DbRole
             }
+        finally:
+            with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    finally:
+        admin.dispose()
+
+
+@pytest.fixture
+def unmigrated_app_url(
+    pg_admin_url: str, role_password: str, provisioned_roles: None
+) -> Iterator[str]:
+    """An app-role URL onto a schema the migrations have NEVER touched. ==A real product state.==
+
+    This is precisely what a production database looks like between step 2 and step 3 of the
+    quickstart: the roles exist, and ``db upgrade`` has not run yet. The web process booting here
+    must say *that* — and it must not be confusable with the database whose ``alembic_version`` it
+    merely cannot READ. The two states have opposite remedies (migrate vs. grant), so a boot check
+    that answers "did the query fail?" while reporting "was it ever migrated?" sends the operator
+    down the wrong one. This fixture is the half of that pair nothing else in the suite can produce.
+
+    Function-scoped and torn down with its schema: nothing else may run here, because the whole
+    point of it is a schema with no tables in it.
+    """
+    schema = f"{_run_schema_name()}_virgin"
+    admin = sa.create_engine(pg_admin_url, poolclass=NullPool)
+    try:
+        with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.exec_driver_sql(f'CREATE SCHEMA "{schema}" AUTHORIZATION {DbRole.OWNER.value}')
+            conn.exec_driver_sql(f'GRANT USAGE ON SCHEMA "{schema}" TO {DbRole.APP.value}')
+        try:
+            yield _url_scoped_to(
+                pg_admin_url, schema, user=DbRole.APP.value, password=role_password
+            )
         finally:
             with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 conn.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

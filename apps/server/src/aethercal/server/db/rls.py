@@ -61,6 +61,15 @@ POLICY_NAME = "aethercal_tenant_isolation"
 TENANT_PREDICATE = f"tenant_id = nullif(current_setting('{TENANT_GUC}', true), '')::uuid"
 """The whole belt in one expression. NULL ⇒ no row matches ⇒ zero rows. Never "all rows"."""
 
+VERSION_TABLE = "alembic_version"
+"""Alembic's own bookkeeping table — ==the one table here nothing in this codebase can derive.==
+
+Created by Alembic, not by ``Base.metadata``, so :func:`tenant_scoped_tables` cannot see it and the
+metadata-driven ``GRANT`` loop cannot reach it. It carries no ``tenant_id`` and never will: it is
+not a business's data, and it gets no policy. :func:`grant_version_table` is why the grant on it
+belongs to a MIGRATION and not to the provisioning runbook.
+"""
+
 TENANT_ROOT = "tenants"
 """The one table with no ``tenant_id``: it IS the tenant.
 
@@ -145,6 +154,45 @@ def grant_table(table: str) -> list[str]:
     return [f'GRANT {_CRUD} ON "{table}" TO {APP_ROLE}, {WORKER_ROLE}']
 
 
+def grant_version_table() -> list[str]:
+    """``GRANT SELECT ON alembic_version`` — ==the grant that CANNOT live in the runbook.==
+
+    The web and the worker read this table at boot to refuse a schema they have outgrown
+    (:func:`~aethercal.server.db.migrate.assert_schema_at_head`). Without ``SELECT`` on it, neither
+    process starts — at all, ever, on a database that is perfectly migrated.
+
+    .. rubric:: Why this is a MIGRATION's job and not ``provision_roles.sql``'s
+
+    ``provision_roles.sql`` is step 2 of the quickstart and ``db upgrade`` is step 3, so when the
+    runbook runs ``alembic_version`` ==does not exist yet==: Alembic creates it. The runbook's grant
+    was therefore wrapped in ``IF EXISTS`` to stay idempotent — which on a virgin database (the only
+    kind step 2 ever runs against) meant the grant ==silently did not happen==, and nothing
+    re-applied it after. Every fresh install crash-looped, reporting that a database "has never been
+    migrated" about a database that was fully migrated. The no-op that does nothing, raises nothing,
+    and passes every test.
+
+    Here the ordering problem cannot exist. A migration runs AFTER Alembic has created the table (it
+    is what records the migration), as the role that OWNS it, so the grant is unconditional and the
+    ``IF EXISTS`` has nothing left to guard. Nor can an operator skip it by running the steps out of
+    order, because it IS one of the steps: the boot check refuses to serve on a schema below head,
+    so a process that starts has necessarily run this.
+
+    ==SELECT, and nothing else.== Only the owner writes this table; the app and worker only ever ask
+    it what revision the schema is at. (:func:`default_privileges` hands future tables full CRUD —
+    right for a business's data, wrong for Alembic's ledger. It would not reach this table anyway:
+    ``ALTER DEFAULT PRIVILEGES`` binds objects created AFTER it runs, and ``alembic_version`` is
+    created before the first migration executes. On a database that has migrated before, the default
+    ACL left behind by an earlier run makes this grant look like it is already there — which is how
+    the defect stayed invisible on a developer's re-used database and fatal on a fresh one.)
+    """
+    return [f'GRANT SELECT ON "{VERSION_TABLE}" TO {APP_ROLE}, {WORKER_ROLE}']
+
+
+def revoke_version_table() -> list[str]:
+    """The downgrade of :func:`grant_version_table`."""
+    return [f'REVOKE SELECT ON "{VERSION_TABLE}" FROM {APP_ROLE}, {WORKER_ROLE}']
+
+
 def default_privileges() -> list[str]:
     """``ALTER DEFAULT PRIVILEGES`` so EVERY FUTURE table the owner creates is granted already.
 
@@ -208,13 +256,16 @@ __all__ = [
     "TENANT_GUC",
     "TENANT_PREDICATE",
     "TENANT_ROOT",
+    "VERSION_TABLE",
     "WORKER_ROLE",
     "default_privileges",
     "disable_rls",
     "drop_resolver_functions",
     "enable_rls",
     "grant_table",
+    "grant_version_table",
     "resolver_functions",
+    "revoke_version_table",
     "tenant_scoped_tables",
     "unscoped_tables",
 ]

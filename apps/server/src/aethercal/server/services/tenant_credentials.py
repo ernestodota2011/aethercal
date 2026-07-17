@@ -170,6 +170,39 @@ class IncompleteCredentialError(CredentialError):
     """
 
 
+class LiveCredentialRefusedError(CredentialError):
+    """A money credential was not provably TEST-MODE, and this cut does not take real money.
+
+    ==The adapters behind this are unverified against their providers, and that is not a rumour —
+    it is what they say about themselves.== ``integrations/stripe.py`` — titled *"Stripe, in TEST
+    MODE"* — records that its gateway is *"NOT verified against live Stripe... exercised only with a
+    stubbed transport"*. ``integrations/mercadopago.py`` is blunter still: *"No Mercado Pago account
+    exists for this project, so nothing here has ever opened a real checkout, taken a real payment,
+    or issued a real refund."*
+
+    Until this class, ==nothing enforced any of that==. The title was a filename and the warnings
+    were prose. An operator pasting an ``sk_live_`` key into ``credentials set`` got a product that
+    charged a real guest's real card through code that had never once spoken to Stripe — and every
+    status code would have said success. "LIVE is not wired" sounds like an absence; the reality was
+    *present and unverified*, which is the worse of the two, because it needed nobody to build it.
+    It needed only that nobody had refused it.
+
+    .. rubric:: ==Refused, not warned — because the danger must not arrive by OMISSION==
+
+    There is no flag, no ``allow_live=`` argument and no environment escape hatch, for the same
+    reason :func:`resolve_money_credential` has no ``instance_default``: there must be nothing to
+    pass. A warning is ignorable by doing nothing, and doing nothing is exactly how a live key would
+    arrive here — nobody DECIDES to charge through an unverified adapter, they simply paste the key
+    they had. A refusal cannot be reached by inattention.
+
+    .. rubric:: What must be true before this is relaxed
+
+    This is a claim about the CUT, not about Stripe. Lifting it is the B-08 gate's job: a real
+    round-trip against each provider, in test mode, with zero real charges — and then a deliberate,
+    reviewed edit HERE, rather than a default that quietly stopped applying.
+    """
+
+
 class MalformedCredentialError(CredentialError):
     """A stored credential decrypted to valid JSON that is NOT an object of field → value.
 
@@ -226,6 +259,48 @@ def required_fields(provider: CredentialProvider) -> frozenset[str]:
             assert_never(unreachable)
 
 
+def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
+    """field → the prefix its value MUST carry in this cut. ==An ALLOWLIST, and exhaustive.==
+
+    A money provider whose key says out loud which mode it is in gets that mode CHECKED, because the
+    adapters here have never spoken to a live provider (:class:`LiveCredentialRefusedError`).
+
+    .. rubric:: ==Why a required prefix and not a list of forbidden ones==
+
+    The obvious spelling is "reject ``sk_live_``". It is a photograph of what we happened to know on
+    the day it was written, and it fails open on everything else: Stripe's restricted live keys
+    (``rk_live_``), whatever prefix Stripe introduces next, a publishable key pasted by mistake, a
+    truncated paste, an ``access_token`` from the wrong account. Every one of those is "not
+    ``sk_live_``", so every one would be stored as though it had been checked — and the mistakes are
+    likelier than the deliberate act. Requiring the TEST prefix inverts that: anything not provably
+    test-mode is refused, which is the only direction that fails closed.
+
+    .. rubric:: ==Exhaustive, so a new payment provider cannot arrive without an answer==
+
+    ``assert_never``, exactly as in :func:`credential_class` and :func:`required_fields`. A third
+    processor does not type-check until somebody has said which prefix proves it is in test mode —
+    and ``tests/test_credential_mode_guard.py`` asserts, by walking the enum, that every provider
+    classified MONEY declares one and that the field it names is one the provider REQUIRES (a guard
+    on an optional field is skipped by leaving the field out).
+
+    The INFRA providers return an empty mapping, and that is a decision rather than a gap: an SMTP
+    host, a WhatsApp instance or a Twilio SID carry no test/live distinction in the value, so there
+    is nothing here to read. Inventing one would refuse every legitimate mail server on the
+    internet.
+    """
+    match provider:
+        case CredentialProvider.STRIPE:
+            # Stripe's own scheme: `sk_test_…` in test mode, `sk_live_…` in live mode.
+            return {"secret_key": "sk_test_"}
+        case CredentialProvider.MERCADO_PAGO:
+            # Mercado Pago's own scheme: `TEST-…` for the sandbox, `APP_USR-…` in production.
+            return {"access_token": "TEST-"}
+        case CredentialProvider.SMTP | CredentialProvider.WHATSAPP | CredentialProvider.SMS:
+            return {}
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ResolvedCredential:
     """A decrypted credential, with the record of WHERE it came from. ==Its ``repr`` is
@@ -250,7 +325,18 @@ class ResolvedCredential:
 
 
 def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[str, str]:
-    """Refuse a half-configured credential AT THE DOOR, naming what is missing."""
+    """Refuse a half-configured credential — or a LIVE one — AT THE DOOR.
+
+    ==The door, and not the callers.== Every write of this table goes through
+    :func:`store_credential`, which goes through here, so a second writer (an admin route, an
+    importer, a fixture) inherits both refusals rather than having to remember them. Gating the
+    caller instead of the funnel is how the CLI ends up with a check the admin UI does not have.
+
+    The two refusals run in this order deliberately, and each keeps answering its OWN question: a
+    credential missing a field is INCOMPLETE whatever mode its other fields are in, and reporting
+    that as a live-key refusal would send the operator off to rotate a key that was never the
+    problem.
+    """
     present = {key: value for key, value in secrets.items() if str(value).strip()}
     missing = sorted(required_fields(provider) - present.keys())
     if missing:
@@ -263,6 +349,29 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
             "\n"
             f"Required for {provider.value}: {', '.join(sorted(required_fields(provider)))}."
         )
+
+    for field, prefix in required_test_mode_prefixes(provider).items():
+        if not str(present[field]).startswith(prefix):
+            # ==Names the FIELD and the PROVIDER — both fixed literals we control — and NEVER the
+            # value.== A live key is the most sensitive thing this system is ever handed, and
+            # refusing it does not make it less secret; echoing it (or even the prefix it failed on)
+            # would put it in the operator's terminal, their shell history and the CLI's stderr.
+            raise LiveCredentialRefusedError(
+                f"the {provider.value} `{field}` is not a test-mode credential, and this build "
+                "does not take real money.\n"
+                "\n"
+                f"It must start with `{prefix}`. ==This is refused rather than warned about==: the "
+                f"{provider.value} adapter in this cut has NEVER been run against the real "
+                "provider — it is exercised only with a stubbed transport — so a live credential "
+                "here would charge a real guest's real card through code that has never spoken to "
+                f"{provider.value}, and every status code would say success.\n"
+                "\n"
+                "Use the test-mode credential from the provider's dashboard. Real charges are the "
+                "B-08 gate's job, after a verified round-trip.\n"
+                "\n"
+                "(The value is not shown — it is a secret, wrong mode or not.)"
+            )
+
     return {key: str(value) for key, value in present.items()}
 
 
@@ -548,6 +657,7 @@ __all__ = [
     "CredentialProvider",
     "CredentialSource",
     "IncompleteCredentialError",
+    "LiveCredentialRefusedError",
     "MalformedCredentialError",
     "MissingCredentialError",
     "ResolvedCredential",
@@ -556,6 +666,7 @@ __all__ = [
     "delete_credential",
     "list_credential_providers",
     "required_fields",
+    "required_test_mode_prefixes",
     "resolve_infra_credential",
     "resolve_money_credential",
     "resolve_tenant_money_provider",
