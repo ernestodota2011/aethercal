@@ -70,9 +70,11 @@ ENV PATH="/app/.venv/bin:$PATH" \
 USER aethercal
 EXPOSE 8000
 
-# A lightweight liveness probe using the stdlib (no curl in the slim image).
+# A lightweight liveness probe using the stdlib (no curl in the slim image). Explicit try/except:
+# a non-200 or a refused connection is a clean exit 1, not a reliance on the uncaught HTTPError/
+# URLError happening to make the interpreter exit non-zero.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status==200 else sys.exit(1)"]
+    CMD ["python", "-c", "import urllib.request, sys\ntry:\n    r = urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4)\n    sys.exit(0 if r.status == 200 else 1)\nexcept Exception:\n    sys.exit(1)"]
 
 # The default command is still the WEB process. It no longer migrates and no longer schedules: the
 # compose file runs `aethercal-admin db upgrade` as a one-shot `migrate` service first, and
