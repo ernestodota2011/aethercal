@@ -205,7 +205,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "icalendar", specifier = ">=6" },
     { name = "itsdangerous", specifier = ">=2.2" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "reflex", specifier = ">=0.9.6.post1,<0.10" },
     { name = "sqlalchemy", specifier = ">=2.0" },
