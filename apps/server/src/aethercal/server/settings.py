@@ -13,6 +13,7 @@ from typing import Self
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from aethercal.core.placeholders import assert_not_published_placeholder
 from aethercal.server.client_ip import TrustedProxies
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.config import (
@@ -180,6 +181,36 @@ class Settings(BaseSettings):
     # Descriptive.
     app_name: str = "AetherCal"
     environment: str = "production"
+
+    @field_validator("app_secret", mode="after")
+    @classmethod
+    def _refuse_the_published_placeholder(cls, value: str) -> str:
+        """==A secret this repository prints is not a secret.== Refuse to boot on it.
+
+        ``deploy/.env.example`` ships ``AETHERCAL_APP_SECRET=CHANGE_ME_LONG_RANDOM_SECRET`` and the
+        quickstart's step 1 is ``cp .env.example .env``. Every check there was accepted it, because
+        it is a perfectly good non-empty string — so an operator who never edited the placeholder
+        got an instance that ran flawlessly on a secret printed in a public repository.
+
+        ==And this one is the key that decrypts money.== The Fernet key is a pure function of this
+        value, so the published placeholder yields a key anybody can derive from a clone and use to
+        read every business's Stripe and Mercado Pago credentials straight out of a database dump.
+        The promise that a stolen dump is useless without the app secret is void when the app secret
+        is one we hand out.
+
+        It fails SILENTLY, which is precisely why it needs a guard and the database URL does not: a
+        placeholder there merely fails to connect, loudly, in seconds. A placeholder here runs
+        perfectly and is simply not secret.
+
+        ==``previous_app_secret`` deliberately does NOT get this validator.== It is the RETIRING
+        secret during a rotation, so an instance that has been running on the placeholder must set
+        it TO the placeholder in order to rotate off it. Guarding it would refuse the one command
+        that escapes this bug.
+
+        The rule itself lives in :mod:`aethercal.core.placeholders` — the booking page's session key
+        has the identical hole, and one question must not have two answers that can drift apart.
+        """
+        return assert_not_published_placeholder(value, env_var="AETHERCAL_APP_SECRET")
 
     @field_validator("metrics_token", mode="after")
     @classmethod

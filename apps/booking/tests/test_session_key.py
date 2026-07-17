@@ -46,11 +46,18 @@ import aethercal.booking.app as booking_app
 from aethercal.booking.app import create_app
 from aethercal.booking.settings import BOOKING_SECRET_ENV, BookingSettings
 from aethercal.client import AetherCalClient
+from aethercal.core.placeholders import PublishedPlaceholderError
 
 BOOKING_SRC = Path(str(booking_app.__file__)).parent
 
 # Synthetic. Not a redaction of anything: there is no real key in this repository.
 SECRET = "not-a-real-booking-secret-for-tests"
+
+#: The literal `deploy/.env.example` hands every operator, and which `cp .env.example .env` puts
+#: straight into production unless somebody remembers to edit it. Hard-coded HERE (rather than
+#: parsed) on purpose: this test is about the booking page's REFUSAL. The sweep that proves the file
+#: and the rule cannot drift apart is core's `test_published_secrets.py`, which reads the file.
+PUBLISHED_PLACEHOLDER = "CHANGE_ME_LONG_RANDOM_BOOKING_SECRET"
 
 
 def _settings(**overrides: object) -> BookingSettings:
@@ -132,6 +139,43 @@ class TestTheSecretIsRequired:
         """
         with pytest.raises(ValueError, match=BOOKING_SECRET_ENV):
             BookingSettings.from_env({BOOKING_SECRET_ENV: "   "})
+
+
+class TestThePublishedPlaceholderIsNotASecret:
+    """==The same bug, one step to the left.== A key nobody can read, replaced by a key everybody
+    can read.
+
+    Making the secret required closed "FastHTML mints it onto disk". It did not close
+    ``deploy/.env.example`` shipping ``AETHERCAL_BOOKING_SECRET=CHANGE_ME_...``, the quickstart
+    saying ``cp .env.example .env``, and any non-blank string passing every check there was. The
+    outcome is identical — cookies signed with a publicly known key — and it arrives the same way:
+    ==by omission==. Nobody publishes their key on purpose; they just do not edit the placeholder.
+
+    The rule lives in ``aethercal.core.placeholders`` because ``AETHERCAL_APP_SECRET`` had it too,
+    and one question must not have two answers. The sweep over every published placeholder is
+    ``packages/aethercal-core/tests/test_published_secrets.py``.
+    """
+
+    def test_the_published_placeholder_is_refused(self) -> None:
+        with pytest.raises(PublishedPlaceholderError):
+            BookingSettings.from_env({BOOKING_SECRET_ENV: PUBLISHED_PLACEHOLDER})
+
+    def test_the_refusal_names_the_variable(self) -> None:
+        with pytest.raises(PublishedPlaceholderError) as raised:
+            BookingSettings.from_env({BOOKING_SECRET_ENV: PUBLISHED_PLACEHOLDER})
+
+        assert BOOKING_SECRET_ENV in str(raised.value)
+
+    def test_a_secret_the_operator_actually_generated_is_accepted(self) -> None:
+        """==The anti-vacuity half==, and the reason this is not an entropy check: the guard must
+        pass anything the repository did not publish."""
+        settings = BookingSettings.from_env({BOOKING_SECRET_ENV: SECRET})
+
+        assert settings.app_secret == SECRET
+
+    def test_the_page_still_builds_from_a_real_secret(self) -> None:
+        """End to end: a generated secret produces an app that signs with it and writes no file."""
+        assert _build(_settings()).secret_key == SECRET
 
 
 class TestNoCallSiteCanForgetIt:

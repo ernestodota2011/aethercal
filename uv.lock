@@ -41,6 +41,7 @@ version = "0.0.0"
 source = { editable = "apps/booking" }
 dependencies = [
     { name = "aethercal-client" },
+    { name = "aethercal-core" },
     { name = "aethercal-schemas" },
     { name = "python-fasthtml" },
 ]
@@ -48,6 +49,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aethercal-client", editable = "packages/aethercal-client" },
+    { name = "aethercal-core", editable = "packages/aethercal-core" },
     { name = "aethercal-schemas", editable = "packages/aethercal-schemas" },
     { name = "python-fasthtml", specifier = ">=0.12" },
 ]

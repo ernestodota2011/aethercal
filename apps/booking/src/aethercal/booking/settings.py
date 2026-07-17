@@ -46,6 +46,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from aethercal.booking.i18n import DEFAULT_LOCALE, Locale, normalize_locale
+from aethercal.core.placeholders import assert_not_published_placeholder
 
 #: Where the booking page looks for the API when ``AETHERCAL_API_URL`` is unset (local dev).
 DEFAULT_API_URL = "http://127.0.0.1:8000"
@@ -141,6 +142,16 @@ class BookingSettings:
                 "decrypts every business's payment credentials; this process is the most exposed "
                 "in the system and has no business holding it. Two secrets, two blast radii."
             )
+
+        # ==A value this repository PRINTS is not a secret.== Requiring the variable closed "the key
+        # gets minted onto disk and committed"; it did not close "the key is the example value that
+        # `cp .env.example .env` hands every operator". Same outcome — cookies signed with a
+        # publicly-known key — and the same arrival: by omission.
+        #
+        # Checked AFTER the blank test, because a blank value is not a placeholder and each refusal
+        # answers its own question. The rule itself lives in ONE place for the whole product:
+        # AETHERCAL_APP_SECRET has the identical hole, and one question must not have two answers.
+        assert_not_published_placeholder(app_secret, env_var=BOOKING_SECRET_ENV)
 
         api_url = environ.get(_ENV_API_URL, DEFAULT_API_URL).strip().rstrip("/") or DEFAULT_API_URL
         tenant_slug = environ.get(_ENV_TENANT_SLUG, "").strip() or None
