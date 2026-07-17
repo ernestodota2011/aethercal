@@ -61,8 +61,10 @@ from aethercal.server.db.models import (
 from aethercal.server.db.roles import DbRole
 from aethercal.server.scheduler import (
     build_busy_refresher,
+    build_parked_payment_runner,
     build_webhook_deliverer,
     make_busy_refresh_tick,
+    make_outbox_drain_tick,
     make_webhook_delivery_tick,
 )
 from aethercal.server.settings import Settings
@@ -451,6 +453,59 @@ class TestTheBootArmsTheBusyRefreshTick:
             "the registered busy-refresh tick reached no connection. It is the closure the worker "
             "hands APScheduler, and it swallows its own failures — so this is the only thing that "
             "looks."
+        )
+
+
+class TestTheBootArmsTheParkedPaymentTick:
+    """B-09's last seam, extracted from make_outbox_drain_tick's pragma into a build function.
+
+    The parked-payment pass reconciles a payment event that beat its checkout's commit. It reads
+    ``app.state.pools`` and — via ``_payment_confirm_effects`` — ``app.state.settings``. Both are
+    boot-seam reads: if the boot ever stops putting those names on the state, the pass dies with an
+    ``AttributeError`` and payment events silently stop being reconciled. These drive it against the
+    REAL lifespan so that break is loud, exactly as the drain / busy / webhook seams are driven.
+    """
+
+    async def test_the_runner_the_tick_builds_reads_both_boot_seam_names(
+        self, booted_worker: FastAPI
+    ) -> None:
+        """Both names, proven by what the runner hands the arbiter: the boot's own pools, and a
+        confirm_effects built from app.state.settings (None would mean the settings seam broke)."""
+        captured: dict[str, Any] = {}
+
+        async def _spy(pools: Any, *, now: Any, confirm_effects: Any) -> None:
+            captured["pools"] = pools
+            captured["confirm_effects"] = confirm_effects
+
+        with mock.patch("aethercal.server.scheduler.run_parked_payment_tick", side_effect=_spy):
+            run = build_parked_payment_runner(booted_worker)
+            await run()
+
+        assert captured["pools"] is booted_worker.state.pools, (
+            "the parked-payment runner did not reach the boot's pools — the app.state.pools seam"
+        )
+        assert captured["confirm_effects"] is not None, (
+            "confirm_effects is built from app.state.settings; None is the signature of that seam "
+            "breaking in silence"
+        )
+
+    async def test_the_tick_the_worker_actually_wires_runs_the_parked_pass(
+        self, booted_worker: FastAPI
+    ) -> None:
+        """And the closure the worker registers runs BOTH halves — the drain and the parked pass —
+        so dropping the pragma over make_outbox_drain_tick is a claim something now checks."""
+        parked_ran = False
+
+        async def _spy(pools: Any, *, now: Any, confirm_effects: Any) -> None:
+            nonlocal parked_ran
+            parked_ran = True
+
+        with mock.patch("aethercal.server.scheduler.run_parked_payment_tick", side_effect=_spy):
+            await make_outbox_drain_tick(booted_worker)()
+
+        assert parked_ran, (
+            "make_outbox_drain_tick ran the drain but never the parked-payment pass — the closure "
+            "the worker hands APScheduler is the only thing that looks, and it must run both"
         )
 
 
