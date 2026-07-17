@@ -102,14 +102,16 @@
     }
   }
   iframe.onerror = showFallback;
-  // The "never posted a resize" timer must NOT start at mount: a `loading="lazy"` iframe below the
-  // fold does not load until scrolled into view, so a mount-time timer would replace a good iframe
-  // the visitor had not reached. Arm it when the iframe enters the viewport (when lazy loading
-  // starts). No IntersectionObserver = no lazy either = it loads at mount, so arm now.
+  // The "never posted a resize" timer must not start at mount when the iframe DEFERS loading: a
+  // lazy iframe below the fold loads only when scrolled into view, so a mount-time timer would
+  // replace a good iframe. Gate on the viewport only when BOTH hold — lazy is honoured AND IO can
+  // report entry. If lazy is unsupported the iframe loads at mount (IO does not change that), so
+  // arm now; likewise if IO is missing.
   function armFallbackTimer() {
     window.setTimeout(showFallback, 12000);
   }
-  if ("IntersectionObserver" in window) {
+  var lazyHonoured = "loading" in HTMLIFrameElement.prototype;
+  if (lazyHonoured && "IntersectionObserver" in window) {
     var io = new IntersectionObserver(function (entries) {
       for (var i = 0; i < entries.length; i++) {
         if (entries[i].isIntersecting) {
