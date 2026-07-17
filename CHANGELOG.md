@@ -114,6 +114,34 @@ serving requests no longer owns the tables (migration `0008_rls_roles_and_polici
 
 ### Added
 
+**The connected calendar** — a booking now creates the event in the host's Google Calendar,
+cancelling deletes it, and rescheduling moves it. ==RF-11/12/13 were ticked and were not true: no
+booking had ever reached a host's calendar.== The integration and the outbox effect were both built
+and tested; the one missing link was resolving the host's connection, and its absence raised nothing
+anywhere — every booking skipped the sync in silence.
+
+- The **existence of a connected calendar** is the gate, and the two ways to read "no calendar" are
+  now kept apart. A host who never linked Google enqueues no intent and the booking is complete
+  (benign, the self-hoster). A host who *has* a connection enqueues the intent — and if the calendar
+  cannot be resolved later, at drain time, the effect retries, dead-letters and lands in the visible
+  outbox backlog. It is never quietly marked delivered. Both cases used to collapse into one silent
+  `return`.
+- **A chain that already has an event is always synced**, whatever the host's calendars look like
+  today. A host who revokes their Google account between the confirmation and the cancellation has
+  no active connection — gating on that alone would drop the intent, the guest would be cancelled,
+  and the meeting would stay in the host's calendar forever with nobody told.
+- The intent captures only the **host**, never a connection id: the target calendar is resolved at
+  drain time from the live configuration, so there is one source of truth for "where does this event
+  go" instead of a snapshot that can rot between enqueue and drain.
+- ==Exercised against a **fake** Google transport only; no booking has yet reached a live Google
+  account.== That the code asks for the right thing is proven; what the real API answers is not.
+
+**No-show becomes observable** — `booking.no_show` joins `booking.created`, `booking.cancelled` and
+`booking.rescheduled` on the outgoing webhook vocabulary. A subscriber's CRM learned about a
+cancellation and about a reschedule, but a guest who simply never turned up was invisible to it.
+Widening the vocabulary needs no data migration, and no existing subscriber starts receiving the new
+event by accident — nobody can have subscribed to an event that did not exist.
+
 **Payments** — a business can now charge for an appointment with its own Stripe or Mercado Pago
 account (BYOK). ==Neither provider has been run against a live account in this cut.==
 

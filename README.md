@@ -31,19 +31,15 @@ below marked *not wired* are exactly that.
 | The 24-hour reminder, seeded per tenant as a workflow rule | Working, over email |
 | No-show — mark a booking `no_show` (it keeps its slot; the time has passed) | Working |
 | Payments — Stripe and Mercado Pago checkout, unpaid holds that self-cancel, refunds and disputes, each business on its own (BYOK) account | Working in **provider test mode only**: the Stripe adapter is exercised against a stubbed transport, never a live `sk_test_` key; the Mercado Pago adapter has never run against a real or sandbox account. Partial refunds are not modelled. See [docs/byok-credentials.md](docs/byok-credentials.md) |
-| Signed outgoing webhooks | Working — **at-least-once**, see [docs/webhooks.md](docs/webhooks.md) |
+| Signed outgoing webhooks — `booking.created`, `booking.cancelled`, `booking.rescheduled`, `booking.no_show` | Working — **at-least-once**, see [docs/webhooks.md](docs/webhooks.md) |
 | Calendar component — month, week, day, list **and resource timeline** views | Working: drag/resize with optimistic reconciliation, 4 theme presets + token overrides, ES/EN i18n, keyboard parity |
-| Google Calendar **busy-check** — a real busy block removes the slot | Working; degrades safely when the calendar is unreachable |
+| Google Calendar — **busy-check** (a real busy block removes the slot) and **write-back** (a booking creates the event; cancelling deletes it, rescheduling moves it) | Working; degrades safely when the calendar is unreachable. Exercised against a **fake** Google transport, never a live account — like the payment adapters above, treat your first real account as an integration nobody has run yet |
 | Multi-business isolation — PostgreSQL row-level security (`FORCE ROW LEVEL SECURITY` + one policy per business-scoped table), enforced by the database rather than by every query remembering its own `WHERE tenant_id` | Working — one instance safely serves more than one business; see [deploy/README.md](deploy/README.md) |
 | Self-host — one image, four processes (a one-shot migrator, the API, the worker and the booking page) plus PostgreSQL, entirely env-configured | Working — see [docs/quickstart.md](docs/quickstart.md) |
 | Minimal admin (Reflex) | Working |
 
 **What is _not_ wired yet — do not plan around it**
 
-- **A booking does not create an event in the host's Google Calendar.** The busy-check reads the
-  host's calendar, but the write-back leg is not connected (see `_build_effects` in
-  `apps/server/src/aethercal/server/api/bookings.py`). Cancelling and rescheduling likewise do not
-  touch Google.
 - **WhatsApp and SMS work — but nothing verifies that the phone number belongs to the person
   booking.** The adapters, the consent checkbox and the mandatory daily caps are live, and both
   channels stay **off until you configure them**. The number, however, is typed into a *public*
@@ -52,8 +48,6 @@ below marked *not wired* are exactly that.
   them, under your brand. Verifying possession of the number (an OTP, or a confirmation link) is a
   **declared gap**, not a thing that quietly works.
   ==Read [docs/phone-channels.md](docs/phone-channels.md) before switching a phone channel on.==
-- **No-show has no webhook.** You can mark a booking `no_show`, but the outgoing events are still
-  only `booking.created`, `booking.cancelled` and `booking.rescheduled`.
 - **Neither payment provider has been verified against a live account, and partial refunds are not
   modelled** — a refund is always the whole charge. Read
   [docs/byok-credentials.md](docs/byok-credentials.md) before taking a real charge.
