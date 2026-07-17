@@ -98,8 +98,13 @@ _CSS = """
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     --bg: #faf9f7; --surface: #ffffff; --border: #e5e2dc;
-    --text: #1b1b1e; --muted: #5f5f68; --accent: #b4632a; --accent-ink: #ffffff;
-    --focus: #b4632a; --danger: #b23a52; color-scheme: light;
+    /* The ember, darkened until white can sit on it: #b4632a gave 4.41:1 against --accent-ink and
+       4.19:1 as link text on --bg, and AA wants 4.5. Hue (24.8deg) and saturation are untouched —
+       only lightness moves — so both uses now pass (4.75 and 4.51). Fixed at the TOKEN, not at the
+       one button axe landed on: the failing pair is --accent/--accent-ink itself, so every element
+       wearing it was failing, including the ones nobody has written yet. */
+    --text: #1b1b1e; --muted: #5f5f68; --accent: #ac5f28; --accent-ink: #ffffff;
+    --focus: #ac5f28; --danger: #b23a52; color-scheme: light;
   }
 }
 * { box-sizing: border-box; }
