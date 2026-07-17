@@ -64,8 +64,8 @@
   script.parentNode.insertBefore(iframe, script.nextSibling);
 
   // Graceful fallback: if the service is down (`onerror`) or loads but never posts a resize (the
-  // 12s timeout), a bare iframe leaves a silent hole on the host page. Swap in an accessible message
-  // linking straight to the full booking page, so a visitor is never stranded.
+  // timer below), a bare iframe leaves a silent hole. Swap in an accessible message linking to the
+  // full booking page, so a visitor is never stranded.
   var booted = false;
   var replaced = false;
   var pageSrc = base + "/e/" + encodeURIComponent(slug);
@@ -102,7 +102,27 @@
     }
   }
   iframe.onerror = showFallback;
-  window.setTimeout(showFallback, 12000);
+  // The "never posted a resize" timer must NOT start at mount: a `loading="lazy"` iframe below the
+  // fold does not load until scrolled into view, so a mount-time timer would replace a good iframe
+  // the visitor had not reached. Arm it when the iframe enters the viewport (when lazy loading
+  // starts). No IntersectionObserver = no lazy either = it loads at mount, so arm now.
+  function armFallbackTimer() {
+    window.setTimeout(showFallback, 12000);
+  }
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].isIntersecting) {
+          io.disconnect();
+          armFallbackTimer();
+          return;
+        }
+      }
+    });
+    io.observe(iframe);
+  } else {
+    armFallbackTimer();
+  }
 
   // The origin an incoming `postMessage` must match to be trusted (derived from `data-base`, not
   // hardcoded) — computed via the classic anchor-element trick rather than the `URL` constructor,
@@ -131,10 +151,11 @@
     if (!data || data.type !== "aethercal:resize") {
       return;
     }
-    // A trusted resize from our own iframe is proof the page is alive — cancel the fallback.
-    booted = true;
     var height = data.height;
-    if (typeof height === "number" && height > 0) {
+    if (typeof height === "number" && isFinite(height) && height > 0) {
+      // Only a VALID resize (finite, positive) cancels the fallback — proof the page rendered live
+      // content. Booting on a malformed post (height 0/NaN/missing) would let a broken page disarm it.
+      booted = true;
       iframe.style.height = height + "px";
     }
   });

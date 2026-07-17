@@ -103,6 +103,28 @@ def test_embed_js_falls_back_when_the_iframe_cannot_load() -> None:
     assert 'role", "alert"' in source or "role\", 'alert'" in source  # accessible fallback
 
 
+def test_embed_js_fallback_timer_waits_for_the_iframe_to_enter_the_viewport() -> None:
+    # Crisol finding (high·correctness): the loader also sets `loading="lazy"`, so a mount-time
+    # timer would replace a below-the-fold iframe that had not started loading yet. The timer must
+    # be gated on IntersectionObserver — armed when the iframe enters the viewport — with a direct
+    # arm as the fallback for browsers that support neither IO nor lazy loading.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "IntersectionObserver" in source
+    assert "isIntersecting" in source
+
+
+def test_embed_js_only_a_valid_resize_disarms_the_fallback() -> None:
+    # Crisol finding (medium·completeness): a single malformed but correctly-typed resize post must
+    # NOT permanently disable the fallback. `booted` is set only after the height is validated as a
+    # finite positive number, so a broken page that posts `height: 0`/NaN still falls back.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    assert "isFinite(height)" in source
+    # The boot flag lives after the validation guard, not before it.
+    guard = source.index("isFinite(height)")
+    booted = source.index("booted = true", guard)
+    assert booted > guard, "`booted = true` must come AFTER the height validation, not before"
+
+
 def test_embed_js_iframe_is_responsive_and_lazy() -> None:
     source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
     assert "loading" in source
