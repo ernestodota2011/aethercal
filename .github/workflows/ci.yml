@@ -193,15 +193,40 @@ jobs:
               failures += int(suite.get("failures") or 0)
               errors += int(suite.get("errors") or 0)
 
-          print(f"db-marked: {total} run, {skipped} skipped, {failures} failed, {errors} errored")
+          print(f"db-marked: {total} collected, {total - skipped} ran, {skipped} skipped, "
+                f"{failures} failed, {errors} errored")
+
+          # Every decline, named out loud: a skip nobody reads is how one quietly becomes a habit.
+          for case in root.iter("testcase"):
+              for skip in case.iter("skipped"):
+                  print(f"  declined: {case.get('classname')}::{case.get('name')}\n"
+                        f"      {skip.get('message')}")
+
           if total == 0:
               sys.exit(
                   "::error::No db-marked test ran. A `pytest -m db` that collects nothing still "
                   "exits 0 — the gate would be green having tested nothing against PostgreSQL."
               )
-          if skipped:
+
+          # ==Did the suite reach PostgreSQL? That is this job's ONE question.==
+          #
+          # It used to ask "were there zero skips?", treating ANY skip as "PostgreSQL was
+          # unreachable or AETHERCAL_TEST_DATABASE_URL was unset". That proxy was exact only while
+          # no db-marked test could legitimately decline — and it stopped being exact the moment one
+          # could: `test_the_database_reaches_its_tailnet_host_through_the_floor` needs a database
+          # the network guard would REFUSE, and a loopback service container is not one, so here it
+          # declines instead of passing while proving nothing. A guard must answer its own question;
+          # inheriting a neighbour's classification is how it comes to fail the wrong thing.
+          #
+          # The condition this job exists for is unmissable and unchanged: with no database,
+          # `pg_admin_url` skips at the FIXTURE, so every db-marked test skips and nothing runs at
+          # all. That is what is checked below. A suite in which anything ran did reach PostgreSQL —
+          # which is the whole claim this job defends. Individual declines are the deciding test's
+          # own business, and it must justify each one in its docstring; they are printed above so
+          # the justification is visible rather than assumed.
+          if total == skipped:
               sys.exit(
-                  f"::error::{skipped} db-marked test(s) SKIPPED — PostgreSQL was unreachable or "
+                  f"::error::All {total} db-marked test(s) SKIPPED — PostgreSQL was unreachable or "
                   "AETHERCAL_TEST_DATABASE_URL was unset. A skipped suite exits 0; this job exists "
                   "precisely so that cannot pass."
               )
