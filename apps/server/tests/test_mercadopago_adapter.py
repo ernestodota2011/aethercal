@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -355,7 +356,22 @@ async def test_the_checkout_anchors_on_our_own_reference_and_returns_the_init_po
     assert body["external_reference"] == "booking:abc"
     assert body["expires"] is True
     assert body["expiration_date_to"].startswith("2026-07-20T15:00:00")
-    assert "book.example.com" in json.dumps(body["back_urls"])
+    # ==Every way back is a URL, so each is checked as one.== This read
+    # `"book.example.com" in json.dumps(body["back_urls"])` — a substring of a JSON blob, which says
+    # nothing about WHICH key holds it or whether it is the host rather than a path, a query
+    # parameter or a neighbouring field. `https://book.example.com.attacker.test/` satisfies it too;
+    # that is why CodeQL calls it `py/incomplete-url-substring-sanitization`. The three ways back
+    # are named, so name them, and compare the parsed host.
+    back_urls = body["back_urls"]
+    assert set(back_urls) == {"success", "pending", "failure"}, (
+        f"the guest must have a way back from every outcome, got {sorted(back_urls)}"
+    )
+    for outcome, raw in back_urls.items():
+        landing = urlsplit(raw)
+        assert (landing.scheme, landing.hostname) == ("https", "book.example.com"), (
+            f"back_urls[{outcome}] is {raw!r}: every way back must derive from the configured "
+            "booking base"
+        )
     assert "example.invalid" not in captured["body"]
 
 

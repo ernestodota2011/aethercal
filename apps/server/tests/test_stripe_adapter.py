@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -159,7 +160,22 @@ async def test_the_checkout_session_returns_to_the_configured_base_not_a_dead_ur
     assert captured["idempotency_key"] == "booking:abc"
     body = captured["body"]
     assert "example.invalid" not in body, "the guest must not land on a dead URL after paying"
-    assert "book.example.com" in body, "success/cancel derive from the configured booking base"
+
+    # ==Where the guest LANDS is a URL, so the assertion is about a URL — not about a string that
+    # happens to contain one.== This read `"book.example.com" in body`, which is equally satisfied
+    # by `https://book.example.com.attacker.test/`, by `https://evil.test/?next=book.example.com`,
+    # and by the host turning up in any unrelated field. That is the substring-for-a-host confusion
+    # CodeQL flags as `py/incomplete-url-substring-sanitization`, and it was a weak assertion long
+    # before it was an alert: the key must be as fine as the meaning. Parse the fields and ask each
+    # the real question — is this OUR base?
+    fields = parse_qs(body)
+    for field in ("success_url", "cancel_url"):
+        assert field in fields, f"the checkout body carries no {field}"
+        landing = urlsplit(fields[field][0])
+        assert (landing.scheme, landing.hostname) == ("https", "book.example.com"), (
+            f"{field} is {fields[field][0]!r}: success/cancel must derive from the configured "
+            "booking base"
+        )
 
 
 async def test_the_refund_call_sends_a_deterministic_idempotency_key() -> None:
