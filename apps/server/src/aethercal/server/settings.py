@@ -152,7 +152,16 @@ class Settings(BaseSettings):
     # keys
     # must not be obliged to obtain a captcha key in order to boot, and must not silently acquire an
     # anonymous write surface because it upgraded. The deployment that wants the public booking page
-    # turns it on in one place, on purpose (deploy/docker-compose.yml).
+    # turns it on in one place, on purpose: `AETHERCAL_PUBLIC_API_ENABLED` in its own `.env`
+    # (documented in `deploy/.env.example`, next to the Turnstile pair the validator below demands).
+    #
+    # ==This used to end "(deploy/docker-compose.yml)", and that file has never set it.== The
+    # sentence read as a description and was a wish: the shipped compose brings up a booking page
+    # that cannot serve one event — all five public endpoints unmounted, every call it makes a 404,
+    # the page answering 503 while /healthz stays green and the API lists those events happily. The
+    # E2E stack inherited the same silence and could not have caught it either, because the booking
+    # unit suite builds its settings in-process and mounts the router itself: it never asks a
+    # DEPLOYMENT whether the door is open.
     public_api_enabled: bool = False
 
     # The Cloudflare Turnstile SECRET (server side). ==Required whenever the public API is on — see

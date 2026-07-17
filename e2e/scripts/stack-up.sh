@@ -136,7 +136,24 @@ fi
 # boots — which is why the page starts last.
 echo "==> starting the booking page with the issued key"
 sed -i.bak "s|^AETHERCAL_API_KEY=.*|AETHERCAL_API_KEY=${api_key}|" "${ENV_FILE}"
+# ==And WHICH BUSINESS it presents that key for.== Without this the page has no default tenant, so
+# every unprefixed `/e/{slug}` — the only URL space this suite drives — answers 404, and the golden
+# flow fails looking for a slot picker on a "Not found" page. Written from the same ${TENANT_SLUG}
+# that created the tenant above: one decision, no second copy to drift out of step with it.
+sed -i.bak "s|^AETHERCAL_TENANT_SLUG=.*|AETHERCAL_TENANT_SLUG=${TENANT_SLUG}|" "${ENV_FILE}"
 rm -f "${ENV_FILE}.bak"
+
+# ==A `sed` that matches nothing exits 0.== Should either placeholder ever leave the template, both
+# substitutions above become silent no-ops and the stack boots misconfigured — a booking page with
+# no key, or with no business, failing later as a mystery timeout in a browser spec. So assert the
+# EFFECT on the file rather than trusting the command's exit code.
+for required in AETHERCAL_API_KEY AETHERCAL_TENANT_SLUG; do
+  if [[ -z "$(sed -n "s|^${required}=||p" "${ENV_FILE}")" ]]; then
+    echo "ERROR: ${required} is empty in ${ENV_FILE}: its placeholder line is missing from" >&2
+    echo "       scripts/deploy.env.template, so the substitution above did nothing." >&2
+    exit 1
+  fi
+done
 compose up -d booking
 wait_for_http "the booking page" "${BOOKING_URL}/healthz" 120
 

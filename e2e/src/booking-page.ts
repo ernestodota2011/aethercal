@@ -63,6 +63,29 @@ export async function bookSlot(
   if (guest.notes !== undefined) {
     await page.getByLabel("Notes (optional)").fill(guest.notes);
   }
+
+  // ==The captcha is part of this form, so filling the form means waiting for it.==
+  //
+  // The page renders a Turnstile widget whenever it holds a site key, and the widget writes its
+  // answer into a hidden `cf-turnstile-response` input ASYNCHRONOUSLY. The API fail-closes on an
+  // empty one — no token, no round-trip to Cloudflare, a flat 403 — so a submit that races the
+  // script books nothing and the guest is told "Something went wrong". That is precisely what
+  // happened the first time this stack ran with the public API switched on.
+  //
+  // The wait is unconditional on purpose: this stack always configures the always-passes test key
+  // (scripts/deploy.env.template), so a missing widget means a broken stack, and this should say so
+  // here rather than skip the wait and fail later, further away, as a mystery.
+  const captcha = page.locator('input[name="cf-turnstile-response"]');
+  await captcha.waitFor({ state: "attached", timeout: 15_000 });
+  await expect
+    .poll(async () => captcha.inputValue().catch(() => ""), {
+      message:
+        "the Turnstile widget never issued a token, so the API refuses this booking with a 403 — " +
+        "the widget script did not load, or the site key is not the always-passes test key",
+      timeout: 15_000,
+    })
+    .not.toBe("");
+
   await page.getByRole("button", { name: "Confirm booking" }).click();
 
   // Step 3 — the confirmation.

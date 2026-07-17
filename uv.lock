@@ -77,7 +77,7 @@ dependencies = [
     { name = "icalendar" },
     { name = "pydantic" },
     { name = "python-dateutil" },
-    { name = "tzdata", marker = "sys_platform == 'win32'" },
+    { name = "tzdata" },
 ]
 
 [package.metadata]
@@ -85,7 +85,7 @@ requires-dist = [
     { name = "icalendar", specifier = ">=6" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "python-dateutil", specifier = ">=2.9" },
-    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
+    { name = "tzdata", specifier = ">=2024.1" },
 ]
 
 [[package]]
