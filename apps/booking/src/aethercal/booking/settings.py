@@ -18,6 +18,24 @@ to boot without it). Absent, the page renders no widget, submits no token — an
 then
 refused by the API. The page can fail to ASK the question; it can never answer it.
 
+.. rubric:: ==``app_secret`` — REQUIRED, no default, and deliberately NOT the server's==
+
+FastHTML signs its session cookies with ``secret_key``, and when it is not handed one it *mints one
+into a ``.sesskey`` file in the working directory*. That is a sensible default for a notebook and a
+hole in a deployed product: the file was committed, reached the public repository, and production
+therefore signed its cookies with a key anybody could read. ==Nobody decided to publish a key.
+Nobody passed a parameter.== So this field exists, it is required, and it has no default — a page
+with no secret does not boot. See ``tests/test_session_key.py``.
+
+==It is its OWN secret (``AETHERCAL_BOOKING_SECRET``), not the server's ``AETHERCAL_APP_SECRET``,
+and that asymmetry is the point.== The server's secret derives the Fernet key that encrypts every
+business's payment credentials on the instance: its blast radius is every secret the product holds.
+THIS process is the most exposed one in the system — which is precisely why its API key was DELETED
+rather than deprecated (above). Handing it the key that decrypts every business's Stripe credential,
+in order to sign a cookie that protects nothing but itself, would undo that removal and buy nothing.
+Two secrets, two blast radii: whoever learns this page's cookie key learns how to forge a cookie,
+and nothing else.
+
 Stateless by design: no session store, and nothing here reaches the network — ``from_env`` is a pure
 mapping read, which keeps it trivially testable.
 """
@@ -58,6 +76,10 @@ DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ()
 #: an empty tuple as ``frame-ancestors *`` for `/embed/*` — everywhere ELSE stays `'self'`-only.
 DEFAULT_EMBED_ALLOWED_ORIGINS: tuple[str, ...] = ()
 
+#: The session cookie signing key. ==REQUIRED: absent, the page does not boot.== Never the server's
+#: ``AETHERCAL_APP_SECRET`` — see the module docstring for why the two are separate on purpose.
+BOOKING_SECRET_ENV = "AETHERCAL_BOOKING_SECRET"
+
 _ENV_API_URL = "AETHERCAL_API_URL"
 _ENV_TENANT_SLUG = "AETHERCAL_TENANT_SLUG"
 _ENV_TURNSTILE_SITE_KEY = "AETHERCAL_TURNSTILE_SITE_KEY"
@@ -80,13 +102,46 @@ class BookingSettings:
     #: server-side and refuses a booking with no token.
     turnstile_site_key: str | None
     default_locale: Locale
+    #: The session cookie signing key. ==No default, deliberately.== FastHTML's fallback is to mint
+    #: one into a `.sesskey` file on disk — which is how a signing key ended up committed to a
+    #: public repository. A required field cannot be reached by omission, and omission is the only
+    #: way that ever happens.
+    app_secret: str
     base_url: str = DEFAULT_BASE_URL
     trusted_proxies: tuple[str, ...] = DEFAULT_TRUSTED_PROXIES
     embed_allowed_origins: tuple[str, ...] = DEFAULT_EMBED_ALLOWED_ORIGINS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> BookingSettings:
-        """Build settings from an environment mapping (defaults applied, secrets never logged)."""
+        """Build settings from an environment mapping (defaults applied, secrets never logged).
+
+        ==Raises when the session secret is absent or blank.== Everything else here has a safe
+        default; this one cannot, because its "default" would be a key read off (or written to)
+        disk.
+        """
+        app_secret = environ.get(BOOKING_SECRET_ENV, "").strip()
+        if not app_secret:
+            # Names the VARIABLE, never a value: a half-pasted secret is still a secret, and this
+            # message lands in a container log.
+            raise ValueError(
+                f"{BOOKING_SECRET_ENV} is not set, and the booking page will not start without "
+                "it.\n"
+                "\n"
+                "It is the key FastHTML signs session cookies with. There is no default on "
+                "purpose: FastHTML's own fallback mints one into a `.sesskey` file in the working "
+                "directory, and a key on disk is a key that gets committed — which is exactly how "
+                "this page's signing key reached a public repository. A key nobody chose is the "
+                "problem, not the solution.\n"
+                "\n"
+                "Generate one per deployment and keep it out of the repo:\n"
+                "\n"
+                '    python -c "import secrets; print(secrets.token_urlsafe(32))"\n'
+                "\n"
+                f"==Do NOT reuse AETHERCAL_APP_SECRET here.== That one derives the key which "
+                "decrypts every business's payment credentials; this process is the most exposed "
+                "in the system and has no business holding it. Two secrets, two blast radii."
+            )
+
         api_url = environ.get(_ENV_API_URL, DEFAULT_API_URL).strip().rstrip("/") or DEFAULT_API_URL
         tenant_slug = environ.get(_ENV_TENANT_SLUG, "").strip() or None
         turnstile_site_key = environ.get(_ENV_TURNSTILE_SITE_KEY, "").strip() or None
@@ -103,6 +158,7 @@ class BookingSettings:
             tenant_slug=tenant_slug,
             turnstile_site_key=turnstile_site_key,
             default_locale=default_locale,
+            app_secret=app_secret,
             base_url=base_url,
             trusted_proxies=trusted_proxies,
             embed_allowed_origins=embed_allowed_origins,
@@ -120,6 +176,7 @@ def _parse_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
 
 
 __all__ = [
+    "BOOKING_SECRET_ENV",
     "DEFAULT_API_URL",
     "DEFAULT_BASE_URL",
     "DEFAULT_EMBED_ALLOWED_ORIGINS",

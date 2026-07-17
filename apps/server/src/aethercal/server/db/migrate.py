@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import psycopg
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -73,6 +74,28 @@ class SchemaOutOfDateError(RuntimeError):
     """The database is not at the migration head. ==Refuse to serve; do not migrate.=="""
 
 
+class VersionTableUnreadableError(RuntimeError):
+    """``alembic_version`` is there and this role may not read it, so the schema state is UNKNOWN.
+
+    ==Deliberately NOT a subclass of :class:`SchemaOutOfDateError`, and that is the point of this
+    class.== They are different facts with opposite remedies:
+
+    * *out of date* is a claim ABOUT the schema — the check read the table and compared. Fix:
+      migrate.
+    * *unreadable* is the admission that the check could not find out. Fix: grant the ``SELECT``.
+
+    This exists because those two used to be one message. ``assert_schema_at_head`` caught
+    ``DatabaseError`` — the base class of BOTH ``relation does not exist`` and ``permission
+    denied`` — and reported the first. So an operator whose database was fully migrated was told it
+    "has never been migrated", ran ``db upgrade`` as instructed, was told it was already at head,
+    and had nowhere left to go. ==The guard answered "did the query fail?" and reported "was it ever
+    migrated?".==
+
+    A subclass would put the hole straight back: ``except SchemaOutOfDateError`` would silently
+    absorb "I could not tell", and the caller would go on believing it had been told something.
+    """
+
+
 def head_revision() -> str:
     """The revision this build's migration tree ends at. Read from disk; no database needed."""
     return ScriptDirectory.from_config(make_alembic_config("sqlite://")).get_current_head() or ""
@@ -94,9 +117,22 @@ async def assert_schema_at_head(engine: AsyncEngine) -> None:
     serves, and it 500s (or worse, half-works) on whichever endpoint touches the column that is not
     there yet. Refusing at boot turns that into one legible message, before any traffic arrives.
 
-    ``alembic_version`` is created by Alembic, not by ``Base.metadata``, so it cannot be derived —
-    its ``GRANT SELECT`` to the app role is part of the provisioning runbook. If the grant is
-    missing this raises loudly, which is an acceptable failure: loud is the whole objective.
+    ``alembic_version`` is created by Alembic, not by ``Base.metadata``, so it cannot be derived
+    from the models — its ``GRANT SELECT`` to the app and worker roles is applied by migration
+    ``0016``, which is to say by the same rail as this check. It ==used to== be "part of the
+    provisioning runbook", and this docstring used to call a missing grant "an acceptable failure:
+    loud is the whole objective". Both sentences were wrong, and together they cost every fresh
+    install its boot:
+
+    * the runbook could not make that grant. It runs BEFORE ``db upgrade``, and the table does not
+      exist until Alembic creates it — so the grant sat under an ``IF EXISTS`` that was false on
+      every virgin database, and nothing re-applied it;
+    * the failure was not acceptable, because it was not loud in any useful sense. It was loud and
+      WRONG: this function reported "never migrated" about a fully migrated database, and named a
+      remedy that answers "already at head".
+
+    ==Loud is not the objective. Loud and RIGHT is the objective== — a message that is confidently
+    wrong is worse than a stack trace, because it is believed.
     """
     if engine.dialect.name != "postgresql":
         # Roles, RLS and Alembic version tracking are PostgreSQL facts. The only non-PostgreSQL
@@ -108,14 +144,43 @@ async def assert_schema_at_head(engine: AsyncEngine) -> None:
     async with engine.connect() as connection:
         try:
             current = (await connection.execute(_CURRENT_REVISION)).scalar_one_or_none()
-        except DatabaseError as exc:  # the table does not exist: never migrated at all
-            raise SchemaOutOfDateError(
-                "This database has no alembic_version table: it has never been migrated.\n"
-                "\n"
-                f"Bring it up to head ({head}) as the OWNER, before starting the web process:\n"
-                "\n"
-                "    aethercal-admin db upgrade\n"
-            ) from exc
+        except DatabaseError as exc:
+            # ==Ask the DATABASE which failure this is; do not infer it from the fact that one
+            # happened.== `DatabaseError` is the base class of every one of these, so catching it
+            # and assuming the first was how "permission denied" came out as "never migrated".
+            # psycopg's own classes carry PostgreSQL's SQLSTATE, which is the authoritative answer
+            # to the question actually being asked.
+            if isinstance(exc.orig, psycopg.errors.UndefinedTable):
+                raise SchemaOutOfDateError(
+                    "This database has no alembic_version table: it has never been migrated.\n"
+                    "\n"
+                    f"Bring it up to head ({head}) as the OWNER, before starting the web process:\n"
+                    "\n"
+                    "    aethercal-admin db upgrade\n"
+                ) from exc
+            if isinstance(exc.orig, psycopg.errors.InsufficientPrivilege):
+                raise VersionTableUnreadableError(
+                    "Permission denied reading alembic_version, so this process cannot tell "
+                    "whether the schema is at head — and it will not serve on a schema it has not "
+                    "checked.\n"
+                    "\n"
+                    "==The database is probably fine. The GRANT is missing.== Do NOT read this as "
+                    "'never migrated': that is a different fault with a different fix, and this "
+                    "message used to claim it.\n"
+                    "\n"
+                    "The grant is applied by migration 0016, so bring the database to head "
+                    f"({head}) as the OWNER:\n"
+                    "\n"
+                    "    aethercal-admin db upgrade\n"
+                    "\n"
+                    "If it is already at head, the grant was removed by hand; re-apply it as the "
+                    "owner:\n"
+                    "\n"
+                    "    GRANT SELECT ON alembic_version TO aethercal_app, aethercal_worker;\n"
+                ) from exc
+            # Anything else is not a fact about migration history, and this function has no standing
+            # to translate it into one. It travels intact.
+            raise
 
     if current != head:
         raise SchemaOutOfDateError(

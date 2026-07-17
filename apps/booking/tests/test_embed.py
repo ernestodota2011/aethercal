@@ -249,6 +249,7 @@ def _make_embed_client(
         tenant_slug="acme",
         turnstile_site_key=None,
         default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
         embed_allowed_origins=embed_allowed_origins,
     )
     transport = httpx.MockTransport(fake.handler)
@@ -379,7 +380,11 @@ def test_embed_rate_limit_applies_to_book_submit_too() -> None:
     limiter = booking_app._RateLimiter(max_requests=1, window_seconds=60)
     fake = FakeAPI()
     settings = BookingSettings(
-        api_url="http://api.test", tenant_slug="acme", turnstile_site_key=None, default_locale="es"
+        api_url="http://api.test",
+        tenant_slug="acme",
+        turnstile_site_key=None,
+        default_locale="es",
+        app_secret="not-a-real-booking-secret-for-tests",
     )
     transport = httpx.MockTransport(fake.handler)
 

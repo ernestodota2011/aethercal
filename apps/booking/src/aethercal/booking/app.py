@@ -1546,6 +1546,19 @@ def create_app(
     # the rate limiter's early 429. The rate limiter is INNER but still ahead of routing/FastHTML's
     # body parse — so a blocked POST is rejected before its body is read.
     app = FastHTML(
+        # ==Without this, FastHTML MINTS A SIGNING KEY ONTO DISK.== `get_key(key, fname='.sesskey')`
+        # is "read the key from the param, or read/create it from a file" — so omitting the argument
+        # writes a `.sesskey` into the working directory and signs every session cookie with it.
+        # That file was committed and reached the public repository, which is how production's
+        # cookie-signing key became world-readable. Nobody chose to publish it; nobody passed this
+        # argument. Passing it makes `get_key` return on its first line and never look at the
+        # filesystem at all.
+        #
+        # It is the booking page's OWN secret, never the server's AETHERCAL_APP_SECRET (which
+        # derives the key decrypting every business's payment credentials). settings.py carries that
+        # argument. `tests/test_session_key.py` proves no `.sesskey` is created, and walks the AST
+        # to hold every FUTURE FastHTML call site to the same rule.
+        secret_key=settings.app_secret,
         middleware=[
             Middleware(
                 _SecurityHeadersMiddleware,
@@ -1557,7 +1570,7 @@ def create_app(
                 turnstile=settings.turnstile_site_key is not None,
             ),
             booking.rate_limit_middleware(),
-        ]
+        ],
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     _register(app, "/", booking.index, ["GET"])
