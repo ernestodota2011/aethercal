@@ -90,9 +90,7 @@ app.add_typer(credentials_app, name="credentials")
 
 # Default cache location for the Google OAuth token during the loopback consent flow (matches the
 # F0-11 spike). Outside the repo, so a token never lands in version control.
-_DEFAULT_GOOGLE_TOKEN_PATH = (
-    Path.home() / ".aetherlogik" / "secrets" / "aethercal-google-token.json"
-)
+_DEFAULT_GOOGLE_TOKEN_PATH = Path.home() / ".aethercal" / "google-token.json"
 
 
 async def run_create_tenant(

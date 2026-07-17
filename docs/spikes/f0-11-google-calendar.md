@@ -19,7 +19,7 @@ integration (BusyCache, incremental sync, safe degradation) on this foundation.
 - `.../google/calendar.py` — a thin live API layer (`build_service`, `query_busy`,
   `insert_event_with_meet`, `delete_event`) with the untyped google-api-python-client contained
   behind an `Any` seam (same discipline as `aethercal.core.ical.serde`).
-- `.../google/spike.py` — the live demo runner used to verify the integration by hand.
+- [`f0-11-google-calendar-runner.py`](./f0-11-google-calendar-runner.py) — the live demo runner used to verify the integration by hand. It lives here, not in the package: a self-hoster installing AetherCal should not receive a one-off exploration script.
 - `apps/server/tests/test_google_parse.py` — 4 unit tests pinning the freebusy mapping (Z and offset
   forms, empty calendar, error-raising) and the Meet event body. The network layer is verified by the
   demo, not by unit tests.

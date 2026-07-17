@@ -1,8 +1,12 @@
 """Live demo runner for the Google Calendar spike (F0-11): OAuth -> freebusy -> insert Meet event.
 
-Run it directly (NOT under pytest) after exporting the agency OAuth Desktop client env vars:
+This is a RECORD of how the integration was verified by hand -- it lives here, beside the spike's
+write-up, rather than inside the installable package, because a one-off exploration runner is not
+something a self-hoster should receive when they install the product.
 
-    set -a; . ~/.aetherlogik/secrets/aethercal-google-oauth.env; set +a
+Run it directly (NOT under pytest) after exporting your own OAuth Desktop client credentials:
+
+    export AETHERCAL_GOOGLE_CLIENT_ID=... AETHERCAL_GOOGLE_CLIENT_SECRET=...
     export AETHERCAL_GOOGLE_CALENDAR_ID=primary
     uv run --package aethercal-server python -m aethercal.server.integrations.google.spike
 

@@ -32,6 +32,13 @@ cp .env.example .env
 #    owner) cannot mint them, and an init script in the postgres image only ever fires on an EMPTY
 #    volume — i.e. perfectly in CI, and never on the instance that actually matters.
 docker compose up -d postgres
+
+# `.env` is read by docker-compose, NOT by your shell — so $POSTGRES_USER and $POSTGRES_DB are
+# empty here unless you load it yourself. Skip this line and psql connects as your own username,
+# failing with `role "<you>" does not exist`: an error that sends you to debug a database that is
+# perfectly fine.
+set -a; source .env; set +a
+
 docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
     -v db="$POSTGRES_DB" -v pw_owner=... -v pw_app=... -v pw_worker=... \
     < sql/provision_roles.sql
