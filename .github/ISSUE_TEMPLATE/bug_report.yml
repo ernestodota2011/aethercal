@@ -1,0 +1,44 @@
+name: Bug report
+description: A scheduling result, API behaviour, or booking flow that is wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. AetherCal is a scheduling engine — the most useful reports are
+        **concrete, reproducible scheduling results that are wrong** (a slot offered that should not
+        be, a recurrence that expands incorrectly, a timezone/DST edge). Please do not include real
+        guest data, credentials, or `.env` values.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did AetherCal do, and what did you expect instead?
+      placeholder: "A 09:30 slot was offered even though the host's calendar shows a busy block 09:00–10:00."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that reproduces it. Event-type config, schedule, and the inputs help most.
+      placeholder: |
+        1. Event type: 30 min, schedule Mon–Fri 09:00–17:00 America/New_York
+        2. GET /e/discovery-call/slots?date=...
+        3. Observed: ...  Expected: ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: The release tag or the `main` commit SHA you are running.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, PostgreSQL version, self-host vs. local, anything relevant.
+    validations:
+      required: false

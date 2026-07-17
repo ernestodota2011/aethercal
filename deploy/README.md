@@ -206,3 +206,43 @@ have reported **zeros**: a permanently green readiness probe over a permanently 
 - The build re-creates the venv from `uv.lock` inside the image; `.dockerignore` keeps the host
   `.venv` and caches out of the context.
 - Data persists in the `aethercal-pgdata` named volume. Back it up like any PostgreSQL data dir.
+
+## Rollback and restore
+
+Two different things fail, and they roll back differently.
+
+**A bad deploy (new image, same schema).** Migrations are forward-only (expand-and-contract, see
+[Migrations](#migrations-a-one-shot-step-as-the-owner)), so a new release rarely changes the schema
+in a way the previous image cannot read. To roll back, redeploy the previous image tag:
+
+```bash
+# Pin the image you are deploying (never :latest in production) so "the previous one" is a real tag.
+docker compose pull      # or: docker compose up -d with the older tag in .env / compose
+docker compose up -d app worker booking
+```
+
+Do **not** run the previous release's `migrate` to "downgrade" the schema. Alembic downgrades exist
+and are tested, but production is forward-only by design: a downgrade that drops a column the newer
+rows still need loses data. If a release shipped a migration you must undo, treat it as a
+**roll-forward** — a new migration that reverses it — not a downgrade against live data.
+
+**Data loss or corruption (restore from backup).** The whole database lives in the `aethercal-pgdata`
+volume. Take logical backups on a schedule and test the restore — a backup you have never restored is
+a hope, not a backup:
+
+```bash
+# Back up (logical dump — portable across PostgreSQL patch versions):
+docker compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > aethercal-$(date +%F).dump
+
+# Restore into a FRESH database (never over a live one). Stop the app/worker first so nothing writes:
+docker compose stop app worker booking
+docker compose exec -T postgres pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists < aethercal-YYYY-MM-DD.dump
+docker compose up -d
+```
+
+After a restore, the running image may be **ahead of** the restored schema. That is the one case the
+`migrate` service is for on a rollback: it brings the restored database up to the image's head before
+`app`/`worker` are allowed to serve (they refuse a schema behind head, so this is enforced, not
+optional). The three database roles are **not** in a logical dump — re-create them first if you
+restored into a brand-new PostgreSQL instance (see
+[The three database roles](#the-three-database-roles--create-them-before-the-first-boot)).
