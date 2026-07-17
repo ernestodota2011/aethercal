@@ -42,7 +42,17 @@ Edit `.env`:
 > not raise an error, it would silently read nothing — so each process asks the database who it is at
 > boot and refuses to start on the wrong answer.
 
-Everything else has a working default. SMTP and Google are optional: leave them blank and the app
+- `AETHERCAL_BOOKING_SECRET` — signs the public booking page's session cookies. Generate a second,
+  **different** value: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. There is no
+  default on purpose, and the placeholder shipped in `.env.example` is refused: a secret this
+  repository publishes is not a secret. The page **will not start** without it — deliberately, because
+  a page that boots with a guessable signing key is worse than one that refuses to boot.
+
+> **Why a second secret?** `AETHERCAL_APP_SECRET` derives the key that decrypts every business's
+> payment credentials. The booking page is the most exposed process you run, and it does not need that
+> power to sign a cookie. Two secrets, two blast radii.
+
+The rest of `.env` has a working default. SMTP and Google are optional: leave them blank and the app
 still boots — bookings work, they just skip the confirmation email and the calendar busy-check.
 
 ## 2. Create the three database roles
@@ -230,9 +240,22 @@ application.
 ## 9. The booking page
 
 The public booking page runs as its own service in the same compose file, on
-<http://localhost:5001>. Put the API key into `AETHERCAL_API_KEY` in `.env` (that is the server-side
-key the page presents on the guest's behalf — the guest never sees a key), restart, and the event
-type is bookable at `/e/intro-call`.
+<http://localhost:5001>. It needs **four** settings in `.env`, not one — set fewer and the page
+answers `404` while `/healthz` keeps reporting 200, which is a confusing way to be broken:
+
+```bash
+AETHERCAL_API_KEY=...            # the server-side key the page presents on the guest's behalf.
+                                 # The guest never sees a key.
+AETHERCAL_PUBLIC_API_ENABLED=1   # mounts the five keyless endpoints the page calls. Off by default:
+                                 # an unauthenticated write surface is a decision, not a default.
+AETHERCAL_TENANT_SLUG=acme       # which business an unprefixed /e/{slug} means. Blank is not "the
+                                 # obvious one" — it means the page has none, and every /e/{slug}
+                                 # is a 404 (only /t/{tenant}/e/{slug} resolves).
+AETHERCAL_TURNSTILE_SITE_KEY=... # required whenever the public API is on: it is the only gate in
+AETHERCAL_TURNSTILE_SECRET=...   # front of an unauthenticated write. Keys: dash.cloudflare.com
+```
+
+Restart, and the event type is bookable at `/e/intro-call`.
 
 To put it on your own site instead, see [embedding](embedding.md).
 

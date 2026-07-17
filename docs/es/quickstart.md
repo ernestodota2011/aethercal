@@ -46,7 +46,17 @@ Edita `.env`:
 > que cada proceso le pregunta a la base de datos quién es al arrancar, y se niega a seguir si la
 > respuesta no es la correcta.
 
-Todo lo demás trae un valor por defecto que funciona. SMTP y Google son opcionales: déjalos en
+- `AETHERCAL_BOOKING_SECRET` — firma las cookies de sesión de la página pública. Genera un segundo
+  valor, **distinto**: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. No tiene valor
+  por defecto a propósito, y el placeholder que viene en `.env.example` se rechaza: un secreto que
+  este repositorio publica no es un secreto. La página **no arranca** sin él — deliberadamente: una
+  página que arranca con una llave de firma adivinable es peor que una que se niega a arrancar.
+
+> **¿Por qué un segundo secreto?** De `AETHERCAL_APP_SECRET` se deriva la llave que descifra las
+> credenciales de pago de **todos** los negocios. La página de reservas es el proceso más expuesto que
+> corres, y no necesita ese poder para firmar una cookie. Dos secretos, dos radios de explosión.
+
+El resto de `.env` trae un valor por defecto que funciona. SMTP y Google son opcionales: déjalos en
 blanco y la aplicación arranca igual — las reservas funcionan, solo se saltan el email de
 confirmación y la verificación de ocupación del calendario.
 
@@ -238,9 +248,23 @@ responde **`409 Conflict`**: el conflicto lo decide la base de datos, no una car
 ## 9. La página de reservas
 
 La página pública corre como su propio servicio en el mismo compose, en <http://localhost:5001>.
-Pon la API key en `AETHERCAL_API_KEY` dentro de `.env` (es la clave que la página presenta en nombre
-del invitado — el invitado nunca ve una clave), reinicia, y tu tipo de evento queda reservable en
-`/e/llamada-intro`.
+Necesita **cuatro** ajustes en `.env`, no uno — con menos, la página responde `404` mientras
+`/healthz` sigue diciendo 200, que es una forma confusa de estar roto:
+
+```bash
+AETHERCAL_API_KEY=...            # la clave que la página presenta en nombre del invitado.
+                                 # El invitado nunca ve una clave.
+AETHERCAL_PUBLIC_API_ENABLED=1   # monta los cinco endpoints sin llave que la página usa. Apagado
+                                 # por defecto: una superficie de escritura sin autenticar es una
+                                 # decisión, no un default.
+AETHERCAL_TENANT_SLUG=acme       # qué negocio significa un /e/{slug} sin prefijo. Vacío NO es "el
+                                 # obvio": significa que la página no tiene ninguno, y todo
+                                 # /e/{slug} es un 404 (solo resuelve /t/{tenant}/e/{slug}).
+AETHERCAL_TURNSTILE_SITE_KEY=... # obligatorias mientras el API público esté encendido: son la única
+AETHERCAL_TURNSTILE_SECRET=...   # puerta frente a una escritura sin autenticar. dash.cloudflare.com
+```
+
+Reinicia, y tu tipo de evento queda reservable en `/e/llamada-intro`.
 
 Para ponerlo en tu propio sitio, mira [cómo embeber el widget](../embedding.md).
 
