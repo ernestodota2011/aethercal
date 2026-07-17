@@ -52,13 +52,25 @@ confirmación y la verificación de ocupación del calendario.
 
 ## 2. Crea los tres roles de base de datos
 
-Una sola vez, antes del primer arranque completo. Levanta PostgreSQL solo y corre el script que ya
-viene en el repositorio:
+Una sola vez, antes del primer arranque completo. `docker compose` lee `.env` automáticamente para
+los *contenedores* — pero el comando de abajo corre `psql` desde **tu propia terminal**, que nunca ha
+visto ese archivo. Cárgalo primero:
+
+```bash
+set -a; source .env; set +a
+```
+
+Levanta PostgreSQL solo y corre el script que ya viene en el repositorio:
 
 ```bash
 docker compose up -d postgres
 
-docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"   -v db="$POSTGRES_DB"   -v pw_owner='<la contraseña del owner, la de tu .env>'   -v pw_app='<la contraseña de app>'   -v pw_worker='<la contraseña de worker>'   < sql/provision_roles.sql
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v db="$POSTGRES_DB" \
+  -v pw_owner='<la contraseña del owner, la de tu .env>' \
+  -v pw_app='<la contraseña de app>' \
+  -v pw_worker='<la contraseña de worker>' \
+  < sql/provision_roles.sql
 ```
 
 Es un paso humano y no una migración, por una razón aburrida con un filo peligroso: crear un usuario
@@ -145,27 +157,34 @@ reservar: 30 días aquí.)
 
 ## 7. Pide los slots libres
 
+`from`/`to` tiene que ser una ventana que todavía no haya pasado, así que calcúlala en vez de escribir
+una fecha fija — es lo único de esta guía que caduca solo:
+
 ```bash
 curl -G "$AETHERCAL_URL/slots/" \
   -H "Authorization: Bearer $AETHERCAL_KEY" \
   --data-urlencode "event_type=$EVENT_TYPE_ID" \
-  --data-urlencode "from=2026-07-13" \
-  --data-urlencode "to=2026-07-20" \
+  --data-urlencode "from=$(date -u +%Y-%m-%d)" \
+  --data-urlencode "to=$(date -u -d '+7 days' +%Y-%m-%d)" \
   --data-urlencode "tz=America/New_York"
 ```
+
+(macOS trae el `date` de BSD, que no tiene `-d`: instala coreutils — `brew install coreutils` — y usa
+`gdate`, o simplemente escribe un `to` de una semana en adelante.)
 
 ```json
 {
   "availability": "ok",
   "slots": [
-    {"start": "2026-07-13T13:00:00Z", "end": "2026-07-13T13:30:00Z"},
-    {"start": "2026-07-13T13:30:00Z", "end": "2026-07-13T14:00:00Z"}
+    {"start": "2026-07-20T13:00:00Z", "end": "2026-07-20T13:30:00Z"},
+    {"start": "2026-07-20T13:30:00Z", "end": "2026-07-20T14:00:00Z"}
   ]
 }
 ```
 
-Los límites de cada slot vienen en **UTC**; `tz` es solo la zona en la que los pediste (las 9:00 de
-Nueva York son las 13:00Z en julio).
+Las fechas de arriba son ilustrativas — las tuyas van a caer dentro de la ventana que pediste. Los
+límites de cada slot vienen en **UTC**; `tz` es solo la zona en la que los pediste (las 9:00 de Nueva
+York son las 13:00Z en julio).
 
 `availability` vale `ok` únicamente cuando la ocupación externa era conocida y completa para toda la
 ventana. Cualquier otro valor significa que un calendario conectado no respondió — y entonces
@@ -174,12 +193,19 @@ reserva.
 
 ## 8. Reserva
 
+Toma uno de los valores `start` que tu **propia** respuesta del paso 7 acaba de devolver — no el del
+ejemplo de arriba, que para cuando leas esto ya quedó en el pasado — y expórtalo:
+
+```bash
+export SLOT_START="2026-07-20T13:00:00Z"   # un "start" de TU respuesta del paso 7
+```
+
 ```bash
 curl -X POST "$AETHERCAL_URL/bookings/" \
   -H "Authorization: Bearer $AETHERCAL_KEY" -H "Content-Type: application/json" \
   -d '{
         "event_type_id": "'"$EVENT_TYPE_ID"'",
-        "start": "2026-07-13T13:00:00Z",
+        "start": "'"$SLOT_START"'",
         "guest_name": "Jane Doe",
         "guest_email": "jane@example.com",
         "guest_timezone": "America/New_York"
@@ -189,14 +215,25 @@ curl -X POST "$AETHERCAL_URL/bookings/" \
 ```json
 {
   "id": "5a13f24c-8e79-4240-b661-b8d4846fe01a",
+  "event_type_id": "a15dfe22-9146-4e11-9e04-3b6cf1e57742",
+  "start": "2026-07-20T13:00:00Z",
+  "end": "2026-07-20T13:30:00Z",
   "status": "confirmed",
-  "start": "2026-07-13T13:00:00",
-  "end": "2026-07-13T13:30:00"
+  "guest_name": "Jane Doe",
+  "guest_email": "jane@example.com",
+  "guest_timezone": "America/New_York",
+  "guest_notes": null,
+  "answers": {},
+  "meeting_url": null,
+  "rescheduled_from_id": null,
+  "cancelled_at": null,
+  "created_at": "2026-07-20T12:58:04Z"
 }
 ```
 
-Eso es una cita real. Envía el mismo slot otra vez y AetherCal responde **`409 Conflict`**: el
-conflicto lo decide la base de datos, no una carrera en la aplicación.
+Eso es una cita real. `start`/`end` vuelven con el sufijo `Z` (UTC), igual que la respuesta de los
+slots de arriba — todas las fechas de la API son UTC. Envía el mismo `SLOT_START` otra vez y AetherCal
+responde **`409 Conflict`**: el conflicto lo decide la base de datos, no una carrera en la aplicación.
 
 ## 9. La página de reservas
 
@@ -217,11 +254,17 @@ Para ponerlo en tu propio sitio, mira [cómo embeber el widget](../embedding.md)
   de verdad.
 - **[Webhooks](../webhooks.md)** — entérate cuando se crea, cancela o reagenda una reserva. Lee el
   contrato **at-least-once** antes de escribir tu handler: vas a recibir duplicados.
+- **[Credenciales BYOK](../byok-credentials.md)** — ponle precio a un tipo de evento con la cuenta
+  propia de Stripe o Mercado Pago de un negocio, antes de cobrar de verdad.
 
 ## Problemas comunes
 
 **`AETHERCAL_DATABASE_URL is not set`.** El contenedor corre sin tu `.env`. Ejecuta
 `docker compose up` desde el directorio `deploy/`, que es donde vive ese archivo.
+
+**`psql: FATAL: role "..." does not exist` en el paso 2.** Corriste ese comando sin cargar `.env` en
+esta terminal primero. `docker compose` lo lee para los contenedores; tu propia terminal nunca vio
+`$POSTGRES_USER` / `$POSTGRES_DB` hasta que corres `set -a; source .env; set +a`.
 
 **Un proceso se niega a arrancar y nombra un rol.** Un mensaje del estilo *"AETHERCAL_DATABASE_URL
 connects as PostgreSQL role 'x', but this engine must run as 'aethercal_app'"* significa que una URL

@@ -1,4 +1,0 @@
-=== intento 1 2026-07-16T20:48:13-04:00 ===
-crisol-remote: GO  [motor: codex (codex)]
-  [high·low·tests] apps/server/tests/test_tenant_senders.py:1617 [655cf375-8e0f-4f85-a0bd-644a1079ec1a::0] El archivo de tests termina con una expresión `asser` inválida
-=== VEREDICTO OBTENIDO ===

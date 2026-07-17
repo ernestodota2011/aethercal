@@ -47,7 +47,15 @@ still boots — bookings work, they just skip the confirmation email and the cal
 
 ## 2. Create the three database roles
 
-Once, before the first full boot. Start PostgreSQL on its own and run the shipped script:
+Once, before the first full boot. `docker compose` reads `.env` automatically for the *containers* —
+but the command below runs `psql` from **your own shell**, which has never seen that file. Load it
+first:
+
+```bash
+set -a; source .env; set +a
+```
+
+Start PostgreSQL on its own and run the shipped script:
 
 ```bash
 docker compose up -d postgres
@@ -142,26 +150,33 @@ book — 30 days here.)
 
 ## 7. Ask for the free slots
 
+`from`/`to` must be a window that has not already passed, so compute it instead of typing a fixed
+date — a hardcoded window is the one thing in this guide that goes stale on its own:
+
 ```bash
 curl -G "$AETHERCAL_URL/slots/" \
   -H "Authorization: Bearer $AETHERCAL_KEY" \
   --data-urlencode "event_type=$EVENT_TYPE_ID" \
-  --data-urlencode "from=2026-07-13" \
-  --data-urlencode "to=2026-07-20" \
+  --data-urlencode "from=$(date -u +%Y-%m-%d)" \
+  --data-urlencode "to=$(date -u -d '+7 days' +%Y-%m-%d)" \
   --data-urlencode "tz=America/New_York"
 ```
+
+(macOS ships BSD `date`, which has no `-d`: `brew install coreutils` and use `gdate`, or just type a
+`to` a week or so out.)
 
 ```json
 {
   "availability": "ok",
   "slots": [
-    {"start": "2026-07-13T13:00:00Z", "end": "2026-07-13T13:30:00Z"},
-    {"start": "2026-07-13T13:30:00Z", "end": "2026-07-13T14:00:00Z"}
+    {"start": "2026-07-20T13:00:00Z", "end": "2026-07-20T13:30:00Z"},
+    {"start": "2026-07-20T13:30:00Z", "end": "2026-07-20T14:00:00Z"}
   ]
 }
 ```
 
-Slot bounds are **UTC**; `tz` is the display zone you asked in (9:00 in New York is 13:00Z in July).
+The dates above are illustrative — yours will fall inside the window you asked for. Slot bounds are
+**UTC**; `tz` is only the zone you asked in (9:00 in New York is 13:00Z in July).
 
 `availability` is `ok` when the external busy set was known and complete for that window. It is
 `unavailable` when a connected calendar could not be reached — and then AetherCal deliberately
@@ -169,12 +184,19 @@ offers **no** slots for that host rather than risk a double-booking.
 
 ## 8. Book it
 
+Pick one of the `start` values **your** step 7 response just returned — not the example above, which
+is already in the past by the time you read this — and export it:
+
+```bash
+export SLOT_START="2026-07-20T13:00:00Z"   # a "start" from YOUR step 7 response
+```
+
 ```bash
 curl -X POST "$AETHERCAL_URL/bookings/" \
   -H "Authorization: Bearer $AETHERCAL_KEY" -H "Content-Type: application/json" \
   -d '{
         "event_type_id": "'"$EVENT_TYPE_ID"'",
-        "start": "2026-07-13T13:00:00Z",
+        "start": "'"$SLOT_START"'",
         "guest_name": "Jane Doe",
         "guest_email": "jane@example.com",
         "guest_timezone": "America/New_York"
@@ -184,14 +206,26 @@ curl -X POST "$AETHERCAL_URL/bookings/" \
 ```json
 {
   "id": "5a13f24c-8e79-4240-b661-b8d4846fe01a",
+  "event_type_id": "a15dfe22-9146-4e11-9e04-3b6cf1e57742",
+  "start": "2026-07-20T13:00:00Z",
+  "end": "2026-07-20T13:30:00Z",
   "status": "confirmed",
-  "start": "2026-07-13T13:00:00",
-  "end": "2026-07-13T13:30:00"
+  "guest_name": "Jane Doe",
+  "guest_email": "jane@example.com",
+  "guest_timezone": "America/New_York",
+  "guest_notes": null,
+  "answers": {},
+  "meeting_url": null,
+  "rescheduled_from_id": null,
+  "cancelled_at": null,
+  "created_at": "2026-07-20T12:58:04Z"
 }
 ```
 
-That is a real appointment. POST the same slot again and AetherCal answers **`409 Conflict`** — the
-conflict is decided by the database, not by a race in the application.
+That is a real appointment. `start`/`end` come back with the `Z` (UTC) suffix, same as the slots
+response above — every timestamp in the API is UTC. POST the same `SLOT_START` again and AetherCal
+answers **`409 Conflict`** — the conflict is decided by the database, not by a race in the
+application.
 
 ## 9. The booking page
 
@@ -211,13 +245,19 @@ To put it on your own site instead, see [embedding](embedding.md).
 - **[Calendar component](calendar-component.md)** — render the bookings in a real calendar.
 - **[Webhooks](webhooks.md)** — be notified when a booking is created, cancelled or rescheduled.
   Read the **at-least-once** contract before you write a handler.
-- **[deploy/README.md](../deploy/README.md)** — every setting, the rule that the scheduler must run
+- **[BYOK credentials](byok-credentials.md)** — give an event type a price with a business's own
+  Stripe or Mercado Pago account, before you take a real charge.
+- **[deploy/README.md](../deploy/README.md)** — every setting, the rule that the worker must run
   in exactly one process, and hardening the admin surface.
 
 ## Troubleshooting
 
 **`AETHERCAL_DATABASE_URL is not set`.** The container is running without your `.env`. Run
 `docker compose up` from the `deploy/` directory, where that file lives.
+
+**`psql: FATAL: role "..." does not exist` in step 2.** You ran that command without loading `.env`
+into this shell first. `docker compose` reads it for the containers; your own shell never saw
+`$POSTGRES_USER` / `$POSTGRES_DB` until you run `set -a; source .env; set +a`.
 
 **A process refuses to start, naming a role.** A message like *"AETHERCAL_DATABASE_URL connects as
 PostgreSQL role 'x', but this engine must run as 'aethercal_app'"* means a URL points at the wrong

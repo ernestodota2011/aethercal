@@ -84,7 +84,55 @@ credentials; nothing sent with them.
   builds senders at all — it never read the ones it was building. Its half-configured-phone-channel
   boot check is unchanged.
 
+**Multi-business isolation is now enforced by PostgreSQL, not by application code** — every
+tenant-scoped table gets `ENABLE` + `FORCE ROW LEVEL SECURITY` plus one policy, and the process
+serving requests no longer owns the tables (migration `0008_rls_roles_and_policies`).
+
+> [!WARNING]
+> **Breaking for every self-host.** The API used to run as a single database role that owned every
+> table and migrated the schema on its own boot (`AETHERCAL_AUTO_MIGRATE`, default on). It now runs
+> as **three** separate PostgreSQL roles across **three** separate processes, and two new environment
+> variables (`AETHERCAL_OWNER_DATABASE_URL`, `AETHERCAL_WORKER_DATABASE_URL`) are required before the
+> stack will start at all.
+>
+> Before pulling this: create the three roles with `deploy/sql/provision_roles.sql` (a superuser,
+> one-time, human step — it cannot be a migration), add the two new database URLs to `.env`, and
+> remove `AETHERCAL_AUTO_MIGRATE` / `AETHERCAL_RUN_SCHEDULER` from `.env` if either is set — both now
+> **fail the boot** instead of being honoured. See [UPGRADING.md](UPGRADING.md).
+
+- Migrations no longer run inside the web process. A one-shot `migrate` service runs
+  `aethercal-admin db upgrade` as the new `aethercal_owner` role, to completion, before `app` or
+  `worker` starts; the web process then refuses to serve a schema behind head.
+- The background drain (reminders, outbound webhooks, the Google busy-cache refresh) is no longer a
+  flag on the web process. It is its own `aethercal-worker` process, which must run in **exactly
+  one** replica for the whole deployment (`deploy/README.md`).
+- `aethercal_app` (the API + admin) never holds `BYPASSRLS`; an unbound session reads zero rows
+  rather than every business's, and a write carrying another business's id is denied.
+- `tenants` deliberately carries no policy (the public router resolves a business by slug before any
+  session is bound to one); every other tenant-scoped table does, derived from the models rather than
+  from a hand-written list, so a future table with no policy fails CI instead of shipping unprotected.
+
 ### Added
+
+**Payments** — a business can now charge for an appointment with its own Stripe or Mercado Pago
+account (BYOK). ==Neither provider has been run against a live account in this cut.==
+
+- `event_types` gains `price_cents` (`NULL` = free), `currency`, `refund_window_minutes` and
+  `refund_kind`; `bookings` gains `hold_expires_at` and `confirmed_by_payment_id` (migration
+  `0015_payments_and_holds`). A paid event type creates the booking as an unpaid **hold** that
+  self-cancels if nobody pays within its window, never blocking the slot forever.
+- The arbiter (`services/payments.py`) turns a provider's payment webhook into exactly one of six
+  outcomes — confirm, refund (a double payment, a stale hold, a mismatched amount), park (the
+  webhook arrived before the checkout's own commit), or mark a dispute — resolved by the provider's
+  own reference, never by the event's metadata.
+- Refunds are always the whole charge; partial refunds are not modelled (`F5`).
+- A business with **two** money credentials configured (both Stripe and Mercado Pago) is refused with
+  an explicit error rather than a silent pick — a per-tenant preference needs its own migration. See
+  [docs/byok-credentials.md](docs/byok-credentials.md#which-payment-provider-a-business-charges-with).
+- Neither adapter has been exercised against a live or sandbox account: Stripe's is unit-tested
+  against a stubbed HTTP transport only; no Mercado Pago account exists for this project at all. Read
+  [docs/byok-credentials.md](docs/byok-credentials.md#neither-payment-adapter-has-been-verified-against-a-live-account)
+  before taking a real charge.
 
 **Per-business branding** — a business's booking page is now *theirs*, not the product's.
 

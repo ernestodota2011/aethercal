@@ -19,13 +19,20 @@ then cutover.
 `aethercal-ui`: month/week/day/list views with drag-and-drop and optimistic reconciliation,
 theming, and internationalization. Public demo and announcement.
 
-## F3 — Multichannel workflows
+## F3 — Multichannel workflows — SHIPPED
 
-Configurable reminders over email, WhatsApp, and SMS; no-show tracking; a durable task runner.
+Configurable reminders over email, WhatsApp, and SMS; no-show tracking; a durable task runner
+(a transactional outbox: the intent commits with the booking, and the drain is idempotent).
 
-## F4 — Payments + multi-business + timeline
+## F4 — Payments + multi-business + timeline — SHIPPED
 
-Deposits and payment providers; light multi-tenant management; the resource/timeline view.
+Deposits and payment providers; multi-business isolation; the resource/timeline view.
+
+Each business is sealed from the others by PostgreSQL row-level security over three database
+roles, holds its own encrypted provider credentials, and sends from its own account — never the
+instance operator's. Payments run in **provider test mode only**: the Stripe adapter has never
+been exercised against a live key, and the Mercado Pago adapter has never run against a real or
+sandbox account. Partial refunds are not modelled — see F5.
 
 ## F5+ — Horizon
 

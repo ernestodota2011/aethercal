@@ -8,11 +8,15 @@ under 300 stars, the dominant JavaScript calendar charges an annual license for 
 views, and the leading hosted booking platform went closed-source in 2026. AetherCal is a
 permissively licensed (MIT) alternative built around one correct scheduling engine.
 
-## Status — v0.1.0, the first release
+## Status
 
-The booking stack is built, tested, and running in production for its first operator. It is a
-**0.1.0**, not a 1.0: the API contract can still change, and the areas below marked *not wired* are
-exactly that. This section is checked against the code, not against the roadmap.
+**v0.1.0**, the first release, shipped 2026-07-13 (see [CHANGELOG.md](CHANGELOG.md)). The table below
+is checked against the code on this branch — not against the roadmap, and not only against v0.1.0's
+own release notes: it also covers what has been added since, including payments and multi-business
+isolation. The booking stack is built and tested; the only public deployment today is
+[demo.aetherlogik.com](https://demo.aetherlogik.com/), which serves the calendar-component demo (F2),
+not the booking API. It is a **0.1.0**, not a 1.0: the API contract can still change, and the areas
+below marked *not wired* are exactly that.
 
 **What works today**
 
@@ -26,10 +30,12 @@ exactly that. This section is checked against the code, not against the roadmap.
 | Guest self-service — the cancel / reschedule links in the confirmation email | Working |
 | The 24-hour reminder, seeded per tenant as a workflow rule | Working, over email |
 | No-show — mark a booking `no_show` (it keeps its slot; the time has passed) | Working |
+| Payments — Stripe and Mercado Pago checkout, unpaid holds that self-cancel, refunds and disputes, each business on its own (BYOK) account | Working in **provider test mode only**: the Stripe adapter is exercised against a stubbed transport, never a live `sk_test_` key; the Mercado Pago adapter has never run against a real or sandbox account. Partial refunds are not modelled. See [docs/byok-credentials.md](docs/byok-credentials.md) |
 | Signed outgoing webhooks | Working — **at-least-once**, see [docs/webhooks.md](docs/webhooks.md) |
 | Calendar component — month, week, day, list **and resource timeline** views | Working: drag/resize with optimistic reconciliation, 4 theme presets + token overrides, ES/EN i18n, keyboard parity |
 | Google Calendar **busy-check** — a real busy block removes the slot | Working; degrades safely when the calendar is unreachable |
-| Self-host — one container + PostgreSQL, env-configured, migrations on boot | Working — see [docs/quickstart.md](docs/quickstart.md) |
+| Multi-business isolation — PostgreSQL row-level security (`FORCE ROW LEVEL SECURITY` + one policy per business-scoped table), enforced by the database rather than by every query remembering its own `WHERE tenant_id` | Working — one instance safely serves more than one business; see [deploy/README.md](deploy/README.md) |
+| Self-host — one image, four processes (a one-shot migrator, the API, the worker and the booking page) plus PostgreSQL, entirely env-configured | Working — see [docs/quickstart.md](docs/quickstart.md) |
 | Minimal admin (Reflex) | Working |
 
 **What is _not_ wired yet — do not plan around it**
@@ -48,9 +54,13 @@ exactly that. This section is checked against the code, not against the roadmap.
   ==Read [docs/phone-channels.md](docs/phone-channels.md) before switching a phone channel on.==
 - **No-show has no webhook.** You can mark a booking `no_show`, but the outgoing events are still
   only `booking.created`, `booking.cancelled` and `booking.rescheduled`.
-- **No payments, no multi-business isolation, no round-robin or collective bookings.**
+- **Neither payment provider has been verified against a live account, and partial refunds are not
+  modelled** — a refund is always the whole charge. Read
+  [docs/byok-credentials.md](docs/byok-credentials.md) before taking a real charge.
+- **No round-robin or collective bookings.**
 
-See [ROADMAP.md](ROADMAP.md) for what comes next.
+See [ROADMAP.md](ROADMAP.md) and [UPGRADING.md](UPGRADING.md) for what comes next and what breaks
+getting there.
 
 ## Install
 
@@ -70,8 +80,8 @@ container built from this repository (see the quickstart).
 
 ## Quickstart
 
-Self-host and book a test appointment: **[docs/quickstart.md](docs/quickstart.md)** —
-`docker compose up`, one database, two required variables.
+Self-host and book a test appointment: **[docs/quickstart.md](docs/quickstart.md)** — one database, a
+signing secret, three PostgreSQL roles created once by hand, then `docker compose up --build`.
 
 ## Documentation
 
@@ -82,7 +92,10 @@ Self-host and book a test appointment: **[docs/quickstart.md](docs/quickstart.md
 | [Calendar component](docs/calendar-component.md) | `@aethercal/calendar-react` and the `aethercal-ui` Reflex wrapper: props, the five views, theming, i18n, events, accessibility |
 | [Webhooks](docs/webhooks.md) | Signature verification and the **at-least-once** delivery contract |
 | [Embedding](docs/embedding.md) | Drop the booking widget onto any site with one `<script>` tag |
+| [BYOK credentials](docs/byok-credentials.md) | Per-business payment/email/phone credentials: precedence, what the encryption protects, and which payment provider is unverified |
+| [Phone channels](docs/phone-channels.md) | The declared gap in phone-number verification before you turn WhatsApp/SMS on |
 | [Español](docs/es/) | Locale español: guía de inicio y quickstart |
+| [Upgrading](UPGRADING.md) | Breaking changes since v0.1.0 and what to do about each one |
 
 Runnable examples live in [`examples/`](examples/).
 

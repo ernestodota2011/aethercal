@@ -87,7 +87,7 @@ with per-line comments. The essentials:
 | `AETHERCAL_DATABASE_URL` | yes | PostgreSQL URL (psycopg driver auto-normalized) |
 | `AETHERCAL_APP_SECRET` | yes | Signs guest tokens + derives the credential-encryption key |
 | `AETHERCAL_RUN_SCHEDULER` | — | Run the background scheduler in **this** process (see below) |
-| `AETHERCAL_AUTO_MIGRATE` | — | Run migrations on boot (default on) |
+| `AETHERCAL_AUTO_MIGRATE` | — | **RETIRED.** A truthy value now FAILS the boot; the one-shot `migrate` service owns migrations. See below. |
 | `AETHERCAL_BOOKING_BASE_URL` | — | Public base for guest cancel/reschedule links |
 | `AETHERCAL_BOOKING_EMBED_ALLOWED_ORIGINS` | — | Origins allowed to iframe `/embed/*` (the [embeddable widget](../docs/embedding.md)). Blank → `*` (any origin) |
 | `AETHERCAL_BOOKING_TRUSTED_PROXIES` | — | CIDRs of reverse proxies trusted to set `CF-Connecting-IP` for the rate limiter. Blank → use the transport peer address |

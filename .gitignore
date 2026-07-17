@@ -51,4 +51,13 @@ packages/aethercal-ui/js/dist/
 *.swp
 .DS_Store
 Thumbs.db
-.crisol-reviewed
+# Crisol (internal cross-review tooling): its logs carry local paths and the engine's
+# name, and NOTHING internal belongs in a public repo. A pattern, not a list of the
+# names we happened to see: `.crisol-reviewed` alone let five `.log` files through.
+.crisol-*
+
+# FastHTML's session-cookie SIGNING KEY (fasthtml/core.py::get_key, default key_fname).
+# It is generated per deployment and read from disk when the app does not pass
+# `secret_key=`. Committing it publishes the key that signs every session cookie the
+# booking app issues. It was tracked and PUBLIC until 2026-07-16.
+.sesskey

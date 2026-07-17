@@ -1,9 +1,0 @@
-########## b02-rbac ##########
-crisol-remote: NO-GO  [motor: codex (codex)]
-  [critical·high·security] apps/server/src/aethercal/server/admin/state.py:817 [b93d5113-ba75-4915-9cd9-f451a5ac1d49::0] Las sesiones conservan roles revocados o degradados
-  [high·high·correctness] apps/server/src/aethercal/server/services/memberships.py:254 [b93d5113-ba75-4915-9cd9-f451a5ac1d49::1] La protección del último owner tiene una carrera TOCTOU
-  [medium·high·correctness] apps/server/src/aethercal/server/admin/state.py:1027 [b93d5113-ba75-4915-9cd9-f451a5ac1d49::2] Cambiar de negocio deja paneles con datos del negocio anterior
-########## b04-public ##########
-crisol-remote: NO-GO  [motor: codex (codex)]
-  [high·high·correctness] apps/booking/src/aethercal/booking/app.py:884 [4307e424-8023-48af-894b-fef5a6762387::0] El índice tenant-scoped no conserva el tenant en sus enlaces
-=== fin
