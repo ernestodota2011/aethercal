@@ -21,6 +21,18 @@ export interface EventType {
   duration_seconds: number;
 }
 
+/**
+ * The API's list envelope (`schemas.base.Page`) — every collection endpoint answers with this, not
+ * with a bare array. Declared here so a client method that forgets it fails to TYPECHECK rather
+ * than at runtime, three layers into a browser journey, as `all.filter is not a function`.
+ */
+export interface Page<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface Slot {
   /** ISO-8601 UTC instant. */
   start: string;
@@ -156,8 +168,27 @@ export class Api {
     return this.call<Booking>("GET", `/bookings/${bookingId}`);
   }
 
-  listBookings(): Promise<Booking[]> {
-    return this.call<Booking[]>("GET", "/bookings/");
+  /**
+   * Every booking the admin API reports.
+   *
+   * ==`GET /bookings/` answers with a `Page` envelope, not a bare array.== This read it as an array,
+   * so `all.filter` threw `all.filter is not a function` the first time the golden flow got far
+   * enough to call it — which was the first time it ever ran. The client had drifted from the
+   * contract and nothing said so, because nothing had asked.
+   *
+   * The short-page check is not ceremony: a page that omitted this run's booking would make
+   * `bookingByGuestEmail` return `undefined`, and that reads exactly like "the guest never booked".
+   * The browser journey would be blamed for a paging limit.
+   */
+  async listBookings(): Promise<Booking[]> {
+    const page = await this.call<Page<Booking>>("GET", "/bookings/");
+    if (page.items.length < page.total) {
+      throw new Error(
+        `the bookings list is paginated: ${page.items.length} of ${page.total} returned. ` +
+          "Filtering this page for a guest would report 'no booking' for one that exists.",
+      );
+    }
+    return page.items;
   }
 
   /** The booking a guest made in the browser, found by the run-unique guest email. */
