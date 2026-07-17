@@ -10,16 +10,32 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import google_auth_httplib2
+import httplib2
 from googleapiclient.discovery import build
 
 from aethercal.core.model import TimeInterval
 
 from .parse import MeetEventRequest, build_meet_event_body, parse_freebusy
 
+# The underlying httplib2 transport has NO timeout by default, so a stalled socket blocks forever.
+# The callers offload every one of these calls with ``asyncio.to_thread`` and wrap it in an
+# ``asyncio.timeout``, but cancelling that ``await`` cannot kill the worker thread -- the socket
+# read keeps going. A bounded transport is what actually stops it, and it MUST sit well under the
+# outbox lease (5 min): the invariant "a Google send cannot outlive its lease" -- and so cannot be
+# re-drained into a duplicate event -- is only true because this ceiling makes the blocking call
+# itself give up first.
+GOOGLE_HTTP_TIMEOUT_SECONDS = 20.0
+
 
 def build_service(credentials: Any) -> Any:  # pragma: no cover - live
-    """Build a Google Calendar v3 service client from OAuth credentials."""
-    return build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    """Build a Google Calendar v3 service client from OAuth credentials, bounded transport."""
+    authorized_http = google_auth_httplib2.AuthorizedHttp(
+        credentials, http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT_SECONDS)
+    )
+    # ``http=`` and ``credentials=`` are mutually exclusive in ``build``; the authorized transport
+    # already carries the credentials.
+    return build("calendar", "v3", http=authorized_http, cache_discovery=False)
 
 
 def query_busy(  # pragma: no cover - live
