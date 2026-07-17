@@ -119,6 +119,17 @@ def test_embed_js_fallback_timer_waits_for_the_iframe_to_enter_the_viewport() ->
     assert '"loading" in HTMLIFrameElement.prototype' in source
 
 
+def test_embed_js_attaches_the_iframe_only_after_the_listener_exists() -> None:
+    # Crisol finding (high·correctness): the iframe must be inserted into the DOM AFTER the message
+    # listener is registered. An iframe outside the DOM has no browsing context and cannot post a
+    # resize, so attaching it last guarantees the listener is already there when the load-time
+    # resize arrives — there is no window in which a fast resize could be missed.
+    source = (STATIC_DIR / "embed.js").read_text(encoding="utf-8")
+    listener = source.index('addEventListener("message"')
+    insert = source.index("insertBefore(iframe")
+    assert insert > listener, "iframe attached before the message listener — a resize can race"
+
+
 def test_embed_js_only_a_valid_resize_disarms_the_fallback() -> None:
     # Crisol finding (medium·completeness): a single malformed but correctly-typed resize post must
     # NOT permanently disable the fallback. `booted` is set only after the height is validated as a

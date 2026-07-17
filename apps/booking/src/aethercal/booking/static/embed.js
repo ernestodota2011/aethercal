@@ -58,10 +58,10 @@
   iframe.style.width = "100%";
   iframe.style.border = "0";
   iframe.style.minHeight = "640px"; // a reasonable first paint; the resize listener refines it
-
-  // Insert right where the <script> tag sits, so the host's own layout/CSS around it applies
-  // exactly as if the iframe had been hand-authored in that spot.
-  script.parentNode.insertBefore(iframe, script.nextSibling);
+  // NOTE: the iframe is NOT inserted here. It is added to the DOM at the very end, AFTER the
+  // `message` listener is registered — an iframe outside the DOM has no browsing context, so it
+  // cannot load or post a resize until it is attached, and by attaching last we guarantee the
+  // listener already exists. No resize can slip through the gap because there is no gap.
 
   // Graceful fallback: if the service is down (`onerror`) or loads but never posts a resize (the
   // timer below), a bare iframe leaves a silent hole. Swap in an accessible message linking to the
@@ -161,4 +161,9 @@
       iframe.style.height = height + "px";
     }
   });
+
+  // NOW attach the iframe — after the message listener exists, so the resize it posts on load can
+  // never arrive before something is listening. Placed where the <script> tag sits, so the host's
+  // own layout/CSS around it applies as if the iframe had been hand-authored in that spot.
+  script.parentNode.insertBefore(iframe, script.nextSibling);
 })();
