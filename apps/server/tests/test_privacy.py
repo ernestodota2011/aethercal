@@ -877,6 +877,38 @@ async def test_a_retained_row_written_before_the_guard_is_still_redacted(
     assert report.outbox_payloads_redacted == 1
 
 
+async def test_a_retained_rows_skip_reason_is_cleared_by_the_purge(
+    sqlite_session: AsyncSession,
+) -> None:
+    """``skip_reason`` is free-form exception text, so it cannot be vouched PII-free the way the
+    classified columns are — the erasure CLEARS it rather than trust it, same spirit as the payload
+    rebuild. The money still moves; the diagnostic that might have quoted the person is gone."""
+    tenant, event_type = await _tenant(sqlite_session, "acme")
+    booking = await _guest_booking(sqlite_session, tenant, event_type)
+    sqlite_session.add(
+        Outbox(
+            tenant_id=tenant.id,
+            booking_id=booking.id,
+            effect=OutboxEffect.REFUND.value,
+            dedupe_key="refund:skipped",
+            payload={"provider": "stripe", "provider_ref": "pi_skipped"},
+            status=OutboxStatus.SKIPPED.value,
+            attempts=0,
+            skip_reason=f"the provider refused: could not reach {_EMAIL}",
+        )
+    )
+    await sqlite_session.flush()
+
+    await purge_guest(sqlite_session, tenant_id=tenant.id, email=_EMAIL)
+
+    row = (
+        await sqlite_session.scalars(sa.select(Outbox).where(Outbox.dedupe_key == "refund:skipped"))
+    ).one()
+    assert row.payload["provider_ref"] == "pi_skipped", "the money must still move"
+    assert row.skip_reason is None, "the free-form skip reason must be cleared, person and all"
+    assert _EMAIL not in await _everything_in_the_database(sqlite_session)
+
+
 # --- B-05c re-Crisol: a retained payload is redacted by ALLOWLIST, not by denylist ---------------
 
 
