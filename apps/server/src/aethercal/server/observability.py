@@ -540,6 +540,63 @@ def render_prometheus(snapshot: MetricsSnapshot, *, counters: DrainCounters) -> 
     return "\n".join(lines) + "\n"
 
 
+def _sorted_counts(counts: dict[str, int]) -> str:
+    """``a=1, b=0, c=3`` — every key, zeroes included, so "absent" and "zero" never look alike."""
+    return ", ".join(f"{key}={counts[key]}" for key in sorted(counts)) or "(none)"
+
+
+def render_human(snapshot: MetricsSnapshot, *, now: datetime) -> str:
+    """A readable operational summary — the same numbers as :func:`render_prometheus`, for a person.
+
+    ``/metrics`` answers a scraper; this answers the operator running the shadow, who would
+    otherwise read the instance's health by opening psql. It is DB-derived and instance-wide (never
+    per-tenant), so it is safe to print: it names statuses and counts, never a guest, a URL, or a
+    business.
+
+    The three lines that decide whether the shadow is healthy, called out by name:
+
+    * ``outbox oldest-due`` — the dead-man switch. Flat means the drain is keeping up; unbounded
+      growth means nothing is draining, and every reminder is quietly late.
+    * ``webhook blocked-*`` — the CRM bridge REFUSING to send. On a self-host it usually means the
+      operator's own CRM is on a network they have not declared; the events are not late, they are
+      never coming.
+    * ``payments dead`` — the money dead-man. Each is a charge that neither confirmed nor refunded.
+      Any non-zero value is a human task, never routine.
+    """
+    total_appts = snapshot.bookings_by_status.get("confirmed", 0) + snapshot.bookings_by_status.get(
+        "no_show", 0
+    )
+    return "\n".join(
+        [
+            f"AetherCal — operational snapshot @ {now.isoformat(timespec='seconds')}",
+            "(instance-wide, DB-derived, no guest/tenant data)",
+            "",
+            "Bookings",
+            f"  by status:       {_sorted_counts(snapshot.bookings_by_status)}",
+            f"  no-show rate:    {snapshot.no_show_ratio * 100:.1f}%  "
+            f"(of {total_appts} appointment(s) that were meant to happen; cancelled excluded)",
+            "",
+            "Outbox (the send queue)",
+            f"  by status:       {_sorted_counts(snapshot.outbox_by_status)}",
+            f"  due (overdue):   {snapshot.outbox_due}",
+            f"  oldest due:      {snapshot.outbox_oldest_due_age_seconds:.0f}s"
+            "   <- dead-man switch: flat = healthy, climbing = nothing is draining",
+            f"  expired leases:  {snapshot.outbox_expired_leases}",
+            "",
+            "Webhooks (CRM bridge)",
+            f"  by status:       {_sorted_counts(snapshot.webhook_deliveries_by_status)}",
+            f"  failed by reason:{_sorted_counts(snapshot.webhook_deliveries_by_reason)}"
+            "   <- alert on any blocked-*",
+            "",
+            "Payments",
+            f"  parked:          {snapshot.payment_events_parked}  (awaiting their booking)",
+            f"  dead:            {snapshot.payment_events_dead}"
+            "   <- MONEY dead-man: any non-zero is a human task",
+            "",
+        ]
+    )
+
+
 __all__ = [
     "CONTENT_TYPE",
     "DRAIN_COUNTERS",
@@ -547,5 +604,6 @@ __all__ = [
     "MetricsSnapshot",
     "collect_metrics",
     "observe_drain",
+    "render_human",
     "render_prometheus",
 ]
