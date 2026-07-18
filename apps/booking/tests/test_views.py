@@ -75,8 +75,11 @@ def test_page_shell_includes_meta_description_and_hreflang_alternates() -> None:
     assert 'name="description"' in html
     assert 'hreflang="es"' in html
     assert 'hreflang="en"' in html
-    assert 'href="/e/intro?lang=es"' in html
-    assert 'href="/e/intro?lang=en"' in html
+    # ABSOLUTE hreflang urls (base_url-prefixed): the spec requires fully-qualified, and a relative
+    # one is silently invalid. The visible language switcher keeps its RELATIVE on-page links, so
+    # asserting the absolute form is what actually proves the hreflang <link> was made absolute.
+    assert f'href="{DEFAULT_BASE_URL}/e/intro?lang=es"' in html
+    assert f'href="{DEFAULT_BASE_URL}/e/intro?lang=en"' in html
     assert 'hreflang="x-default"' in html
 
 

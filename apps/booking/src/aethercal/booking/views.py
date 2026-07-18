@@ -412,18 +412,23 @@ def _footer(locale: Locale) -> Any:
     return Footer(P(t(locale, "footer_powered")), cls="site-footer")
 
 
-def _hreflang_links(lang_urls: Mapping[Locale, str]) -> list[Any]:
+def _hreflang_links(lang_urls: Mapping[Locale, str], base_url: str) -> list[Any]:
     """``<link rel="alternate" hreflang="...">`` for every locale ``page()`` was given a URL for,
     plus ``x-default`` pointing at the default-locale URL — so a crawler (and any client that
-    parses it) knows the current page's URL in each language (RNF-1: ES primary + EN)."""
+    parses it) knows the current page's URL in each language (RNF-1: ES primary + EN).
+
+    ==The urls are ABSOLUTE (``base_url``-prefixed), like ``og:url``.== The hreflang spec requires a
+    fully-qualified URL; a relative one is silently invalid — a crawler drops it and Lighthouse
+    flags it — which is exactly the state a page carrying the ``<link>`` with a bare path is in.
+    Same ``base_url`` the Open Graph tags already use, for the same reason (parsed out of band)."""
     links = [
-        Link(rel="alternate", hreflang=candidate, href=lang_urls[candidate])
+        Link(rel="alternate", hreflang=candidate, href=f"{base_url}{lang_urls[candidate]}")
         for candidate in SUPPORTED_LOCALES
         if candidate in lang_urls
     ]
     default_url = lang_urls.get(DEFAULT_LOCALE)
     if default_url:
-        links.append(Link(rel="alternate", hreflang="x-default", href=default_url))
+        links.append(Link(rel="alternate", hreflang="x-default", href=f"{base_url}{default_url}"))
     return links
 
 
@@ -528,7 +533,7 @@ def page(
                 brand=brand,
             ),
             Title(full_title),
-            *_hreflang_links(lang_urls),
+            *_hreflang_links(lang_urls, base_url),
             Link(rel="icon", type="image/svg+xml", href="/static/favicon.svg"),
             Style(_CSS),
             # AFTER the base stylesheet, so the business's accent wins on specificity-equal
