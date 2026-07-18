@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import mimetypes
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
@@ -104,6 +105,13 @@ COMMON_TIMEZONES: tuple[str, ...] = (
 #: The ``static/`` directory next to this module — the vendored htmx bundle and the tz-detect
 #: script (A5.1/A5.2), served by the app itself so it has no third-party CDN dependency.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Python's mimetypes table predates the webfont formats on many hosts, so a bare `StaticFiles` mount
+# serves the vendored `.woff2` as `application/octet-stream`: it renders (browsers sniff the bytes),
+# but the wrong type defeats HTTP caching heuristics and any strict client/CDN. Register the correct
+# type at import so the `/static` mount — and every other reader of the process `mimetypes` table —
+# answers `font/woff2`.
+mimetypes.add_type("font/woff2", ".woff2")
 
 #: ``Cache-Control`` for ``GET /embed.js`` (B2.2) — a year, ``immutable``: the loader changes
 #: rarely and integrators paste the ``<script src>`` once. ``docs/embedding.md`` documents the
