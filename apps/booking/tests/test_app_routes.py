@@ -1299,6 +1299,17 @@ def test_static_tz_detect_script_is_served() -> None:
     assert b"currentScript" in response.content
 
 
+def test_static_display_font_is_served_as_woff2() -> None:
+    # The vendored display face must carry the correct `font/woff2` type, not the
+    # `application/octet-stream` a bare mimetypes table falls back to (app.py registers it at
+    # import). The wrong type still renders but defeats caching/CDN heuristics: a quiet regression.
+    client, _ = _make_client()
+    response = client.get("/static/bricolage-grotesque.woff2")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "font/woff2"
+    assert response.content[:4] == b"wOF2"  # the woff2 magic number — the real font, not a stub
+
+
 def test_no_rendered_page_carries_an_inline_script_body() -> None:
     client, _ = _make_client()
     _assert_no_inline_scripts(client.get("/e/intro?tz=UTC").text)
