@@ -88,6 +88,7 @@ signing secret, three PostgreSQL roles created once by hand, then `docker compos
 | [Embedding](docs/embedding.md) | Drop the booking widget onto any site with one `<script>` tag |
 | [BYOK credentials](docs/byok-credentials.md) | Per-business payment/email/phone credentials: precedence, what the encryption protects, and which payment provider is unverified |
 | [Phone channels](docs/phone-channels.md) | The declared gap in phone-number verification before you turn WhatsApp/SMS on |
+| [Privacy & retention](docs/privacy.md) | What guest data is handled, how long it is kept, and how a right-to-erasure request is fulfilled |
 | [Español](docs/es/) | Locale español: guía de inicio y quickstart |
 | [Upgrading](UPGRADING.md) | Breaking changes since v0.1.0 and what to do about each one |
 
