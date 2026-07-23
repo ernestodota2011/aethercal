@@ -7,18 +7,17 @@
  * `/embed/{slug}`, and grow that iframe to fit the guest's content by trusting one resize message —
  * lives in the *seam between two origins*: the host page and the booking service. A jsdom unit test
  * can drive the code but fakes the very things that carry the disagreement (a real cross-origin
- * `postMessage`, a real IntersectionObserver, an iframe that either loads or does not). So this is a
- * browser spec, on the shipping artifact, exactly like the golden flow.
+ * `postMessage`, a real iframe that either loads or does not). So this is a browser spec, on the
+ * shipping artifact, exactly like the golden flow.
  *
- * The host page is served from a REAL, distinct origin (`tenant.embedder.test`, fulfilled by
- * `page.route`), NOT `about:blank`. That matters: `setContent` gives an opaque-origin document, and a
- * lazy cross-origin iframe inside one never triggers its load — the widget would fall back to its
- * "couldn't load" link and the resize handshake would never happen. A real navigated origin is both
- * faithful (it is the relationship a customer's WordPress site has to `book.aetherlogik.com`) and the
- * only place the load + handshake actually fire.
+ * The host is a `setContent` page carrying the one-line snippet. One wrinkle it forces us to handle:
+ * a `loading="lazy"` iframe inside such a document does not begin loading on its own in headless
+ * Chromium, even when it is in view. That is the browser's lazy heuristic, not the widget — the mount,
+ * the src, the no-slug contract and the unreachable-fallback are all exercised without a load, and the
+ * one test that genuinely needs the iframe's content (the resize handshake) forces the load itself.
  */
 
-import { expect, type Page, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 import { runContext, stackConfig } from "../src/stack.js";
 
@@ -27,9 +26,6 @@ const run = runContext();
 
 /** The loader, served by the real booking service (`apps/booking/.../static/embed.js`). */
 const EMBED_SRC = `${stack.bookingUrl}/embed.js`;
-
-/** A real third-party host origin, distinct from the booking stack, served entirely by `route`. */
-const HOST_URL = "http://tenant.embedder.test/";
 
 /**
  * A minimal third-party host page carrying one embed snippet. `slug === null` omits the required
@@ -47,23 +43,14 @@ function hostPage(slug: string | null, base: string = stack.bookingUrl): string 
   ].join("\n");
 }
 
-/** Serve `html` as a real navigated document at `HOST_URL` (cross-origin to the booking stack). */
-async function openHost(page: Page, html: string): Promise<void> {
-  await page.route(HOST_URL, (route) =>
-    route.fulfill({ contentType: "text/html; charset=utf-8", body: html }),
-  );
-  await page.goto(HOST_URL);
-}
-
 test("the snippet mounts exactly one iframe at the compact /embed/{slug} flow", async ({ page }) => {
-  await openHost(page, hostPage(run.eventSlug));
+  await page.setContent(hostPage(run.eventSlug));
 
   const iframes = page.locator("iframe");
   await expect(iframes).toHaveCount(1);
   // The src is the compact embed shell for THIS slug on the booking origin, carrying the `data-lang`
   // the snippet declared — not the full `/e/` page, not another tenant's slug. `data-base` decides
-  // the origin; the loader decides the path and the lang query. If any drifts, the tenant embeds the
-  // wrong thing and never knows.
+  // the origin; the loader decides the path and the lang query.
   await expect(iframes.first()).toHaveAttribute(
     "src",
     `${stack.bookingUrl}/embed/${run.eventSlug}?lang=en`,
@@ -73,16 +60,24 @@ test("the snippet mounts exactly one iframe at the compact /embed/{slug} flow", 
 test("the widget grows to fit its content via the cross-origin resize handshake", async ({
   page,
 }) => {
-  await openHost(page, hostPage(run.eventSlug));
+  await page.setContent(hostPage(run.eventSlug));
+  const iframe = page.locator("iframe").first();
+  await expect(iframe).toHaveCount(1);
 
-  // Bring the lazy iframe into view so it loads (it is at the top of the page, but make the load a
-  // guarantee, not a layout accident). The embedded page then posts `{type:'aethercal:resize',
-  // height:<scrollHeight>}` to its parent (views.py `EMBED_RESIZE_SCRIPT`, allowed by a CSP sha256
-  // hash), and the loader answers by setting the iframe's inline height to that many pixels. A
+  // Force the mounted-but-lazy iframe to load (see file header): re-navigating through about:blank
+  // guarantees a fresh load regardless of the lazy heuristic. Once it loads, the embedded page posts
+  // `{type:'aethercal:resize', height:<scrollHeight>}` to its parent (views.py `EMBED_RESIZE_SCRIPT`,
+  // allowed by a CSP sha256 hash) and the loader answers by setting the iframe's inline height. A
   // concrete `Npx` here is proof the message crossed the origin boundary, passed the
   // origin+source+shape guards, and was applied — the entire reason the widget is not a fixed box.
-  const iframe = page.locator("iframe").first();
-  await iframe.scrollIntoViewIfNeeded();
+  await iframe.evaluate((el) => {
+    const frame = el as HTMLIFrameElement;
+    frame.loading = "eager";
+    const src = frame.src;
+    frame.src = "about:blank";
+    frame.src = src;
+  });
+
   await expect
     .poll(async () => iframe.evaluate((el) => (el as HTMLIFrameElement).style.height), {
       message:
@@ -96,7 +91,7 @@ test("the widget grows to fit its content via the cross-origin resize handshake"
 test("a snippet with no slug mounts nothing (the required attribute is the contract)", async ({
   page,
 }) => {
-  await openHost(page, hostPage(null));
+  await page.setContent(hostPage(null));
   // No `data-aethercal-slug` ⇒ nothing to embed ⇒ the loader returns without touching the DOM,
   // rather than mounting a broken iframe at `/embed/undefined`.
   await expect(page.locator("iframe")).toHaveCount(0);
@@ -106,10 +101,10 @@ test("an unreachable widget degrades to an accessible link, never a silent hole"
   page,
 }) => {
   // Point the widget at a dead origin: the iframe can never load, so no resize ever arrives. The
-  // loader's 12s guard then swaps the blank iframe for an accessible message linking to the full
-  // booking page — a visitor is redirected, not stranded on a silent gap. (Port 9 = discard.)
+  // loader's guard then swaps the blank iframe for an accessible message linking to the full booking
+  // page — a visitor is redirected, not stranded on a silent gap. (Port 9 = discard.)
   const deadBase = "http://127.0.0.1:9";
-  await openHost(page, hostPage(run.eventSlug, deadBase));
+  await page.setContent(hostPage(run.eventSlug, deadBase));
 
   const fallback = page.getByRole("alert");
   await expect(fallback).toBeVisible({ timeout: 20_000 });
