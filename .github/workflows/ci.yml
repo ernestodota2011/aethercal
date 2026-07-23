@@ -248,7 +248,7 @@ jobs:
       - name: Build the deploy image
         run: docker build -f deploy/Dockerfile -t aethercal-server .
 
-  # The end-to-end gate (F1-13). Two independent runners over the SAME shipping stack
+  # The end-to-end gate (F1-13). Three independent runners over the SAME shipping stack
   # (deploy/docker-compose.yml + e2e/compose.e2e.yml):
   #
   #   * golden — a guest books in a real browser on the public page; the API, the outbound webhook
@@ -256,6 +256,8 @@ jobs:
   #     booking is rescheduled and cancelled, and the slot grid is checked to move with it (RF-23).
   #   * a11y   — axe-core over every step of the booking flow, in both locales. This used to be a
   #     manual, unrepeatable run; the contrast bug it once caught could have come straight back.
+  #   * embed  — the tenant's one-line widget on a cross-origin host page: the iframe mounts at
+  #     `/embed/{slug}`, the resize handshake sizes it, and an unreachable widget degrades to a link.
   #
   # `needs: docker-build` so a broken image fails ONCE, loudly, instead of three times obscurely.
   # The suite never boots the app itself: it points at the artifact users deploy. It cannot pass
@@ -272,6 +274,8 @@ jobs:
             label: golden flow (book → webhook → email → reschedule → cancel)
           - suite: a11y
             label: accessibility (axe on the booking page)
+          - suite: embed
+            label: embed widget (cross-origin iframe mount + resize + fallback)
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0

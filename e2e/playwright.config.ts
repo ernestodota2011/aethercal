@@ -41,7 +41,9 @@ export default defineConfig({
   projects: [
     {
       name: "golden",
-      testIgnore: /a11y\.spec\.ts/,
+      // The golden journey only. `a11y` and `embed` are their own projects/jobs, so exclude both —
+      // a bare `testIgnore: /a11y/` would silently sweep every new sibling spec into the golden run.
+      testIgnore: /(a11y|embed)\.spec\.ts/,
       // Three lifecycle events × (a ≤60 s outbox tick + a ≤60 s webhook tick), plus the browser.
       timeout: 8 * 60_000,
       use: { browserName: "chromium" },
@@ -49,6 +51,14 @@ export default defineConfig({
     {
       name: "a11y",
       testMatch: /a11y\.spec\.ts/,
+      timeout: 90_000,
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "embed",
+      testMatch: /embed\.spec\.ts/,
+      // The resize handshake and the 12 s unreachable-widget fallback are the slow assertions; a
+      // full journey's minutes are not needed here.
       timeout: 90_000,
       use: { browserName: "chromium" },
     },

@@ -10,6 +10,7 @@
     "test": "playwright test",
     "test:golden": "playwright test --project=golden",
     "test:a11y": "playwright test --project=a11y",
+    "test:embed": "playwright test --project=embed",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
