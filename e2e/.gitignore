@@ -7,3 +7,7 @@ playwright-report/
 test-results/
 blob-report/
 .playwright/
+
+# This package is pnpm-only (pnpm-lock.yaml + CI's `pnpm install --frozen-lockfile`). An npm
+# package-lock.json here is a stray from a stray `npm install` — never the lockfile of record.
+package-lock.json
