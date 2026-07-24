@@ -45,6 +45,13 @@ packages/aethercal-ui/js/dist/
 # Reflex build output
 .web/
 
+# examples/demo public screenshots (E-01): the source of truth is the base64 sidecar under
+# assets-src/ (plain text, safe for every publishing path), decoded to real .webp files by
+# scripts/decode-assets.mjs as a build/dev step. The decoded binaries are reproducible and must
+# not be committed (public/og.png, hand-authored and NOT generated, stays tracked as before).
+packages/aethercal-ui/js/examples/demo/public/screenshot-calendar.webp
+packages/aethercal-ui/js/examples/demo/public/screenshot-live-booking.webp
+
 # IDE / OS
 .idea/
 .vscode/

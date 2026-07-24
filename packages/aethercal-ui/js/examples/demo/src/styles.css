@@ -73,17 +73,6 @@ body {
   letter-spacing: -0.01em;
 }
 
-.demo-repo-link {
-  color: var(--ac-muted);
-  text-decoration: none;
-  font-size: 0.9rem;
-  border-bottom: 1px solid transparent;
-}
-.demo-repo-link:hover {
-  color: var(--ac-fg);
-  border-bottom-color: var(--ac-border);
-}
-
 /* ---- Hero ---- */
 .demo-hero {
   padding: clamp(28px, 6vw, 56px) 0 clamp(20px, 4vw, 34px);
@@ -353,7 +342,6 @@ body {
 @media (prefers-reduced-motion: no-preference) {
   .demo-seg,
   .demo-reset,
-  .demo-repo-link,
   .demo-cta {
     transition:
       color 0.15s ease,

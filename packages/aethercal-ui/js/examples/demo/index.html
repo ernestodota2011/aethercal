@@ -37,9 +37,151 @@
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='2' y='3' width='20' height='19' rx='4' fill='%231f2328'/><rect x='2' y='3' width='20' height='6' rx='4' fill='%23334a5e'/><rect x='7' y='1.5' width='2' height='4' rx='1' fill='%23e6e8eb'/><rect x='15' y='1.5' width='2' height='4' rx='1' fill='%23e6e8eb'/><circle cx='8' cy='14' r='1.6' fill='%23e6e8eb'/><circle cx='12' cy='14' r='1.6' fill='%238a95a1'/><circle cx='16' cy='14' r='1.6' fill='%238a95a1'/><circle cx='8' cy='18' r='1.6' fill='%238a95a1'/><circle cx='12' cy='18' r='1.6' fill='%238a95a1'/></svg>"
     />
+
+    <!-- Static landing shell (E-01, AetherCal-13 Ola 1). A dedicated <link> (not JS-imported like
+         styles.css), so it paints before the React bundle runs — the page has real content whether
+         or not JavaScript ever executes. It WRAPS the interactive demo below; it does not replace it. -->
+    <link rel="stylesheet" href="/src/landing.css" />
   </head>
   <body>
-    <div id="root"></div>
+    <div class="landing-page">
+      <a class="landing-skip-link" href="#demo-interactivo">Saltar a la demo interactiva</a>
+
+      <header class="landing-topbar landing-container">
+        <a class="landing-brand" href="https://demo.aetherlogik.com/" aria-label="AetherCal, inicio">
+          <span class="landing-logo" aria-hidden="true"></span>
+          <span>AetherCal</span>
+        </a>
+        <nav class="landing-nav" aria-label="Principal">
+          <a href="https://github.com/ernestodota2011/aethercal" target="_blank" rel="noreferrer noopener">GitHub</a>
+          <a href="https://book.aetherlogik.com" target="_blank" rel="noreferrer noopener">book.aetherlogik.com</a>
+        </nav>
+      </header>
+
+      <section class="landing-hero landing-container" aria-labelledby="landing-hero-title">
+        <div class="landing-hero-copy">
+          <p class="landing-eyebrow">Código abierto · MIT</p>
+          <h1 id="landing-hero-title">Calendario y agendamiento, de código abierto</h1>
+          <p class="landing-lead">
+            AetherCal es un componente de calendario headless-first: un motor de geometría puro y una
+            capa de React sobre él. Cinco vistas, arrastrar y redimensionar con reconciliación
+            optimista, temas por tokens e internacionalización ES/EN. Se autohospeda con Docker:
+            Postgres, API, worker y página de reservas en una sola pila, sin depender de un SaaS de
+            terceros.
+          </p>
+          <div class="landing-cta">
+            <a class="landing-btn landing-btn-primary" href="#demo-interactivo">Probar la demo interactiva</a>
+            <a
+              class="landing-btn"
+              href="https://github.com/ernestodota2011/aethercal"
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              Ver el código en GitHub
+            </a>
+          </div>
+        </div>
+        <!-- Real screenshot (E-01). The file under public/ is a BUILD ARTIFACT, not a committed
+             binary: the publishing path for this branch is the GitHub Contents API via MCP tools,
+             which take `content` as literal text (verified empirically) and cannot carry raw
+             binary bytes without corruption. The source of truth is the base64 sidecar in
+             assets-src/ (plain text, safe to publish); `pnpm build`/`pnpm dev` decode it here via
+             scripts/decode-assets.mjs before Vite ever runs. Crisol gate round 4 flagged an
+             earlier inline-base64 version of this same image as bloating and un-caching the HTML
+             — this is the fix, not a workaround. -->
+        <div class="landing-shot">
+          <img
+            src="/screenshot-calendar.webp"
+            alt="Vista de mes del calendario AetherCal en tema Medianoche, con eventos de ejemplo listos para arrastrar."
+            width="900"
+            height="557"
+            loading="eager"
+            fetchpriority="high"
+            decoding="async"
+            class="landing-shot-img"
+          />
+        </div>
+      </section>
+
+      <section class="landing-features landing-container" aria-labelledby="landing-features-title">
+        <h2 id="landing-features-title" class="landing-section-title">Qué incluye</h2>
+        <ul class="landing-features-grid">
+          <li>
+            <h3>Cinco vistas</h3>
+            <p>Mes, semana, día, agenda y cronograma con recursos: la vista adecuada para cada caso de uso.</p>
+          </li>
+          <li>
+            <h3>Reconciliación optimista</h3>
+            <p>
+              Arrastrá o redimensioná un evento y verlo aplicarse al instante. El servidor confirma o
+              revierte el cambio, con animación de rollback.
+            </p>
+          </li>
+          <li>
+            <h3>Temas por tokens</h3>
+            <p>Cuatro presets (claro, oscuro, medianoche, alto contraste) gobernados por variables CSS, sin recompilar nada.</p>
+          </li>
+          <li>
+            <h3>i18n ES/EN</h3>
+            <p>La interfaz y el calendario cambian de idioma en vivo, sincronizando el idioma del documento.</p>
+          </li>
+          <li>
+            <h3>Self-hosteable</h3>
+            <p>Una imagen Docker con Postgres, API, worker y página de reservas. Sin dependencia de un SaaS de terceros.</p>
+          </li>
+          <li>
+            <h3>MIT license</h3>
+            <p>Componente y backend completos, disponibles en GitHub. Pre-alpha: la API todavía puede cambiar.</p>
+          </li>
+        </ul>
+      </section>
+
+      <section class="landing-live landing-container" aria-labelledby="landing-live-title">
+        <div class="landing-live-copy">
+          <h2 id="landing-live-title" class="landing-section-title">AetherCal en producción</h2>
+          <p>
+            AetherCal impulsa
+            <a href="https://book.aetherlogik.com" target="_blank" rel="noreferrer noopener">book.aetherlogik.com</a>,
+            el sistema de reservas de AetherLogik: elegí franja horaria, reservá y recibí confirmación,
+            con la misma reconciliación optimista que probás en la demo de abajo.
+          </p>
+          <a class="landing-btn" href="https://book.aetherlogik.com" target="_blank" rel="noreferrer noopener">
+            Ver AetherCal en producción
+          </a>
+        </div>
+        <!-- Real screenshot (E-01), decoded from assets-src/ at build time — see the comment on
+             the hero screenshot above. This one is below the fold, so it stays `loading="lazy"`
+             (a real deferral now that it is an actual file, not a data: URI). -->
+        <img
+          src="/screenshot-live-booking.webp"
+          alt="Página de reservas de book.aetherlogik.com con franjas horarias disponibles para agendar una llamada de descubrimiento."
+          width="900"
+          height="557"
+          loading="lazy"
+          decoding="async"
+          class="landing-shot-img"
+        />
+      </section>
+    </div>
+
+    <section id="demo-interactivo" class="landing-demo-wrap" aria-labelledby="landing-demo-title">
+      <div class="landing-demo-intro">
+        <h2 id="landing-demo-title" class="landing-section-title">Demo interactiva</h2>
+        <p class="landing-demo-note">
+          Corre 100% en tu navegador, sin backend. Cambiá de vista, tema e idioma, y arrastrá un
+          evento para ver la reconciliación optimista en acción.
+        </p>
+      </div>
+      <div id="root"></div>
+    </section>
+
+    <footer class="landing-footer landing-container">
+      <span>AetherCal — proyecto de código abierto de AetherLogik (MIT). Pre-alpha: la API puede cambiar.</span>
+      <span>
+        <a href="https://github.com/ernestodota2011/aethercal" target="_blank" rel="noreferrer noopener">GitHub</a>
+      </span>
+    </footer>
+
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
