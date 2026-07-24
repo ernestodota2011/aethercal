@@ -1,12 +1,18 @@
 // k6 load test for the hottest READ path: the public slots endpoint.
 //
-//   GET /public/{tenant}/{event}/slots?from=YYYY-MM-DD&to=YYYY-MM-DD&tz=America/New_York
+//   GET /api/v1/public/{tenant}/{event}/slots?from=YYYY-MM-DD&to=YYYY-MM-DD&tz=America/New_York
 //
 // This is the query every booking-page load makes, unauthenticated, and the one that fans out into
 // the availability + busy-cache computation — so it is where latency shows up first under load. It
 // is a pure read: it books nothing, so it is safe to point at a staging instance. (The booking POST
 // is deliberately NOT here — it mutates, trips Turnstile and the per-IP rate limit, and would need
 // its own scenario with real anti-spam handling. See README.md.)
+//
+// Prerequisites on the target instance (see README.md "The read path" for the full list):
+//   AETHERCAL_PUBLIC_API_ENABLED=true, a Turnstile secret configured (the app refuses to boot
+//   without one once the flag above is on), and — if running from a single source IP, which k6
+//   normally does — a raised AETHERCAL_PUBLIC_RATE_LIMIT_PER_MINUTE (default 30/min PER ADDRESS),
+//   or the ramp to 50 VUs measures the rate limiter, not the app's serving capacity.
 //
 // Run (see README.md for the full setup):
 //   k6 run -e BASE_URL=https://staging.example.com -e TENANT=acme -e EVENT=discovery-call loadtest/slots.js
@@ -54,7 +60,7 @@ function windowDates() {
 
 export default function () {
   const { from, to } = windowDates();
-  const url = `${BASE_URL}/public/${TENANT}/${EVENT}/slots?from=${from}&to=${to}&tz=${encodeURIComponent(TZ)}`;
+  const url = `${BASE_URL}/api/v1/public/${TENANT}/${EVENT}/slots?from=${from}&to=${to}&tz=${encodeURIComponent(TZ)}`;
   const res = http.get(url, { tags: { name: "public_slots" } });
   check(res, {
     "status is 200": (r) => r.status === 200,
