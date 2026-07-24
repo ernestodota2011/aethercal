@@ -291,3 +291,39 @@ Keep **at most one previous release directory** around (if you deviate from the 
 convention for a rollback drill) and purge anything older — a stale directory with no live container
 pointing at it is dead weight, and one with a live container pointing at it is the drift this section
 exists to avoid.
+
+### Docker image / build-cache retention
+
+Every image build tags `<service>:latest` plus, when a deploy script snapshots the outgoing image
+first, a `<service>:pre-<label>` rollback tag. Those accumulate — `docker image ls -a` after a run of
+redeploys shows one `pre-*` tag per past release, most of them sharing layers with `latest` (so they
+barely cost disk) but cluttering the list and making "which one do I roll back to" a guess.
+
+**Policy: keep `latest` (active) + the single most recent `pre-*` tag per service ("N-1"), remove
+everything older.** That is enough for the one rollback scenario this actually serves — the deploy
+right before caused a problem — without the list growing forever:
+
+```bash
+# List with creation time, oldest last, to see what's actually there:
+docker image ls -a --format '{{.Repository}}:{{.Tag}}	{{.ID}}	{{.CreatedAt}}'
+
+# Remove anything older than the N-1 tag by name (docker rmi refuses anything still in use by a
+# container, so this is safe to run against a stale list without checking first):
+docker rmi <service>:<old-tag> [...]
+
+# Dangling (untagged) layers left behind by the removals above:
+docker image prune -f
+```
+
+**The build cache is the bigger number, and a different knob.** `docker system df` reports it
+separately from images — on an instance with several redeploys behind it, the cache can be several
+GB, mostly from layers `latest` no longer references. Prune what is older than a day (keeps same-day
+cache so an in-progress redeploy doesn't lose its speed-up):
+
+```bash
+docker builder prune --filter until=24h --force
+```
+
+Check `docker system df` and `df -h` before/after — on the instance this repo runs in production,
+this recovered disk usage from 73% to 31% (7GB) with zero container restarts (image/cache pruning
+never touches running containers, only unreferenced layers).
