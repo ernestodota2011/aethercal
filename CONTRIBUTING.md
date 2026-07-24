@@ -109,7 +109,7 @@ deliberately lightweight for a pre-alpha project and will grow as contributors d
 - **Every path has a required reviewer**, and the highest-risk paths (the pure scheduling engine
   `packages/aethercal-core/` and everything under `.github/`) are reviewed by a maintainer directly.
   See [CODEOWNERS](.github/CODEOWNERS) for the current mapping.
-- **The Reglas de Oro of the codebase** — correctness-first with tests, a pure I/O-free `core`, one
+- **The core rules of the codebase** — correctness-first with tests, a pure I/O-free `core`, one
   concern per PR, no secrets in source — are enforced by CI, not by memory. A change that weakens a
   guard is expected to explain why in the pull request.
 - **A maintainer has the final say** on scope and direction, and is responsible for keeping the
