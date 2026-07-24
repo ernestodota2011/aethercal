@@ -1,7 +1,7 @@
 /**
  * AetherCal public demo — a static React playground for `@aethercal/calendar-react` (AetherCal-06
  * §9). It mounts the batteries-included `OptimisticCalendar` with realistic sample data and exposes
- * live controls: the four views, the four theme presets, the ES/EN locale, and a reconciliation
+ * live controls: the five views, the four theme presets, the ES/EN locale, and a reconciliation
  * mode toggle that flips the mocked "server" between accept and reject so a visitor can watch the
  * optimistic update commit — or roll back with the flash animation. No backend: the mutation is a
  * client-side promise, so the whole thing builds to a portable static bundle.

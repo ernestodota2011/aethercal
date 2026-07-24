@@ -4,8 +4,8 @@ A static React playground for [`@aethercal/calendar-react`](../../packages/react
 task F2-G). It mounts the batteries-included `OptimisticCalendar` with realistic sample data and
 lets a visitor drive it live:
 
-- **View switcher** — `month` / `week` / `day` / `list`, showing overlapping events (lanes),
-  all-day and multi-day bands, and a cross-midnight event.
+- **View switcher** — `month` / `week` / `day` / `list` / `timeline`, showing overlapping events
+  (lanes), all-day and multi-day bands, and a cross-midnight event.
 - **Theme toggle** — the four shipped presets (`light` / `dark` / `midnight` / `high_contrast`).
   The whole page follows the selected preset (it reuses the same `--ac-*` tokens).
 - **Language toggle** — ES / EN, localizing both the calendar and the page chrome.
