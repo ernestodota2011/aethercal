@@ -14,6 +14,30 @@ the engine and reporting incorrect scheduling results.
 - **Conventional Commits.** Commit messages follow the Conventional Commits specification; the
   changelog is generated from them.
 
+## How to propose a change
+
+1. **Open an issue first for anything non-trivial** — a bug, a behaviour change, a new capability.
+   Trivial fixes (a typo, a broken link) can go straight to a pull request. Discussing scope before
+   you write code avoids a large diff being turned away on direction.
+2. **Fork the repository and branch** from `main`. Keep the branch focused on one concern.
+3. **Work test-first** where the change touches scheduling, and keep `aethercal-core` pure and
+   I/O-free (both are enforced in CI — see below).
+4. **Run the full local gate before you push:**
+
+   ```bash
+   uv run poe check     # ruff format, ruff check, pyright, import contracts, pytest
+   ```
+
+   The same checks run in CI (`.github/workflows/ci.yml`): lint + type-check, the JS calendar
+   bundle drift guard, the test matrix across Python 3.11–3.13 on Linux and Windows, the
+   PostgreSQL-backed `-m db` suite, and a `docker build` of the deploy image. **A pull request does
+   not merge until CI is green.**
+5. **Open the pull request** and fill in the [template](.github/pull_request_template.md): a
+   one-line summary, the linked issue, and your test evidence. One concern per PR; no secrets or
+   generated artifacts (`dist/`, `.venv/`, lockfile churn) committed.
+6. **A maintainer reviews and merges.** Every path has a required reviewer
+   (see [Project governance](#project-governance)); expect review comments and be ready to iterate.
+
 ## Local setup
 
 ```bash
@@ -51,3 +75,43 @@ outright; the next run sweeps it.
 A great report includes the recurrence rule (or availability configuration), the query window, the
 timezone, and the occurrences you expected versus what you got. If it reproduces in
 `aethercal-core`, that is where the fix and its regression test belong.
+
+## Reporting a security issue
+
+Do **not** open a public issue or pull request for a vulnerability. Report it privately — the
+process, scope, and what to expect are in [SECURITY.md](SECURITY.md).
+
+## License and sign-off (DCO)
+
+AetherCal is [MIT-licensed](LICENSE). Contributions are **inbound = outbound**: by opening a pull
+request you agree that your contribution is licensed to the project and its users under the same MIT
+license, and that you have the right to grant it.
+
+We use the [Developer Certificate of Origin](https://developercertificate.org/) rather than a CLA.
+Certify each commit by signing it off — this appends a `Signed-off-by: Your Name <you@example.com>`
+line using the identity in your Git config:
+
+```bash
+git commit -s -m "fix: correct DST boundary in slot expansion"
+```
+
+Sign-off says you wrote the change, or have the right to submit it under the project's license. Use
+your real name and a reachable email.
+
+## Project governance
+
+AetherCal is maintained by a small maintainer team, listed as the required reviewers in
+[`.github/CODEOWNERS`](.github/CODEOWNERS). Today that is a single maintainer; the model is
+deliberately lightweight for a pre-alpha project and will grow as contributors do.
+
+- **Decisions are made in the open** — in issues and pull requests, not in private. Substantial
+  changes start as an issue so direction is agreed before code is written.
+- **Every path has a required reviewer**, and the highest-risk paths (the pure scheduling engine
+  `packages/aethercal-core/` and everything under `.github/`) are reviewed by a maintainer directly.
+  See [CODEOWNERS](.github/CODEOWNERS) for the current mapping.
+- **The Reglas de Oro of the codebase** — correctness-first with tests, a pure I/O-free `core`, one
+  concern per PR, no secrets in source — are enforced by CI, not by memory. A change that weakens a
+  guard is expected to explain why in the pull request.
+- **A maintainer has the final say** on scope and direction, and is responsible for keeping the
+  released stack coherent. Disagreement is resolved in the thread; if it cannot be, the maintainer
+  decides and records the reasoning.
