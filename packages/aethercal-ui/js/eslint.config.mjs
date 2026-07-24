@@ -13,8 +13,13 @@ export default tseslint.config(
       "**/node_modules/**",
       "**/dist/**",
       "**/.web/**",
-      "scripts/**",
-      "*.mjs",
+      // Node build/tooling scripts (not part of the shipped TS lib surface) are out of lint scope,
+      // like `build.mjs` and `scripts/check-react-alignment.mjs`. The globs are recursive so the
+      // same intent covers nested example tooling too (e.g. examples/demo/scripts/decode-assets.mjs);
+      // a non-recursive `scripts/**`/`*.mjs` only matched the workspace root and let nested Node
+      // scripts fall onto the browser/TS-lib config, failing `no-undef` on Buffer/console.
+      "**/scripts/**",
+      "**/*.mjs",
     ],
   },
   eslintJs.configs.recommended,

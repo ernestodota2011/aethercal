@@ -6,8 +6,9 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "decode-assets": "node scripts/decode-assets.mjs",
+    "dev": "pnpm run decode-assets && vite",
+    "build": "pnpm run decode-assets && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

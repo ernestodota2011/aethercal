@@ -1,0 +1,340 @@
+/*
+ * AetherCal — static landing shell (E-01, AetherCal-13 Ola 1) that WRAPS the interactive demo
+ * without replacing it. This paints before any JavaScript runs: a crawler, a social-card scraper, or
+ * a plain `curl` (the "sonda sin-JS") sees real, server-served content instead of an empty
+ * `<div id="root">`. Deliberately its own stylesheet, linked directly in <head> (not JS-imported like
+ * styles.css), so it renders even if the JS bundle is slow, blocked, or fails.
+ *
+ * Palette: reuses AetherCal's own shipped "midnight" preset verbatim (theme-presets.json), so the
+ * static wrapper and the live widget below read as ONE surface instead of two products stitched
+ * together. Boxless: hairlines + air, no cards/shadows, no lavender/cyan accent, no glow — the same
+ * aesthetic already established in styles.css.
+ */
+
+:root {
+  --lp-bg: #0b0f14;
+  --lp-bg-raised: #090d12;
+  --lp-fg: #dfe4ea;
+  --lp-muted: #8b95a1;
+  --lp-faint: #828a95;
+  --lp-border: #1c232c;
+  --lp-focus: #74a9ff;
+  --lp-maxw: 1080px;
+  --lp-font:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Mirrors styles.css's own `* { box-sizing: border-box }` (which is JS-imported and so does NOT
+   apply without JS): without it, elements like .landing-shot-img (width: 100% + a 1px border) would
+   overflow their container by the border width under the browser's content-box default. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Paint the near-black background immediately, before any layout, so there is no white flash while
+   the JS bundle (and the theme it will pick) is still loading. */
+html {
+  background: var(--lp-bg);
+}
+
+/* On `body`, not `.landing-page` (Crisol gate: two high-confidence findings). This has to work with
+   ZERO JavaScript, and two real bugs came from forgetting that:
+   (1) `body { margin: 0 }` lives in styles.css, which is JS-imported (main.tsx) — with JS off it
+       NEVER loads, so the browser's default body margin showed through around everything.
+   (2) `.landing-demo-wrap` and `.landing-footer` sit OUTSIDE `.landing-page` (they wrap the React
+       mount point, which must not be nested inside anything that could become a second `<main>`) —
+       so they never inherited `.landing-page`'s color/background, and rendered as default black
+       text with no explicit background, on top of `html`'s dark background: illegible. Setting this
+       on `body` covers the whole document — every section inherits it, JS or not. */
+body {
+  margin: 0;
+  background: var(--lp-bg);
+  color: var(--lp-fg);
+  font-family: var(--lp-font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.landing-skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 10px 16px;
+  background: var(--lp-fg);
+  color: var(--lp-bg);
+  border-radius: 0 0 8px 0;
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.landing-skip-link:focus-visible {
+  left: 0;
+}
+
+.landing-container {
+  max-width: var(--lp-maxw);
+  margin: 0 auto;
+  padding: 0 clamp(16px, 4vw, 40px);
+}
+
+/* ---- Topbar ---- */
+.landing-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  /* padding-block, not the `padding` shorthand: this element also carries `.landing-container`,
+     whose own `padding: 0 clamp(...)` shorthand supplies the horizontal padding. A `padding: X 0`
+     shorthand here would win the cascade (later rule, equal specificity) and zero it out — Crisol
+     round 1 caught exactly that regression. */
+  padding-block: clamp(18px, 3vw, 26px);
+  border-bottom: 1px solid var(--lp-border);
+}
+
+.landing-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--lp-fg);
+  text-decoration: none;
+  font-weight: 650;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.landing-logo {
+  width: 14px;
+  height: 14px;
+  border-radius: 5px;
+  background: var(--lp-fg);
+  display: inline-block;
+}
+
+.landing-nav {
+  display: flex;
+  gap: clamp(14px, 3vw, 24px);
+}
+
+.landing-nav a {
+  color: var(--lp-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  border-bottom: 1px solid transparent;
+}
+.landing-nav a:hover {
+  color: var(--lp-fg);
+  border-bottom-color: var(--lp-border);
+}
+.landing-nav a:focus-visible,
+.landing-brand:focus-visible {
+  outline: 2px solid var(--lp-focus);
+  outline-offset: 2px;
+}
+
+/* ---- Hero ---- */
+.landing-hero {
+  /* padding-block (see the .landing-topbar comment above): keeps .landing-container's horizontal
+     padding intact instead of zeroing it via the `padding` shorthand. */
+  padding-block: clamp(40px, 8vw, 84px) clamp(28px, 5vw, 48px);
+}
+
+.landing-hero-copy {
+  max-width: 62ch;
+}
+
+.landing-eyebrow {
+  margin: 0 0 14px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lp-faint);
+}
+
+.landing-hero h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-weight: 680;
+}
+
+.landing-lead {
+  margin: 20px 0 0;
+  color: var(--lp-muted);
+  font-size: clamp(1.02rem, 1.7vw, 1.18rem);
+  line-height: 1.6;
+  max-width: 62ch;
+}
+
+.landing-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 30px;
+}
+
+.landing-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 11px 20px;
+  border-radius: 9px;
+  border: 1px solid var(--lp-border);
+  color: var(--lp-fg);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.landing-btn-primary {
+  background: var(--lp-fg);
+  color: var(--lp-bg);
+  border-color: var(--lp-fg);
+}
+.landing-btn:hover {
+  border-color: var(--lp-muted);
+}
+.landing-btn-primary:hover {
+  opacity: 0.92;
+}
+.landing-btn:active {
+  transform: scale(0.97);
+}
+.landing-btn:focus-visible {
+  outline: 2px solid var(--lp-focus);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .landing-btn {
+    transition:
+      transform 0.15s cubic-bezier(0.2, 0, 0, 1),
+      border-color 0.15s ease,
+      opacity 0.15s ease;
+  }
+  .landing-nav a,
+  .landing-brand {
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease;
+  }
+}
+
+/* ---- Screenshots (real captures, not placeholders — E-01) ---- */
+.landing-shot {
+  margin-top: clamp(32px, 6vw, 56px);
+}
+.landing-shot-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--lp-border);
+  border-radius: 12px;
+  background: var(--lp-bg-raised);
+}
+
+/* ---- Features ---- */
+.landing-features {
+  /* padding-block: see the .landing-topbar comment above. */
+  padding-block: clamp(36px, 6vw, 60px);
+  border-top: 1px solid var(--lp-border);
+}
+
+.landing-section-title {
+  margin: 0 0 clamp(24px, 4vw, 36px);
+  font-size: clamp(1.2rem, 2.4vw, 1.5rem);
+  letter-spacing: -0.02em;
+  font-weight: 640;
+}
+
+.landing-features-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: clamp(24px, 4vw, 36px) clamp(24px, 4vw, 40px);
+}
+
+.landing-features-grid h3 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+.landing-features-grid p {
+  margin: 0;
+  color: var(--lp-muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+/* ---- "AetherCal en producción" ---- */
+.landing-live {
+  /* padding-block: see the .landing-topbar comment above. */
+  padding-block: clamp(36px, 6vw, 60px);
+  border-top: 1px solid var(--lp-border);
+  display: grid;
+  gap: clamp(24px, 4vw, 40px);
+}
+.landing-live-copy p {
+  margin: 14px 0 0;
+  color: var(--lp-muted);
+  font-size: 1rem;
+  line-height: 1.6;
+  max-width: 60ch;
+}
+.landing-live-copy a {
+  color: inherit;
+}
+.landing-live .landing-btn {
+  margin-top: 22px;
+}
+@media (min-width: 860px) {
+  .landing-live {
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    align-items: center;
+  }
+}
+
+/* ---- Demo section wrapper (the interactive playground lives inside, unchanged) ---- */
+.landing-demo-wrap {
+  border-top: 1px solid var(--lp-border);
+  padding-top: clamp(28px, 5vw, 48px);
+}
+.landing-demo-intro {
+  max-width: var(--lp-maxw);
+  margin: 0 auto;
+  padding: 0 clamp(16px, 4vw, 40px) clamp(18px, 3vw, 26px);
+}
+.landing-demo-intro .landing-section-title {
+  margin-bottom: 10px;
+}
+.landing-demo-note {
+  margin: 0;
+  color: var(--lp-muted);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  max-width: 70ch;
+}
+
+/* ---- Footer ---- */
+.landing-footer {
+  border-top: 1px solid var(--lp-border);
+  /* padding-block: see the .landing-topbar comment above. */
+  padding-block: clamp(22px, 4vw, 30px) clamp(40px, 6vw, 60px);
+  color: var(--lp-faint);
+  font-size: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  justify-content: space-between;
+}
+.landing-footer a {
+  color: var(--lp-muted);
+  text-decoration: none;
+}
+.landing-footer a:hover {
+  color: var(--lp-fg);
+}

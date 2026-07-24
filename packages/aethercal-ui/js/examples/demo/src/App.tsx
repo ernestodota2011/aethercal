@@ -293,14 +293,15 @@ export function App(): React.JSX.Element {
       style={rootStyle}
     >
       <div className="demo-shell">
+        {/* The GitHub link used to live here too, but this shell now mounts inside the static
+            landing's "Demo interactiva" section (index.html, E-01): that page already has the repo
+            link in its topbar and its quickstart CTA, so repeating it a third time here was noise.
+            The brand mark stays — it is what tells a visitor which widget they are looking at. */}
         <header className="demo-header">
           <div className="demo-brand">
             <span className="demo-logo" aria-hidden="true" />
             <span className="demo-wordmark">AetherCal</span>
           </div>
-          <a className="demo-repo-link" href={REPO_URL} target="_blank" rel="noreferrer noopener">
-            {t.repo}
-          </a>
         </header>
 
         {/* One top-level landmark for the whole body (N-2): the hero, controls, hint, calendar,
@@ -308,8 +309,11 @@ export function App(): React.JSX.Element {
             leaving their content orphaned. Wrapping them in a single `<main>` keeps 0 content outside a
             landmark; header/footer remain the banner/contentinfo. Pure semantics — no visual change. */}
         <main className="demo-main">
+          {/* h3, not h1: the page's single <h1> now lives in the static landing hero that wraps this
+              shell (index.html, E-01), and this widget mounts inside that page's own "Demo
+              interactiva" <h2> section (Crisol round 2) — so this tagline nests one level under it. */}
           <section className="demo-hero">
-            <h1 className="demo-title">{t.tagline}</h1>
+            <h3 className="demo-title">{t.tagline}</h3>
             <p className="demo-lead">{t.lead}</p>
           </section>
 
