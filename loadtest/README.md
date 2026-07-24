@@ -15,6 +15,18 @@ story. Point it at a staging deploy that mirrors production.
 
 ## The read path — `slots.js`
 
+Before running: the public router is off by default and needs three things set on the target
+instance (see [`.env.example`](../deploy/.env.example)):
+
+- `AETHERCAL_PUBLIC_API_ENABLED=true`
+- A Turnstile secret + site key (the app refuses to boot with the flag above on and no secret set —
+  Cloudflare publishes dummy "always passes" test keys for exactly this: `AETHERCAL_TURNSTILE_SECRET=1x0000000000000000000000000000000AA`,
+  `AETHERCAL_TURNSTILE_SITE_KEY=1x00000000000000000000AA`)
+- If you are running k6 from a single machine (the normal case), a raised
+  `AETHERCAL_PUBLIC_RATE_LIMIT_PER_MINUTE` (default `30`, **per address** — k6's VUs all share one
+  source IP, so the default ceiling gates the ramp within the first few seconds and the run measures
+  the rate limiter, not the app). Raise it for the staging instance only; never in production.
+
 ```bash
 # Install k6 once (https://k6.io/docs/get-started/installation/), then:
 k6 run \
@@ -25,7 +37,7 @@ k6 run \
   loadtest/slots.js
 ```
 
-This ramps to 50 virtual users hitting `GET /public/{tenant}/{event}/slots` — the query every
+This ramps to 50 virtual users hitting `GET /api/v1/public/{tenant}/{event}/slots` — the query every
 booking-page load makes, the one that fans out into availability + busy-cache computation. Its
 thresholds (in the script) are the contract:
 
@@ -44,6 +56,21 @@ bad run go green.
   proxy, not the code path. Check `pg_stat_activity` and the pool size.
 - Compare runs across releases: a p95 that regressed between two tags is a performance regression a
   correctness suite will never catch.
+
+**A real run** (staging instance freshly provisioned from this repo's own production commit,
+4 vCPU / 3GB, single-node Postgres in the same compose project — see `deploy/README.md`):
+
+```
+checks.........................: 100.00% 53350 out of 53350
+http_req_failed................: 0.00%   0 out of 26675
+http_req_duration..............: avg=235.95ms min=6.22ms med=196.99ms max=827.18ms p(90)=430.54ms p(95)=455.3ms
+http_reqs......................: 26675   127.01958/s
+```
+
+All thresholds green at 50 VUs — but p95 (455ms) sits at 91% of the 500ms budget, close enough that
+this is the number to re-check if this instance's real traffic grows: the knee is not far past 50
+VUs on this hardware. No fix was needed for this run; noted here so the next run has a baseline to
+compare against (see "Reading the result" above).
 
 ## The write path — booking POST (not scripted here, on purpose)
 

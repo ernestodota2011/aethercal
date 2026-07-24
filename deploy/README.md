@@ -2,7 +2,7 @@
 
 AetherCal ships as **one image, four processes + PostgreSQL**, configured entirely by environment
 variables (RF-19 — no secrets in source): a one-shot `migrate`, the `app` (API + admin), the `worker`
-(outbox drain, outbound-webhook delivery, calendar busy-cache refresh, `/metrics`), and the public
+(outbox drain, outbound-webhook delivery, calendar busy-cache refresh, `/api/v1/metrics`), and the public
 `booking` page. The split is not cosmetic — see
 [The three database roles](#the-three-database-roles--create-them-before-the-first-boot) and
 [The worker](#the-worker-exactly-one-process).
@@ -192,7 +192,7 @@ Only `outbox` has the columns to hold one (`claimed_by`, `lease_expires_at`), an
 other tables would have meant new DDL in the batch every other wave is queued behind. What makes going
 without one safe is precisely this invariant. **Run two workers and those two passes will double-send.**
 
-The worker also serves the operator surface — `GET /metrics` and the `GET /health/ready` that reports
+The worker also serves the operator surface — `GET /api/v1/metrics` and the `GET /api/v1/health/ready` that reports
 the outbox backlog (port `8001`, guarded by `AETHERCAL_METRICS_TOKEN`; unset means the endpoint is
 CLOSED, not open). Both used to be served by the web process, where, under RLS, they could only ever
 have reported **zeros**: a permanently green readiness probe over a permanently burning queue.
@@ -246,3 +246,84 @@ After a restore, the running image may be **ahead of** the restored schema. That
 optional). The three database roles are **not** in a logical dump — re-create them first if you
 restored into a brand-new PostgreSQL instance (see
 [The three database roles](#the-three-database-roles--create-them-before-the-first-boot)).
+
+
+## Redeploying in production (persistent checkout, not a new directory per release)
+
+Every service in `docker-compose.yml` shares one Compose project — pinned by the top-level `name:
+aethercal` in this file — and the database lives in the `aethercal-pgdata` *named* volume that
+project owns. Docker keys that volume by **project + volume name**, not by the path you ran
+`docker compose` from, so the data survives a `down`/`up` cycle regardless of which checkout issued
+the commands, *as long as `name: aethercal` is never removed or overridden*.
+
+That said, do **not** extract a fresh directory per release (`/opt/aethercal-<sha>/`,
+`/opt/aethercal-<tag>/`, …) and run `docker compose` from a different one each time. Nothing stops
+you — the volume is safe either way — but two live checkouts invite **drift**: if `postgres` gets
+recreated from directory A while `app` gets redeployed from directory B, `docker inspect`'s
+`com.docker.compose.project.working_dir` label ends up split across services, nobody can say which
+checkout is "the deployed one," and a routine cleanup of an "old" release directory can delete the
+config a running container still points at (labels are metadata; a running container itself keeps
+working, but recreating that specific service later needs the file to exist again).
+
+The convention this repo's own production instance uses instead — **one persistent checkout**:
+
+```bash
+# One-time: clone into a STABLE path with no commit/tag suffix.
+git clone https://github.com/<you>/aethercal.git /opt/aethercal
+
+# Every redeploy: fetch + checkout in place — same directory every time.
+cd /opt/aethercal
+git fetch origin
+git checkout <sha-or-tag>          # never redeploy off a floating branch ref in prod
+
+# Recreate everything from that one checkout. All services end up on the SAME
+# com.docker.compose.project.working_dir — no split state to reason about.
+cd deploy
+docker compose down                # stops + removes containers; the named volume is untouched
+docker compose up -d --build
+
+# Verify before moving on — don't assume a clean exit code means the data survived:
+docker exec -u postgres aethercal-postgres-1 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -t -c "SELECT count(*) FROM bookings;"   # compare against the count you had before `down`
+```
+
+Keep **at most one previous release directory** around (if you deviate from the single-checkout
+convention for a rollback drill) and purge anything older — a stale directory with no live container
+pointing at it is dead weight, and one with a live container pointing at it is the drift this section
+exists to avoid.
+
+### Docker image / build-cache retention
+
+Every image build tags `<service>:latest` plus, when a deploy script snapshots the outgoing image
+first, a `<service>:pre-<label>` rollback tag. Those accumulate — `docker image ls -a` after a run of
+redeploys shows one `pre-*` tag per past release, most of them sharing layers with `latest` (so they
+barely cost disk) but cluttering the list and making "which one do I roll back to" a guess.
+
+**Policy: keep `latest` (active) + the single most recent `pre-*` tag per service ("N-1"), remove
+everything older.** That is enough for the one rollback scenario this actually serves — the deploy
+right before caused a problem — without the list growing forever:
+
+```bash
+# List with creation time, oldest last, to see what's actually there:
+docker image ls -a --format '{{.Repository}}:{{.Tag}}	{{.ID}}	{{.CreatedAt}}'
+
+# Remove anything older than the N-1 tag by name (docker rmi refuses anything still in use by a
+# container, so this is safe to run against a stale list without checking first):
+docker rmi <service>:<old-tag> [...]
+
+# Dangling (untagged) layers left behind by the removals above:
+docker image prune -f
+```
+
+**The build cache is the bigger number, and a different knob.** `docker system df` reports it
+separately from images — on an instance with several redeploys behind it, the cache can be several
+GB, mostly from layers `latest` no longer references. Prune what is older than a day (keeps same-day
+cache so an in-progress redeploy doesn't lose its speed-up):
+
+```bash
+docker builder prune --filter until=24h --force
+```
+
+Check `docker system df` and `df -h` before/after — on the instance this repo runs in production,
+this recovered disk usage from 73% to 31% (7GB) with zero container restarts (image/cache pruning
+never touches running containers, only unreferenced layers).
