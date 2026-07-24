@@ -248,7 +248,7 @@ jobs:
       - name: Build the deploy image
         run: docker build -f deploy/Dockerfile -t aethercal-server .
 
-  # The end-to-end gate (F1-13). Three independent runners over the SAME shipping stack
+  # The end-to-end gate (F1-13). Four independent runners over the SAME shipping stack
   # (deploy/docker-compose.yml + e2e/compose.e2e.yml):
   #
   #   * golden — a guest books in a real browser on the public page; the API, the outbound webhook
@@ -258,6 +258,9 @@ jobs:
   #     manual, unrepeatable run; the contrast bug it once caught could have come straight back.
   #   * embed  — the tenant's one-line widget on a cross-origin host page: the iframe mounts at
   #     `/embed/{slug}`, the resize handshake sizes it, and an unreachable widget degrades to a link.
+  #   * cwv    — Core Web Vitals of the booking page (LCP + CLS), budgeted (U-01 / gap G-9). The page
+  #     was measured once at LCP ≈ 367 ms / CLS 0; this makes that a GATE, not a photograph, so a
+  #     runtime regression the static bundle-byte budget cannot see fails here (e2e/src/cwv.ts).
   #
   # `needs: docker-build` so a broken image fails ONCE, loudly, instead of three times obscurely.
   # The suite never boots the app itself: it points at the artifact users deploy. It cannot pass
@@ -276,6 +279,8 @@ jobs:
             label: accessibility (axe on the booking page)
           - suite: embed
             label: embed widget (cross-origin iframe mount + resize + fallback)
+          - suite: cwv
+            label: core web vitals (LCP + CLS budget on the booking page)
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0

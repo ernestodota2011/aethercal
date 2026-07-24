@@ -41,9 +41,9 @@ export default defineConfig({
   projects: [
     {
       name: "golden",
-      // The golden journey only. `a11y` and `embed` are their own projects/jobs, so exclude both —
-      // a bare `testIgnore: /a11y/` would silently sweep every new sibling spec into the golden run.
-      testIgnore: /(a11y|embed)\.spec\.ts/,
+      // The golden journey only. `a11y`, `embed` and `cwv` are their own projects/jobs, so exclude
+      // each — a bare `testIgnore: /a11y/` would silently sweep every new sibling spec into golden.
+      testIgnore: /(a11y|embed|cwv)\.spec\.ts/,
       // Three lifecycle events × (a ≤60 s outbox tick + a ≤60 s webhook tick), plus the browser.
       timeout: 8 * 60_000,
       use: { browserName: "chromium" },
@@ -59,6 +59,14 @@ export default defineConfig({
       testMatch: /embed\.spec\.ts/,
       // The resize handshake and the 12 s unreachable-widget fallback are the slow assertions; a
       // full journey's minutes are not needed here.
+      timeout: 90_000,
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "cwv",
+      // The Core Web Vitals guard (U-01/G-9): budgets the booking page's LCP + CLS. One navigation
+      // plus a short settle window — no outbox ticks to wait on.
+      testMatch: /cwv\.spec\.ts/,
       timeout: 90_000,
       use: { browserName: "chromium" },
     },

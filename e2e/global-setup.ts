@@ -60,6 +60,17 @@ async function assertBookingPageServesTheEvent(bookingUrl: string, slug: string)
 }
 
 export default async function globalSetup(): Promise<void> {
+  // `E2E_CWV_URL` points the Core Web Vitals guard (cwv.spec.ts) at an already-deployed booking page
+  // — a staging URL, live `book.aetherlogik.com`, or a local fixture — so there is no stack to bring
+  // up and nothing to bootstrap. Bail out before `stackConfig()` (which would fail closed on the
+  // absent stack). CI's cwv leg leaves this unset and runs the full bootstrap like every other suite.
+  if (process.env.E2E_CWV_URL) {
+    process.stdout.write(
+      `[e2e] E2E_CWV_URL set (${process.env.E2E_CWV_URL}) — skipping stack bootstrap; the CWV guard ` +
+        "measures the given URL directly.\n",
+    );
+    return;
+  }
   const stack = stackConfig(); // throws when the stack was never brought up
   const api = new Api(stack);
   const mail = new Mail(stack);

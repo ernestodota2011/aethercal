@@ -11,6 +11,7 @@
     "test:golden": "playwright test --project=golden",
     "test:a11y": "playwright test --project=a11y",
     "test:embed": "playwright test --project=embed",
+    "test:cwv": "playwright test --project=cwv",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
