@@ -7,6 +7,8 @@ autoalojable con **un contenedor y una base de datos**.
 |---|---|
 | [Guía de inicio](inicio.md) | Los conceptos: tenant, anfitrión, horario, tipo de evento, slot, reserva |
 | [Quickstart](quickstart.md) | Levántalo desde cero y reserva una cita de prueba |
+| [Contribuir](contribuir.md) | Flujo de PR, licencia/DCO, cómo correr los tests y gobernanza |
+| [Seguridad](seguridad.md) | Cómo reportar una vulnerabilidad, el alcance y qué no reportar |
 
 El resto de la documentación está en inglés:
 
