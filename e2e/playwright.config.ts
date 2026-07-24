@@ -41,9 +41,10 @@ export default defineConfig({
   projects: [
     {
       name: "golden",
-      // The golden journey only. `a11y`, `embed` and `cwv` are their own projects/jobs, so exclude
-      // each — a bare `testIgnore: /a11y/` would silently sweep every new sibling spec into golden.
-      testIgnore: /(a11y|embed|cwv)\.spec\.ts/,
+      // The golden journey only. `a11y`, `embed`, `cwv` and `booking` are their own projects/jobs,
+      // so exclude each — a bare `testIgnore: /a11y/` would silently sweep every new sibling spec
+      // into golden.
+      testIgnore: /(a11y|embed|cwv|booking)\.spec\.ts/,
       // Three lifecycle events × (a ≤60 s outbox tick + a ≤60 s webhook tick), plus the browser.
       timeout: 8 * 60_000,
       use: { browserName: "chromium" },
@@ -68,6 +69,15 @@ export default defineConfig({
       // plus a short settle window — no outbox ticks to wait on.
       testMatch: /cwv\.spec\.ts/,
       timeout: 90_000,
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "booking",
+      testMatch: /booking\.spec\.ts/,
+      // F-01.1 waits for the confirmation email — an outbox intent drained by the scheduler's ≤60 s
+      // tick — so this leg needs more than the a11y/embed 90 s, but far less than the golden
+      // journey's eight minutes (it drains one email, not three lifecycle events × two ticks).
+      timeout: 4 * 60_000,
       use: { browserName: "chromium" },
     },
   ],
