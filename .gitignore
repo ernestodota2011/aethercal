@@ -45,12 +45,17 @@ packages/aethercal-ui/js/dist/
 # Reflex build output
 .web/
 
-# examples/demo public screenshots (E-01): the source of truth is the base64 sidecar under
-# assets-src/ (plain text, safe for every publishing path), decoded to real .webp files by
-# scripts/decode-assets.mjs as a build/dev step. The decoded binaries are reproducible and must
-# not be committed (public/og.png, hand-authored and NOT generated, stays tracked as before).
+# examples/demo public assets (E-01, extended for the I-1 landing-polish fix): the source of
+# truth is the base64 sidecar under assets-src/ (plain text, safe for every publishing path),
+# decoded to real binary files by scripts/decode-assets.mjs as a build/dev step. The decoded
+# binaries are reproducible and must not be committed. og.png used to be the one hand-authored
+# exception here — it joined the same sidecar pipeline once it needed a real content update
+# (stale "FOUR VIEWS" copy) and hand-committing a raw PNG through the GitHub Contents API (the
+# MCP publishing path for this branch) turned out to corrupt binary content the same way a raw
+# .webp would.
 packages/aethercal-ui/js/examples/demo/public/screenshot-calendar.webp
 packages/aethercal-ui/js/examples/demo/public/screenshot-live-booking.webp
+packages/aethercal-ui/js/examples/demo/public/og.png
 
 # IDE / OS
 .idea/

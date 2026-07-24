@@ -2,7 +2,7 @@
   "name": "@aethercal/calendar-demo",
   "version": "0.1.0",
   "private": true,
-  "description": "Public static playground for @aethercal/calendar-react: four views, drag/resize with optimistic reconciliation, token theming, and ES/EN i18n. No backend.",
+  "description": "Public static playground for @aethercal/calendar-react: five views, drag/resize with optimistic reconciliation, token theming, and ES/EN i18n. No backend.",
   "license": "MIT",
   "type": "module",
   "scripts": {
