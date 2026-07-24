@@ -46,6 +46,17 @@ services:
       # so they carry the published address of the booking page, not its container name.
       AETHERCAL_BOOKING_BASE_URL: http://localhost:5001
       AETHERCAL_ENVIRONMENT: e2e
+      # ==The public anti-flood limit, turned up for a throwaway stack.== The API rate-limits
+      # `/api/v1/public` to 30 requests / 60 s PER CLIENT IP (settings.public_rate_limit_per_minute →
+      # api/ratelimit.py). That is right for production and wrong for this suite: every browser page
+      # load fans out to branding + event-types + slots, the booking leg drives four full journeys
+      # from ONE browser IP in seconds (no real guest ever does), and — unlike the golden journey,
+      # whose scheduler-tick waits drain the window between steps — those requests bunch inside one
+      # 60 s window and trip the limit. The page then degrades to its service-unavailable view (no
+      # `#slots`) and the spec fails looking for a slot picker that a 429, not a product defect, hid.
+      # Same knob an operator has (RF-19); the production DEFAULT is untouched — this raises it only
+      # for the ephemeral E2E stack, exactly as the worker's tick above is turned down.
+      AETHERCAL_PUBLIC_RATE_LIMIT_PER_MINUTE: "100000"
 
   worker:
     # ==The process that actually SENDS.== Every observable effect this suite waits for — the guest's
