@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -81,9 +81,10 @@ def test_the_hard_cap_cannot_be_passed_a_different_amount(
         "100 minor units is $1.00 in USD and a different sum elsewhere; the currency is fixed "
         "alongside the cap for that reason"
     )
-    assert set(parameters) == {"idempotency_key", "expires_at"}, (
-        f"the session opener takes {sorted(parameters)}. Anything beyond the idempotency key and "
-        "the expiry is a lever over real money that a test should not have."
+    assert set(parameters) == {"idempotency_key", "expires_at", "return_url"}, (
+        f"the session opener takes {sorted(parameters)}. The idempotency key, the expiry and the "
+        "return URL (which carries the harness's provenance mark) are the only levers it may "
+        "offer; anything else is a lever over real money that a test should not have."
     )
 
 
@@ -283,6 +284,108 @@ def test_a_pending_refund_does_not_count_as_the_money_being_back(
     assert "in flight" in problem, problem
     assert not [r for r in refunds if r["id"].startswith("re_ISSUED")], (
         "the whole amount was already in flight; issuing another refund would double it"
+    )
+
+
+def _foreign_paid_session() -> dict[str, Any]:
+    """A real customer's payment, as Stripe would return it. ==Same amount, same currency, paid.==
+
+    This is the session the harness must refuse: everything about it looks exactly like phase A's
+    except the one thing that matters — it was not opened by this harness. An invoice paid through
+    the agency's own Stripe account is precisely this shape.
+    """
+    return {
+        "id": "cs_live_SOMEBODY_ELSES_PAYMENT",
+        "amount_total": 100,
+        "currency": "usd",
+        "payment_status": "paid",
+        "status": "complete",
+        "payment_intent": "pi_SOMEBODY_ELSES_PAYMENT",
+        "success_url": "https://crm.example.com/invoice/paid?id=INV-2026-00042",
+    }
+
+
+def test_a_paid_session_of_the_same_amount_is_refused_without_provenance(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+) -> None:
+    """==The finding: phase B would refund any session id it was handed.==
+
+    Nothing proved the id came from phase A, and the account this runs against carries **real
+    customer invoices**. A mistyped, stale or hostile value pointed the refund at somebody else's
+    transaction — and ==the $1 cap defends nothing==, because $1 is one figure among thousands. The
+    harness ASSUMED provenance instead of ESTABLISHING it.
+
+    The session below is paid, in USD, for exactly the harness's amount. It is refused anyway,
+    because it does not carry the mark phase A applies at creation.
+    """
+    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
+        require_phase_a_provenance(_foreign_paid_session(), "v1")
+
+
+def test_a_session_from_a_different_run_is_refused(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """The mark carries the RUN ID, so phase B refunds the run it was asked about and no other.
+
+    Two payable sessions can exist at once (a lapsed ``v1``, a fresh ``v2``). Refunding whichever
+    one happened to be pasted would be the same class of mistake in miniature.
+    """
+    session = _foreign_paid_session() | {"success_url": f"{harness_return_url('refund/v2')}?x=1"}
+
+    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
+        require_phase_a_provenance(session, "v1")
+
+
+def test_a_prefix_of_the_run_id_is_not_a_match(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """==Run id ``v1`` must not match a session marked ``v11``.==
+
+    The check requires the query-string boundary right after the run id, so one id cannot pass as
+    the prefix of another. Without that boundary this would be a silent, plausible-looking match.
+    """
+    session = _foreign_paid_session() | {"success_url": f"{harness_return_url('refund/v11')}?x=1"}
+
+    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
+        require_phase_a_provenance(session, "v1")
+
+
+def test_a_session_this_harness_opened_is_accepted(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """==Anti-vacuity.== A check that refused everything would pass all three tests above and make
+    phase B impossible to run at all.
+
+    The URL is built exactly as the gateway builds it: the harness's return URL, then the query
+    string ``create_checkout_session`` appends.
+    """
+    query = "?checkout=success&session_id={CHECKOUT_SESSION_ID}"
+    session = _foreign_paid_session() | {"success_url": harness_return_url("refund/v1") + query}
+
+    require_phase_a_provenance(session, "v1")  # must not raise
+
+
+def test_provenance_is_demanded_before_the_refund_is_sent() -> None:
+    """==A correct check that runs too late is not a check.==
+
+    The decision above is only worth anything if phase B consults it BEFORE it acts. This pins the
+    order in the source, the same way the evidence guard does — and for the same reason: the two
+    defects this harness keeps producing are *a fact asserted before it was established* and *a
+    guard consulted after the thing it guards*.
+    """
+    source = (pathlib.Path(__file__).parent / "test_stripe_live_refund.py").read_text(
+        encoding="utf-8"
+    )
+
+    demand = "require_phase_a_provenance(session, _run_id())"
+    refund_call = "await gateway.refund("
+    assert demand in source, "phase B no longer demands provenance at all"
+    assert refund_call in source, "phase B no longer calls the gateway's refund"
+    assert source.index(demand) < source.index(refund_call), (
+        "phase B sends the refund before it has established that the session came from phase A"
     )
 
 

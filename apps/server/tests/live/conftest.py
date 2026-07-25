@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from datetime import datetime
 from typing import Any
 
@@ -56,8 +56,20 @@ ONE_DOLLAR_CENTS = 100
 CURRENCY = "usd"
 """Fixed alongside the cap: 100 minor units is $1.00 in USD and something else elsewhere."""
 
-RETURN_URL = "https://example.com/aethercal-live-verification"
-"""Where the guest would be sent back to. Stripe requires a well-formed URL and never fetches it."""
+PROVENANCE_BASE = "https://example.com/aethercal-live-verification"
+"""==The harness's mark on everything it creates.== Stripe requires a well-formed return URL, never
+fetches it, and echoes it back on the session as ``success_url`` — so it is where this harness signs
+its work. See :func:`harness_return_url`."""
+
+PHASE_A_PURPOSE = "refund"
+"""The segment marking a PAYABLE phase-A session, so a free checkout-harness session (marked
+``checkout``) can never be mistaken for one."""
+
+RUN_ID_ENV = "AETHERCAL_LIVE_STRIPE_RUN_ID"
+"""Names the phase-A run. It is part of the mark, so phase B can demand the exact run."""
+
+CHECKOUT_PURPOSE = "checkout"
+"""The zero-cost harness's segment. Nothing payable is ever left standing under it."""
 
 REFUND_SUCCEEDED = "succeeded"
 """==The ONLY status that means the money is back.== Terminal, and the money has actually moved."""
@@ -224,22 +236,97 @@ def unauthenticated_stripe_api() -> Iterator[httpx.Client]:
 
 
 @pytest.fixture
+def harness_return_url() -> Callable[[str], str]:
+    """The return URL this harness stamps on a session, by purpose. ==Its signature on its work.==
+
+    .. rubric:: ==Why provenance is needed at all==
+
+    Phase B refunds whatever Checkout Session id it is handed. Nothing proved that id came from this
+    harness — and the Stripe account it runs against carries **real customer invoices**. A mistyped,
+    stale or hostile value pointed phase B at somebody else's transaction, and the $1 cap
+    distinguishes nothing: it is one amount among many. ==The harness ASSUMED provenance rather than
+    ESTABLISHING it==, which is the same failure as every other finding in this change.
+
+    .. rubric:: Why the return URL, and not a metadata update afterwards
+
+    ``metadata`` is the field designed for this, but it would have to be attached by a SECOND call
+    after the session exists — and a second call can fail, leaving an unmarked payable session
+    behind, which is exactly the window this is supposed to close. The return URL is passed to
+    ``create_checkout_session`` itself, so the mark is applied **atomically, at creation, through
+    the production code path**. Stripe echoes it back as ``success_url``, and there is no moment
+    when a harness session exists without it.
+
+    Distinct segment per purpose, so a checkout-harness session can never be mistaken for a payable
+    phase-A one — and the run id is inside the path, so phase B can demand the exact run.
+    """
+
+    def _url(purpose: str) -> str:
+        return f"{PROVENANCE_BASE}/{purpose}"
+
+    return _url
+
+
+@pytest.fixture
+def require_phase_a_provenance(
+    harness_return_url: Callable[[str], str],
+) -> Callable[[Mapping[str, Any], str], None]:
+    """Refuse to act on a session this harness did not open. ==Checked BEFORE any refund.==
+
+    Raises rather than returning a verdict, for the reason ``resolve_money_credential`` raises: a
+    boolean here is one hurried ``if`` away from being ignored, and what it guards is somebody
+    else's money.
+
+    ==The amount proves nothing.== $1 is one figure among thousands in a real account, so the check
+    is on the mark this harness applied at creation and on the run id inside it — not on how much
+    the transaction was for.
+    """
+
+    def _require(session: Mapping[str, Any], run_id: str) -> None:
+        expected = harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}")
+        success_url = session.get("success_url")
+        # The trailing `?` is load-bearing: the gateway appends its query string right after the
+        # return URL, so requiring the boundary stops run id `v1` matching a session marked `v11`.
+        if not isinstance(success_url, str) or not success_url.startswith(f"{expected}?"):
+            raise AssertionError(
+                f"session {session.get('id')!r} does not carry this harness's mark for run id "
+                f"{run_id!r}, so there is nothing to show it was opened by phase A.\n"
+                "\n"
+                "==Refusing to touch it.== This account holds real customer payments, and the "
+                "amount distinguishes nothing — a $1 charge here could be anybody's. Phase B only "
+                "refunds what phase A opened.\n"
+                "\n"
+                f"expected a return URL of {expected!r}; the session carries {success_url!r}.\n"
+                "\n"
+                "If phase A was run with a different run id, pass the same one: "
+                f"{RUN_ID_ENV}=<id>."
+            )
+
+    return _require
+
+
+@pytest.fixture
 def open_one_dollar_session(secret_key: str, gateway: StripeGateway) -> OpenSession:
     """Open a Checkout Session through the real gateway. ==There is no ``amount_cents`` to pass.==
 
     The hard cap is enforced by the SHAPE of this seam and not by a rule a test has to follow: a
     test that wanted to create a $100 session would have to stop using this fixture, which is a
     visible edit rather than a mistyped literal.
+
+    ``return_url`` IS a parameter, and deliberately so: it is what marks the session as this
+    harness's (:func:`harness_return_url`), and each caller marks its own purpose. It is not a lever
+    over money — the two things that are, the amount and the currency, remain unpassable.
     """
 
-    async def _open(*, idempotency_key: str, expires_at: datetime) -> CheckoutSession:
+    async def _open(
+        *, idempotency_key: str, expires_at: datetime, return_url: str
+    ) -> CheckoutSession:
         _assert_the_hard_cap()
         return await gateway.create_checkout_session(
             idempotency_key=idempotency_key,
             amount_cents=ONE_DOLLAR_CENTS,
             currency=CURRENCY,
             expires_at=expires_at,
-            return_url=RETURN_URL,
+            return_url=return_url,
             secrets={"secret_key": secret_key},
         )
 

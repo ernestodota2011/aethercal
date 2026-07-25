@@ -197,6 +197,11 @@ differently, so it could only be overruled and never discharged.
   - Phase A validates amount, currency, mode and status after creating the session and **expires it
     on any failure**: a payable invitation is left standing only once it has passed. The pay-URL it
     publishes is Stripe's own, checked against the gateway's.
+  - **Phase B refunds only what phase A opened.** The session is marked at creation (its return URL
+    carries the harness name and the run id; Stripe echoes it back as `success_url`), and phase B
+    demands that mark before resolving the PaymentIntent. The account this runs against holds real
+    customer payments and a $1 amount identifies nothing, so a mistyped, stale or hostile session
+    id is refused rather than refunded.
 - **Each verification records the `ProviderMode` it was gathered in, and only `LIVE` authorises a
   live credential.** Test mode is a different backend — different keys, no card networks, no money —
   so a free test-mode round-trip proves the transport and buys nothing the money guard will spend.

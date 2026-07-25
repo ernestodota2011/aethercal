@@ -34,7 +34,11 @@ The run is therefore cut where the human is:
   because the gateway's refund has never run for real. If it is broken, the cleanup must not share
   its fault — so the safety net does not go through ``StripeGateway`` at all;
 * ==**if the refund cannot be completed, the run SHOUTS the charge id.**== $1 stuck on somebody's
-  card behind a green test is the worst thing this file can produce, because nobody goes looking.
+  card behind a green test is the worst thing this file can produce, because nobody goes looking;
+* ==**phase B refunds ONLY what phase A opened.**== The session is marked at creation (the return
+  URL carries the harness's name and the run id, and Stripe echoes it back), and phase B demands
+  that mark before it resolves the PaymentIntent. This account holds **real customer invoices**, and
+  a $1 amount identifies nothing — so a mistyped or hostile session id must not reach a refund.
 
 .. rubric:: How to run it
 
@@ -60,7 +64,7 @@ part of an ordinary ``-m live_provider`` run.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -77,6 +81,18 @@ PAID_SESSION_ENV = "AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION"
 
 RUN_ID_ENV = "AETHERCAL_LIVE_STRIPE_RUN_ID"
 DEFAULT_RUN_ID = "v1"
+PHASE_A_PURPOSE = "refund"
+"""The provenance segment phase A stamps. Phase B demands it; the checkout harness uses another."""
+
+
+def _run_id() -> str:
+    """Which phase-A run this is. ==One reading, used by the key, the mark and the demand.==
+
+    Phase A stamps it into the session and phase B requires the same value back, so a session opened
+    under one run id is not refunded by a phase B expecting another. Two readings of the environment
+    could disagree; one cannot.
+    """
+    return os.environ.get(RUN_ID_ENV, "").strip() or DEFAULT_RUN_ID
 
 
 def _phase_a_idempotency_key() -> str:
@@ -94,8 +110,7 @@ def _phase_a_idempotency_key() -> str:
     by accident (it is not the default, and phase A already carries its own opt-in), and phase A
     tells the operator this exact sentence at the moment it hits the wall.
     """
-    run_id = os.environ.get(RUN_ID_ENV, "").strip() or DEFAULT_RUN_ID
-    return f"aethercal-live-refund-verification:{run_id}"
+    return f"aethercal-live-refund-verification:{_run_id()}"
 
 
 HUMAN_PAYMENT_WINDOW = timedelta(hours=2)
@@ -141,6 +156,7 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
     one_dollar_currency: str,
     stripe_api: httpx.Client,
     expire_session: Callable[[str], str | None],
+    harness_return_url: Callable[[str], str],
 ) -> None:
     """==Phase A: open a real, payable $1 invitation and stop.== No money moves in this test.
 
@@ -153,7 +169,11 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
     """
     expires_at = datetime.now(UTC) + HUMAN_PAYMENT_WINDOW
     session = await open_one_dollar_session(
-        idempotency_key=_phase_a_idempotency_key(), expires_at=expires_at
+        idempotency_key=_phase_a_idempotency_key(),
+        expires_at=expires_at,
+        # ==The provenance mark, applied AT CREATION through the production path.== Phase B refunds
+        # only what carries it: this account holds real customer payments and $1 identifies nothing.
+        return_url=harness_return_url(f"{PHASE_A_PURPOSE}/{_run_id()}"),
     )
 
     # ==The invitation exists from the line above onwards, so from here the default is CLOSE IT.==
@@ -175,7 +195,7 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
             already_paid = opened.get("payment_status") == "paid"
             pytest.fail(
                 f"the phase-A session for run id "
-                f"{os.environ.get(RUN_ID_ENV, '') or DEFAULT_RUN_ID!r} is "
+                f"{_run_id()!r} is "
                 f"{opened.get('status')!r}, not open — Stripe replayed the one an earlier run "
                 f"created (idempotency keys live 24 hours).\n\n"
                 + (
@@ -259,8 +279,10 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
     secret_key: str,
     gateway: StripeGateway,
     one_dollar_cents: int,
+    one_dollar_currency: str,
     terminal_refund_success: str,
     stripe_api: httpx.Client,
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
     ensure_refunded: Callable[[str, str], str | None],
     shout_that_money_is_held: Callable[[str, str], None],
 ) -> None:
@@ -287,6 +309,16 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
     session_response.raise_for_status()
     session: dict[str, Any] = session_response.json()
 
+    # ==PROVENANCE FIRST, before anything is read as a target.== Nothing about a session id proves
+    # it came from phase A, and this account carries real customer invoices — so a mistyped, stale
+    # or hostile value would have pointed the refund at somebody else's transaction. The amount is
+    # no defence: $1 is one figure among thousands. This runs before the PaymentIntent is even
+    # resolved, so a foreign session is refused before it can become a target at all.
+    require_phase_a_provenance(session, _run_id())
+
+    assert session["currency"] == one_dollar_currency, (
+        f"session {paid_session_id} is in {session['currency']!r}, not {one_dollar_currency!r}"
+    )
     assert session["payment_status"] == "paid", (
         f"session {paid_session_id} is {session['payment_status']!r}, not 'paid'. Phase B refunds "
         "a charge that exists; in live mode nothing here can create one, so pay the phase-A "

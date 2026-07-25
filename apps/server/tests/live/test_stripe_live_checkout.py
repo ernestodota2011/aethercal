@@ -85,12 +85,13 @@ def test_the_control_proves_this_process_really_reaches_stripe(
     assert body.get("error", {}).get("type") == "invalid_request_error", body
 
 
-async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
+async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(  # noqa: PLR0913
     gateway: StripeGateway,
     open_one_dollar_session: Callable[..., Any],
     one_dollar_cents: int,
     stripe_api: httpx.Client,
     expire_session: Callable[[str], str | None],
+    harness_return_url: Callable[[str], str],
 ) -> None:
     """==The exercise itself: the production ``StripeGateway``, the real API, and no money.==
 
@@ -112,7 +113,11 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
     """
     expires_at = datetime.now(UTC) + gateway.checkout_session_floor + timedelta(minutes=5)
     session = await open_one_dollar_session(
-        idempotency_key=f"live-verification:{uuid.uuid4()}", expires_at=expires_at
+        idempotency_key=f"live-verification:{uuid.uuid4()}",
+        expires_at=expires_at,
+        # Marked as the ZERO-COST harness's, so it can never be mistaken for a payable phase-A
+        # session — and so phase B refuses it if anybody ever pastes this id there.
+        return_url=harness_return_url("checkout"),
     )
 
     failed = False

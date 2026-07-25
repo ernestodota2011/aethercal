@@ -259,6 +259,7 @@ The barriers on the money phase are structural, not procedural:
 | **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
 | **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
 | **nothing payable is left unvalidated** | phase A validates amount, currency, mode and status **after** creating the session and **expires it on any failure** — a session is left open only once it has passed. The pay-URL it prints is Stripe's own, checked against the gateway's |
+| **phase B refunds only what phase A opened** | the session is **marked at creation** (its return URL carries the harness name + run id; Stripe echoes it back) and phase B demands that mark **before** resolving the PaymentIntent. ==This account holds real customer invoices and $1 identifies nothing==, so a mistyped or stale session id is refused rather than refunded |
 | **the evidence cannot outrun the fact** | the evidence block is composed **only after** the refund has reached a terminal `succeeded` (and the checkout session has actually been expired). ==A `pending` refund is never certified as money returned== |
 | **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
 
