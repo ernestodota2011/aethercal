@@ -11,9 +11,11 @@ import {
   type ViewChangePayload,
   formatLocalDateTime,
   getTimelineGridDays,
+  getVisibleRange,
   getWeekGridDays,
   parseLocalDateTime,
   resolveTimelineDays,
+  stepAnchor,
   toDateOnly,
 } from "@aethercal/calendar-core";
 import * as React from "react";
@@ -25,6 +27,11 @@ import { ensureCalendarStyles } from "./styles";
 import { type ThemeInput, resolveThemeVars } from "./theme";
 import { TimeGridView } from "./TimeGridView";
 import { TimelineView } from "./TimelineView";
+import { useSwipeNavigation } from "./useSwipeNavigation";
+
+function cx(...parts: (string | false | undefined)[]): string {
+  return parts.filter(Boolean).join(" ");
+}
 
 export interface AetherCalendarProps {
   /** Which surface to render. All five (month/week/day/list/timeline) are implemented. */
@@ -251,6 +258,25 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
     [dayStartHour, dayEndHour],
   );
 
+  // Touch swipe-to-navigate (U-02): ADDITIVE to the toolbar's prev/next, so it only makes sense
+  // where those already do something — the controlled `navigation` mode, with a real
+  // `onRangeChange` to feed the new period back to. A swipe steps the anchor the exact same way
+  // CalendarNav's own prev/next buttons do (`stepAnchor` + `getVisibleRange`, honoring
+  // `timelineDays` for the timeline view), so it never contradicts the toolbar's own math.
+  const handleSwipe = React.useCallback(
+    (direction: "prev" | "next") => {
+      if (!onRangeChange) return;
+      const delta = direction === "next" ? 1 : -1;
+      const nextAnchor = stepAnchor(anchorDate, view, delta, safeTimelineDays);
+      onRangeChange(getVisibleRange(view, nextAnchor, safeFirstDayOfWeek, safeTimelineDays));
+    },
+    [onRangeChange, anchorDate, view, safeTimelineDays, safeFirstDayOfWeek],
+  );
+  const swipe = useSwipeNavigation({
+    enabled: navigation && Boolean(onRangeChange),
+    onSwipe: handleSwipe,
+  });
+
   const viewElement: React.JSX.Element = (() => {
     if (view === "list") {
       return (
@@ -367,7 +393,20 @@ export function AetherCalendar(props: AetherCalendarProps): React.JSX.Element {
         {...(onRangeChange ? { onRangeChange } : {})}
         {...(onViewChange ? { onViewChange } : {})}
       />
-      {viewElement}
+      {/* Swipe viewport (U-02): touch-only, additive — see useSwipeNavigation for how it avoids
+          fighting the grid's own drag-to-create/resize gestures on the same surface. `touch-action:
+          pan-y` (styles.ts) leaves vertical scrolling native while handing horizontal gestures to
+          the recognizer, exactly like every swipeable-carousel pattern. */}
+      <div
+        className={cx(
+          "aethercal-swipe-viewport",
+          swipe.swipeDirection === "next" && "is-swiping-next",
+          swipe.swipeDirection === "prev" && "is-swiping-prev",
+        )}
+        {...swipe.handlers}
+      >
+        {viewElement}
+      </div>
     </div>
   );
 }
