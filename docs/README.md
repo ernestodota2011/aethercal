@@ -8,6 +8,7 @@
 | [Webhooks](webhooks.md) | Signature verification and the **at-least-once** delivery contract |
 | [Embedding](embedding.md) | Drop the booking widget onto any site with one `<script>` tag |
 | [Phone channels](phone-channels.md) | WhatsApp/SMS: enabling them, the mandatory caps, and **the consent limitation to read before you switch them on** |
+| [CalDAV busy-check](caldav-busy-check.md) | Connect a **read-only** CalDAV calendar (Nextcloud, Radicale, iCloud…) as a second busy provider — breaking the Google monoculture (RNF-9) |
 | [BYOK credentials](byok-credentials.md) | Each business's own payment/sending accounts, key rotation, and **what the encryption does and does not protect** |
 
 Operator reference: [`deploy/README.md`](../deploy/README.md) — every setting, the scheduler rule,
