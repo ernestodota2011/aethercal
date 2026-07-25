@@ -103,6 +103,23 @@ def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
     )
 
 
+LIVE_PROVIDER_ALLOWED_DESTINATIONS = frozenset({("api.stripe.com", 443)})
+"""==Where a ``live_provider`` test may go. Everything else is refused, marker or no marker.==
+
+The first cut of the live exception simply stopped patching ``httpx`` and the socket floor, which
+opened ==arbitrary egress==: any host, any port, for any test carrying the marker. That is a much
+larger hole than the one being asked for. What the verification harness actually needs is *one host
+on one port*, so that is what it gets.
+
+==Named hosts, not addresses.== The allowlist is the thing a reader can check against the harness's
+purpose (*"why does a payment test need `api.stripe.com`?"* answers itself; *"why does it need
+`104.18.…`?"* does not). Stripe sits behind a CDN whose addresses rotate, so a pinned IP list would
+be wrong within the week; the socket floor resolves these names at connect time instead.
+
+Widening this is a deliberate edit with a reviewer attached — and ``test_live_suite_gate`` pins the
+contents, so growing it silently is not one of the available moves.
+"""
+
 LIVE_PROVIDER_MARKER = "live_provider"
 """==The ONE marker that may reach a provider's real API, and it is not merely "an exception".==
 
@@ -118,10 +135,12 @@ deleted in a hurry by whoever needs to ship, which is a worse outcome than the o
 
 .. rubric:: What the hole is NOT
 
-* it is not "the guard is off". ==SMTP and the Google API stay shut for a live test too==: those
-  write to a real person's inbox and to somebody's real calendar, and wanting to talk to Stripe is
-  no reason at all to open them. Only the HTTP doors and the socket floor beneath them open — the
-  narrowest set that lets one HTTPS request out;
+* it is not "the guard is off", and it is not even "HTTP is open". SMTP and the Google API stay
+  shut — those write to a real person's inbox and to somebody's real calendar, and wanting to talk
+  to Stripe is no reason at all to open them. The HTTP doors and the socket floor are not removed
+  either: they are ==re-pointed at an ALLOWLIST== of one host on one port
+  (:data:`LIVE_PROVIDER_ALLOWED_DESTINATIONS`). A live-marked test that reaches for any other
+  destination is refused exactly as an ordinary test would be;
 * it is not reachable by inattention, which is the property that actually matters. It takes the
   marker on the test, that marker registered in ``pyproject.toml`` under ``--strict-markers``, the
   provider's key exported into the environment, and (for ``-m live_provider``) the root
@@ -132,6 +151,90 @@ deleted in a hurry by whoever needs to ship, which is a worse outcome than the o
   ``StripeGateway.refund`` on itself so the one operation that moves money cannot be reached even by
   mistake. That belt lives with the tests, because it is a fact about them, not about the network.
 """
+
+
+_REAL_ASYNC_HANDLE = httpx.AsyncHTTPTransport.handle_async_request
+_REAL_SYNC_HANDLE = httpx.HTTPTransport.handle_request
+"""Captured at IMPORT, before any test can patch them: the only honest way back to the real door."""
+
+
+def _forbidden_destination(destination: str) -> NoReturn:
+    raise RealNetworkForbiddenError(
+        f"a live-provider test tried to reach {destination}, which is NOT on the allowlist.\n"
+        "\n"
+        "The `live_provider` marker does not open the network — it re-points the guard at "
+        f"{sorted(LIVE_PROVIDER_ALLOWED_DESTINATIONS)}. Everything else is refused exactly as it "
+        "would be for an ordinary test, because a marker that granted arbitrary egress would be a "
+        "far larger hole than the one the verification harness needs.\n"
+        "\n"
+        "If a harness genuinely needs another destination, add it to "
+        "LIVE_PROVIDER_ALLOWED_DESTINATIONS deliberately — `test_live_suite_gate` pins the "
+        "contents, so it cannot grow by accident.\n"
+        "\n"
+        "See pytest_network_guard.py."
+    )
+
+
+def _require_allowed_url(url: httpx.URL) -> None:
+    """The allowlist check at the layer where the destination still has a NAME."""
+    port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    if (url.host, port) not in LIVE_PROVIDER_ALLOWED_DESTINATIONS:
+        _forbidden_destination(f"{url.scheme}://{url.host}:{port}")
+
+
+async def _live_guarded_async_request(
+    transport: httpx.AsyncHTTPTransport, request: httpx.Request
+) -> httpx.Response:
+    _require_allowed_url(request.url)
+    return await _REAL_ASYNC_HANDLE(transport, request)
+
+
+def _live_guarded_request(transport: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
+    _require_allowed_url(request.url)
+    return _REAL_SYNC_HANDLE(transport, request)
+
+
+def _is_allowed_live_address(address: Any) -> bool:
+    """Whether a raw socket address belongs to an allowlisted destination. ==Resolved, not pinned.==
+
+    The floor beneath the HTTP filter, and it has to answer the same question one layer lower, where
+    the destination is an ADDRESS and the allowlist is a set of NAMES. So each allowed host is
+    resolved *at connect time* — the same moment the client resolved it, through the same OS
+    resolver and cache — and the address is matched against the answer. A pinned IP list would be
+    wrong within the week (Stripe is behind a CDN), and a name recorded once at session start can go
+    stale mid-run.
+
+    ==A host that will not resolve is refused, not excused==: `getaddrinfo` failing means we cannot
+    show this address belongs to an allowed destination, and "cannot show" is a refusal at a door.
+    """
+    if _is_loopback(address):
+        return True
+    if not isinstance(address, tuple) or len(address) < 2:
+        return True  # AF_UNIX or a socketpair: it cannot leave the machine by construction
+    host, port = str(address[0]), address[1]
+    for allowed_host, allowed_port in LIVE_PROVIDER_ALLOWED_DESTINATIONS:
+        if port != allowed_port:
+            continue
+        try:
+            infos = socket.getaddrinfo(allowed_host, allowed_port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            continue
+        if host in {str(info[4][0]) for info in infos}:
+            return True
+    return False
+
+
+def _guarded_live_connect(sock: socket.socket, address: Any) -> Any:
+    """The socket floor for a live-provider test: loopback, the allowlist, and nothing else.
+
+    ==Without this, the HTTP filter above would be a fence with no posts.== A test could reach any
+    host in the world through ``urllib``, a raw socket, or any stack that does not go through
+    ``httpx`` — which is the whole reason this plugin has a floor in the first place.
+    """
+    if _is_allowed_live_address(address):
+        return _REAL_SOCKET_CONNECT(sock, address)
+    sock.close()
+    _forbidden_destination(f"the raw address {address!r}")
 
 
 @pytest.fixture(autouse=True)
@@ -230,14 +333,21 @@ def _forbid_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
     .. rubric:: ==And the one way through, for the one suite whose job is to walk through it==
 
     A ``live_provider``-marked test (see :data:`LIVE_PROVIDER_MARKER`) keeps the two doors that
-    write to PEOPLE — SMTP and the Google API — shut, and opens only the HTTP doors and the socket
-    floor. ==The order below is what makes that narrowing real rather than described:== the two
-    human-facing doors are shut FIRST, unconditionally, so the early return cannot take them with it
-    however this function is later edited.
+    write to PEOPLE — SMTP and the Google API — shut, and gets the HTTP doors and the socket floor
+    ==re-pointed at an allowlist rather than removed== (:data:`LIVE_PROVIDER_ALLOWED_DESTINATIONS`).
+    Every door is still patched for every test; what differs is what the patch permits.
+
+    ==The order below is what makes the narrowing real rather than described:== the two human-facing
+    doors are shut FIRST, unconditionally, so no later edit to the branching can take them with it.
     """
     monkeypatch.setattr(aiosmtplib.SMTP, "connect", _forbidden, raising=True)
     monkeypatch.setattr(httplib2.Http, "request", _forbidden, raising=True)
     if request.node.get_closest_marker(LIVE_PROVIDER_MARKER) is not None:
+        monkeypatch.setattr(
+            httpx.AsyncHTTPTransport, "handle_async_request", _live_guarded_async_request
+        )
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _live_guarded_request)
+        monkeypatch.setattr(socket.socket, "connect", _guarded_live_connect, raising=True)
         return
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)

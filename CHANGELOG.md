@@ -174,10 +174,22 @@ differently, so it could only be overruled and never discharged.
   only ever spoken to a stubbed transport, and no Mercado Pago account exists. What changed is that
   the refusal can now be **retired by evidence** instead of by editing the guard.
 - The evidence comes from a new opt-in harness (`apps/server/tests/live/`, marked `live_provider`)
-  that exercises the real `StripeGateway` against `api.stripe.com` with **zero-cost calls only** —
-  create a Checkout Session, read it back, expire it. It never issues a refund, and it cannot: the
-  refund method is unplugged for the duration. It needs a key from the environment, never a flag,
-  and it never runs in CI.
+  that exercises the real `StripeGateway` against `api.stripe.com`. It takes its key from the
+  environment, never a flag, and never runs in CI.
+  - **`checkout` is verified at zero cost**: create a Checkout Session, read it back through a
+    separate request, expire it. No card, no charge.
+  - **`refund` costs a real charge, so it is a two-phase run** — in live mode there are no test
+    cards, and a live Checkout Session is completed by a person. Phase A opens a **$1** session and
+    leaves it payable (behind its own opt-in); phase B runs the real refund and confirms it with an
+    independent request.
+  - The money barriers are structural: the session opener takes **no amount** (a units bug is what
+    turns $1 into $100), phase A's idempotency key is fixed so a retry cannot charge twice, phase B
+    uses production's own `refund_dedupe_key`, the refund is re-checked in a `finally` through an
+    **independent** client, and if it cannot be completed the run prints the **charge id** with
+    manual-refund instructions rather than failing quietly.
+- The live suite is the one exception to the repo-wide network guard, and the exception is an
+  **allowlist**: `api.stripe.com:443` and nothing else, with SMTP and the Google API still shut. A
+  marked test reaching anywhere else is refused exactly as an ordinary test would be.
 - **Granularity is per operation because the two cost different things to prove.** Checkout is free
   to verify; refund is not (it needs a real charge to refund). Verifying checkout alone therefore
   does **not** open the door — a stored credential is the row `refund` will read weeks later, for a

@@ -211,21 +211,62 @@ would record something false about the expensive half, silently.
 
 #### Running the verification harness
 
+Every run takes its key from the **environment, never a flag** — an argument lands in the process
+table (`ps`), the shell's history file and the terminal scrollback:
+
 ```bash
-# The ENVIRONMENT, never a flag — an argument lands in the process table, the shell history
-# and the terminal scrollback. `read -s` keeps it out of the history too.
 read -rs AETHERCAL_LIVE_STRIPE_SECRET_KEY && export AETHERCAL_LIVE_STRIPE_SECRET_KEY
-uv run pytest apps/server/tests/live -m live_provider -s
 ```
 
-It creates a Checkout Session through the real `StripeGateway`, reads it back through a *separate*
-request (so the confirmation comes from Stripe rather than from a return value), and expires it so
-nothing payable is left standing. **Zero-cost calls only** — and `StripeGateway.refund` is unplugged
-for the duration, so the one operation that moves money cannot be reached even by accident.
+**1 — `checkout`, free.** Creates a Checkout Session through the real `StripeGateway`, reads it back
+through a *separate* request (so the confirmation comes from Stripe rather than from a return
+value), and expires it so nothing payable is left standing:
+
+```bash
+uv run pytest apps/server/tests/live/test_stripe_live_checkout.py -m live_provider -s
+```
+
+**Zero-cost calls only** — and `StripeGateway.refund` is unplugged for the whole directory, so the
+one operation that moves money is unreachable rather than merely unused.
+
+**2 — `refund`, and this one moves real money.** In live mode there are **no test cards**: a live
+Checkout Session is completed by a person with a real card, and no API call can pay it. So the
+refund run is cut where the human is, and it is **$1, refunded**:
+
+```bash
+# Phase A — opens a payable $1 session and prints its URL. Needs its own opt-in, because it
+# deliberately leaves the session OPEN so somebody can pay it.
+AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE=1 \
+  uv run pytest apps/server/tests/live/test_stripe_live_refund.py -m live_provider -s
+
+# ...pay it with a real card, then:
+
+# Phase B — runs the REAL StripeGateway.refund and confirms with a separate request.
+AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION=cs_live_… \
+  uv run pytest apps/server/tests/live/test_stripe_live_refund.py -m live_provider -s
+```
+
+`-s` in every case, because the evidence is printed and pytest swallows the output of passing tests.
+
+The barriers on the money phase are structural, not procedural:
+
+| Barrier | How it is enforced |
+|---|---|
+| **$1 hard cap** | the session opener takes **no `amount_cents`** — there is no figure to mistype. A units bug is what turns $1 into $100 |
+| **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one |
+| **the refund is idempotent** | phase B uses production's own `refund_dedupe_key`, so a retry gets the same refund and never a second |
+| **the money always comes back** | the refund is re-checked in a `finally`, through the **independent** client — the gateway is the thing on trial, so the safety net must not share its fault |
+| **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
+| **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
 
 The run prints an evidence block. **That block, not a boolean, is what goes into
 `live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
 carrying the date and what was observed. Writing one requires having done the run.
+
+> [!NOTE]
+> The live suite is the one exception to the repo-wide network guard, and the exception is narrow:
+> it may reach **`api.stripe.com:443` and nothing else**. SMTP and the Google API stay shut for it
+> too — a charge can be refunded, an email cannot be unsent.
 
 > [!IMPORTANT]
 > **Verifying `checkout` alone does not open the door.** A stored credential is not scoped to an
