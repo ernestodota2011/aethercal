@@ -597,6 +597,64 @@ def render_human(snapshot: MetricsSnapshot, *, now: datetime) -> str:
     )
 
 
+def render_summary(snapshot: MetricsSnapshot, *, counters: DrainCounters) -> dict[str, object]:
+    """The machine-readable twin of :func:`render_human` — the same numbers, shaped as JSON.
+
+    ``/metrics`` answers a scraper and :func:`render_human` answers a person at a terminal; this
+    answers the **pilot feedback loop** and any dashboard that wants the numbers as structured data
+    it can pull a field out of, diff over time, or post as-is. The groups are the operator's five
+    questions during the shadow, named so a reader need not know the Prometheus wire format to find
+    the one that matters:
+
+    * ``outbox`` — is the queue draining? Carries ``due`` (the alertable backlog) and
+      ``oldest_due_age_seconds`` (==the dead-man switch: flat when healthy, unbounded the moment
+      nothing drains==).
+    * ``bookings`` — are appointments being kept? Counts by status and the ``no_show_ratio``.
+    * ``money`` — did a charge fall through the floor? ``payment_events_dead`` is ==the money
+      dead-man==: each is a charge that neither confirmed nor refunded.
+    * ``webhooks`` — is the CRM bridge sending, or refusing? Counts by status and by failure reason
+      (alert on the ``blocked-*`` reasons).
+    * ``drain`` — did the drain itself misbehave? ``lost`` is ==the possible-double-send==: a real
+      guest may have been messaged twice, kept apart from the routine ``voided_midflight`` /
+      ``purged_midflight`` so the one alarm worth reading is not drowned in ordinary noise.
+
+    ==Instance-wide only, exactly like :func:`render_prometheus`.== Every value is a scalar or a
+    dict keyed by a status/reason TOKEN — never by a tenant, a guest, a slug or an event title. It
+    cannot carry per-business data because the snapshot it reads has none; a test asserts that
+    against real seeded values rather than against the word "tenant". The status/reason maps are
+    copied out of the (frozen) snapshot so a caller mutating the return cannot reach back into it.
+    """
+    return {
+        "outbox": {
+            "by_status": dict(snapshot.outbox_by_status),
+            "due": snapshot.outbox_due,
+            "oldest_due_age_seconds": snapshot.outbox_oldest_due_age_seconds,
+            "expired_leases": snapshot.outbox_expired_leases,
+        },
+        "bookings": {
+            "by_status": dict(snapshot.bookings_by_status),
+            "no_show_ratio": snapshot.no_show_ratio,
+        },
+        "money": {
+            "payment_events_parked": snapshot.payment_events_parked,
+            "payment_events_dead": snapshot.payment_events_dead,
+        },
+        "webhooks": {
+            "by_status": dict(snapshot.webhook_deliveries_by_status),
+            "by_reason": dict(snapshot.webhook_deliveries_by_reason),
+        },
+        "drain": {
+            "lost": counters.lost,
+            "voided_midflight": counters.voided_midflight,
+            "purged_midflight": counters.purged_midflight,
+            "passes": counters.passes,
+            "delivered": counters.delivered,
+            "failed": counters.failed,
+            "dead": counters.dead,
+        },
+    }
+
+
 __all__ = [
     "CONTENT_TYPE",
     "DRAIN_COUNTERS",
@@ -606,4 +664,5 @@ __all__ = [
     "observe_drain",
     "render_human",
     "render_prometheus",
+    "render_summary",
 ]
