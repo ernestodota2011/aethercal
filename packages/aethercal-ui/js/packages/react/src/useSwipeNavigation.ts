@@ -134,9 +134,38 @@ export function useSwipeNavigation(options: UseSwipeNavigationOptions): UseSwipe
     feedbackTimer.current = window.setTimeout(() => setSwipeDirection(null), SWIPE_FEEDBACK_MS);
   }, []);
 
-  const endTracking = React.useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  /** Shared by the element-bound handler below AND the window backstop — both only need the
+   * pointerId, so this takes the narrowest shape either kind of event actually offers. */
+  const clearIfTracked = React.useCallback((e: { pointerId: number }) => {
     if (trackedRef.current?.pointerId === e.pointerId) trackedRef.current = null;
   }, []);
+
+  const endTracking = React.useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => clearIfTracked(e),
+    [clearIfTracked],
+  );
+
+  // Window backstop (H1, hardening pass): `onPointerUp`/`onPointerCancel` above are bound only to
+  // the swipeable element via React's synthetic props, so they fire only if THAT element is still
+  // under the pointer when the gesture ends. A drag that wanders off the element's bounds before
+  // lifting — finger exits the swipe viewport's edge, or a scrollable ancestor carries it past —
+  // ends on whatever DOM node happens to be there instead, and `trackedRef` is never cleared. The
+  // next real touch then finds a stale `trackedRef.current` and `onPointerDown`'s "first finger
+  // wins" guard silently refuses to track it — swipe stays broken until the component remounts.
+  // Native `pointerup`/`pointercancel` still bubble all the way to `window` regardless of which
+  // element they end on (nothing here calls `stopPropagation`), so a window-level listener is a
+  // reliable backstop: it clears `trackedRef` for ITS pointerId no matter where the gesture ended,
+  // while the element-bound handlers above keep firing first (same pointerId, idempotent clear) for
+  // the common case where the gesture never left the element.
+  React.useEffect(() => {
+    const onWindowPointerEnd = (e: PointerEvent): void => clearIfTracked(e);
+    window.addEventListener("pointerup", onWindowPointerEnd);
+    window.addEventListener("pointercancel", onWindowPointerEnd);
+    return () => {
+      window.removeEventListener("pointerup", onWindowPointerEnd);
+      window.removeEventListener("pointercancel", onWindowPointerEnd);
+    };
+  }, [clearIfTracked]);
 
   return {
     handlers: {
