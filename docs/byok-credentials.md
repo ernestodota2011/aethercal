@@ -258,6 +258,8 @@ The barriers on the money phase are structural, not procedural:
 | **the money always comes back — *all* of it** | the `finally` reads what was actually **captured**, sums only refunds that are `succeeded` (`pending` is *in flight*, not done), issues the remainder on its own derived key, and polls to a terminal state. ==A partial or pending refund is a failure, not a pass== |
 | **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
 | **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
+| **nothing payable is left unvalidated** | phase A validates amount, currency, mode and status **after** creating the session and **expires it on any failure** — a session is left open only once it has passed. The pay-URL it prints is Stripe's own, checked against the gateway's |
+| **the evidence cannot outrun the fact** | the evidence block is composed **only after** the refund has reached a terminal `succeeded` (and the checkout session has actually been expired). ==A `pending` refund is never certified as money returned== |
 | **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
 
 The run prints an evidence block. **That block, not a boolean, is what goes into

@@ -116,6 +116,7 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
     )
 
     failed = False
+    must_expire = True
     try:
         assert session.checkout_session_id.startswith("cs_"), session.checkout_session_id
         assert session.checkout_url.startswith("https://"), session.checkout_url
@@ -135,6 +136,19 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
             "the real API instead of assumed from the documentation"
         )
 
+        assert isinstance(opened.get("livemode"), bool), opened.get("livemode")
+
+        # ==Expire it HERE, and only then certify it.== The evidence used to say "expired
+        # afterwards" while the expiry was still sitting in the `finally` BELOW the print — an
+        # observation about the future, written as though it had been made. If that expiry then
+        # failed, the block already claimed otherwise, and that block is what gets pasted into
+        # `live_verifications()`. Same defect as the refund evidence accepting `pending`: what
+        # certifies must be what measured. `expire_session` verifies `status == "expired"` against
+        # Stripe, so passing it is the observation.
+        problem = expire_session(session.checkout_session_id)
+        assert problem is None, problem
+        must_expire = False
+
         mode = "LIVE" if opened["livemode"] else "TEST"
         print(
             "\n=== EVIDENCE for live_verifications(CredentialProvider.STRIPE) ===\n"
@@ -147,7 +161,8 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
             f"  session     : {opened['id']}\n"
             "  observed    : created via StripeGateway.create_checkout_session against "
             "api.stripe.com; read back independently as status=open, payment_status=unpaid, "
-            "payment_intent=null; expired afterwards. No charge, no refund, no money moved.\n"
+            "payment_intent=null; then expired and confirmed status=expired. No charge, no "
+            "refund, no money moved.\n"
             "  NOT verified: refund — see test_stripe_live_refund.py.\n"
             "==================================================================\n"
         )
@@ -155,8 +170,9 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(
         failed = True
         raise
     finally:
-        # ==Leave nothing payable standing, whatever happened above.==
-        problem = expire_session(session.checkout_session_id)
+        # ==The backstop for the failure path only.== The happy path already expired it above and
+        # checked the result; re-expiring an expired session would report a spurious problem.
+        problem = expire_session(session.checkout_session_id) if must_expire else None
         if problem is not None:
             print(
                 f"\n!!! a LIVE Checkout Session may still be open: {problem}\n"

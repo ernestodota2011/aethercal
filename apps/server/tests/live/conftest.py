@@ -186,6 +186,28 @@ def one_dollar_cents() -> int:
 
 
 @pytest.fixture
+def one_dollar_currency() -> str:
+    """The currency the cap is denominated in. ==Nothing in this directory re-types ``"usd"``.==
+
+    100 minor units is $1.00 here and a different sum elsewhere, so the figure and the currency are
+    one fact and are read from one place.
+    """
+    _assert_the_hard_cap()
+    return CURRENCY
+
+
+@pytest.fixture
+def terminal_refund_success() -> str:
+    """The ONE refund status that means the money is back. ==Read, never retyped.==
+
+    A test that spelled ``"succeeded"`` itself would be a second definition of "done", free to drift
+    from the one :func:`ensure_refunded` enforces — and the drift would be invisible, because both
+    spellings look right.
+    """
+    return REFUND_SUCCEEDED
+
+
+@pytest.fixture
 def unauthenticated_stripe_api() -> Iterator[httpx.Client]:
     """A client carrying a key Stripe never issued. ==For the control, and it creates nothing.==
 

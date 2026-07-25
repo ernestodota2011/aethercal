@@ -190,6 +190,13 @@ differently, so it could only be overruled and never discharged.
   - The cleanup verifies the **whole** capture came back: it sums only `succeeded` refunds (a
     `pending` one is in flight, not done), issues any remainder on its own derived key, and polls
     to a terminal state. A partial or pending refund raises the alarm instead of passing.
+  - The **evidence block** is composed only after the fact it certifies has been established — the
+    refund settled to a terminal `succeeded`, the checkout session actually expired. That block is
+    what gets pasted into `live_verifications()`, so certifying ahead of the measurement would put
+    a false record into the very register the money guard reads.
+  - Phase A validates amount, currency, mode and status after creating the session and **expires it
+    on any failure**: a payable invitation is left standing only once it has passed. The pay-URL it
+    publishes is Stripe's own, checked against the gateway's.
 - **Each verification records the `ProviderMode` it was gathered in, and only `LIVE` authorises a
   live credential.** Test mode is a different backend — different keys, no card networks, no money —
   so a free test-mode round-trip proves the transport and buys nothing the money guard will spend.

@@ -134,11 +134,13 @@ def paid_session_id() -> str:
     return value
 
 
-async def test_phase_a_opens_a_payable_one_dollar_session(
+async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
     real_charge_allowed: None,
     open_one_dollar_session: Callable[..., Any],
     one_dollar_cents: int,
+    one_dollar_currency: str,
     stripe_api: httpx.Client,
+    expire_session: Callable[[str], str | None],
 ) -> None:
     """==Phase A: open a real, payable $1 invitation and stop.== No money moves in this test.
 
@@ -154,62 +156,101 @@ async def test_phase_a_opens_a_payable_one_dollar_session(
         idempotency_key=_phase_a_idempotency_key(), expires_at=expires_at
     )
 
-    opened_response = stripe_api.get(f"/checkout/sessions/{session.checkout_session_id}")
-    opened_response.raise_for_status()
-    opened: dict[str, Any] = opened_response.json()
+    # ==The invitation exists from the line above onwards, so from here the default is CLOSE IT.==
+    # The cap used to be checked after creation with nothing to catch a failure, so a session that
+    # failed validation — the wrong amount, say — stayed OPEN and PAYABLE. The one case where a
+    # failure is punished by leaving somebody able to pay.
+    must_expire = True
+    try:
+        opened_response = stripe_api.get(f"/checkout/sessions/{session.checkout_session_id}")
+        opened_response.raise_for_status()
+        opened: dict[str, Any] = opened_response.json()
 
-    assert opened["amount_total"] == one_dollar_cents, (
-        f"Stripe says this session is for {opened['amount_total']} and the hard cap is "
-        f"{one_dollar_cents}. A person is about to pay this. Do NOT pay it — expire it."
-    )
-    assert opened["currency"] == "usd", opened["currency"]
-    assert opened["payment_status"] in {"unpaid", "paid"}, opened["payment_status"]
-
-    # ==The fixed idempotency key's one real cost, surfaced instead of suffered.== Stripe replays a
-    # repeated key for 24 hours, so this may be a session an earlier run opened. If that session has
-    # since lapsed — or has already been paid — the operator needs to be told WHICH, and what to do,
-    # rather than reading a bare `status != 'open'` assertion and guessing.
-    if opened["status"] != "open":
-        already_paid = opened["payment_status"] == "paid"
-        pytest.fail(
-            f"the phase-A session for run id {os.environ.get(RUN_ID_ENV, '') or DEFAULT_RUN_ID!r} "
-            f"is {opened['status']!r}, not open — Stripe replayed the one an earlier run created "
-            f"(idempotency keys live 24 hours).\n\n"
-            + (
-                f"It was PAID: {opened['id']}. Nothing new is needed — run phase B on it:\n"
-                f"  AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION={opened['id']} \\\n"
-                "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
-                "-m live_provider -s\n"
-                if already_paid
-                else "It lapsed unpaid, so there is nothing to refund and no way to reopen it. To "
-                "open a NEW payable session deliberately, pick a fresh run id:\n"
-                f"  {RUN_ID_ENV}=v2 AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE=1 \\\n"
-                "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
-                "-m live_provider -s\n"
+        # ==The fixed idempotency key's one real cost, surfaced instead of suffered.== Stripe
+        # replays a repeated key for 24 hours, so this may be a session an earlier run opened. If it
+        # has since lapsed — or has already been paid — the operator needs to be told WHICH, and
+        # what to do, rather than reading a bare `status != 'open'` assertion and guessing.
+        if opened.get("status") != "open":
+            must_expire = False  # already expired, or PAID: either way not ours to close
+            already_paid = opened.get("payment_status") == "paid"
+            pytest.fail(
+                f"the phase-A session for run id "
+                f"{os.environ.get(RUN_ID_ENV, '') or DEFAULT_RUN_ID!r} is "
+                f"{opened.get('status')!r}, not open — Stripe replayed the one an earlier run "
+                f"created (idempotency keys live 24 hours).\n\n"
+                + (
+                    f"It was PAID: {opened['id']}. Nothing new is needed — run phase B on it:\n"
+                    f"  AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION={opened['id']} \\\n"
+                    "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
+                    "-m live_provider -s\n"
+                    if already_paid
+                    else "It lapsed unpaid, so there is nothing to refund and no way to reopen it. "
+                    "To open a NEW payable session deliberately, pick a fresh run id:\n"
+                    f"  {RUN_ID_ENV}=v2 AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE=1 \\\n"
+                    "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
+                    "-m live_provider -s\n"
+                )
             )
+
+        assert opened["amount_total"] == one_dollar_cents, (
+            f"Stripe says this session is for {opened['amount_total']} and the hard cap is "
+            f"{one_dollar_cents}. Expiring it rather than letting anybody pay it."
+        )
+        assert opened["currency"] == one_dollar_currency, opened["currency"]
+        assert opened["payment_status"] == "unpaid", opened["payment_status"]
+        assert isinstance(opened.get("livemode"), bool), (
+            "Stripe did not say which MODE this session is in "
+            f"(livemode={opened.get('livemode')!r}), and the mode is what decides whether the "
+            "evidence is worth a live credential"
         )
 
-    mode = "LIVE" if opened["livemode"] else "TEST"
-    print(
-        "\n=== PHASE A: a payable session is now OPEN ===\n"
-        f"  mode        : {mode}\n"
-        f"  amount      : {opened['amount_total']} cents {opened['currency'].upper()} "
-        "(the hard cap; nothing else can be created here)\n"
-        f"  session     : {opened['id']}\n"
-        f"  expires     : {datetime.fromtimestamp(opened['expires_at'], UTC).isoformat()}\n"
-        f"  PAY IT HERE : {session.checkout_url}\n"
-        "\n"
-        f"  {'REAL MONEY. ' if opened['livemode'] else ''}Paying this charges a real card "
-        f"{opened['amount_total']} cents. Phase B refunds it.\n"
-        "\n"
-        "  Then run phase B:\n"
-        f"    AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION={opened['id']} \\\n"
-        "      uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
-        "-m live_provider -s\n"
-        "\n"
-        "  Changed your mind? Expire it from the dashboard and nothing happens.\n"
-        "==============================================\n"
-    )
+        # ==The URL comes from the SOURCE, not from the gateway's return value.== A human opens
+        # this and types a card into it; if the gateway ever returned a URL that was not the one
+        # Stripe has for this session, printing its answer would send somebody to pay somewhere
+        # else. So the printed URL is Stripe's, and the gateway's is checked AGAINST it.
+        checkout_url = opened.get("url")
+        assert isinstance(checkout_url, str) and checkout_url.startswith("https://"), checkout_url
+        assert checkout_url == session.checkout_url, (
+            "the gateway returned a different checkout URL from the one Stripe holds for this "
+            "session; refusing to publish either"
+        )
+
+        must_expire = False  # ==validated: leaving it open is now the POINT of this phase==
+        mode = "LIVE" if opened["livemode"] else "TEST"
+        print(
+            "\n=== PHASE A: a payable session is now OPEN ===\n"
+            f"  mode        : {mode}\n"
+            f"  amount      : {opened['amount_total']} cents {opened['currency'].upper()} "
+            "(the hard cap; nothing else can be created here)\n"
+            f"  session     : {opened['id']}\n"
+            f"  expires     : {datetime.fromtimestamp(opened['expires_at'], UTC).isoformat()}\n"
+            f"  PAY IT HERE : {checkout_url}\n"
+            "\n"
+            f"  {'REAL MONEY. ' if opened['livemode'] else ''}Paying this charges a real card "
+            f"{opened['amount_total']} cents. Phase B refunds it.\n"
+            "\n"
+            "  Then run phase B:\n"
+            f"    AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION={opened['id']} \\\n"
+            "      uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
+            "-m live_provider -s\n"
+            "\n"
+            "  Changed your mind? Expire it from the dashboard and nothing happens.\n"
+            "==============================================\n"
+        )
+    finally:
+        if must_expire:
+            # Validation failed, or the read did. ==Nothing unvalidated is left payable.==
+            problem = expire_session(session.checkout_session_id)
+            print(
+                f"\n!!! phase A created {session.checkout_session_id} and did NOT validate it, so "
+                "it was expired rather than published.\n"
+                + (
+                    f"    THE EXPIRY ALSO FAILED: {problem}\n"
+                    "    A live, payable session may still be OPEN — expire it by hand NOW.\n"
+                    if problem is not None
+                    else "    It is expired; nobody can pay it.\n"
+                )
+            )
 
 
 async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR0913
@@ -218,6 +259,7 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
     secret_key: str,
     gateway: StripeGateway,
     one_dollar_cents: int,
+    terminal_refund_success: str,
     stripe_api: httpx.Client,
     ensure_refunded: Callable[[str, str], str | None],
     shout_that_money_is_held: Callable[[str, str], None],
@@ -272,8 +314,21 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
             secrets={"secret_key": secret_key},
         )
 
-        # ==Confirmed by Stripe, not by the return value.== `refund` returns None on success, which
-        # is exactly what a broken implementation that sent nothing would also return.
+        # ==Settle FIRST, certify second.== `ensure_refunded` is the only thing here that knows
+        # whether the money is actually back: it reads the capture, counts only terminal successes,
+        # and waits out anything in flight. Until it says `None`, nothing is known — so it runs
+        # before a single line of evidence is composed.
+        #
+        # The bug this ordering closes: the evidence block used to accept `pending` and then print
+        # "The money went back". ==The cleanup had been taught that pending is not done, and the
+        # thing PRINTING THE CERTIFICATE had not.== That block is what gets pasted into
+        # `live_verifications()`, so a lie here becomes a lie in the register — the exact failure
+        # this whole change exists to prevent, one layer up from where it was fixed.
+        unsettled = ensure_refunded(payment_intent_id, idempotency_key)
+        assert unsettled is None, unsettled
+
+        # ==Now re-read from the source and require TERMINAL success.== Not the value returned by
+        # anything above: a fresh answer from Stripe, after the settling is done.
         refunds_response = stripe_api.get(
             "/refunds", params={"payment_intent": payment_intent_id, "limit": 10}
         )
@@ -281,9 +336,14 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
         refunds: list[dict[str, Any]] = refunds_response.json().get("data", [])
         assert len(refunds) == 1, (
             f"expected exactly ONE refund for {payment_intent_id}, found {len(refunds)}. More than "
-            "one means the idempotency key did not do its job."
+            "one means the gateway did not do the job alone — the cleanup topped it up — so "
+            "GatewayOperation.REFUND is NOT verified by this run, whatever the money did."
         )
-        assert refunds[0]["status"] in {"succeeded", "pending"}, refunds[0]["status"]
+        assert refunds[0]["status"] == terminal_refund_success, (
+            f"the refund is {refunds[0]['status']!r}, not {terminal_refund_success!r}. Only a "
+            "terminal success may be certified: a pending refund can still fail, and evidence that "
+            "says otherwise would put a false record in live_verifications()."
+        )
         assert refunds[0]["amount"] == one_dollar_cents, refunds[0]["amount"]
 
         intent_response = stripe_api.get(f"/payment_intents/{payment_intent_id}")
@@ -304,8 +364,9 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
             f"  refund      : {refunds[0]['id']} status={refunds[0]['status']} "
             f"amount={refunds[0]['amount']}\n"
             "  observed    : a real card was charged by a human; StripeGateway.refund was called "
-            "against api.stripe.com on production's own idempotency key; a SEPARATE request "
-            "confirmed exactly one refund, for the full amount. The money went back.\n"
+            "against api.stripe.com on production's own idempotency key; after the refund reached "
+            "a TERMINAL state, a SEPARATE request confirmed exactly one refund, status=succeeded, "
+            "for the full captured amount. The money went back.\n"
             "==================================================================\n"
         )
     except BaseException:

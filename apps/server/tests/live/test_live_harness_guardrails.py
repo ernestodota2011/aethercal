@@ -18,6 +18,7 @@ describes and the test goes red.
 from __future__ import annotations
 
 import inspect
+import pathlib
 from collections.abc import Callable
 from typing import Any
 
@@ -131,6 +132,59 @@ def test_ensuring_a_refund_reports_instead_of_raising(
 
     assert problem is not None, "a failed refund must be REPORTED so the caller can shout"
     assert "pi_NOT_A_REAL_INTENT" in problem, "the report must name the payment that is still held"
+
+
+EVIDENCE_MARKER = "=== EVIDENCE for live_verifications"
+
+MUST_BE_ESTABLISHED_BEFORE_CERTIFYING = {
+    # The evidence block claimed "expired afterwards" while the expiry still sat in the `finally`
+    # BELOW the print — an observation about the future, written as though it had been made.
+    "test_stripe_live_checkout.py": "expire_session(session.checkout_session_id)",
+    # The evidence block accepted a `pending` refund and then printed "The money went back". The
+    # cleanup had been taught that pending is not done; the thing printing the certificate had not.
+    "test_stripe_live_refund.py": "ensure_refunded(payment_intent_id, idempotency_key)",
+}
+"""For each harness: the call that ESTABLISHES the fact, which must run before the block that
+CERTIFIES it. See :func:`test_no_harness_certifies_a_fact_before_establishing_it`."""
+
+
+def test_no_harness_certifies_a_fact_before_establishing_it() -> None:
+    """==The pattern that bit twice in one review: what certifies is not what measures.==
+
+    Both defects were the same shape one layer apart. The cleanup was taught that a `pending`
+    refund is not money returned — and the evidence block, which is what gets pasted into
+    `live_verifications()`, went on saying "the money went back" anyway. The checkout harness
+    claimed "expired afterwards" before anything had expired. ==A false evidence block is worse
+    than a failed test==: it is the input to the register the money guard reads, so a lie there
+    becomes a lie in the guard.
+
+    So the ordering is pinned: the call that establishes the fact must appear before the block that
+    certifies it.
+
+    .. note::
+
+       ==This proves ORDER, not correctness.== It cannot tell whether the right thing was verified —
+       the runtime assertions next to each call do that (`assert unsettled is None`,
+       `assert problem is None`, `status == terminal_refund_success`). What it catches is the
+       specific regression that has now happened twice: somebody moves or adds a print, and the
+       certificate goes back to being written before the measurement.
+    """
+    for module, establishing_call in MUST_BE_ESTABLISHED_BEFORE_CERTIFYING.items():
+        source = (pathlib.Path(__file__).parent / module).read_text(encoding="utf-8")
+
+        assert EVIDENCE_MARKER in source, (
+            f"{module} no longer prints an evidence block, so this guard is watching nothing. If "
+            "the harness moved, move this with it."
+        )
+        assert establishing_call in source, (
+            f"{module} no longer calls `{establishing_call}`, so nothing establishes the fact its "
+            "evidence block certifies."
+        )
+        assert source.index(establishing_call) < source.index(EVIDENCE_MARKER), (
+            f"{module} composes its EVIDENCE block before `{establishing_call}` has run. That "
+            "block is pasted into live_verifications() — certifying a fact that has not been "
+            "established yet is how a false record reaches the money guard."
+        )
 
 
 @pytest.fixture
