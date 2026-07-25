@@ -8,10 +8,18 @@
   half is pure crypto + JSON and is UNIT-TESTED== against Stripe's documented format — no network.
 
 * :class:`StripeGateway` — the outgoing API calls (open a Checkout Session, issue a refund) over
-  HTTPS, on the BUSINESS's own ``sk_test_`` key (BYOK). ==This half is NOT verified against live
-  Stripe== in this cut — same honest treatment as the Twilio adapter in Tanda A. It is written to
-  Stripe's test-mode API shape and exercised only with a stubbed transport; a real ``sk_test_`` key
-  and a network round-trip are the B-08 gate's job, in TEST mode, with **zero real charges**.
+  HTTPS, on the BUSINESS's own key (BYOK). ==This half is NOT verified against real Stripe== — the
+  same honest treatment as the Twilio adapter in Tanda A. It is written to Stripe's documented API
+  shape and exercised only with a stubbed transport.
+
+  ==That last sentence is a CLAIM, and it is deliberately not MADE here.== Prose in a module
+  docstring is exactly what let *"Stripe, in TEST MODE"* be a filename for a cut in which nothing
+  enforced it. The machine-readable statement lives in
+  :func:`~aethercal.server.services.tenant_credentials.live_verifications`, **per operation**, and
+  the BYOK credential door reads it: while an operation of this gateway has no record of having been
+  run for real, a live Stripe credential is refused. Producing such a record is what
+  ``apps/server/tests/live/`` is for — zero-cost calls only. ==Keep the status THERE and not in this
+  paragraph==, or the two will drift and only one of them will be load-bearing.
 
 .. rubric:: Why the ``Stripe-Signature`` timestamp tolerance is NOT enforced here
 
@@ -172,8 +180,11 @@ class StripeGateway:
     """Stripe's outgoing API — checkout + refund, on the business's own key. ==NOT verified live.==
 
     ``transport`` is injectable so a unit test can stub the HTTP round-trip; production passes
-    ``None`` and a fresh :class:`httpx.AsyncClient` is used per call. The calls follow Stripe's
-    test-mode API shape but have not been exercised against a real ``sk_test_`` key in this cut.
+    ``None`` and a fresh :class:`httpx.AsyncClient` is used per call.
+
+    ==Which of these calls has ever met the real API is recorded in
+    :func:`~aethercal.server.services.tenant_credentials.live_verifications`, not here== — see this
+    module's docstring for why the fact does not live in a sentence.
     """
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:

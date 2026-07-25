@@ -158,9 +158,30 @@ account (BYOK). ==Neither provider has been run against a live account in this c
   an explicit error rather than a silent pick — a per-tenant preference needs its own migration. See
   [docs/byok-credentials.md](docs/byok-credentials.md#which-payment-provider-a-business-charges-with).
 - Neither adapter has been exercised against a live or sandbox account: Stripe's is unit-tested
-  against a stubbed HTTP transport only; no Mercado Pago account exists for this project at all. Read
-  [docs/byok-credentials.md](docs/byok-credentials.md#neither-payment-adapter-has-been-verified-against-a-live-account)
+  against a stubbed HTTP transport only; no Mercado Pago account exists for this project at all.
+  **A live credential is refused for exactly that reason** — see the next entry, and read
+  [docs/byok-credentials.md](docs/byok-credentials.md#which-payment-operations-have-been-run-against-the-real-api--and-what-that-gates)
   before taking a real charge.
+
+**A live payment credential is now refused per GATEWAY OPERATION, on evidence** — the guard used to
+require an `sk_test_`/`TEST-` prefix, which asked a question no amount of testing could ever answer
+differently, so it could only be overruled and never discharged.
+
+- The product now keeps a register of what has actually been **run against the real provider API**,
+  one record per operation (`checkout`, `refund`), each carrying the date and what was observed. A
+  live credential is refused while any operation of that gateway has no record.
+- **Nothing is verified today**, so the refusal is byte-for-byte what it was: Stripe's gateway has
+  only ever spoken to a stubbed transport, and no Mercado Pago account exists. What changed is that
+  the refusal can now be **retired by evidence** instead of by editing the guard.
+- The evidence comes from a new opt-in harness (`apps/server/tests/live/`, marked `live_provider`)
+  that exercises the real `StripeGateway` against `api.stripe.com` with **zero-cost calls only** —
+  create a Checkout Session, read it back, expire it. It never issues a refund, and it cannot: the
+  refund method is unplugged for the duration. It needs a key from the environment, never a flag,
+  and it never runs in CI.
+- **Granularity is per operation because the two cost different things to prove.** Checkout is free
+  to verify; refund is not (it needs a real charge to refund). Verifying checkout alone therefore
+  does **not** open the door — a stored credential is the row `refund` will read weeks later, for a
+  guest who has already paid.
 
 **Per-business branding** — a business's booking page is now *theirs*, not the product's.
 

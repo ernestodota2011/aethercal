@@ -177,16 +177,65 @@ aethercal-admin credentials delete --tenant-slug acme --provider stripe
 If a business genuinely needs both configured at once, that needs a **per-tenant preference field**
 (a column, a migration and an admin control) — a product decision, not a default.
 
-### Neither payment adapter has been verified against a live account
+### Which payment operations have been run against the real API — and what that gates
 
 > [!WARNING]
 > **Zero real charges have ever been made from this codebase.** Read this before you switch either
 > provider on for real money.
 
-| Provider | Verified against a live account? |
-|---|---|
-| `stripe` | ❌ **no** — written to Stripe's documented test-mode API, covered only by contract tests |
-| `mercado_pago` | ❌ **no** — no Mercado Pago account exists for this project; built against Mercado Pago's documented API and its official SDKs |
+**A live payment credential is refused while any operation of that provider's gateway has never been
+run against the real API.** Not a prefix rule and not a build flag: the product keeps a register of
+what has actually been exercised, and the door reads it.
+
+| Provider | `checkout` | `refund` | A live credential is |
+|---|---|---|---|
+| `stripe` | ❌ never run | ❌ never run | **refused** — the gateway has only ever spoken to a stubbed transport |
+| `mercado_pago` | ❌ never run | ❌ never run | **refused** — no Mercado Pago account exists for this project at all |
+
+While any ❌ remains for a provider, `aethercal-admin credentials set` accepts only a provably
+test-mode credential (`sk_test_…`, `TEST-…`) and names the operations that are still unproven.
+
+#### Why per operation, and not one flag per provider
+
+Because the two cost different things to prove, and a single flag would have to lie about one of
+them:
+
+* a **Checkout Session** can be created, read back and expired against the real API for **nothing**.
+  No card, no charge, no money;
+* a **refund** cannot be proved without a real charge to refund. That evidence has a price, and
+  somebody has to decide to pay it.
+
+So a run that exercises checkout says nothing whatever about refund — and refund is the path whose
+failure lands on a guest who has **already paid**. Marking "Stripe: verified" after the cheap half
+would record something false about the expensive half, silently.
+
+#### Running the verification harness
+
+```bash
+# The ENVIRONMENT, never a flag — an argument lands in the process table, the shell history
+# and the terminal scrollback. `read -s` keeps it out of the history too.
+read -rs AETHERCAL_LIVE_STRIPE_SECRET_KEY && export AETHERCAL_LIVE_STRIPE_SECRET_KEY
+uv run pytest apps/server/tests/live -m live_provider -s
+```
+
+It creates a Checkout Session through the real `StripeGateway`, reads it back through a *separate*
+request (so the confirmation comes from Stripe rather than from a return value), and expires it so
+nothing payable is left standing. **Zero-cost calls only** — and `StripeGateway.refund` is unplugged
+for the duration, so the one operation that moves money cannot be reached even by accident.
+
+The run prints an evidence block. **That block, not a boolean, is what goes into
+`live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
+carrying the date and what was observed. Writing one requires having done the run.
+
+> [!IMPORTANT]
+> **Verifying `checkout` alone does not open the door.** A stored credential is not scoped to an
+> operation — it is the row `refund` will read weeks later, for a guest who has already paid — so the
+> door stays shut until every operation the gateway performs has a record. The practical consequence
+> today: even after a successful checkout run, a live Stripe credential is still refused, because
+> `refund` remains unexercised. That is the honest reading of the evidence, and it is exactly what a
+> single "verified" flag would have hidden.
+
+The Mercado Pago adapter is not waiting on a harness. It is waiting on an **account**.
 
 The Mercado Pago adapter builds its `x-signature` manifest exactly as Mercado Pago's own SDKs build
 it, and derives a payment's meaning by fetching `GET /v1/payments/{id}` rather than trusting the
@@ -197,9 +246,9 @@ It also **refuses a currency whose minor unit it cannot prove** (CLP, COP, and a
 `unit_price`, and that conversion is a 100× error in a currency with no minor unit. The canonical
 table (`GET /currencies`) needs an account to read, so the adapter refuses rather than guesses.
 
-Before either adapter is trusted with real money it needs a run against a real account (test mode,
-zero real charges): the shapes above are documented, not observed. See `integrations/mercadopago.py`
-— "What is NOT proven".
+The shapes above are **documented, not observed** — and that is now the product's rule rather than
+this page's advice: until a run against a real account records what it saw, the register above keeps
+the live credential out. See `integrations/mercadopago.py` — "What is NOT proven".
 
 ---
 
@@ -292,6 +341,8 @@ not a rotation: it is a re-encryption under the key you believe you have just re
 | Concern | Module |
 |---|---|
 | Precedence, and the money asymmetry | `services/tenant_credentials.py` |
+| Which operations have been run for real (the register the live door reads) | `live_verifications()` in `services/tenant_credentials.py` |
+| The verification harness that produces the evidence | `apps/server/tests/live/` |
 | Key rotation | `services/key_rotation.py` |
 | Which columns hold ciphertext | `db/encrypted.py` |
 | Key derivation | `crypto.py` |

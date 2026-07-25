@@ -103,8 +103,39 @@ def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
     )
 
 
+LIVE_PROVIDER_MARKER = "live_provider"
+"""==The ONE marker that may reach a provider's real API, and it is not merely "an exception".==
+
+.. rubric:: Why a hole in a fail-closed guard is the honest answer here
+
+This plugin closes the door because an unverified payment adapter must never reach a real provider
+BY ACCIDENT. But the product's money guard
+(:func:`~aethercal.server.services.tenant_credentials.live_verifications`) refuses a live credential
+until somebody has DELIBERATELY exercised that adapter against the real API — so with no way through
+this door at all, the evidence could never be gathered and ==the money guard would be permanent by
+construction==: not fail-closed, merely stuck. A guard that can never be discharged is one that gets
+deleted in a hurry by whoever needs to ship, which is a worse outcome than the one it prevents.
+
+.. rubric:: What the hole is NOT
+
+* it is not "the guard is off". ==SMTP and the Google API stay shut for a live test too==: those
+  write to a real person's inbox and to somebody's real calendar, and wanting to talk to Stripe is
+  no reason at all to open them. Only the HTTP doors and the socket floor beneath them open — the
+  narrowest set that lets one HTTPS request out;
+* it is not reachable by inattention, which is the property that actually matters. It takes the
+  marker on the test, that marker registered in ``pyproject.toml`` under ``--strict-markers``, the
+  provider's key exported into the environment, and (for ``-m live_provider``) the root
+  ``conftest.py`` gate agreeing the key is really there. An ordinary run, a forgotten fake, a
+  mis-wired fixture — ==the incident this plugin was written for== — carries none of those and still
+  walks straight into the door;
+* and it is not a licence to spend. The live suite makes zero-cost calls only, and it neuters
+  ``StripeGateway.refund`` on itself so the one operation that moves money cannot be reached even by
+  mistake. That belt lives with the tests, because it is a fact about them, not about the network.
+"""
+
+
 @pytest.fixture(autouse=True)
-def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _forbid_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """==Make reaching the real network IMPOSSIBLE, rather than remembering not to.==
 
     .. rubric:: The incident this exists for
@@ -195,11 +226,21 @@ def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     an injected Google service), so this sits below both fakes and races neither. And the database,
     per the rubric above. That asymmetry is deliberate: this closes the doors that TOUCH THE WORLD,
     not the one that stores.
+
+    .. rubric:: ==And the one way through, for the one suite whose job is to walk through it==
+
+    A ``live_provider``-marked test (see :data:`LIVE_PROVIDER_MARKER`) keeps the two doors that
+    write to PEOPLE — SMTP and the Google API — shut, and opens only the HTTP doors and the socket
+    floor. ==The order below is what makes that narrowing real rather than described:== the two
+    human-facing doors are shut FIRST, unconditionally, so the early return cannot take them with it
+    however this function is later edited.
     """
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     monkeypatch.setattr(aiosmtplib.SMTP, "connect", _forbidden, raising=True)
     monkeypatch.setattr(httplib2.Http, "request", _forbidden, raising=True)
+    if request.node.get_closest_marker(LIVE_PROVIDER_MARKER) is not None:
+        return
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     # ==And the floor beneath all three.== The three above are known doors; this is the rule that
     # makes a door nobody has built yet unusable too. See the class docstring.
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect, raising=True)

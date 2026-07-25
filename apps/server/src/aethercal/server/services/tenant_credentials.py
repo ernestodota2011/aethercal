@@ -77,6 +77,7 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from typing import assert_never
 
@@ -171,14 +172,13 @@ class IncompleteCredentialError(CredentialError):
 
 
 class LiveCredentialRefusedError(CredentialError):
-    """A money credential was not provably TEST-MODE, and this cut does not take real money.
+    """A money credential was live, and this gateway has operations nobody has ever run for real.
 
-    ==The adapters behind this are unverified against their providers, and that is not a rumour —
-    it is what they say about themselves.== ``integrations/stripe.py`` — titled *"Stripe, in TEST
-    MODE"* — records that its gateway is *"NOT verified against live Stripe... exercised only with a
-    stubbed transport"*. ``integrations/mercadopago.py`` is blunter still: *"No Mercado Pago account
-    exists for this project, so nothing here has ever opened a real checkout, taken a real payment,
-    or issued a real refund."*
+    ==The refusal is not a claim about the KEY. It is a claim about the CODE that would use it.==
+    ``integrations/stripe.py`` records that its gateway is *"NOT verified against live Stripe...
+    exercised only with a stubbed transport"*. ``integrations/mercadopago.py`` is blunter still:
+    *"No Mercado Pago account exists for this project, so nothing here has ever opened a checkout,
+    taken a real payment, or issued a real refund."*
 
     Until this class, ==nothing enforced any of that==. The title was a filename and the warnings
     were prose. An operator pasting an ``sk_live_`` key into ``credentials set`` got a product that
@@ -186,6 +186,20 @@ class LiveCredentialRefusedError(CredentialError):
     status code would have said success. "LIVE is not wired" sounds like an absence; the reality was
     *present and unverified*, which is the worse of the two, because it needed nobody to build it.
     It needed only that nobody had refused it.
+
+    .. rubric:: ==The question this asks — and the one it USED to ask==
+
+    It used to ask *"is this key a TEST key?"*, and answered by requiring an ``sk_test_`` prefix.
+    ==That question has only one possible answer for ever==, because no amount of testing changes a
+    prefix: a product that refuses live keys is a product that cannot take money, and the guard was
+    therefore permanent by construction. The prefix was standing in for the fact that actually
+    mattered, and ==a stand-in cannot be discharged by evidence — only overruled==, which is how a
+    guard ends up deleted in a hurry by whoever needs to ship.
+
+    It now asks the fact directly: ==*has this provider's gateway been EXERCISED against the real
+    API, and for WHICH operations?*== (:func:`live_verifications`). An operation nobody has run is
+    refused exactly as before — so an unverified provider is still refused, arrived at honestly —
+    but the refusal can now be **retired by evidence** instead of only by fiat.
 
     .. rubric:: ==Refused, not warned — because the danger must not arrive by OMISSION==
 
@@ -195,11 +209,11 @@ class LiveCredentialRefusedError(CredentialError):
     arrive here — nobody DECIDES to charge through an unverified adapter, they simply paste the key
     they had. A refusal cannot be reached by inattention.
 
-    .. rubric:: What must be true before this is relaxed
-
-    This is a claim about the CUT, not about Stripe. Lifting it is the B-08 gate's job: a real
-    round-trip against each provider, in test mode, with zero real charges — and then a deliberate,
-    reviewed edit HERE, rather than a default that quietly stopped applying.
+    ==And the evidence cannot arrive by omission either.== Lifting this is not an edit to a boolean:
+    it is a :class:`LiveVerification` record naming the operation, the date and what was observed,
+    ONE PER OPERATION, produced by running the harness in ``apps/server/tests/live/``. Every
+    operation the gateway performs needs one, because ==a gateway verified by halves is a gateway
+    whose other half moves somebody's money unseen==.
     """
 
 
@@ -259,11 +273,149 @@ def required_fields(provider: CredentialProvider) -> frozenset[str]:
             assert_never(unreachable)
 
 
-def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
-    """field → the prefix its value MUST carry in this cut. ==An ALLOWLIST, and exhaustive.==
+class GatewayOperation(StrEnum):
+    """One ACT a money gateway performs against its provider's API. ==Verified one at a time.==
 
-    A money provider whose key says out loud which mode it is in gets that mode CHECKED, because the
-    adapters here have never spoken to a live provider (:class:`LiveCredentialRefusedError`).
+    .. rubric:: ==Why the unit of verification is the OPERATION and not the provider==
+
+    Because the two acts cost different things to prove, and a single ``stripe: verified`` flag
+    would have to lie about one of them.
+
+    * a Checkout Session can be created, read back and expired against the real API for **nothing**
+      — no card, no charge, no money moves at any point;
+    * a refund cannot be proved without a real charge to refund. The evidence has a PRICE, and
+      somebody has to decide to pay it.
+
+    So a run that exercises checkout says nothing whatever about refund — and ==refund is the path
+    whose failure lands on a guest who has ALREADY PAID==, which is the worst place in this system
+    for a claim to be optimistic. One flag for both would record the cheap evidence and quietly
+    extend it to cover the expensive question.
+
+    ==This enum is the domain's, not the gateway module's, and that is deliberate.== The
+    verification registry is read on the credential WRITE path, and ``services`` cannot import
+    ``integrations`` (that is the direction the import contracts forbid, and reversing it would make
+    a cycle). ``tests/test_credential_mode_guard.py`` therefore ties the two together from outside:
+    it walks :class:`~aethercal.server.services.payments.PaymentGateway` and asserts every operation
+    the protocol declares has a member here — so a THIRD operation (F5's partial refund, a capture)
+    cannot be added to the gateway without arriving as unverified and re-closing the door.
+    """
+
+    CHECKOUT = "checkout"
+    """``create_checkout_session`` — opening a hosted checkout. ==Provable at zero cost.=="""
+
+    REFUND = "refund"
+    """``refund`` — sending a guest's money back. ==Only provable by charging somebody first.=="""
+
+
+@dataclass(frozen=True, slots=True)
+class LiveVerification:
+    """The record of ONE operation having been exercised against the provider's REAL API.
+
+    ==A boolean is a claim; this is a claim with its receipt attached.== The thing being asserted —
+    "this code has spoken to the real provider and behaved" — is a historical fact about a run that
+    somebody performed on a day, and a bare ``True`` records none of it. Six months on, the question
+    that matters is not *is it verified?* but *what exactly was run, when, and did it cover the
+    operation I am about to trust?*, and only the evidence answers that.
+
+    It also changes what flipping the switch COSTS. A boolean is flipped by whoever is impatient; a
+    record has to be written, and writing "checkout: created cs_live_…, expired it, no money moved"
+    requires having done it. ==The friction is the feature==: this is the exact edit that stands
+    between the product and somebody's real money.
+    """
+
+    operation: GatewayOperation
+    """Which act was exercised. ==One record per act== — never one record meaning "the provider"."""
+
+    verified_on: date
+    """The day the harness was run against the real API."""
+
+    evidence: str
+    """What was actually observed: the calls made, the identifiers returned, the money NOT moved."""
+
+
+def gateway_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
+    """Which acts this provider's gateway performs. ==DERIVED from the credential class.==
+
+    Every MONEY provider gets the same set because they all implement the same
+    :class:`~aethercal.server.services.payments.PaymentGateway` protocol — the operations are a
+    property of that seam, not of the individual provider. Deriving it means a new payment processor
+    inherits the full list of things it must prove, rather than an empty one somebody forgot to fill
+    in.
+
+    INFRA providers have no gateway at all, so the answer is the empty set — and that is what makes
+    :func:`unverified_operations` vacuously empty for them, which is the correct reading: an SMTP
+    relay has nothing to verify against a payment API because it never talks to one.
+    """
+    match credential_class(provider):
+        case CredentialClass.MONEY:
+            return frozenset(GatewayOperation)
+        case CredentialClass.INFRA:
+            return frozenset()
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
+def live_verifications(provider: CredentialProvider) -> tuple[LiveVerification, ...]:
+    """What has ACTUALLY been exercised against this provider's real API. ==Exhaustive.==
+
+    ==This is the fact the money guard is now founded on==, and it is a register of history rather
+    than a policy: each entry is something somebody ran, on a day, and wrote down what came back.
+
+    A tuple of records rather than a mapping keyed by operation, so there is no key that can
+    disagree with the record it points at — the operation a verification is ABOUT is a field of the
+    verification, and it is stated once.
+
+    ``assert_never``, exactly as in :func:`credential_class` and :func:`required_fields`: a third
+    payment processor does not type-check until somebody has said what has been run against it, and
+    the only honest answer on the day it is added is ``()``.
+    """
+    match provider:
+        case CredentialProvider.STRIPE:
+            # ==NOTHING. `StripeGateway` has still only ever spoken to a stubbed transport.==
+            #
+            # The harness that can change this line is `tests/live/test_stripe_live_checkout.py`,
+            # and ONLY running it may: `CHECKOUT` goes here when somebody has watched a real
+            # Checkout Session be created, read back and expired against api.stripe.com. `REFUND`
+            # needs a real charge to refund, which is a decision with a price attached — see
+            # `docs/byok-credentials.md`.
+            return ()
+        case CredentialProvider.MERCADO_PAGO:
+            # No Mercado Pago account exists for this project, so neither operation has ever run.
+            # Nothing here is pending a harness — it is pending an ACCOUNT.
+            return ()
+        case CredentialProvider.SMTP | CredentialProvider.WHATSAPP | CredentialProvider.SMS:
+            # No payment gateway, nothing to verify against one. See `gateway_operations`.
+            return ()
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
+def verified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
+    """The operations with a :class:`LiveVerification` behind them. Derived from the register."""
+    return frozenset(record.operation for record in live_verifications(provider))
+
+
+def unverified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
+    """What this gateway DOES, minus what has been seen working. ==The gap the guard defends.==
+
+    Non-empty means: there is an act this product would perform with a live credential that has
+    never once been performed for real. Empty means every act the gateway can take has a receipt.
+    """
+    return gateway_operations(provider) - verified_operations(provider)
+
+
+def declared_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
+    """field → the prefix that PROVES test mode. ==The DECLARATION: an allowlist, and exhaustive.==
+
+    This is what each provider's own scheme says, and it never changes with what has been verified.
+    ==What is ENFORCED at any moment is :func:`required_test_mode_prefixes`==, which reads this one
+    through the verification register.
+
+    Keeping the two apart is what stops the derived-rule tests going vacuous: they assert *every
+    money provider declares a prefix, and the field it names is one the provider requires*, and they
+    must keep asserting it after a provider is verified and stops being checked. A test that walked
+    the ENFORCED map would silently start passing over an empty dict — proving nothing, loudly
+    green.
 
     .. rubric:: ==Why a required prefix and not a list of forbidden ones==
 
@@ -299,6 +451,40 @@ def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, st
             return {}
         case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
             assert_never(unreachable)
+
+
+def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
+    """What the door ENFORCES right now. ==DERIVED from what has been verified, not declared.==
+
+    One sentence, and the whole of the money guard reads off it: ==*a provider whose gateway still
+    has an unexercised operation must present a provably TEST-mode credential; a provider whose
+    every operation has a receipt may present a live one.*==
+
+    .. rubric:: ==Why ALL of them, and not just the one about to run==
+
+    A stored credential is not scoped to an operation. It sits in the row that ``refund`` will read
+    six weeks from now, on a Sunday, for a guest who has already paid. This door authorises
+    everything the gateway can do, so it must be satisfied about everything the gateway can do —
+    ==an aggregate that lets ONE verified operation open the door would be authorising the others by
+    silence==, which is the shape of the original defect wearing a newer word.
+
+    The practical consequence, stated rather than discovered: verifying Stripe's checkout (free) is
+    ==not enough on its own== to accept a live Stripe key, because ``refund`` remains unexercised.
+    That is the honest reading of the evidence, and it is exactly what a single "Stripe verified"
+    flag would have hidden.
+
+    .. rubric:: The three degenerate answers, and why each is right
+
+    * **unverified provider** → the declared prefixes. The pre-existing refusal, unchanged;
+    * **fully verified provider** → ``{}``. Nothing to check: a live key is as legitimate as a test
+      one, which is the entire point of having verified it. A test-mode key still passes — it simply
+      is not required any more;
+    * **INFRA provider** → ``{}`` by both routes at once (no gateway operations, no declared
+      prefixes). It was never subject to a mode and still is not.
+    """
+    if unverified_operations(provider):
+        return declared_test_mode_prefixes(provider)
+    return {}
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -356,18 +542,22 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
             # value.== A live key is the most sensitive thing this system is ever handed, and
             # refusing it does not make it less secret; echoing it (or even the prefix it failed on)
             # would put it in the operator's terminal, their shell history and the CLI's stderr.
+            unverified = ", ".join(sorted(op.value for op in unverified_operations(provider)))
             raise LiveCredentialRefusedError(
-                f"the {provider.value} `{field}` is not a test-mode credential, and this build "
-                "does not take real money.\n"
+                f"the {provider.value} `{field}` is not a test-mode credential, and the "
+                f"{provider.value} gateway still performs operations that have NEVER been run "
+                f"against the real provider: {unverified}.\n"
                 "\n"
-                f"It must start with `{prefix}`. ==This is refused rather than warned about==: the "
-                f"{provider.value} adapter in this cut has NEVER been run against the real "
-                "provider — it is exercised only with a stubbed transport — so a live credential "
-                "here would charge a real guest's real card through code that has never spoken to "
-                f"{provider.value}, and every status code would say success.\n"
+                f"It must start with `{prefix}`. ==This is refused rather than warned about==: a "
+                "live credential here would move real money through code exercised only with a "
+                "stubbed transport, and every status code would say success.\n"
                 "\n"
-                "Use the test-mode credential from the provider's dashboard. Real charges are the "
-                "B-08 gate's job, after a verified round-trip.\n"
+                "==The refusal is lifted by EVIDENCE, one operation at a time.== Exercise the "
+                "operation against the real API (`apps/server/tests/live/`, zero-cost calls only) "
+                "and record what came back as a `LiveVerification` in `live_verifications()`. The "
+                "door opens when EVERY operation the gateway performs has one — a half-verified "
+                "gateway is one whose other half moves somebody's money unseen. Meanwhile, use the "
+                "test-mode credential from the provider's dashboard.\n"
                 "\n"
                 "(The value is not shown — it is a secret, wrong mode or not.)"
             )
@@ -656,19 +846,26 @@ __all__ = [
     "CredentialError",
     "CredentialProvider",
     "CredentialSource",
+    "GatewayOperation",
     "IncompleteCredentialError",
     "LiveCredentialRefusedError",
+    "LiveVerification",
     "MalformedCredentialError",
     "MissingCredentialError",
     "ResolvedCredential",
     "WrongCredentialClassError",
     "credential_class",
+    "declared_test_mode_prefixes",
     "delete_credential",
+    "gateway_operations",
     "list_credential_providers",
+    "live_verifications",
     "required_fields",
     "required_test_mode_prefixes",
     "resolve_infra_credential",
     "resolve_money_credential",
     "resolve_tenant_money_provider",
     "store_credential",
+    "unverified_operations",
+    "verified_operations",
 ]

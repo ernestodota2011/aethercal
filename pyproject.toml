@@ -121,6 +121,14 @@ markers = [
     # lock). They skip unless AETHERCAL_TEST_DATABASE_URL is set, so the default matrix
     # (ubuntu+windows, no Docker) stays green; a dedicated CI job with a postgres service runs them.
     "db: requires a real PostgreSQL database (set AETHERCAL_TEST_DATABASE_URL)",
+    # Opt-in tests that exercise a REAL provider API with a REAL credential, to produce the
+    # evidence `live_verifications()` records before a live payment credential may be stored.
+    # They skip unless the provider's key is exported, so the default matrix never dials out; the
+    # repo-root conftest turns `-m live_provider` WITHOUT a key into a hard error rather than a
+    # green run of nothing. ==Zero-cost calls only: create a Checkout Session, read it, expire it.
+    # No charge, no refund, no money moves.== They are the one exception to the repo-wide network
+    # guard (see pytest_network_guard.py) and are never run in CI.
+    "live_provider: exercises a REAL provider API (set AETHERCAL_LIVE_STRIPE_SECRET_KEY); zero-cost calls only, never in CI",
 ]
 
 [tool.coverage.run]
