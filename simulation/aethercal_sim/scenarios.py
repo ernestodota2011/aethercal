@@ -725,6 +725,90 @@ def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two ti
     )
 
 
+def control_single_winner(
+    race: RaceOutcome | None,
+    *,
+    ident: str,
+    guards: str,
+    expected_refusal: str,
+) -> Control:
+    """==THE claim of the whole report, finally wired to the verdict.==
+
+    The same-slot race was reported in a table and nowhere else: the run would have stamped
+    ``MEASURED`` with five winners on one slot, because nothing compared its result to anything.
+    The headline number of the document could not invalidate the document.
+
+    Passing requires all three of:
+
+    * **exactly one winner** — the RF-04 guarantee itself;
+    * **every other contender refused with the expected code** (a slot that is taken must answer
+      ``slot_unavailable``, not some other conflict that happens to be a 409);
+    * **no unexpected responses** — a 5xx or a transport error under load is a finding, and a race
+      that produced one winner because the other 39 crashed is not a passing race.
+    """
+    if race is None:
+        return Control.not_run(ident, guards, "exactly 1 winner", "the race never ran")
+    codes = set(race.refusals_by_code)
+    passed = (
+        race.winners == 1
+        and race.refusals == race.contenders - 1
+        and codes <= {expected_refusal}
+        and not race.unexpected
+    )
+    return Control(
+        ident=ident,
+        guards=guards,
+        expected=f"exactly 1 winner of {race.contenders}, the rest `{expected_refusal}`",
+        observed=(
+            f"{race.winners} winner(s), {race.refusals} refused {race.refusals_by_code}"
+            + (f", UNEXPECTED: {race.unexpected}" if race.unexpected else "")
+        ),
+        passed=passed,
+    )
+
+
+def control_outbox_drained(
+    *, drained: bool, waited_seconds: float, scrape_failures: int
+) -> Control:
+    """The queue must actually empty, and the instrument must have been readable throughout.
+
+    A run that ends with work still due did not observe the drain keeping up — it observed it
+    losing — and the latency figures for booking→confirmation describe only the messages that made
+    it out. Scrape failures count too: backlog numbers computed over a series with holes in it
+    understate the peak, so an unexplained hole invalidates rather than decorates the result. (The
+    deliberate outage in C5 pauses the sampler, so those failures never reach this count.)
+    """
+    passed = drained and scrape_failures == 0
+    return Control(
+        ident="C12",
+        guards="the outbox actually drained, and the backlog was readable throughout",
+        expected="due == 0 before the run ends, with 0 unexplained scrape failures",
+        observed=(
+            f"drained={drained} after {waited_seconds:.1f}s; "
+            f"unexplained scrape failures={scrape_failures}"
+        ),
+        passed=passed,
+    )
+
+
+def pick_micro_slot(
+    starts: list[str], *, duration_seconds: int, budget_seconds: float, now: datetime
+) -> str | None:
+    """The first offered slot that will really END inside this run's waiting budget.
+
+    ==The no-show leg used to take ``starts[0]`` and then cap its wait with ``min(...)``.== If that
+    slot ended later than the cap, the harness stopped waiting, marked the no-show anyway, and
+    recorded whatever came back — a `409 not_ended` would have been filed as the observed outcome of
+    a *positive* test. Choosing the slot by its end time removes the need for a cap at all: either a
+    slot fits the budget and is waited out in full, or none does and the control says NOT RUN.
+    """
+    for start in starts:
+        ends_in = (parse_iso(start) + timedelta(seconds=duration_seconds) - now).total_seconds()
+        if 0 <= ends_in <= budget_seconds:
+            return start
+    return None
+
+
 def active_bookings_for_guest(
     stack: StackConfig,
     business: Business,

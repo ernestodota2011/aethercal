@@ -122,15 +122,26 @@ class Client:
         if data is not None:
             request.add_header("Content-Type", "application/json")
 
+        # ==The clock stops AFTER the body is read and the response closed, on BOTH branches.==
+        # It used to stop the moment the headers arrived, which measures time-to-first-byte and
+        # published it as the guest's wait. Every percentile in the report was therefore biased LOW
+        # by however long the body took — and a regression that made responses fatter or slower to
+        # stream would have been invisible to the very instrument built to catch it. The order below
+        # is load-bearing: read, close, THEN measure.
         started = time.perf_counter()
         try:
             with _OPENER.open(request, timeout=_TIMEOUT_SECONDS) as raw:
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                text = raw.read().decode("utf-8", errors="replace")
+                payload_bytes = raw.read()
                 status = int(raw.status)
-        except urllib.error.HTTPError as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            text = exc.read().decode("utf-8", errors="replace")
+            text = payload_bytes.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            # Same order on the error branch, or refusals would look artificially faster than
+            # successes and the 409-heavy race tables would quietly flatter themselves.
+            payload_bytes = exc.read()
+            exc.close()
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            text = payload_bytes.decode("utf-8", errors="replace")
             status = int(exc.code)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000.0

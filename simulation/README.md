@@ -21,6 +21,20 @@ Every claim the report makes has a case that **must fail**, and a control that c
 **voids the run** rather than improving it. The harness exits non-zero unless every control held, so
 a run that proved nothing can never read as a green one.
 
+==And the verdict is bound to the REQUIRED SET of control ids, not to however many happened to be
+appended.== That distinction is the whole point, and it was learned the hard way: the first version
+of this harness appended each control inside the `if` that created its subject, so a missing
+prerequisite produced *no control* rather than a failing one — and "7 of 7 held" reads exactly as
+well as "12 of 12 held". A pass count derived from the list it summarises **cannot see its own
+omissions**. So `report.REQUIRED_CONTROL_IDS` names them independently, an id that never appears is
+`VOID` (not merely `INCOMPLETE`), and a prerequisite that cannot be met emits `Control.not_run(...)`
+— a fact — instead of silence.
+
+The same version stamped `MEASURED` while the **double-booking race itself took no part in the
+verdict**: it lived in a table and nowhere else, so a run with five winners on one slot would have
+been certified green. `C10` exists because the headline claim of a document must be able to
+invalidate that document.
+
 | id | What it guards | It passes only if |
 |---|---|---|
 | **C1** | the no-double-booking claim | booking an already-taken slot is refused `409 slot_unavailable` |
@@ -32,6 +46,9 @@ a run that proved nothing can never read as a green one.
 | **C7** | cancel idempotency | N simultaneous cancels emit **exactly one** `booking.cancelled` webhook |
 | **C8** | a reschedule race leaves ONE successor | exactly one live appointment survives in the lineage |
 | **C9** | a cancel racing a reschedule | **never** two live appointments (either order is legitimate) |
+| **C10** | ==the headline claim itself (RF-04)== | the same-slot race left **exactly one** winner, the rest `slot_unavailable`, nothing unexpected |
+| **C11** | the no-show transition | `200` **and** the booking's status really becomes `no_show` |
+| **C12** | the drain finished, readably | `due == 0` before the run ends, with zero unexplained scrape failures |
 
 **C2 and C5 audit the harness rather than the product**, and they are the two that matter most.
 

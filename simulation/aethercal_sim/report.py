@@ -70,8 +70,37 @@ def _latency_row(latency: Latency) -> str:
     )
 
 
+#: ==The controls a run MUST account for, by id.== Not "however many happened to be appended".
+#:
+#: Every one of these was, at some point, appended inside an `if` — so a missing prerequisite did
+#: not produce a failing control, it produced NO control, and the report cheerfully announced
+#: "7 of 7 held". A count that is derived from the list it is summarising cannot detect its own
+#: omissions: "9 of 9" and "7 of 7" look equally perfect, and the second is a run that never asked
+#: two of its questions. Naming the set here makes absence a first-class failure.
+#:
+#: Adding a control means adding its id here. That is the intended friction.
+REQUIRED_CONTROL_IDS: frozenset[str] = frozenset(
+    {"C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12"}
+)
+
+
+def missing_controls(controls: list[Control]) -> list[str]:
+    """Required ids that never appeared in the run at all. Sorted, for a stable report."""
+    present = {control.ident for control in controls}
+    return sorted(REQUIRED_CONTROL_IDS - present, key=lambda ident: (len(ident), ident))
+
+
 def verdict_for(controls: list[Control]) -> str:
-    """VOID beats INCOMPLETE beats MEASURED — the worst true statement wins."""
+    """VOID beats INCOMPLETE beats MEASURED — the worst true statement wins.
+
+    ==A required control that is ABSENT is VOID, not INCOMPLETE.== "Did not run" is a fact the
+    harness reports about itself (``Control.not_run``), and it is honest: the run is INCOMPLETE and
+    says which question went unasked. But an id that never reached this list at all means the code
+    path meant to ask it was skipped without saying so — a defect in the instrument, which is
+    strictly worse than a known gap and must not be softened into one.
+    """
+    if missing_controls(controls):
+        return "VOID"
     if any(control.ran and not control.passed for control in controls):
         return "VOID"
     if any(not control.ran for control in controls):
@@ -99,6 +128,7 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
 ) -> str:
     verdict = verdict_for(controls)
     not_run = [control for control in controls if not control.ran]
+    absent = missing_controls(controls)
 
     lines: list[str] = []
     add = lines.append
@@ -234,15 +264,29 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         "These are the cases that MUST be refused; without them the numbers above are anecdote."
     )
     add("")
+    add(
+        f"Required control set: **{len(REQUIRED_CONTROL_IDS)}** ids "
+        f"(`{', '.join(sorted(REQUIRED_CONTROL_IDS, key=lambda i: (len(i), i)))}`). "
+        f"Accounted for in this run: **{len(controls)}**."
+    )
+    add("")
     add("| id | guards | expected | observed | held |")
     add("|---|---|---|---|:--:|")
-    for control in sorted(controls, key=lambda item: item.ident):
+    for control in sorted(controls, key=lambda item: (len(item.ident), item.ident)):
         mark = "⏭️" if not control.ran else ("✅" if control.passed else "❌")
         add(
             f"| **{control.ident}** | {control.guards} | {control.expected} "
             f"| {control.observed} | {mark} |"
         )
     add("")
+    if absent:
+        add(
+            f"> [!danger] ==**{len(absent)} required control(s) never appeared in this run at "
+            f"all: {', '.join(absent)}.**== That is not a gap the harness reported — it is a gap "
+            "the harness FAILED to report, which is why this run is VOID rather than INCOMPLETE. "
+            "A pass count derived from the list it summarises cannot see its own omissions."
+        )
+        add("")
 
     # ---- 6. errors ----
     add("## 6. Error taxonomy (every outcome, successes included)")

@@ -45,10 +45,13 @@ from .scenarios import (
     control_drain_deadman,
     control_lineage_after_race,
     control_no_show_before_end,
+    control_outbox_drained,
+    control_single_winner,
     control_taken_slot,
     count_sink_events,
     fetch_slots,
     next_saturday,
+    pick_micro_slot,
     race_cancel,
     race_cancel_vs_reschedule,
     race_distinct_slots,
@@ -60,7 +63,7 @@ from .scenarios import (
 )
 from .scenarios import book as book_slot
 from .traffic import plan_two_weeks, summarise_plan
-from .world import MICRO_DURATION_SECONDS, load_stack, provision
+from .world import load_stack, provision
 
 #: How Spanish-leaning each business's guests are. The third is deliberately bilingual.
 LOCALE_MIX = {"clinica-sonrisa": 0.85, "katy-hvac": 0.15, "estudio-legal": 0.5}
@@ -68,6 +71,10 @@ LOCALE_MIX = {"clinica-sonrisa": 0.85, "katy-hvac": 0.15, "estudio-legal": 0.5}
 #: Slots the adversarial phase needs beyond the burst itself: one for the taken-slot control and
 #: three subjects for the mutation races.
 _SPARE_SLOTS = 4
+
+#: How long the run will wait for a micro appointment to genuinely end before giving up on the
+#: no-show leg. A budget, never a truncation: a slot that does not fit is not chosen at all.
+NO_SHOW_WAIT_BUDGET_SECONDS = 420.0
 
 _DEFAULT_STACK_FILE = Path(__file__).resolve().parent.parent / ".stack.json"
 
@@ -203,6 +210,17 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
     same_slot = race_same_slot(stack, target, start=starts[0], contenders=args.contenders)
     races.append(same_slot)
     print(f"    same slot: {same_slot.winners} winner(s) of {same_slot.contenders}")
+    # ==C10 — THE claim of the whole report, wired to the verdict.== Until this existed the
+    # same-slot race lived in a table and nowhere else: the run would have stamped MEASURED with
+    # five winners on one slot, because nothing ever compared its result against anything.
+    controls.append(
+        control_single_winner(
+            same_slot,
+            ident="C10",
+            guards="RF-04 itself: N simultaneous bookings of ONE slot leave exactly one",
+            expected_refusal="slot_unavailable",
+        )
+    )
 
     # ==The control for the oracle.== Same burst, same code path, N different slots → N winners.
     distinct = race_distinct_slots(
@@ -236,8 +254,21 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         )
         return str(response.body["id"]) if response.ok else None
 
+    # ==Every control below is appended on EVERY path.== They used to live inside the `if` that
+    # created their subject, so a booking that failed to be created did not produce a failing
+    # control — it produced no control at all, and the report announced "7 of 7 held" for a run
+    # that had quietly stopped asking two of its questions. A missing prerequisite is now a
+    # NOT RUN row (and an INCOMPLETE verdict), which is a fact; silence was not.
+    _C7 = "an idempotent cancel emits exactly ONE booking.cancelled webhook"
+    _C8 = "a reschedule race leaves ONE successor, not two live appointments"
+    _C9 = "a cancel racing a reschedule never leaves TWO live appointments"
+
     cancel_id = subject(args.contenders + 1, "Cancel")
-    if cancel_id is not None:
+    if cancel_id is None:
+        controls.append(
+            Control.not_run("C7", _C7, "exactly 1 booking.cancelled", "its subject never booked")
+        )
+    else:
         races.append(race_cancel(stack, target, booking_id=cancel_id, contenders=args.contenders))
         # Let the drain deliver whatever was queued, then ask the sink the question that matters.
         time.sleep(12)
@@ -245,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         controls.append(
             Control(
                 ident="C7",
-                guards="an idempotent cancel emits exactly ONE booking.cancelled webhook",
+                guards=_C7,
                 expected="exactly 1 booking.cancelled at the sink for this booking",
                 observed=f"{cancel_race_events}",
                 passed=cancel_race_events.get("booking.cancelled", 0) == 1,
@@ -253,98 +284,148 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         )
 
     reschedule_id = subject(args.contenders + 2, "Reschedule")
+    later_starts: list[str] = []
     if reschedule_id is not None:
-        later = fetch_slots(
-            client,
-            event_type_id=target.event_types["standard"].id,
-            day=race_day + timedelta(days=7),
-            timezone=target.config.timezone,
-            days=5,
+        later_starts = slot_starts(
+            fetch_slots(
+                client,
+                event_type_id=target.event_types["standard"].id,
+                day=race_day + timedelta(days=7),
+                timezone=target.config.timezone,
+                days=5,
+            )
+        )[: args.contenders]
+    if reschedule_id is None or len(later_starts) < 2:
+        why = (
+            "its subject never booked"
+            if reschedule_id is None
+            else f"only {len(later_starts)} target slots on offer, need 2"
         )
-        later_starts = slot_starts(later)[: args.contenders]
-        if len(later_starts) >= 2:
-            races.append(
-                race_reschedule(stack, target, booking_id=reschedule_id, starts=later_starts)
+        controls.append(Control.not_run("C8", _C8, "exactly 1 successor survives", why))
+    else:
+        races.append(race_reschedule(stack, target, booking_id=reschedule_id, starts=later_starts))
+        # ==What the race LEFT BEHIND, which is the invariant that matters.== One HTTP winner is
+        # not the contract; one live appointment is.
+        controls.append(
+            control_lineage_after_race(
+                stack,
+                target,
+                ident="C8",
+                guards=_C8,
+                guest_email=f"reschedule.subject.{run_id}@guests.sim.test",
+                date_from=race_day,
+                date_to=race_day + timedelta(days=28),
             )
-            # ==What the race LEFT BEHIND, which is the invariant that matters.== One HTTP winner
-            # is not the contract; one live appointment is.
-            controls.append(
-                control_lineage_after_race(
-                    stack,
-                    target,
-                    ident="C8",
-                    guards="a reschedule race leaves ONE successor, not two live appointments",
-                    guest_email=f"reschedule.subject.{run_id}@guests.sim.test",
-                    date_from=race_day,
-                    date_to=race_day + timedelta(days=28),
-                )
-            )
+        )
 
     mixed_id = subject(args.contenders + 3, "Mixed")
+    spare_starts: list[str] = []
     if mixed_id is not None:
-        spare = fetch_slots(
-            client,
-            event_type_id=target.event_types["standard"].id,
-            day=race_day + timedelta(days=14),
-            timezone=target.config.timezone,
-            days=5,
+        spare_starts = slot_starts(
+            fetch_slots(
+                client,
+                event_type_id=target.event_types["standard"].id,
+                day=race_day + timedelta(days=14),
+                timezone=target.config.timezone,
+                days=5,
+            )
         )
-        spare_starts = slot_starts(spare)
-        if spare_starts:
-            races.append(
-                race_cancel_vs_reschedule(stack, target, booking_id=mixed_id, start=spare_starts[0])
+    if mixed_id is None or not spare_starts:
+        why = "its subject never booked" if mixed_id is None else "no target slot on offer"
+        controls.append(Control.not_run("C9", _C9, "at most 1 active booking survives", why))
+    else:
+        races.append(
+            race_cancel_vs_reschedule(stack, target, booking_id=mixed_id, start=spare_starts[0])
+        )
+        # ==Both calls answering 200 here is CORRECT, so the winner count is not the oracle.== The
+        # reschedule swaps in a successor; the cancel then finds the predecessor already cancelled
+        # and is an idempotent no-op. Either order is legitimate — what must never happen is the
+        # guest ending up holding two live appointments.
+        controls.append(
+            control_lineage_after_race(
+                stack,
+                target,
+                ident="C9",
+                guards=_C9,
+                guest_email=f"mixed.subject.{run_id}@guests.sim.test",
+                date_from=race_day,
+                date_to=race_day + timedelta(days=28),
+                at_most=True,
             )
-            # ==Both calls answering 200 here is CORRECT, so the winner count is not the oracle.==
-            # The reschedule swaps in a successor; the cancel then finds the predecessor already
-            # cancelled and is an idempotent no-op. Either order is legitimate — what must never
-            # happen is the guest ending up holding two live appointments.
-            controls.append(
-                control_lineage_after_race(
-                    stack,
-                    target,
-                    ident="C9",
-                    guards="a cancel racing a reschedule never leaves TWO live appointments",
-                    guest_email=f"mixed.subject.{run_id}@guests.sim.test",
-                    date_from=race_day,
-                    date_to=race_day + timedelta(days=28),
-                    at_most=True,
-                )
-            )
+        )
 
     # ---- Phase 3: the remaining controls ----------------------------------------------------
     print("==> phase 3: controls")
     controls.append(control_closed_day(stack, target, saturday=next_saturday(window_start)))
     controls.append(control_day_cap(stack, target, day=window_start + timedelta(days=35)))
 
-    # The no-show leg: a two-minute appointment that really ends during the run.
-    no_show_outcome = "no micro slot on offer"
+    # ---- The no-show leg: an appointment that REALLY ends inside this run --------------------
+    #
+    # ==The slot is chosen by when it ENDS, and the wait is never truncated.== This used to take
+    # the first offered slot and then cap the wait with `min(...)`: if that slot ended after the
+    # cap, the harness stopped waiting early, marked the no-show anyway, and filed whatever came
+    # back as the outcome — so a `409 not_ended`, which is the guard correctly refusing, would have
+    # been recorded as the result of a POSITIVE test. Picking by end time removes the need for a
+    # cap: either a slot fits the budget and is waited out in full, or none does and C11 says NOT
+    # RUN.
+    _C6 = "the no-show guard: an appointment that has not ended cannot be a no-show"
+    _C11 = "the no-show transition itself, against a real end time"
+    no_show_outcome = "not attempted"
     micro = target.event_types["micro"]
-    micro_starts = slot_starts(
-        fetch_slots(client, event_type_id=micro.id, day=date.today(), timezone="UTC", days=2)
+    micro_start = pick_micro_slot(
+        slot_starts(
+            fetch_slots(client, event_type_id=micro.id, day=date.today(), timezone="UTC", days=2)
+        ),
+        duration_seconds=micro.duration_seconds,
+        budget_seconds=NO_SHOW_WAIT_BUDGET_SECONDS,
+        now=datetime.now(UTC),
     )
-    if micro_starts:
-        micro_booking = book_slot(
+    micro_booking = (
+        book_slot(
             client,
             event_type_id=micro.id,
-            start=micro_starts[0],
+            start=micro_start,
             guest_name="No Show Subject",
             guest_email=f"noshow.{run_id}@guests.sim.test",
             guest_timezone="UTC",
             locale="en",
         )
-        if micro_booking.ok:
-            micro_id = str(micro_booking.body["id"])
-            # C6 first: while the appointment is still running, a no-show must be refused.
-            controls.append(control_no_show_before_end(stack, target, booking_id=micro_id))
-            end_at = datetime.fromisoformat(str(micro_booking.body["end"]).replace("Z", "+00:00"))
-            wait = (end_at - datetime.now(UTC)).total_seconds() + 5
-            if wait > 0:
-                print(f"    waiting {wait:.0f}s for the micro appointment to really end")
-                time.sleep(min(wait, MICRO_DURATION_SECONDS + 90))
-            marked = client.post(f"/api/v1/bookings/{micro_id}/no-show")
-            no_show_outcome = f"{marked.status} {marked.error_code or 'no_show recorded'}"
-        else:
-            no_show_outcome = f"could not book the micro slot: {micro_booking.status}"
+        if micro_start is not None
+        else None
+    )
+    if micro_booking is None or not micro_booking.ok:
+        why = (
+            f"no offered slot ends within {NO_SHOW_WAIT_BUDGET_SECONDS:.0f}s"
+            if micro_booking is None
+            else f"the micro slot could not be booked ({micro_booking.status})"
+        )
+        no_show_outcome = f"NOT RUN — {why}"
+        controls.append(Control.not_run("C6", _C6, "409 not_ended", why))
+        controls.append(Control.not_run("C11", _C11, "200 and status becomes no_show", why))
+    else:
+        micro_id = str(micro_booking.body["id"])
+        # C6 first: while the appointment is still running, a no-show must be REFUSED.
+        controls.append(control_no_show_before_end(stack, target, booking_id=micro_id))
+        end_at = datetime.fromisoformat(str(micro_booking.body["end"]).replace("Z", "+00:00"))
+        wait = (end_at - datetime.now(UTC)).total_seconds() + 5
+        if wait > 0:
+            print(f"    waiting {wait:.0f}s for the micro appointment to really end")
+            time.sleep(wait)
+        marked = client.post(f"/api/v1/bookings/{micro_id}/no-show")
+        # ==Assert the EFFECT, not just the status.== A 200 whose row is still `confirmed` would
+        # be a silent no-op, which is this repo's signature defect; so the booking is re-read.
+        after = client.get(f"/api/v1/bookings/{micro_id}")
+        final_status = str(after.body.get("status")) if isinstance(after.body, dict) else "unknown"
+        no_show_outcome = f"{marked.status} {marked.error_code or 'ok'} → status={final_status}"
+        controls.append(
+            Control(
+                ident="C11",
+                guards=_C11,
+                expected="200, and the booking's status really becomes no_show",
+                observed=no_show_outcome,
+                passed=marked.ok and final_status == "no_show",
+            )
+        )
 
     # C5 — the drain dead-man. It stops the worker, so it runs last.
     drain_stats: dict[str, float] = {}
@@ -391,6 +472,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
     print("==> waiting for the outbox to drain")
     drained, drain_wait = wait_for_drain(sampler, timeout_seconds=300.0)
     sampler.stop()
+    # ==C12 — a failed drain now INVALIDATES the run.== `drained` was computed, printed in §3 and
+    # then ignored: a run whose queue never emptied still stamped MEASURED, while the
+    # booking→confirmation figures silently described only the messages that escaped. Scrape
+    # failures gate too, because a backlog series with holes in it understates its own peak. (C5's
+    # deliberate outage pauses the sampler, so those never land in this count.)
+    controls.append(
+        control_outbox_drained(
+            drained=drained,
+            waited_seconds=drain_wait,
+            scrape_failures=len(sampler.failures),
+        )
+    )
 
     drain_latency = Latency("booking_to_confirmation_email")
     first_seen: dict[str, float] = {}

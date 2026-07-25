@@ -15,7 +15,7 @@ import pytest
 
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import ErrorTally, Latency, percentile
-from aethercal_sim.report import verdict_for
+from aethercal_sim.report import REQUIRED_CONTROL_IDS, missing_controls, verdict_for
 from aethercal_sim.scenarios import Control, next_saturday
 from aethercal_sim.traffic import WEEKDAY_WEIGHTS, PlannedBooking, plan_two_weeks, summarise_plan
 
@@ -181,24 +181,80 @@ def _control(ident: str, *, passed: bool, ran: bool = True) -> Control:
     return Control(ident, "guards", "expected", "observed", passed=passed, ran=ran)
 
 
+def _full_set(**overrides: Control) -> list[Control]:
+    """Every REQUIRED control, all passing, minus whatever a test wants to change."""
+    controls = {ident: _control(ident, passed=True) for ident in REQUIRED_CONTROL_IDS}
+    controls.update(overrides)
+    return list(controls.values())
+
+
 def test_all_controls_holding_is_measured() -> None:
-    assert verdict_for([_control("C1", passed=True), _control("C2", passed=True)]) == "MEASURED"
+    assert verdict_for(_full_set()) == "MEASURED"
 
 
 def test_a_failed_control_voids_the_run() -> None:
     """==A run with a dead control is not a good run with an asterisk; it is no run at all.=="""
-    assert verdict_for([_control("C1", passed=True), _control("C2", passed=False)]) == "VOID"
+    assert verdict_for(_full_set(C2=_control("C2", passed=False))) == "VOID"
 
 
 def test_a_control_that_did_not_run_makes_the_run_incomplete() -> None:
-    controls = [_control("C1", passed=True), _control("C5", passed=False, ran=False)]
-    assert verdict_for(controls) == "INCOMPLETE"
+    assert verdict_for(_full_set(C5=_control("C5", passed=False, ran=False))) == "INCOMPLETE"
 
 
 def test_a_failure_outranks_a_skip() -> None:
     """The worst TRUE statement wins: a real failure is not softened by an unrelated skip."""
-    controls = [_control("C1", passed=False), _control("C5", passed=False, ran=False)]
+    controls = _full_set(
+        C1=_control("C1", passed=False),
+        C5=_control("C5", passed=False, ran=False),
+    )
     assert verdict_for(controls) == "VOID"
+
+
+# --------------------------------------------------------------------------------------
+# ==The verdict must notice a control that is ABSENT, not merely one that failed.==
+#
+# Every control used to be appended inside an `if`, so a missing prerequisite produced NO control
+# rather than a failing one — and "7 of 7 held" reads exactly as well as "9 of 9 held". A pass count
+# derived from the list it summarises cannot see its own omissions, so the required set is named
+# independently and absence is checked against it.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_omitted_control_voids_the_run() -> None:
+    """A SHORT list of all-passing controls must not read as a clean run."""
+    controls = [control for control in _full_set() if control.ident != "C10"]
+    assert all(control.passed for control in controls)  # everything present passed
+    assert missing_controls(controls) == ["C10"]
+    assert verdict_for(controls) == "VOID"
+
+
+def test_the_empty_control_list_is_void_not_measured() -> None:
+    """==The degenerate case: measuring nothing must never be the best possible outcome.=="""
+    assert verdict_for([]) == "VOID"
+
+
+def test_absence_outranks_a_mere_skip() -> None:
+    """A control the harness FAILED to report is worse than one it honestly skipped."""
+    controls = [
+        control
+        for control in _full_set(C5=_control("C5", passed=False, ran=False))
+        if control.ident != "C11"
+    ]
+    assert verdict_for(controls) == "VOID"
+
+
+def test_missing_controls_is_empty_for_a_complete_run() -> None:
+    assert missing_controls(_full_set()) == []
+
+
+def test_the_required_ids_are_the_contiguous_set_the_report_documents() -> None:
+    """==The required set and what ``main()`` can emit must not drift apart.==
+
+    If an id is added here and never emitted, every run VOIDs with a confusing "absent" message.
+    Asserting the ids are contiguous ``C1..CN`` makes a typo like ``C13`` fail here rather than in
+    production.
+    """
+    assert {f"C{n}" for n in range(1, len(REQUIRED_CONTROL_IDS) + 1)} == REQUIRED_CONTROL_IDS
 
 
 def test_not_run_control_is_marked_as_such() -> None:
