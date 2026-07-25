@@ -11,6 +11,7 @@ keys exported, the same mistake bills a real person.
 
 from __future__ import annotations
 
+import errno
 import socket
 from datetime import UTC, datetime
 from email.message import EmailMessage
@@ -154,6 +155,37 @@ def test_a_raw_socket_to_the_outside_world_is_refused() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with sock, pytest.raises(RealNetworkForbiddenError):
         sock.connect(("93.184.216.34", 80))
+
+
+def test_connect_ex_is_shut_too_and_keeps_its_return_code_contract() -> None:
+    """==The floor had two doors, and only one of them was guarded.==
+
+    ``connect_ex`` reaches the same place as ``connect`` and reports failure as an errno instead of
+    raising — so a caller that prefers it (asyncio's selector loop does) walked straight past the
+    floor. Guarding one and not the other left the floor depending on which method a stack happened
+    to pick.
+
+    ==It must NOT raise.== ``loop.sock_connect`` reads the return code, and a guard that raises
+    through the event loop's own plumbing is one that gets switched off. So it answers ``EACCES`` —
+    what the kernel returns for a destination policy forbids — and the real ``connect_ex`` is never
+    reached, so nothing is sent. The socket having no peer afterwards is that fact, checked.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        assert sock.connect_ex(("93.184.216.34", 80)) == errno.EACCES
+        with pytest.raises(OSError):
+            sock.getpeername()  # never connected: the refusal happened before the syscall
+
+
+def test_connect_ex_still_lets_the_process_talk_to_itself() -> None:
+    """==Anti-vacuity.== A ``connect_ex`` that refused everything would break asyncio's self-pipe
+    and every loopback client in this suite, while proving nothing about the rule."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            assert client.connect_ex(("127.0.0.1", port)) == 0
+            assert client.getpeername()[1] == port
 
 
 def test_a_brand_new_http_stack_is_covered_the_day_it_is_added() -> None:

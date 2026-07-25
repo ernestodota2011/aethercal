@@ -253,15 +253,23 @@ The barriers on the money phase are structural, not procedural:
 | Barrier | How it is enforced |
 |---|---|
 | **$1 hard cap** | the session opener takes **no `amount_cents`** — there is no figure to mistype. A units bug is what turns $1 into $100 |
-| **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one |
+| **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one. To open a new one on purpose, set `AETHERCAL_LIVE_STRIPE_RUN_ID=v2` — phase A names that command itself if the replayed session has lapsed |
 | **the refund is idempotent** | phase B uses production's own `refund_dedupe_key`, so a retry gets the same refund and never a second |
-| **the money always comes back** | the refund is re-checked in a `finally`, through the **independent** client — the gateway is the thing on trial, so the safety net must not share its fault |
+| **the money always comes back — *all* of it** | the `finally` reads what was actually **captured**, sums only refunds that are `succeeded` (`pending` is *in flight*, not done), issues the remainder on its own derived key, and polls to a terminal state. ==A partial or pending refund is a failure, not a pass== |
+| **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
 | **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
 | **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
 
 The run prints an evidence block. **That block, not a boolean, is what goes into
 `live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
-carrying the date and what was observed. Writing one requires having done the run.
+carrying the mode, the date and what was observed. Writing one requires having done the run.
+
+> [!WARNING]
+> **A verification performed in TEST mode does not authorise a LIVE credential.** Each record states
+> the `ProviderMode` it was gathered in, and only `LIVE` counts towards opening the door. Test mode
+> is a *different backend* — different keys, no card networks, no money — so a free test-mode
+> round-trip proves the request shape and the transport and says nothing about the world where the
+> money is. The harness reports the mode Stripe itself declared (`livemode`) rather than assuming it.
 
 > [!NOTE]
 > The live suite is the one exception to the repo-wide network guard, and the exception is narrow:

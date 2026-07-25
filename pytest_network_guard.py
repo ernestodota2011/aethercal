@@ -9,6 +9,7 @@ modules this repo has.
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import socket
 from typing import Any, NoReturn
@@ -63,6 +64,38 @@ def _is_loopback(address: Any) -> bool:
         return False
 
 
+def _guarded_connect_ex(sock: socket.socket, address: Any) -> int:
+    """``connect_ex`` is the OTHER door in the socket, and it was standing open.
+
+    ==Guarding ``connect`` alone was a hole with a well-known name.== ``connect_ex`` does the same
+    thing and reports failure as an errno instead of raising, so any caller that prefers it — and
+    asyncio's selector loop is one — walked straight past the floor and out into the world.
+
+    .. rubric:: ==It returns an errno; it does NOT raise, and that is not a softening==
+
+    Raising here would be the louder refusal, and it would break the event loop's own plumbing:
+    ``loop.sock_connect`` calls ``connect_ex`` and reads the code. A guard that takes the
+    interpreter down with it is a guard that gets switched off. ``EACCES`` is what the kernel itself
+    returns for a destination policy forbids, so the caller meets a refusal it already handles.
+
+    The socket is left for its owner to close: a ``connect_ex`` caller reads a return code and
+    cleans up, unlike the ``connect`` caller below, which may raise straight past its descriptor.
+
+    ==What matters is identical either way: nothing leaves the machine.== The real ``connect_ex`` is
+    never reached, so no packet is sent — the refusal happens before the syscall, not after it.
+    """
+    if _is_loopback(address):
+        return _REAL_SOCKET_CONNECT_EX(sock, address)
+    return errno.EACCES
+
+
+def _guarded_live_connect_ex(sock: socket.socket, address: Any) -> int:
+    """The same door, for a live-provider test: the allowlist decides, and nothing else."""
+    if _is_allowed_live_address(address):
+        return _REAL_SOCKET_CONNECT_EX(sock, address)
+    return errno.EACCES
+
+
 def _guarded_connect(sock: socket.socket, address: Any) -> Any:
     """Refuse anything that is not this machine talking to itself.
 
@@ -82,6 +115,7 @@ def _guarded_connect(sock: socket.socket, address: Any) -> Any:
 
 
 _REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
 
 
 def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
@@ -348,9 +382,11 @@ def _forbid_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
         )
         monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _live_guarded_request)
         monkeypatch.setattr(socket.socket, "connect", _guarded_live_connect, raising=True)
+        monkeypatch.setattr(socket.socket, "connect_ex", _guarded_live_connect_ex, raising=True)
         return
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     # ==And the floor beneath all three.== The three above are known doors; this is the rule that
     # makes a door nobody has built yet unusable too. See the class docstring.
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect, raising=True)
+    monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex, raising=True)

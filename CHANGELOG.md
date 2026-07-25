@@ -187,6 +187,13 @@ differently, so it could only be overruled and never discharged.
     uses production's own `refund_dedupe_key`, the refund is re-checked in a `finally` through an
     **independent** client, and if it cannot be completed the run prints the **charge id** with
     manual-refund instructions rather than failing quietly.
+  - The cleanup verifies the **whole** capture came back: it sums only `succeeded` refunds (a
+    `pending` one is in flight, not done), issues any remainder on its own derived key, and polls
+    to a terminal state. A partial or pending refund raises the alarm instead of passing.
+- **Each verification records the `ProviderMode` it was gathered in, and only `LIVE` authorises a
+  live credential.** Test mode is a different backend — different keys, no card networks, no money —
+  so a free test-mode round-trip proves the transport and buys nothing the money guard will spend.
+  Without this, the cheap and obvious way to "verify" would have paid for real money.
 - The live suite is the one exception to the repo-wide network guard, and the exception is an
   **allowlist**: `api.stripe.com:443` and nothing else, with SMTP and the Google API still shut. A
   marked test reaching anywhere else is refused exactly as an ordinary test would be.

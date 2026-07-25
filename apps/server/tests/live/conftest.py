@@ -34,6 +34,7 @@ harness can produce, and a cleanup error that swallows a real one is the second 
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Coroutine, Iterator
 from datetime import datetime
 from typing import Any
@@ -57,6 +58,16 @@ CURRENCY = "usd"
 
 RETURN_URL = "https://example.com/aethercal-live-verification"
 """Where the guest would be sent back to. Stripe requires a well-formed URL and never fetches it."""
+
+REFUND_SUCCEEDED = "succeeded"
+"""==The ONLY status that means the money is back.== Terminal, and the money has actually moved."""
+
+REFUND_DEAD_ENDS = frozenset({"failed", "canceled"})
+"""Terminal and the money did NOT move — so these count as zero, never as progress.
+
+Everything that is neither this nor :data:`REFUND_SUCCEEDED` (``pending``, ``requires_action``) is
+**in flight**: real money that has not come back yet. Counting it as done is the exact bug this
+distinction exists to prevent."""
 
 _REAL_REFUND = StripeGateway.refund
 """Captured at import, before the autouse fixture below can unplug it."""
@@ -241,44 +252,142 @@ def expire_session(stripe_api: httpx.Client) -> Callable[[str], str | None]:
 
 
 @pytest.fixture
-def ensure_refunded(stripe_api: httpx.Client) -> Callable[[str, str], str | None]:
-    """Guarantee the money went back. ==The single most important thing in this directory.==
+def refund_settle_budget() -> tuple[int, float]:
+    """How long :func:`ensure_refunded` waits for a refund to reach a TERMINAL state.
 
-    Called from a ``finally``, so it never raises. It checks for an existing refund first and issues
-    one only if there is none — **on the caller's own idempotency key**, so a refund the gateway
-    half-sent is completed rather than duplicated.
+    ``(attempts, seconds between them)``. Card refunds are usually ``succeeded`` on the first read;
+    the budget exists for the ones that are not, because ==``pending`` is not "the money is back"==
+    and treating it as such is precisely the silent no-op this fixture exists to prevent.
+
+    A test overrides this by declaring a fixture of the same name in its own module.
+    """
+    return (10, 1.0)
+
+
+@pytest.fixture
+def ensure_refunded(
+    stripe_api: httpx.Client, refund_settle_budget: tuple[int, float]
+) -> Callable[[str, str], str | None]:
+    """Guarantee the money went back — ==all of it, and definitively.== Never raises.
+
+    .. rubric:: ==The bug this replaces: "a refund exists" is not "the money is back"==
+
+    The first cut returned success on finding ANY refund whose status was ``succeeded`` **or
+    ``pending``**, without ever looking at the amount. Both halves of that are wrong, and each one
+    breaks the only promise this directory makes:
+
+    * a **partial** refund satisfied it. Stripe will happily refund 40 of 100 cents; the old check
+      saw one refund, called it done, and 60 cents stayed on the card with no alarm;
+    * a **pending** refund satisfied it. Pending is not terminal — it can still fail — so the
+      cleanup declared victory over money that had not moved.
+
+    ==The cleanup "worked" and did nothing==, which is the shape this codebase keeps finding
+    (``feedback_no_op_fail_closed``). Worse than a loud failure, because the alarm below never fires
+    and nobody goes looking.
+
+    .. rubric:: What it does instead
+
+    1. reads what was actually **captured** (``amount_received`` on the PaymentIntent) — the figure
+       that has to come back, taken from Stripe rather than assumed to be the hard cap;
+    2. sums only refunds that are ``succeeded``. ``pending`` is counted separately, as *in flight*;
+       ``failed``/``canceled`` are counted as nothing at all;
+    3. issues a refund for whatever is neither refunded nor in flight, ==on its own idempotency
+       key== (derived from the caller's, plus the amount) — a different amount cannot reuse the key
+       that was minted for the full refund, and deriving it keeps a retry of THIS top-up idempotent;
+    4. polls until the succeeded total covers the capture, or the budget runs out;
+    5. and if anything is still outstanding or merely pending, ==returns a problem== so the caller
+       shouts the charge id and fails.
 
     ==It deliberately does NOT go through ``StripeGateway``.== Phase B exists precisely because that
     adapter has never been run for real; if it is broken, this is what still gets the dollar back. A
     cleanup path that shares the fault of the thing it is cleaning up after is not a cleanup path.
     """
+    attempts, delay = refund_settle_budget
 
-    def _ensure(payment_intent_id: str, idempotency_key: str) -> str | None:
+    def _captured_cents(payment_intent_id: str) -> tuple[int | None, str | None]:
         try:
-            existing = stripe_api.get(
-                "/refunds", params={"payment_intent": payment_intent_id, "limit": 10}
-            )
-            existing.raise_for_status()
-            for refund in existing.json().get("data", []):
-                if refund.get("status") in {"succeeded", "pending"}:
-                    return None
+            response = stripe_api.get(f"/payment_intents/{payment_intent_id}")
+            response.raise_for_status()
+            received = response.json().get("amount_received")
         except Exception as exc:
-            return _problem(f"checking refunds for {payment_intent_id}", exc)
+            return None, _problem(f"reading payment intent {payment_intent_id}", exc)
+        if not isinstance(received, int):
+            return None, (
+                f"payment intent {payment_intent_id} reports amount_received={received!r}, so "
+                "there is no way to tell how much has to come back"
+            )
+        return received, None
 
+    def _tally(payment_intent_id: str) -> tuple[int, int, str | None]:
+        """``(succeeded cents, in-flight cents, problem)`` — terminal success counted separately."""
         try:
-            made = stripe_api.post(
-                "/refunds",
-                data={"payment_intent": payment_intent_id},
-                headers={"Idempotency-Key": idempotency_key},
+            response = stripe_api.get(
+                "/refunds", params={"payment_intent": payment_intent_id, "limit": 100}
             )
-            made.raise_for_status()
-            status = made.json().get("status")
+            response.raise_for_status()
+            refunds = response.json().get("data", [])
         except Exception as exc:
-            return _problem(f"refunding {payment_intent_id}", exc)
+            return 0, 0, _problem(f"listing refunds for {payment_intent_id}", exc)
 
-        if status not in {"succeeded", "pending"}:
-            return f"the refund of {payment_intent_id} came back {status!r}"
-        return None
+        succeeded = in_flight = 0
+        for refund in refunds:
+            amount = refund.get("amount")
+            if not isinstance(amount, int):
+                continue
+            status = refund.get("status")
+            if status == REFUND_SUCCEEDED:
+                succeeded += amount
+            elif status not in REFUND_DEAD_ENDS:
+                in_flight += amount  # pending / requires_action: real money, not yet back
+        return succeeded, in_flight, None
+
+    def _ensure(payment_intent_id: str, idempotency_key: str) -> str | None:  # noqa: PLR0911
+        # Seven exits, and each one answers a different question about somebody's money: could not
+        # read it, nothing was taken, could not list it, could not re-issue it, still not settled,
+        # settled in full. Collapsing them would make the alarm's message vaguer, and the message is
+        # what an operator acts on at the moment a dollar is stuck.
+        captured, problem = _captured_cents(payment_intent_id)
+        if problem is not None:
+            return problem
+        if not captured:
+            return None  # nothing was ever taken, so nothing is being held
+
+        succeeded, in_flight, problem = _tally(payment_intent_id)
+        if problem is not None:
+            return problem
+
+        uncovered = captured - succeeded - in_flight
+        if uncovered > 0:
+            # ==Its own key.== The caller's was minted for the FULL refund; reusing it for a
+            # different amount is an idempotency conflict, and a fresh random one would let a retry
+            # of this top-up refund twice. Derived = stable across retries, distinct per amount.
+            try:
+                made = stripe_api.post(
+                    "/refunds",
+                    data={"payment_intent": payment_intent_id, "amount": uncovered},
+                    headers={"Idempotency-Key": f"{idempotency_key}:outstanding:{uncovered}"},
+                )
+                made.raise_for_status()
+            except Exception as exc:
+                return _problem(
+                    f"refunding the outstanding {uncovered} cents of {payment_intent_id}", exc
+                )
+
+        for attempt in range(attempts):
+            succeeded, in_flight, problem = _tally(payment_intent_id)
+            if problem is not None:
+                return problem
+            if succeeded >= captured:
+                return None  # ==terminal, and it covers the whole capture==
+            if attempt < attempts - 1:
+                time.sleep(delay)
+
+        outstanding = captured - succeeded
+        return (
+            f"{outstanding} of {captured} cents are STILL NOT refunded for {payment_intent_id} "
+            f"({succeeded} succeeded, {in_flight} in flight and not yet terminal). The money has "
+            "NOT come back."
+        )
 
     return _ensure
 

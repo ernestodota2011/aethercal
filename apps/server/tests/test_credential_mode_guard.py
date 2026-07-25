@@ -65,6 +65,7 @@ from aethercal.server.services.tenant_credentials import (
     IncompleteCredentialError,
     LiveCredentialRefusedError,
     LiveVerification,
+    ProviderMode,
     credential_class,
     declared_test_mode_prefixes,
     gateway_operations,
@@ -113,7 +114,11 @@ async def _store(
     )
 
 
-def _exercised(monkeypatch: pytest.MonkeyPatch, *operations: GatewayOperation) -> None:
+def _exercised(
+    monkeypatch: pytest.MonkeyPatch,
+    *operations: GatewayOperation,
+    mode: ProviderMode = ProviderMode.LIVE,
+) -> None:
     """Rewrite the verification register so every provider has exactly ``operations`` exercised.
 
     ==The register is patched, never the door.== These tests are about the RULE — "an unexercised
@@ -122,10 +127,14 @@ def _exercised(monkeypatch: pytest.MonkeyPatch, *operations: GatewayOperation) -
     the real :func:`required_test_mode_prefixes` and the real ``store_credential`` derive their
     behaviour from it is what makes these tests about the derivation. Patching the enforced map
     instead would test the patch.
+
+    ``mode`` defaults to LIVE because that is the interesting case for most of these; the tests that
+    turn on the distinction pass it explicitly and loudly.
     """
     records = tuple(
         LiveVerification(
             operation=operation,
+            mode=mode,
             verified_on=date(2026, 7, 25),
             evidence="synthetic: arranged by a test, nothing was run against any provider",
         )
@@ -172,6 +181,48 @@ class TestTheDoorFollowsTheRegister:
         _exercised(monkeypatch, GatewayOperation.CHECKOUT)
         with pytest.raises(LiveCredentialRefusedError):
             await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+    async def test_evidence_gathered_in_test_mode_does_not_open_the_live_door(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==The trap that nearly shipped: verify for free in TEST mode, accept a LIVE key.==
+
+        Every operation exercised, every record real — and all of it against the provider's sandbox,
+        where there are no card networks, no fraud rules and no money. ==A live credential must
+        still be refused.==
+
+        This is the cheap and obvious way to "verify", which is exactly why it needed closing: the
+        first cut recorded the date and the observation but nothing structured about the mode, so a
+        free test-mode run would have paid for real money. The guard would have gone on looking like
+        a guard while answering a question it no longer asked.
+        """
+        _exercised(monkeypatch, *GatewayOperation, mode=ProviderMode.TEST)
+        with pytest.raises(LiveCredentialRefusedError):
+            await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+    async def test_the_refusal_explains_that_the_evidence_was_test_mode_only(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==Being told "unverified" right after a green test-mode run reads as a broken guard.==
+
+        So the refusal distinguishes *nobody has run this* from *somebody ran it where there is no
+        money*. The second is the state an operator will actually be in, and only naming it sends
+        them to the right fix instead of to re-run what they just ran.
+        """
+        _exercised(monkeypatch, *GatewayOperation, mode=ProviderMode.TEST)
+        with pytest.raises(LiveCredentialRefusedError) as raised:
+            await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+        message = str(raised.value)
+        assert "TEST mode" in message, message
+        assert GatewayOperation.CHECKOUT.value in message
+        assert GatewayOperation.REFUND.value in message
 
     async def test_a_live_key_is_accepted_once_every_operation_has_been_exercised(
         self,

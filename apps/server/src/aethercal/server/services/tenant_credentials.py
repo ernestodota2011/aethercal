@@ -307,24 +307,74 @@ class GatewayOperation(StrEnum):
     """``refund`` — sending a guest's money back. ==Only provable by charging somebody first.=="""
 
 
+class ProviderMode(StrEnum):
+    """Which of a provider's two worlds a verification happened in. ==They are not one system.==
+
+    A provider's test mode is a *different backend*: different keys, no card networks, different
+    fraud rules, different webhook signing secrets, and no money. A round-trip there proves the
+    request shape and the transport — real, and worth having — and it proves ==nothing whatever
+    about live mode==, which is where the money is.
+    """
+
+    TEST = "test"
+    """Exercised against the provider's sandbox. Free, and it authorises nothing about live."""
+
+    LIVE = "live"
+    """Exercised against the provider's real, money-moving backend."""
+
+
+def authorises_live_credentials(mode: ProviderMode) -> bool:
+    """May evidence gathered in ``mode`` open the door to a LIVE credential? ==Exhaustive.==
+
+    ``assert_never``, like :func:`credential_class`: a third mode (a provider's "sandbox" tier, a
+    regional staging environment) does not type-check until somebody has said whether evidence from
+    it is worth real money. ==The dangerous default is "yes"==, so this makes having no answer
+    impossible rather than merely discouraged.
+    """
+    match mode:
+        case ProviderMode.LIVE:
+            return True
+        case ProviderMode.TEST:
+            return False
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
 @dataclass(frozen=True, slots=True)
 class LiveVerification:
-    """The record of ONE operation having been exercised against the provider's REAL API.
+    """The record of ONE operation exercised against the provider's REAL API, in ONE mode.
 
     ==A boolean is a claim; this is a claim with its receipt attached.== The thing being asserted —
     "this code has spoken to the real provider and behaved" — is a historical fact about a run that
     somebody performed on a day, and a bare ``True`` records none of it. Six months on, the question
-    that matters is not *is it verified?* but *what exactly was run, when, and did it cover the
-    operation I am about to trust?*, and only the evidence answers that.
+    that matters is not *is it verified?* but *what exactly was run, when, in which mode, and did it
+    cover the operation I am about to trust?*, and only the evidence answers that.
 
     It also changes what flipping the switch COSTS. A boolean is flipped by whoever is impatient; a
     record has to be written, and writing "checkout: created cs_live_…, expired it, no money moved"
     requires having done it. ==The friction is the feature==: this is the exact edit that stands
     between the product and somebody's real money.
+
+    .. rubric:: ==Why :attr:`mode` exists, and the trap it closes==
+
+    The first cut recorded the date and the observation but nothing structured about WHICH MODE the
+    run happened in — so ==evidence gathered for free in TEST mode would have opened the door to a
+    LIVE credential==. That is not hypothetical: verifying in test mode is the cheap and obvious
+    thing to do, and every incentive points at it. The guard would have gone on looking like a guard
+    while quietly answering a question it no longer asked — the same failure as the ``sk_test_``
+    prefix, one level deeper and harder to see.
+
+    ==Note the asymmetry, which is the whole point.== LIVE evidence authorises a live credential;
+    TEST evidence does not. Recording a TEST run is still worth doing — it is honest, and says the
+    transport and the request shape work — it simply buys nothing that the money guard is willing to
+    spend. ``verified_on``/``evidence`` say *what happened*; this says *what it is worth*.
     """
 
     operation: GatewayOperation
     """Which act was exercised. ==One record per act== — never one record meaning "the provider"."""
+
+    mode: ProviderMode
+    """==Which world it was exercised in.== Only :attr:`ProviderMode.LIVE` authorises a live key."""
 
     verified_on: date
     """The day the harness was run against the real API."""
@@ -391,8 +441,21 @@ def live_verifications(provider: CredentialProvider) -> tuple[LiveVerification, 
 
 
 def verified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
-    """The operations with a :class:`LiveVerification` behind them. Derived from the register."""
-    return frozenset(record.operation for record in live_verifications(provider))
+    """The operations whose evidence ==authorises a LIVE credential.== Derived from the register.
+
+    ==Not simply "operations with a record".== A record made in TEST mode is real evidence about the
+    transport and the request shape, and it is worth nothing here: this function answers the money
+    guard's question — *may a live key be stored?* — so it counts only what
+    :func:`authorises_live_credentials` says may pay for that.
+
+    Which is why the filter lives HERE and not at each call site: there is exactly one place that
+    decides what evidence is worth, and no caller can forget to apply it.
+    """
+    return frozenset(
+        record.operation
+        for record in live_verifications(provider)
+        if authorises_live_credentials(record.mode)
+    )
 
 
 def unverified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
@@ -542,13 +605,30 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
             # value.== A live key is the most sensitive thing this system is ever handed, and
             # refusing it does not make it less secret; echoing it (or even the prefix it failed on)
             # would put it in the operator's terminal, their shell history and the CLI's stderr.
-            unverified = ", ".join(sorted(op.value for op in unverified_operations(provider)))
+            outstanding = unverified_operations(provider)
+            unverified = ", ".join(sorted(op.value for op in outstanding))
+            # ==Name the operations whose ONLY evidence is test-mode, separately.== Being told
+            # "refund is unverified" right after watching a green test-mode run of refund reads as a
+            # bug in the guard; being told the evidence exists but was gathered where there is no
+            # money is the real state of the world, and it sends somebody to the right fix.
+            test_only = sorted(
+                record.operation.value
+                for record in live_verifications(provider)
+                if record.operation in outstanding and not authorises_live_credentials(record.mode)
+            )
             raise LiveCredentialRefusedError(
                 f"the {provider.value} `{field}` is not a test-mode credential, and the "
                 f"{provider.value} gateway still performs operations that have NEVER been run "
-                f"against the real provider: {unverified}.\n"
+                f"against the real provider in LIVE mode: {unverified}.\n"
                 "\n"
-                f"It must start with `{prefix}`. ==This is refused rather than warned about==: a "
+                + (
+                    f"({', '.join(test_only)} HAS been exercised, but in TEST mode — a different "
+                    "backend, with no card networks and no money. That evidence is real, and it "
+                    "does not pay for this: only a LIVE run can.)\n\n"
+                    if test_only
+                    else ""
+                )
+                + f"It must start with `{prefix}`. ==This is refused rather than warned about==: a "
                 "live credential here would move real money through code exercised only with a "
                 "stubbed transport, and every status code would say success.\n"
                 "\n"
@@ -852,8 +932,10 @@ __all__ = [
     "LiveVerification",
     "MalformedCredentialError",
     "MissingCredentialError",
+    "ProviderMode",
     "ResolvedCredential",
     "WrongCredentialClassError",
+    "authorises_live_credentials",
     "credential_class",
     "declared_test_mode_prefixes",
     "delete_credential",

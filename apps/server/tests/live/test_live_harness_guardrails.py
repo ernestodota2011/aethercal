@@ -131,3 +131,146 @@ def test_ensuring_a_refund_reports_instead_of_raising(
 
     assert problem is not None, "a failed refund must be REPORTED so the caller can shout"
     assert "pi_NOT_A_REAL_INTENT" in problem, "the report must name the payment that is still held"
+
+
+@pytest.fixture
+def refund_settle_budget() -> tuple[int, float]:
+    """Override the conftest budget: these controls must not spend ten real seconds waiting."""
+    return (2, 0.0)
+
+
+def _stripe_double(
+    monkeypatch: pytest.MonkeyPatch, *, captured: int, refunds: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """A tiny Stripe stand-in for the cleanup path. Returns the live refund list, so a test can
+    watch what the cleanup does to it — a POST appends, exactly as the real API would."""
+
+    def _respond(payload: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(
+            200, json=payload, request=httpx.Request("GET", "https://api.stripe.com/v1/x")
+        )
+
+    def _get(_self: httpx.Client, url: str, **_kwargs: Any) -> httpx.Response:
+        if url.startswith("/payment_intents"):
+            return _respond({"amount_received": captured, "latest_charge": "ch_DOUBLE"})
+        if url.startswith("/refunds"):
+            return _respond({"data": refunds})
+        raise AssertionError(f"the cleanup asked for an unexpected URL: {url}")
+
+    def _post(_self: httpx.Client, url: str, **kwargs: Any) -> httpx.Response:
+        assert url == "/refunds", url
+        # Whatever it issues arrives PENDING and never settles — the worst realistic case.
+        issued = {
+            "id": f"re_ISSUED_{len(refunds)}",
+            "status": "pending",
+            "amount": int(kwargs["data"]["amount"]),
+        }
+        refunds.append(issued)
+        return _respond(issued)
+
+    monkeypatch.setattr(httpx.Client, "get", _get)
+    monkeypatch.setattr(httpx.Client, "post", _post)
+    return refunds
+
+
+def test_a_partial_refund_does_not_count_as_the_money_being_back(
+    monkeypatch: pytest.MonkeyPatch, ensure_refunded: Callable[[str, str], str | None]
+) -> None:
+    """==The finding, reproduced.== 40 of 100 cents refunded is 60 cents still on somebody's card.
+
+    The old cleanup returned success on *finding a refund*, without ever reading its amount — so a
+    partial refund passed, the alarm never fired, and the money stayed put. That is the silent no-op
+    in its purest form: the cleanup "worked" and did nothing.
+
+    This also proves the top-up happens: the cleanup must ISSUE the missing 60 rather than merely
+    complain about it.
+    """
+    refunds = _stripe_double(
+        monkeypatch,
+        captured=100,
+        refunds=[{"id": "re_PARTIAL", "status": "succeeded", "amount": 40}],
+    )
+
+    problem = ensure_refunded("pi_PARTIAL", "refund:pi_PARTIAL")
+
+    assert problem is not None, (
+        "a 40-of-100 refund was accepted as complete. 60 cents are still held and nothing would "
+        "have raised the alarm."
+    )
+    assert "60 of 100" in problem, problem
+    assert [r["amount"] for r in refunds if r["id"].startswith("re_ISSUED")] == [60], (
+        "the cleanup must issue the outstanding 60 cents, not merely report them"
+    )
+
+
+def test_a_pending_refund_does_not_count_as_the_money_being_back(
+    monkeypatch: pytest.MonkeyPatch, ensure_refunded: Callable[[str, str], str | None]
+) -> None:
+    """==``pending`` is not terminal, and it is not the money being back.==
+
+    A pending refund can still fail. Counting it as success is how a run reports green while the
+    charge is untouched — and it is what the old cleanup did, explicitly, by treating ``pending``
+    and ``succeeded`` as the same thing.
+
+    Note that nothing new is issued here: the full amount is already in flight, so the cleanup waits
+    for it and then reports that it never settled. Issuing a second refund on top would be the
+    opposite mistake.
+    """
+    refunds = _stripe_double(
+        monkeypatch,
+        captured=100,
+        refunds=[{"id": "re_PENDING", "status": "pending", "amount": 100}],
+    )
+
+    problem = ensure_refunded("pi_PENDING", "refund:pi_PENDING")
+
+    assert problem is not None, "a pending refund was accepted as if the money had come back"
+    assert "100 of 100" in problem, problem
+    assert "in flight" in problem, problem
+    assert not [r for r in refunds if r["id"].startswith("re_ISSUED")], (
+        "the whole amount was already in flight; issuing another refund would double it"
+    )
+
+
+def test_a_fully_succeeded_refund_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, ensure_refunded: Callable[[str, str], str | None]
+) -> None:
+    """==The anti-vacuity half.== A cleanup that reported a problem every time would pass both
+    controls above while making phase B impossible to complete.
+
+    Two succeeded refunds summing to the capture also proves the tally ADDS them rather than
+    stopping at the first one it sees.
+    """
+    _stripe_double(
+        monkeypatch,
+        captured=100,
+        refunds=[
+            {"id": "re_ONE", "status": "succeeded", "amount": 40},
+            {"id": "re_TWO", "status": "succeeded", "amount": 60},
+        ],
+    )
+
+    assert ensure_refunded("pi_WHOLE", "refund:pi_WHOLE") is None
+
+
+def test_a_failed_refund_counts_as_nothing_and_is_retried(
+    monkeypatch: pytest.MonkeyPatch, ensure_refunded: Callable[[str, str], str | None]
+) -> None:
+    """A ``failed`` refund is terminal and the money did NOT move, so it must count as zero.
+
+    Counting it as either succeeded or in-flight would leave the charge untouched: as succeeded, the
+    alarm never fires; as in-flight, the cleanup waits for something that will never arrive and
+    never re-issues.
+    """
+    refunds = _stripe_double(
+        monkeypatch,
+        captured=100,
+        refunds=[{"id": "re_FAILED", "status": "failed", "amount": 100}],
+    )
+
+    problem = ensure_refunded("pi_FAILED", "refund:pi_FAILED")
+
+    assert problem is not None
+    assert [r["amount"] for r in refunds if r["id"].startswith("re_ISSUED")] == [100], (
+        "a failed refund moved no money, so the full amount must be issued again"
+    )

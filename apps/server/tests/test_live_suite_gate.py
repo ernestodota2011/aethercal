@@ -25,6 +25,7 @@ variable really unset, checking the exit code CI would really read.
 
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import socket
@@ -177,6 +178,24 @@ async def test_a_live_test_may_not_reach_a_destination_off_the_allowlist() -> No
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with sock, pytest.raises(RealNetworkForbiddenError):
         sock.connect(("93.184.216.34", 80))
+
+
+@pytest.mark.live_provider
+def test_a_live_test_may_not_slip_out_through_connect_ex() -> None:
+    """==The allowlist had the same two-door problem as the floor beneath it.==
+
+    ``connect_ex`` bypassed the socket check entirely: a live-marked test could reach any host in
+    the world simply by choosing the method that returns an errno instead of raising. The allowlist
+    now guards both doors.
+
+    ==The refusal keeps ``connect_ex``'s contract== (an errno, never an exception), because asyncio
+    reads that return code — and the point is not how loudly it refuses but that the real syscall is
+    never reached. No packet leaves; the socket ends with no peer.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        assert sock.connect_ex(("93.184.216.34", 443)) == errno.EACCES
+        with pytest.raises(OSError):
+            sock.getpeername()
 
 
 @pytest.mark.live_provider

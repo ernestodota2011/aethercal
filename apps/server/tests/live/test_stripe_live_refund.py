@@ -28,7 +28,8 @@ The run is therefore cut where the human is:
   the exact opposite of the zero-cost checkout harness, for the exact opposite reason: there, a
   repeated key would replay an old session and exercise nothing; here, a fresh key would mint a
   **second payable $1 invitation**. A re-run of phase A inside Stripe's 24-hour window returns the
-  same session, so a retry cannot charge twice;
+  same session, so a retry cannot charge twice — and when that replayed session turns out to have
+  lapsed or already been paid, phase A says which, and names the run id that opens a new one;
 * ==**every charge is refunded in a ``finally``, through the INDEPENDENT client.**== Phase B exists
   because the gateway's refund has never run for real. If it is broken, the cleanup must not share
   its fault — so the safety net does not go through ``StripeGateway`` at all;
@@ -74,16 +75,28 @@ pytestmark = pytest.mark.live_provider
 ALLOW_REAL_CHARGE_ENV = "AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE"
 PAID_SESSION_ENV = "AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION"
 
-PHASE_A_IDEMPOTENCY_KEY = "aethercal-live-refund-verification:v1"
-"""==FIXED on purpose.== A re-run inside Stripe's 24-hour window returns the SAME session.
+RUN_ID_ENV = "AETHERCAL_LIVE_STRIPE_RUN_ID"
+DEFAULT_RUN_ID = "v1"
 
-A fresh key here would mint a second payable $1 invitation every time somebody re-ran phase A —
-two invitations, two possible charges, from a command that reads like a retry. The zero-cost
-checkout harness needs the opposite (a fresh key, or it replays an old session and exercises
-nothing), and the two live one directory apart, so the reasoning is written down in both.
 
-Bump the ``:v1`` only to deliberately open a NEW payable session after the window has passed.
-"""
+def _phase_a_idempotency_key() -> str:
+    """==FIXED on purpose.== A re-run inside Stripe's 24-hour window returns the SAME session.
+
+    A fresh key here would mint a second payable $1 invitation every time somebody re-ran phase A —
+    two invitations, two possible charges, from a command that reads like a retry. The zero-cost
+    checkout harness needs the exact opposite (a fresh key, or it replays an old session and
+    exercises nothing), and the two live one directory apart, so the reasoning is written in both.
+
+    ==The escape hatch is deliberate, and it is named where it is needed.== A fixed key has a real
+    cost: if the session lapses unpaid, re-running phase A replays the *expired* one and there is no
+    way to open another for 24 hours. So the run id is a variable — export
+    ``AETHERCAL_LIVE_STRIPE_RUN_ID=v2`` to open a new payable session on purpose. It cannot happen
+    by accident (it is not the default, and phase A already carries its own opt-in), and phase A
+    tells the operator this exact sentence at the moment it hits the wall.
+    """
+    run_id = os.environ.get(RUN_ID_ENV, "").strip() or DEFAULT_RUN_ID
+    return f"aethercal-live-refund-verification:{run_id}"
+
 
 HUMAN_PAYMENT_WINDOW = timedelta(hours=2)
 """How long the phase-A session stays payable. Comfortably over Stripe's 30-minute floor and well
@@ -138,7 +151,7 @@ async def test_phase_a_opens_a_payable_one_dollar_session(
     """
     expires_at = datetime.now(UTC) + HUMAN_PAYMENT_WINDOW
     session = await open_one_dollar_session(
-        idempotency_key=PHASE_A_IDEMPOTENCY_KEY, expires_at=expires_at
+        idempotency_key=_phase_a_idempotency_key(), expires_at=expires_at
     )
 
     opened_response = stripe_api.get(f"/checkout/sessions/{session.checkout_session_id}")
@@ -150,8 +163,31 @@ async def test_phase_a_opens_a_payable_one_dollar_session(
         f"{one_dollar_cents}. A person is about to pay this. Do NOT pay it — expire it."
     )
     assert opened["currency"] == "usd", opened["currency"]
-    assert opened["status"] == "open", opened["status"]
-    assert opened["payment_status"] == "unpaid", opened["payment_status"]
+    assert opened["payment_status"] in {"unpaid", "paid"}, opened["payment_status"]
+
+    # ==The fixed idempotency key's one real cost, surfaced instead of suffered.== Stripe replays a
+    # repeated key for 24 hours, so this may be a session an earlier run opened. If that session has
+    # since lapsed — or has already been paid — the operator needs to be told WHICH, and what to do,
+    # rather than reading a bare `status != 'open'` assertion and guessing.
+    if opened["status"] != "open":
+        already_paid = opened["payment_status"] == "paid"
+        pytest.fail(
+            f"the phase-A session for run id {os.environ.get(RUN_ID_ENV, '') or DEFAULT_RUN_ID!r} "
+            f"is {opened['status']!r}, not open — Stripe replayed the one an earlier run created "
+            f"(idempotency keys live 24 hours).\n\n"
+            + (
+                f"It was PAID: {opened['id']}. Nothing new is needed — run phase B on it:\n"
+                f"  AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION={opened['id']} \\\n"
+                "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
+                "-m live_provider -s\n"
+                if already_paid
+                else "It lapsed unpaid, so there is nothing to refund and no way to reopen it. To "
+                "open a NEW payable session deliberately, pick a fresh run id:\n"
+                f"  {RUN_ID_ENV}=v2 AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE=1 \\\n"
+                "    uv run pytest apps/server/tests/live/test_stripe_live_refund.py "
+                "-m live_provider -s\n"
+            )
+        )
 
     mode = "LIVE" if opened["livemode"] else "TEST"
     print(
@@ -257,9 +293,11 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
         mode = "LIVE" if session["livemode"] else "TEST"
         print(
             "\n=== EVIDENCE for live_verifications(CredentialProvider.STRIPE) ===\n"
-            "  operation   : refund (GatewayOperation.REFUND)\n"
+            "  operation   : GatewayOperation.REFUND\n"
+            f"  mode        : ProviderMode.{mode}  <- Stripe's own `livemode`, on the paid "
+            "session.\n"
+            "                ==Only ProviderMode.LIVE authorises a live credential.==\n"
             f"  verified_on : {datetime.now(UTC).date().isoformat()}\n"
-            f"  mode        : {mode} (Stripe's own `livemode` on the paid session)\n"
             f"  session     : {paid_session_id}\n"
             f"  intent      : {payment_intent_id}\n"
             f"  charge      : {charge_id}\n"
