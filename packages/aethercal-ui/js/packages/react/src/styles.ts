@@ -171,6 +171,63 @@ ${defaultBaseTokenCss()}
   border-color: var(--ac-today-marker-bg);
 }
 
+/* Swipe viewport (U-02): wraps the active view when the toolbar is on, so a touch drag can page the
+   period the same way the toolbar's own prev/next buttons do (useSwipeNavigation). 'pan-y' leaves
+   vertical scroll (the time-grid's hour body) native while handing horizontal gestures to the
+   recognizer — the same touch-action split every swipeable-carousel pattern uses. The transient
+   'is-swiping-*' nudge is a MICRO cue (transform + opacity only, ~120ms) confirming the gesture was
+   caught; it never implies the new period's content, which the host still has to fetch and re-render
+   the calendar with. */
+.aethercal-swipe-viewport {
+  touch-action: pan-y;
+}
+.aethercal-swipe-viewport.is-swiping-next {
+  animation: aethercal-swipe-nudge-next 150ms ease-out;
+}
+.aethercal-swipe-viewport.is-swiping-prev {
+  animation: aethercal-swipe-nudge-prev 150ms ease-out;
+}
+@keyframes aethercal-swipe-nudge-next {
+  0% { transform: translateX(0); opacity: 1; }
+  40% { transform: translateX(-6px); opacity: 0.85; }
+  100% { transform: translateX(0); opacity: 1; }
+}
+@keyframes aethercal-swipe-nudge-prev {
+  0% { transform: translateX(0); opacity: 1; }
+  40% { transform: translateX(6px); opacity: 0.85; }
+  100% { transform: translateX(0); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Same belt-and-suspenders stance as the calendar's own reduced-motion rule below: the swipe
+     viewport sits OUTSIDE .aethercal-calendar (it wraps it), so it needs its own opt-out rather
+     than inheriting that selector. The gesture still navigates — only the motion is dropped. */
+  .aethercal-swipe-viewport,
+  .aethercal-swipe-viewport.is-swiping-next,
+  .aethercal-swipe-viewport.is-swiping-prev {
+    animation: none;
+  }
+}
+
+/* Mobile tap targets (U-02.2): the toolbar's compact desktop sizing (~24-26px tall) is comfortable
+   for a mouse pointer but under the ~44px WCAG 2.5.5 / iOS HIG minimum for a finger. Scoped to small
+   viewports OR a coarse pointer (a touch laptop at desktop width still benefits) so the desktop look
+   is completely unchanged. */
+@media (max-width: 640px), (pointer: coarse) {
+  .aethercal-nav-btn {
+    min-height: 44px;
+    padding: 4px 14px;
+  }
+  .aethercal-nav-arrow {
+    min-width: 44px;
+  }
+  .aethercal-more {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    padding: 4px 10px;
+  }
+}
+
 .aethercal-agenda { display: block; }
 .aethercal-agenda-empty {
   margin: 0;
