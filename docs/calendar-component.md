@@ -57,6 +57,18 @@ speaks UTC, the grid speaks local.
 With `navigation`, the component is **controlled**: it renders the toolbar and *emits* the new
 period, but you own `anchor` and `view` in state. Ignore the events and it will not move.
 
+On a touchscreen, `navigation` also arms swipe-to-navigate: a fast, mostly-horizontal drag steps
+the period the same way the toolbar's prev/next buttons do. It is additive (mouse/pen and the
+keyboard are unaffected) and assumes none of the five views scroll *horizontally* inside the
+calendar itself. That assumption is load-bearing at the CSS level, not just a convention: the
+swipe wrapper sets `touch-action: pan-y`, and a descendant cannot relax an ancestor's
+`touch-action` restriction (the browser intersects the two) — so slotting in custom content with
+its own horizontal scroll will still have its horizontal touch gestures claimed by the swipe
+recognizer. There is currently no supported way to opt a nested region back into native horizontal
+scroll; that would need a real code change here (a wrapper mode that switches its own
+`touch-action` to `auto`, and teaches the recognizer to ignore drags starting on that region), not
+a CSS override on the descendant.
+
 ## The five views
 
 | `view` | What it renders |

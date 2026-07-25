@@ -157,6 +157,23 @@ body {
   outline-offset: 2px;
 }
 
+/* Mobile tap targets (WCAG 2.5.5 / iOS HIG ~44px), mirroring the calendar package's own
+   `.aethercal-nav-btn`/`.aethercal-more` treatment (U-02.2, packages/react/src/styles.ts): the
+   segmented-control chips (View/Tema/Idioma) and the mock-server Aceptar/Rechazar buttons all use
+   `.demo-seg`, and none of them got the coarse-pointer sizing pass — a launch audit measured these
+   at a fixed 32px tall regardless of pointer type. Scoped to small viewports OR a coarse pointer,
+   same as the package's own rule, so desktop stays pixel-identical. */
+@media (max-width: 640px), (pointer: coarse) {
+  .demo-seg {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    min-width: 44px;
+    padding-inline: 13px;
+  }
+}
+
 /* ---- Hint ---- */
 .demo-hint {
   margin: 18px 0 20px;
