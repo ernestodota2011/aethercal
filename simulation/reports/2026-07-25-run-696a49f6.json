@@ -1,0 +1,217 @@
+{
+  "cancel_race_sink_events": {
+    "booking.cancelled": 1,
+    "booking.created": 1
+  },
+  "cancelled": 21,
+  "controls": [
+    {
+      "id": "C2",
+      "observed": "40 winners, refusals {}",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C1",
+      "observed": "409 slot_unavailable",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C7",
+      "observed": "{'booking.created': 1, 'booking.cancelled': 1}",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C8",
+      "observed": "1 active: ['a4a47d94-6491-40a9-8081-ee2908581682 confirmed']",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C9",
+      "observed": "1 active: ['999dcad1-766f-46c6-bd20-6eeca1fa5c1c confirmed']",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C3",
+      "observed": "0 slots offered",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C4",
+      "observed": "201/ok \u2192 201/ok \u2192 no_slots_offered",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C6",
+      "observed": "409 not_ended",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C5",
+      "observed": "baseline due=0; surface unreachable during the outage: yes; first reading after restart=6 (oldest 29.7s); drained in 7.9s",
+      "passed": true,
+      "ran": true
+    }
+  ],
+  "created": 199,
+  "errors": [
+    {
+      "code": "ok",
+      "count": 273,
+      "status": 200
+    },
+    {
+      "code": "ok",
+      "count": 199,
+      "status": 201
+    },
+    {
+      "code": "slot_unavailable",
+      "count": 42,
+      "status": 409
+    }
+  ],
+  "latency": {
+    "booking_cancel": {
+      "count": 21,
+      "max": 215.75690999816288,
+      "min": 27.063367997470777,
+      "p50": 64.44779099911102,
+      "p95": 201.54972599993926,
+      "p99": 215.75690999816288
+    },
+    "booking_create": {
+      "count": 239,
+      "max": 458.6322649993235,
+      "min": 24.20872300353949,
+      "p50": 84.01486100046895,
+      "p95": 210.7413470002939,
+      "p99": 313.93688400203246
+    },
+    "booking_reschedule": {
+      "count": 15,
+      "max": 234.45286300193402,
+      "min": 35.575721001805505,
+      "p50": 89.13590700103668,
+      "p95": 234.45286300193402,
+      "p99": 234.45286300193402
+    },
+    "booking_to_confirmation_email": {
+      "count": 199,
+      "max": 10431.748867034912,
+      "min": 2716.0775661468506,
+      "p50": 4656.1384201049805,
+      "p95": 9032.965898513794,
+      "p99": 10431.190729141235
+    },
+    "slots_read": {
+      "count": 239,
+      "max": 321.85953200314543,
+      "min": 10.63186299870722,
+      "p50": 62.938346000009915,
+      "p95": 206.75018499969156,
+      "p99": 287.0761459998903
+    }
+  },
+  "organic_collisions": 40,
+  "outbox": {
+    "deadman": {
+      "baseline_due": 0.0,
+      "drain_recovery_seconds": 7.8540216729998065,
+      "first_reading_after_restart": 6.0,
+      "first_reading_oldest_age_seconds": 29.694538,
+      "surface_unreachable_during_outage": 1.0
+    },
+    "drained": true,
+    "peak_due": 177,
+    "peak_oldest_age_seconds": 7.371744,
+    "samples": 348,
+    "scrape_failures": 0
+  },
+  "plan": {
+    "by_business": {
+      "clinica-sonrisa": 81,
+      "estudio-legal": 79,
+      "katy-hvac": 79
+    },
+    "by_event_type": {
+      "long": 52,
+      "standard": 187
+    },
+    "by_follow_up": {
+      "cancel": 26,
+      "none": 192,
+      "reschedule": 21
+    },
+    "by_locale": {
+      "en": 120,
+      "es": 119
+    },
+    "by_weekday": {
+      "0": 57,
+      "1": 55,
+      "2": 48,
+      "3": 46,
+      "4": 33
+    },
+    "distinct_days": 10,
+    "total": 239
+  },
+  "races": [
+    {
+      "contenders": 40,
+      "name": "race_same_slot",
+      "refusals": {
+        "slot_unavailable": 39
+      },
+      "unexpected": [],
+      "winners": 1
+    },
+    {
+      "contenders": 40,
+      "name": "control_race_distinct_slots",
+      "refusals": {},
+      "unexpected": [],
+      "winners": 40
+    },
+    {
+      "contenders": 40,
+      "name": "race_cancel_same_booking",
+      "refusals": {},
+      "unexpected": [],
+      "winners": 40
+    },
+    {
+      "contenders": 40,
+      "name": "race_reschedule_same_booking",
+      "refusals": {
+        "not_active": 39
+      },
+      "unexpected": [],
+      "winners": 1
+    },
+    {
+      "contenders": 2,
+      "name": "race_cancel_vs_reschedule",
+      "refusals": {},
+      "unexpected": [],
+      "winners": 2
+    }
+  ],
+  "rescheduled": 13,
+  "run_id": "696a49f6",
+  "seed": 20260725,
+  "sink": {
+    "booking.cancelled": 22,
+    "booking.created": 252,
+    "booking.rescheduled": 15
+  },
+  "verdict": "MEASURED"
+}
