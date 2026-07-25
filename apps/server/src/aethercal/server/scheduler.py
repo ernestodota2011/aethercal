@@ -63,6 +63,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.payments import build_money_runners, run_parked_payment_tick
+from aethercal.server.services.slots import MAX_PAST_DAYS, busy_window
 from aethercal.server.services.tenant_senders import TenantSenders, resolve_tenant_senders
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
 from aethercal.server.webhooks.delivery import DeliveryReport, deliver_due
@@ -85,7 +86,9 @@ DEFAULT_WEBHOOK_INTERVAL_SECONDS = 60
 DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS = 60
 
-# How far ahead the periodic busy-cache refresh pulls freebusy for each connected calendar.
+# How far ahead the periodic busy-cache refresh keeps each connected calendar complete. Read as
+# DATES, not as an offset from the tick: the cache answers any slots query whose ``to`` lands within
+# this many days of today (:func:`busy_refresh_window` turns it into the instants to fetch).
 BUSY_REFRESH_HORIZON = timedelta(days=30)
 
 # Per-tick HTTP client timeout for outbound-webhook POSTs (a slow subscriber never stalls a tick).
@@ -364,6 +367,38 @@ async def _refresh_one_busy_cache(
             return True
 
 
+def busy_refresh_window(
+    now: datetime, *, horizon: timedelta = BUSY_REFRESH_HORIZON
+) -> TimeInterval:
+    """The instants one refresh pass pulls — drawn on the CONSUMER's grid, not on the tick's clock.
+
+    ==This is the whole fix for the near-date ``UNAVAILABLE``.== ``refresh_busy_cache`` stamps
+    ``busy_synced_from/to`` with exactly the window it fetched, and ``read_busy`` then serves a host
+    only while that stamp fully CONTAINS the window a query asks about. So the stamp and the query
+    have to be drawn the same way — and they were not:
+
+    * a query is built by :func:`~aethercal.server.services.slots.busy_window`, on UTC midnights
+      padded a day on each side (a wall-time availability can spill across the UTC date boundary);
+    * this pass used to fetch ``[now, now + horizon]`` — the wall-clock instant of the tick.
+
+    An instant is never ``<=`` the midnight before it, so a tick at 16:40 could not cover a query
+    about today or tomorrow, the request path has no ``service_factory`` to fall back on (RNF-6),
+    and a healthy, freshly-synced calendar degraded to ``UNAVAILABLE`` (a 503 on the booking page)
+    for precisely the near dates a real visitor picks. The cache held the answer; the arithmetic
+    could not see it.
+
+    So the window is now built from the SAME function, over the widest date band a caller is allowed
+    to ask about (``MAX_PAST_DAYS`` back — the booking page anchors to today in the VISITOR's zone,
+    so a guest west of UTC legitimately asks about yesterday-in-UTC) out to the horizon. It is a
+    ==re-referencing, not a widening==: the fetched window still describes exactly what was pulled,
+    the stamp still describes exactly what was fetched, and containment stays a strict test. Beyond
+    the horizon nothing is claimed and ``read_busy`` still refuses (RF-13) — as it must, because out
+    there we genuinely have not looked.
+    """
+    today = now.astimezone(UTC).date()
+    return busy_window(today - timedelta(days=MAX_PAST_DAYS), today + horizon)
+
+
 async def run_busy_refresh_once(
     *,
     pools: WorkerPools,
@@ -375,7 +410,7 @@ async def run_busy_refresh_once(
     ``None`` if the whole tick failed (logged) — never propagates.
     """
     moment = now if now is not None else datetime.now(UTC)
-    window = TimeInterval(start=moment, end=moment + horizon)
+    window = busy_refresh_window(moment, horizon=horizon)
     try:
         return await refresh_all_busy_caches(
             pools, now=moment, window=window, service_factory=service_factory
@@ -657,6 +692,7 @@ __all__ = [
     "build_interval_scheduler",
     "build_parked_payment_runner",
     "build_webhook_deliverer",
+    "busy_refresh_window",
     "make_busy_refresh_tick",
     "make_outbox_drain_tick",
     "make_webhook_delivery_tick",

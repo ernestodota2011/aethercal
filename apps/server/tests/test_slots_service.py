@@ -431,7 +431,7 @@ async def test_window_at_min_date_does_not_overflow(
     schedule = await _schedule(sqlite_session, tenant)
     event_type = await _event_type(sqlite_session, tenant, host, schedule)
 
-    # ``date.min`` at the low end forces ``_busy_window`` to pad below ``date.min``: the padded
+    # ``date.min`` at the low end forces ``busy_window`` to pad below ``date.min``: the padded
     # bound must be clamped rather than raising ``OverflowError`` (which would 500 the endpoint).
     result = await compute_slots(
         sqlite_session,
@@ -455,7 +455,7 @@ async def test_window_at_max_date_does_not_overflow(
     schedule = await _schedule(sqlite_session, tenant)
     event_type = await _event_type(sqlite_session, tenant, host, schedule)
 
-    # ``date.max`` at the high end forces ``_busy_window`` to pad above ``date.max``: the padded
+    # ``date.max`` at the high end forces ``busy_window`` to pad above ``date.max``: the padded
     # bound must be clamped rather than raising ``OverflowError``.
     result = await compute_slots(
         sqlite_session,
