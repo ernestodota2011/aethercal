@@ -221,16 +221,45 @@ async def test_metrics_with_the_operator_token_serves_prometheus_text(
     assert "ada@example.com" not in body
 
 
-async def test_metrics_summary_with_the_operator_token_serves_the_human_report(
+async def test_metrics_summary_with_the_operator_token_serves_grouped_json(
     sqlite_maker: async_sessionmaker[AsyncSession], client_factory: ClientFactory
 ) -> None:
-    """The human-readable twin: the operator running the shadow reads the same numbers as a person,
-    and it leaks no more than the Prometheus text does."""
+    """==What the pilot feedback loop reads.== The same numbers as /metrics, grouped as
+    JSON behind the same operator token, leaking no more than the Prometheus text does. It is the
+    canonical machine-readable summary; the human plain-text twin lives at /metrics/summary.txt."""
     tenant = await _seed(sqlite_maker)
     client = await client_factory(metrics_token=_TOKEN)
 
     resp = await client.get(
         "/api/v1/metrics/summary", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()
+    assert set(body) == {"outbox", "bookings", "money", "webhooks", "drain"}
+    assert body["bookings"]["by_status"]["no_show"] == 1
+    assert body["outbox"]["by_status"]["dead"] == 1
+    # The named dead-man switches are fields the pilot can pull, not buried lines.
+    assert "oldest_due_age_seconds" in body["outbox"]
+    assert "payment_events_dead" in body["money"]
+    assert "lost" in body["drain"]
+    # And, exactly like /metrics, it says the numbers but never WHOSE.
+    assert tenant.slug not in resp.text
+    assert "ada@example.com" not in resp.text
+
+
+async def test_metrics_summary_txt_with_the_operator_token_serves_the_human_report(
+    sqlite_maker: async_sessionmaker[AsyncSession], client_factory: ClientFactory
+) -> None:
+    """The plain-text twin, at /metrics/summary.txt so /metrics/summary itself can be JSON. The
+    operator running the shadow reads the same numbers as a person, and it leaks no more than the
+    Prometheus text does."""
+    tenant = await _seed(sqlite_maker)
+    client = await client_factory(metrics_token=_TOKEN)
+
+    resp = await client.get(
+        "/api/v1/metrics/summary.txt", headers={"Authorization": f"Bearer {_TOKEN}"}
     )
 
     assert resp.status_code == 200
@@ -244,6 +273,32 @@ async def test_metrics_summary_with_the_operator_token_serves_the_human_report(
     # And, exactly like /metrics, it says the numbers but never WHOSE.
     assert tenant.slug not in body
     assert "ada@example.com" not in body
+
+
+async def test_metrics_summary_with_no_token_configured_is_closed_not_open(
+    client_factory: ClientFactory,
+) -> None:
+    """==Fail-closed, like /metrics.== "The operator did not set a token" must never resolve to
+    "serve the instance-wide summary of every business to whoever asks". Unconfigured is OFF: 503,
+    naming the variable, rather than a JSON endpoint quietly open to the world."""
+    client = await client_factory()
+
+    resp = await client.get("/api/v1/metrics/summary")
+
+    assert resp.status_code == 503
+    assert "AETHERCAL_METRICS_TOKEN" in resp.json()["detail"]["message"]
+
+
+async def test_metrics_summary_with_the_wrong_token_is_unauthorized(
+    client_factory: ClientFactory,
+) -> None:
+    client = await client_factory(metrics_token=_TOKEN)
+
+    resp = await client.get(
+        "/api/v1/metrics/summary", headers={"Authorization": f"Bearer {'x' * 40}"}
+    )
+
+    assert resp.status_code == 401
 
 
 async def test_metrics_summary_without_a_token_is_unauthorized(

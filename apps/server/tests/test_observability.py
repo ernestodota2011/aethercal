@@ -18,6 +18,7 @@ apparent one:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -43,6 +44,7 @@ from aethercal.server.observability import (
     observe_drain,
     render_human,
     render_prometheus,
+    render_summary,
 )
 from aethercal.server.services.outbox import OutboxEffect, OutboxReport, OutboxWork, drain_outbox
 
@@ -547,3 +549,76 @@ def test_render_human_shows_zeroes_rather_than_hiding_an_absent_series() -> None
     assert "Bookings" in report
     assert "(none)" in report  # the empty status maps, spelled out, not omitted
     assert "0.0%" in report
+
+
+# --------------------------------------------------------------------------------------
+# The JSON summary — render_human's machine-readable twin, for the pilot feedback loop.
+# --------------------------------------------------------------------------------------
+
+
+def test_render_summary_groups_the_pilot_numbers_for_a_machine_reader() -> None:
+    """==The JSON twin of render_human, grouped by the operator's question.== The pilot loop and
+    any dashboard read the SAME numbers as a structured object: is the queue draining (``outbox``),
+    are appointments being kept (``bookings``), did a charge fall through the floor (``money``), is
+    the CRM bridge sending (``webhooks``), did the drain misbehave (``drain``, where ``lost`` is the
+    possible-double-send worth an alarm)."""
+    snapshot = MetricsSnapshot(
+        outbox_by_status={"pending": 2, "delivered": 5, "dead": 1},
+        outbox_due=3,
+        outbox_oldest_due_age_seconds=42.0,
+        outbox_expired_leases=1,
+        bookings_by_status={"confirmed": 4, "no_show": 1, "cancelled": 2},
+        no_show_ratio=0.2,
+        webhook_deliveries_by_status={"delivered": 6, "dead": 1},
+        webhook_deliveries_by_reason={"blocked-private-target": 2, "http-error": 1},
+        payment_events_parked=0,
+        payment_events_dead=1,
+    )
+    counters = DrainCounters()
+    report = OutboxReport()
+    report.lost.append(uuid.uuid4())
+    report.voided_midflight.append(uuid.uuid4())
+    counters.observe(report)
+
+    summary = render_summary(snapshot, counters=counters)
+
+    assert set(summary) == {"outbox", "bookings", "money", "webhooks", "drain"}
+    # The three dead-man switches, each reachable by name rather than buried in a flat blob.
+    assert summary["outbox"]["due"] == 3
+    assert summary["outbox"]["oldest_due_age_seconds"] == 42.0  # the outbox dead-man
+    assert summary["money"]["payment_events_dead"] == 1  # the money dead-man
+    assert summary["drain"]["lost"] == 1  # the possible-double-send counter
+    # The pilot's headline numbers.
+    assert summary["bookings"]["no_show_ratio"] == 0.2
+    assert summary["bookings"]["by_status"]["no_show"] == 1
+    assert summary["outbox"]["by_status"]["dead"] == 1
+    assert summary["webhooks"]["by_reason"]["blocked-private-target"] == 2
+    # It is JSON-native through and through — a dashboard can post it as-is, no coercion.
+    json.dumps(summary)
+
+
+async def test_the_summary_carries_no_per_business_data(sqlite_session: AsyncSession) -> None:
+    """==The same rule as the Prometheus text, checked the same way.== The summary is built from the
+    same snapshot, so it cannot carry a tenant, a guest, a slug or an event title — not
+    in a key, not in a value. The test looks for the real seeded values in the SERIALISED json, not
+    for the word "tenant", because a summary that only fails on the literal string is no guard."""
+    tenant, event_type = await _tenant_with_event_type(sqlite_session)
+    booking = await _booking(sqlite_session, tenant, event_type)
+    await _intent(sqlite_session, booking, status=OutboxStatus.PENDING, created_at=_NOW)
+
+    summary = render_summary(
+        await collect_metrics(sqlite_session, now=_NOW),
+        counters=DrainCounters(),
+    )
+    blob = json.dumps(summary)
+
+    for private in (
+        tenant.slug,
+        str(tenant.id),
+        str(booking.id),
+        booking.guest_email,
+        booking.guest_name,
+        event_type.slug,
+        event_type.title,
+    ):
+        assert private not in blob

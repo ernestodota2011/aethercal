@@ -1,8 +1,9 @@
 """The OPERATOR surface — served by the ``aethercal-worker`` process, and only by it.
 
-``GET /metrics`` (Prometheus, operator token) · ``GET /metrics/summary`` (the same numbers,
-human-readable, same token) · ``GET /health`` (liveness) · ``GET /health/ready`` (readiness **with
-the outbox backlog**).
+``GET /metrics`` (Prometheus, operator token) · ``GET /metrics/summary`` (the same numbers as
+grouped JSON, for the pilot feedback loop, same token) · ``GET /metrics/summary.txt`` (that JSON's
+human plain-text twin) · ``GET /health`` (liveness) · ``GET /health/ready`` (readiness **with the
+outbox backlog**).
 
 .. rubric:: Why this moved out of the web process
 
@@ -51,7 +52,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from aethercal.server.api.auth import bearer_token
 from aethercal.server.db.pools import BypassReason, WorkerPools
@@ -62,6 +63,7 @@ from aethercal.server.observability import (
     collect_metrics,
     render_human,
     render_prometheus,
+    render_summary,
 )
 from aethercal.server.settings import Settings
 
@@ -229,14 +231,34 @@ async def metrics(request: Request) -> PlainTextResponse:
     return PlainTextResponse(content=body, media_type=CONTENT_TYPE)
 
 
-@router.get("/metrics/summary", response_class=PlainTextResponse, include_in_schema=False)
-async def metrics_summary(request: Request) -> PlainTextResponse:
-    """The SAME instance-wide numbers as ``/metrics``, rendered for a PERSON rather than a scraper.
+@router.get("/metrics/summary", response_class=JSONResponse, include_in_schema=False)
+async def metrics_summary(request: Request) -> JSONResponse:
+    """The SAME instance-wide numbers as ``/metrics``, grouped as JSON for the PILOT feedback loop.
 
-    The operator running the shadow needs to read booking counts, the outbox backlog, the no-show
-    rate and the money dead-man without either scraping Prometheus or opening psql. This is that
-    read. It is guarded by the SAME operator token as ``/metrics`` and carries the SAME guarantee —
-    instance-wide, no tenant/guest/URL — because it is the same snapshot, only formatted.
+    A dashboard, a feedback-loop note, or an operator diffing two snapshots wants the numbers as a
+    structured object it can pull a field out of — the no-show rate, the outbox dead-man, the money
+    dead-letter — not as a text blob it has to parse. That is this endpoint;
+    :func:`~aethercal.server.observability.render_summary` owns the shape. The human plain-text twin
+    lives at ``/metrics/summary.txt`` for eyeballing in a terminal.
+
+    It is guarded by the SAME operator token as ``/metrics`` and carries the SAME guarantee —
+    ==instance-wide, no tenant/guest/slug/title, not in a key, not in a value== — because it is the
+    same snapshot, only shaped. A test asserts that against the real seeded values, not the word
+    "tenant".
+    """
+    _require_operator(request)
+    snapshot = await _snapshot(_pools(request))
+    return JSONResponse(content=render_summary(snapshot, counters=DRAIN_COUNTERS))
+
+
+@router.get("/metrics/summary.txt", response_class=PlainTextResponse, include_in_schema=False)
+async def metrics_summary_text(request: Request) -> PlainTextResponse:
+    """The human plain-text twin of ``/metrics/summary``, for a PERSON rather than a machine.
+
+    The operator running the shadow reads booking counts, the outbox backlog, the no-show rate and
+    the money dead-man in a terminal without scraping Prometheus or opening psql. Same operator
+    token, same instance-wide guarantee as its JSON sibling — the same snapshot, only formatted
+    for eyes instead of for a dashboard.
     """
     _require_operator(request)
     snapshot = await _snapshot(_pools(request))
