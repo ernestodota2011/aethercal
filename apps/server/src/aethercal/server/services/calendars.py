@@ -57,9 +57,10 @@ the booking back.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -76,11 +77,23 @@ from aethercal.server.db.models import (
     ExternalConnection,
     User,
 )
+from aethercal.server.integrations.caldav.client import (
+    build_service as build_caldav_service,
+)
+from aethercal.server.integrations.caldav.client import (
+    query_busy as caldav_query_busy,
+)
+from aethercal.server.integrations.caldav.parse import (
+    caldav_account_id,
+    validate_caldav_endpoint,
+)
 from aethercal.server.integrations.google.calendar import (
     build_service,
     delete_event,
     insert_event_with_meet,
-    query_busy,
+)
+from aethercal.server.integrations.google.calendar import (
+    query_busy as google_query_busy,
 )
 from aethercal.server.integrations.google.oauth import credentials_from_token_json
 from aethercal.server.integrations.google.parse import MeetEventRequest
@@ -88,6 +101,25 @@ from aethercal.server.integrations.google.parse import MeetEventRequest
 _logger = logging.getLogger(__name__)
 
 GOOGLE_PROVIDER = "google"
+# CalDAV (C-03): a SECOND freebusy provider, READ-ONLY. It contributes busy time from any standards
+# calendar server (Nextcloud, Radicale, iCloud…) so no core function depends on Google alone
+# (RNF-9). It is NEVER a booking write target — there is no create/delete/reschedule path for it —
+# which is exactly why the WRITE path (``resolve_calendar_target``, ``_retire_other_targets``, the
+# booking sync in ``services/bookings``) keeps ``load_active_connections`` on its Google-only
+# default, and only the READ path (``read_busy``) widens to ``BUSY_PROVIDERS``.
+CALDAV_PROVIDER = "caldav"
+
+# The providers whose connected calendars contribute to a host's BUSY set (read/union path, RF-30).
+BUSY_PROVIDERS: tuple[str, ...] = (GOOGLE_PROVIDER, CALDAV_PROVIDER)
+
+# The per-provider freebusy query, dispatched by ``connection.provider`` in ``refresh_busy_cache``.
+# Both have the same signature ``(service, calendar_id, window) -> list[TimeInterval]`` and both run
+# offline against an injected fake; the only difference is which wire protocol shapes the request.
+BusyQueryFn = Callable[[Any, str, TimeInterval], list[TimeInterval]]
+_BUSY_QUERY_BY_PROVIDER: dict[str, BusyQueryFn] = {
+    GOOGLE_PROVIDER: google_query_busy,
+    CALDAV_PROVIDER: caldav_query_busy,
+}
 # The calendar a connection uses when the operator has linked NONE explicitly: the account's own
 # default. It is a FALLBACK, not the policy — the calendar is configured per connection through the
 # ``ExternalCalendarLink`` rows (which is how a host books into a dedicated secondary calendar
@@ -150,6 +182,23 @@ class GoogleCredential:
 
     account_email: str
     token_json: str
+
+
+@dataclass(frozen=True)
+class CaldavCredential:
+    """A CalDAV connection's server + Basic-auth secret + the calendar collection URL (C-03).
+
+    READ-ONLY: this feeds the host's busy set from a standards CalDAV server (Nextcloud, Radicale,
+    iCloud…) and is never a booking write target. ``server_url``/``username``/``password`` are
+    encrypted at rest as a JSON payload in ``encrypted_credentials`` (reusing the existing Fernet
+    seam — no new column, no migration); ``calendar_url`` is the collection whose freebusy is read,
+    stored on an ``ExternalCalendarLink`` exactly like a linked Google calendar.
+    """
+
+    server_url: str
+    username: str
+    password: str
+    calendar_url: str
 
 
 @dataclass(frozen=True)
@@ -233,6 +282,118 @@ async def store_google_connection(
         connection.revoked_at = None
     await session.flush()
     return connection
+
+
+async def store_caldav_connection(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    credential: CaldavCredential,
+    fernet: Fernet,
+) -> ExternalConnection:
+    """Persist (or refresh) a host's READ-ONLY CalDAV connection, credentials encrypted at rest.
+
+    The ``{server_url, username, password}`` triple is Fernet-encrypted as a JSON payload before it
+    ever hits the row — the plaintext app-password is never stored or logged — reusing the SAME
+    ``encrypted_credentials`` column and Fernet seam Google uses, so this adds NO column and NO
+    migration. The connection is keyed by ``(tenant, user, provider='caldav', account_email)`` where
+    ``account_email`` is ``username@server-origin`` (:func:`caldav_account_id`) — the SERVER is part
+    of the identity, so the same username on two different servers is two connections. Re-storing
+    (a password rotation, a re-run of the connect command) updates the ciphertext in place instead
+    of piling up rows.
+
+    ``credential.calendar_url`` is recorded on an ``ExternalCalendarLink`` flagged ``busy=True`` and
+    ``is_booking_target=False`` — CalDAV contributes freebusy and is never written to. It becomes
+    the connection's SOLE read calendar: re-storing with a different ``calendar_url`` REPLACES the
+    previous one (see :func:`_link_busy_calendar`). The busy cache is invalidated ONLY when the set
+    of calendars actually read changes, never on an idempotent re-store — mirroring
+    ``link_booking_calendar``'s rule so re-saving the same configuration does not blank the cache
+    and switch the host's slots off.
+
+    Refuses (``ValueError``) an endpoint that would leak the Basic-auth secret over cleartext or to
+    a foreign host (:func:`validate_caldav_endpoint`) — checked at the door, before anything stored.
+    """
+    validate_caldav_endpoint(credential.server_url, credential.calendar_url)
+    # The account identity folds in the server ORIGIN, not just the username: the same username on
+    # two different servers must be two connections, or one overwrites the other and its busy set
+    # silently vanishes (RF-30 unions EVERY connection). See ``caldav_account_id``.
+    account_id = caldav_account_id(credential.server_url, credential.username)
+    payload = json.dumps(
+        {
+            "server_url": credential.server_url,
+            "username": credential.username,
+            "password": credential.password,
+        }
+    )
+    ciphertext = fernet.encrypt(payload.encode("utf-8"))
+    connection = (
+        await session.scalars(
+            select(ExternalConnection).where(
+                ExternalConnection.tenant_id == tenant_id,
+                ExternalConnection.user_id == user_id,
+                ExternalConnection.provider == CALDAV_PROVIDER,
+                ExternalConnection.account_email == account_id,
+            )
+        )
+    ).one_or_none()
+    if connection is None:
+        connection = ExternalConnection(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=CALDAV_PROVIDER,
+            account_email=account_id,
+            encrypted_credentials=ciphertext,
+        )
+        session.add(connection)
+    else:
+        connection.encrypted_credentials = ciphertext
+        connection.revoked_at = None
+    await session.flush()
+
+    before = await busy_calendar_ids(session, connection=connection)
+    await _link_busy_calendar(session, connection=connection, calendar_id=credential.calendar_url)
+    after = await busy_calendar_ids(session, connection=connection)
+    if after != before:
+        await invalidate_busy_cache(session, connection=connection)
+    return connection
+
+
+async def _link_busy_calendar(
+    session: AsyncSession, *, connection: ExternalConnection, calendar_id: str
+) -> ExternalCalendarLink:
+    """Set this CalDAV connection's READ-ONLY busy calendar to EXACTLY ``calendar_id``.
+
+    A CalDAV connection reads ONE calendar — the collection passed to ``connect-caldav``. Re-storing
+    the connection with a DIFFERENT ``calendar_url`` must REPLACE what is read, not accumulate: a
+    stale calendar left ``busy`` would keep blocking slots the host meant to free, and worse, if it
+    became unreadable (revoked/deleted) its freebusy query would fail and wedge the WHOLE host at
+    ``UNAVAILABLE`` for ever (one connection we cannot read fails the host closed). So every OTHER
+    link of this connection is retired in the same transaction. Idempotent for the same
+    ``calendar_id`` (nothing else to remove, the existing row is reused). Never sets
+    ``is_booking_target`` — CalDAV has no write path, so it must never receive a booking.
+    """
+    links = await _links(session, connection=connection)
+    existing: ExternalCalendarLink | None = None
+    for link in links:
+        if link.external_calendar_id == calendar_id:
+            existing = link
+            link.busy = True
+        else:
+            # A read calendar the host has re-pointed away from. Retiring it (not just opting it out
+            # of busy) keeps the connection's read set exactly {calendar_id}.
+            await session.delete(link)
+    if existing is None:
+        existing = ExternalCalendarLink(
+            tenant_id=connection.tenant_id,
+            connection_id=connection.id,
+            external_calendar_id=calendar_id,
+            busy=True,
+            is_booking_target=False,
+        )
+        session.add(existing)
+    await session.flush()
+    return existing
 
 
 async def link_booking_calendar(
@@ -385,14 +546,22 @@ def load_credentials(connection: ExternalConnection, *, fernet: Fernet | MultiFe
 def build_live_service(
     connection: ExternalConnection, *, fernet: Fernet | MultiFernet
 ) -> Any:  # pragma: no cover - live wiring
-    """Production ``ServiceFactory``: decrypt the connection's token and build a live Google client.
+    """Production ``ServiceFactory``: decrypt the connection and build its live client, BY PROVIDER.
 
     Wire it as ``service_factory=functools.partial(build_live_service, fernet=fernet)`` when calling
-    :func:`read_busy` from the app. Kept out of the tested path because it constructs the untyped
-    google-api-python-client.
+    :func:`read_busy` (or from the scheduler's refresh). A single injected factory that dispatches
+    on ``connection.provider`` is what lets a host union Google and CalDAV busy through the one
+    ``read_busy`` seam. Kept out of the tested path because it constructs the untyped live clients.
     """
-    credentials = credentials_from_token_json(load_credentials(connection, fernet=fernet))
-    return build_service(credentials)
+    token = load_credentials(connection, fernet=fernet)
+    if connection.provider == CALDAV_PROVIDER:
+        secrets = json.loads(token)
+        return build_caldav_service(
+            server_url=secrets["server_url"],
+            username=secrets["username"],
+            password=secrets["password"],
+        )
+    return build_service(credentials_from_token_json(token))
 
 
 # --------------------------------------------------------------------------------------
@@ -401,13 +570,24 @@ def build_live_service(
 
 
 async def load_active_connections(
-    session: AsyncSession, *, tenant_id: uuid.UUID, user_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    providers: Collection[str] = (GOOGLE_PROVIDER,),
 ) -> list[ExternalConnection]:
-    """ALL of the host's active (not revoked) Google connections, tenant-scoped, oldest first.
+    """ALL of the host's active (not revoked) connections for ``providers``, tenant-scoped, oldest
+    first.
 
     Deliberately plural. The predecessor of this function ended in ``.first()``, so a host with two
     connected accounts had one of them silently ignored — and an ignored calendar is an ignored busy
     set, which is a double-booking waiting to happen. Every read path unions the lot.
+
+    ``providers`` defaults to Google ONLY, and that default is load-bearing: the WRITE path
+    (``resolve_calendar_target``, ``_retire_other_targets``, the booking sync in
+    ``services/bookings``) must see only providers it can write events into, and CalDAV cannot be
+    written to (C-03). The READ path (:func:`read_busy`) passes ``providers=BUSY_PROVIDERS`` to
+    union Google and CalDAV busy — the one caller that widens the set.
     """
     return list(
         (
@@ -416,7 +596,7 @@ async def load_active_connections(
                 .where(
                     ExternalConnection.tenant_id == tenant_id,
                     ExternalConnection.user_id == user_id,
-                    ExternalConnection.provider == GOOGLE_PROVIDER,
+                    ExternalConnection.provider.in_(providers),
                     ExternalConnection.revoked_at.is_(None),
                 )
                 .order_by(ExternalConnection.created_at, ExternalConnection.id)
@@ -504,6 +684,21 @@ async def resolve_calendar_target(
     )
 
 
+def _busy_query_for(provider: str) -> BusyQueryFn:
+    """The freebusy query for ``provider`` — Google's or CalDAV's — or a loud refusal.
+
+    An unknown provider raises rather than silently reading no busy: a connection whose calendars we
+    cannot query is a calendar we cannot see, and treating that as "free" is the double-booking this
+    module exists to prevent. The caller (``refresh_busy_cache``) is wrapped by ``read_busy`` in a
+    try/except that degrades fail-closed, so this refusal turns into ``STALE``/``UNAVAILABLE`` --
+    never an empty (all-free) result.
+    """
+    try:
+        return _BUSY_QUERY_BY_PROVIDER[provider]
+    except KeyError as exc:
+        raise ValueError(f"no freebusy query registered for provider {provider!r}") from exc
+
+
 async def refresh_busy_cache(
     session: AsyncSession,
     *,
@@ -525,14 +720,15 @@ async def refresh_busy_cache(
     intervals that were cached. The write is flushed, not committed -- the caller owns the
     transaction.
     """
+    query_busy = _busy_query_for(connection.provider)
     busy: list[TimeInterval] = []
     for calendar_id in await busy_calendar_ids(session, connection=connection):
-        # ``query_busy`` is a BLOCKING network call (googleapiclient is sync). Run it off the event
-        # loop: called inline it would freeze the whole worker -- every other booking, the webhook
-        # drain, ``/metrics`` -- and, worse, defeat the ``asyncio.timeout`` the outbox wraps every
-        # effect in (that timeout only interrupts at an ``await``), so a hung Google call could
-        # outlive its lease and get re-executed. Offloading keeps the loop responsive and the
-        # timeout real. See ``create_event_for_booking`` for the write side.
+        # ``query_busy`` is a BLOCKING network call (googleapiclient and the CalDAV client are both
+        # sync). Run it off the event loop: called inline it would freeze the whole worker -- every
+        # other booking, the webhook drain, ``/metrics`` -- and, worse, defeat the
+        # ``asyncio.timeout`` the outbox wraps every effect in (that timeout only interrupts at an
+        # ``await``), so a hung provider call could outlive its lease and get re-executed.
+        # Offloading keeps the loop responsive and the timeout real -- see create_event_for_booking.
         busy.extend(await asyncio.to_thread(query_busy, service, calendar_id, window))
     await session.execute(
         delete(BusyCache).where(
@@ -598,14 +794,17 @@ async def read_busy(
     unreachable) the function serves only what the cache can prove -- it never treats "unknown" as
     "free".
 
-    MULTI-CONNECTION (RF-30): a host may have several connected accounts, and they are ALL read --
-    their busy sets are unioned. The predecessor took the first row and dropped the rest, which
-    offered slots the host was already booked in. The statuses combine fail-closed: ONE connection
-    we cannot establish makes the whole host ``UNAVAILABLE`` (serving the readable calendars alone
-    would present incomplete data as complete); otherwise one degraded copy makes the result
-    ``STALE``.
+    MULTI-CONNECTION, MULTI-PROVIDER (RF-30, RNF-9): a host may have several connected accounts
+    ACROSS providers — Google and CalDAV (C-03) — and they are ALL read; their busy sets are
+    unioned (``providers=BUSY_PROVIDERS``). The predecessor took the first row and dropped the rest,
+    which offered slots the host was already booked in. The statuses combine fail-closed: ONE
+    connection we cannot establish — of EITHER provider — makes the whole host ``UNAVAILABLE``
+    (serving the readable calendars alone would present incomplete data as complete); otherwise one
+    degraded copy makes the result ``STALE``.
     """
-    connections = await load_active_connections(session, tenant_id=tenant_id, user_id=host_user_id)
+    connections = await load_active_connections(
+        session, tenant_id=tenant_id, user_id=host_user_id, providers=BUSY_PROVIDERS
+    )
     if not connections:
         # NO CONNECTED CALENDAR — not a broken one (RNF-9). There is no external busy set to be
         # ignorant of, so this is FRESH-and-empty and the host's slots are offered normally (only
@@ -883,12 +1082,15 @@ def _extract_meet_url(created: dict[str, Any]) -> str | None:
 
 
 __all__ = [
+    "BUSY_PROVIDERS",
+    "CALDAV_PROVIDER",
     "DEFAULT_CALENDAR_ID",
     "GOOGLE_PROVIDER",
     "AmbiguousCalendarTargetError",
     "BusyQuery",
     "BusyReadResult",
     "BusyStatus",
+    "CaldavCredential",
     "CalendarSyncError",
     "CalendarTarget",
     "CalendarTargetMissingError",
@@ -906,5 +1108,6 @@ __all__ = [
     "refresh_busy_cache",
     "reschedule_event_for_booking",
     "resolve_calendar_target",
+    "store_caldav_connection",
     "store_google_connection",
 ]

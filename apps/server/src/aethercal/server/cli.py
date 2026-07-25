@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import uuid
 from collections.abc import Mapping
@@ -38,8 +39,10 @@ from aethercal.server.services.api_keys import (
     revoke_api_key,
 )
 from aethercal.server.services.calendars import (
+    CaldavCredential,
     GoogleCredential,
     link_booking_calendar,
+    store_caldav_connection,
     store_google_connection,
 )
 from aethercal.server.services.key_rotation import (
@@ -228,6 +231,47 @@ async def run_connect_google(  # noqa: PLR0913 - the tenant/host pair + credenti
         )
         if calendar_id is not None:
             await link_booking_calendar(session, connection=connection, calendar_id=calendar_id)
+        return connection.id
+
+
+async def run_connect_caldav(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    tenant_slug: str,
+    user_email: str,
+    credential: CaldavCredential,
+    fernet: Fernet,
+) -> uuid.UUID:
+    """Store a host's READ-ONLY CalDAV connection (C-03) with its credentials encrypted at rest.
+
+    Resolves the tenant by slug and the host user by email, then delegates to
+    ``store_caldav_connection`` (Fernet-encrypts ``{server_url, username, password}`` before
+    persisting, and records ``calendar_url`` as a busy-only link). Returns the connection id. The
+    ``credential`` argument keeps this coroutine offline-testable; the Typer command below reads the
+    app-password from the environment (never a CLI option) and calls it.
+
+    CalDAV is a BUSY provider only — it is never a booking write target — so there is no
+    ``calendar_id`` designation here, unlike ``run_connect_google``.
+    """
+    async with sessionmaker() as session, session.begin():
+        tenant = (
+            await session.scalars(select(Tenant).where(Tenant.slug == tenant_slug))
+        ).one_or_none()
+        if tenant is None:
+            raise LookupError(f"no tenant with slug {tenant_slug!r}")
+        try:
+            user = await get_user_by_email(session, tenant_id=tenant.id, email=user_email)
+        except UserNotFoundError as exc:
+            raise LookupError(
+                f"no user with email {user_email!r} in tenant {tenant_slug!r}"
+            ) from exc
+        connection = await store_caldav_connection(
+            session,
+            tenant_id=tenant.id,
+            user_id=user.id,
+            credential=credential,
+            fernet=fernet,
+        )
         return connection.id
 
 
@@ -844,6 +888,81 @@ def connect_google_command(  # pragma: no cover - live OAuth (loopback browser c
             calendar_id=calendar_id,
         )
     )
+    typer.echo(f"connection_id={connection_id}")
+
+
+# The env var the CalDAV app-password is read from — NEVER a CLI option (see the command docstring).
+_CALDAV_PASSWORD_ENV = "AETHERCAL_CALDAV_APP_PASSWORD"
+
+
+@app.command("connect-caldav")
+def connect_caldav_command(  # pragma: no cover - reads env Settings + owner engine
+    tenant_slug: Annotated[str, typer.Option(help="Slug of the tenant that owns the host.")],
+    user_email: Annotated[str, typer.Option(help="Email of the host user to connect.")],
+    server_url: Annotated[
+        str, typer.Option(help="Base URL of the CalDAV server, e.g. https://cloud.example.")
+    ],
+    username: Annotated[str, typer.Option(help="CalDAV username (the account identifier).")],
+    calendar_url: Annotated[
+        str,
+        typer.Option(
+            help="URL of the calendar COLLECTION whose freebusy is read for the host's busy set."
+        ),
+    ],
+) -> None:
+    """Connect a host's READ-ONLY CalDAV calendar as a busy provider (C-03, RNF-9).
+
+    This breaks the Google monoculture: a self-hoster can feed their busy time from any standards
+    CalDAV server (Nextcloud, Radicale, Fastmail, iCloud) instead of Google. It is BUSY-ONLY —
+    AetherCal never writes an event to a CalDAV calendar — so there is no ``--calendar-id`` booking
+    target here, only ``--calendar-url`` to READ.
+
+    ==The app-password is read from ``AETHERCAL_CALDAV_APP_PASSWORD``, never from a CLI option.== A
+    ``--password`` option would put the secret into the process table (``ps``), the shell history
+    and the terminal scrollback. Export it for the one invocation:
+
+        AETHERCAL_CALDAV_APP_PASSWORD=... aethercal-admin connect-caldav --tenant-slug acme \\
+          --user-email host@acme.test --server-url https://cloud.example --username host \\
+          --calendar-url https://cloud.example/remote.php/dav/calendars/host/personal/
+
+    Use a provider APP-PASSWORD (a scoped, revocable token), never the account's real password.
+    """
+    password = os.environ.get(_CALDAV_PASSWORD_ENV)
+    if not password:
+        typer.echo(
+            f"set {_CALDAV_PASSWORD_ENV} to the CalDAV app-password before running this.\n"
+            "\n"
+            "It is deliberately not a --password option: that would land the secret in `ps`, in "
+            "the shell history and in the scrollback. Export it for the single invocation instead.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    settings = Settings()  # type: ignore[call-arg]  # fields sourced from the environment (RF-19)
+    try:
+        connection_id = asyncio.run(
+            run_connect_caldav(
+                # The same owner-asserted sessionmaker every other write command uses; a copy that
+                # forgot the assertion would run as the app role and write a connection that lands
+                # nowhere under RLS while reporting success.
+                build_sessionmaker(_owner_engine(settings)),
+                tenant_slug=tenant_slug,
+                user_email=user_email,
+                credential=CaldavCredential(
+                    server_url=server_url,
+                    username=username,
+                    password=password,
+                    calendar_url=calendar_url,
+                ),
+                fernet=Fernet(settings.fernet_key()),
+            )
+        )
+    except (LookupError, ValueError) as exc:
+        # LookupError: unknown tenant/user. ValueError: an endpoint that would leak the app-password
+        # over cleartext or to a foreign host (validate_caldav_endpoint) — a clean message, not a
+        # traceback.
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"connection_id={connection_id}")
 
 

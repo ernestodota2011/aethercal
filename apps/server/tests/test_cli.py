@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ from aethercal.server.cli import (
     RevokeKeyOutcome,
     _credential_fields,
     credentials_app,
+    run_connect_caldav,
     run_connect_google,
     run_create_tenant,
     run_credentials_delete,
@@ -47,7 +49,11 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.services.api_keys import verify_api_key
-from aethercal.server.services.calendars import GoogleCredential, load_credentials
+from aethercal.server.services.calendars import (
+    CaldavCredential,
+    GoogleCredential,
+    load_credentials,
+)
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
@@ -220,6 +226,106 @@ async def test_connect_google_unknown_user_raises(
             tenant_slug="acme",
             user_email="nobody@acme.test",
             credential=GoogleCredential(account_email="host@gmail.com", token_json="{}"),
+            fernet=fernet,
+        )
+
+
+# --------------------------------------------------------------------------------------
+# `connect-caldav` (C-03) — a READ-ONLY CalDAV busy provider, credentials encrypted at rest.
+# --------------------------------------------------------------------------------------
+
+
+async def test_connect_caldav_stores_an_encrypted_readonly_connection(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id, user_id = await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+
+    connection_id = await run_connect_caldav(
+        maker,
+        tenant_slug="acme",
+        user_email="host@acme.test",
+        credential=CaldavCredential(
+            server_url="https://cloud.example",
+            username="host",
+            password="s3cret-app-password",
+            calendar_url="https://cloud.example/remote.php/dav/calendars/host/personal/",
+        ),
+        fernet=fernet,
+    )
+
+    async with maker() as session:
+        connection = (
+            await session.scalars(
+                select(ExternalConnection).where(ExternalConnection.id == connection_id)
+            )
+        ).one()
+        assert connection.tenant_id == tenant_id
+        assert connection.user_id == user_id
+        assert connection.provider == "caldav"
+        # The app-password never appears at rest, and round-trips through load_credentials.
+        assert b"s3cret-app-password" not in connection.encrypted_credentials
+        payload = json.loads(load_credentials(connection, fernet=fernet))
+        assert payload == {
+            "server_url": "https://cloud.example",
+            "username": "host",
+            "password": "s3cret-app-password",
+        }
+        # The calendar collection URL is a READ-ONLY busy link, never a write target.
+        link = (
+            await session.scalars(
+                select(ExternalCalendarLink).where(
+                    ExternalCalendarLink.connection_id == connection_id
+                )
+            )
+        ).one()
+        assert (
+            link.external_calendar_id
+            == "https://cloud.example/remote.php/dav/calendars/host/personal/"
+        )
+        assert link.busy is True
+        assert link.is_booking_target is False
+
+
+async def test_connect_caldav_unknown_tenant_raises(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+    with pytest.raises(LookupError, match="ghost"):
+        await run_connect_caldav(
+            maker,
+            tenant_slug="ghost",
+            user_email="host@acme.test",
+            credential=CaldavCredential(
+                server_url="https://cloud.example",
+                username="host",
+                password="pw",
+                calendar_url="https://cloud.example/cal/",
+            ),
+            fernet=fernet,
+        )
+
+
+async def test_connect_caldav_unknown_user_raises(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await run_create_tenant(
+        maker, slug="acme", name="Acme Inc", email="host@acme.test", timezone="UTC"
+    )
+    fernet = Fernet(derive_fernet_key("cli-app-secret"))
+    with pytest.raises(LookupError, match="nobody@acme"):
+        await run_connect_caldav(
+            maker,
+            tenant_slug="acme",
+            user_email="nobody@acme.test",
+            credential=CaldavCredential(
+                server_url="https://cloud.example",
+                username="host",
+                password="pw",
+                calendar_url="https://cloud.example/cal/",
+            ),
             fernet=fernet,
         )
 
