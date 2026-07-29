@@ -690,10 +690,18 @@ class Mailbox:
         mailbox-wide count; older builds publish only the second, so both are tried in that order.
         ``None`` means the envelope carried neither, which is a CHANGED CONTRACT and emphatically
         not a mailbox of zero.
+
+        ==``bool`` is rejected explicitly.== In Python ``isinstance(True, int)`` is true, so a
+        ``messages_count: true`` — an envelope whose contract has changed — would have read as a
+        mailbox of ONE and the read would have declared itself whole after a single message. An
+        unexpected type has to fall through to the ``None`` that means "changed contract", never
+        to a number. A negative count is refused for the same reason.
         """
         for key in ("messages_count", "total"):
             value: Any = payload.get(key)
-            if isinstance(value, int):
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value >= 0:
                 return value
         return None
 

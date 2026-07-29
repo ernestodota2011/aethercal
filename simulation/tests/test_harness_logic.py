@@ -2714,3 +2714,26 @@ def test_error_tally_sigue_contando_bien_con_escritura_concurrente() -> None:
     for h in hilos:
         h.join()
     assert tally.total() == escritores * por_escritor
+
+
+@pytest.mark.parametrize("valor", [True, False])
+def test_reported_total_rechaza_booleanos(valor: bool) -> None:
+    """En Python `isinstance(True, int)` es cierto, asi que un `messages_count: true`
+    —una respuesta con el contrato cambiado— se habria leido como un buzon de UNO y
+    la lectura se habria declarado completa tras un solo mensaje. Un tipo inesperado
+    tiene que caer al `None` de "contrato cambiado", nunca a un numero."""
+    assert Mailbox.reported_total({"messages_count": valor}) is None
+
+
+@pytest.mark.parametrize("valor", [-1, -99])
+def test_reported_total_rechaza_negativos(valor: int) -> None:
+    """Un buzon no puede tener menos de cero mensajes: es contrato roto, no un total."""
+    assert Mailbox.reported_total({"messages_count": valor}) is None
+
+
+def test_reported_total_sigue_leyendo_un_total_valido() -> None:
+    """Anti-vacuidad: un lector que devolviera None siempre pasaria los dos de arriba
+    y dejaria toda lectura marcada como contrato roto."""
+    assert Mailbox.reported_total({"messages_count": 0}) == 0
+    assert Mailbox.reported_total({"messages_count": 279}) == 279
+    assert Mailbox.reported_total({"total": 42}) == 42
