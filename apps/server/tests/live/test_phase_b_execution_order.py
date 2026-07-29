@@ -38,6 +38,7 @@ from collections.abc import Callable, Coroutine, Mapping
 from datetime import timedelta
 from typing import Any
 
+import httpx
 import pytest
 import test_stripe_live_checkout as checkout_module
 import test_stripe_live_refund as phase_b_module
@@ -107,21 +108,27 @@ class _StripeApiDouble:
 
 
 class _GatewayDouble:
-    def __init__(self, tape: _Recorder) -> None:
+    """The gateway, which may answer — or blow up. ==Both are states it really reaches.=="""
+
+    def __init__(self, tape: _Recorder, *, raises: Exception | None = None) -> None:
         self._tape = tape
+        self._raises = raises
 
     async def refund(self, **_: object) -> RefundOutcome:
         self._tape.note("refund")
+        if self._raises is not None:
+            raise self._raises
         return RefundOutcome.succeeded("re_1")
 
 
-def _drive(
+def _drive(  # noqa: PLR0913 - each argument arranges one state phase B really reaches
     tape: _Recorder,
     monkeypatch: pytest.MonkeyPatch,
     *,
     session: Mapping[str, Any] | None = None,
     provenance_fails: bool = False,
     settled: str | None = None,
+    gateway_raises: Exception | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Build the coroutine that runs phase B against doubles. ==The real function, real flow.=="""
 
@@ -152,7 +159,7 @@ def _drive(
             paid_session_id=PAID_SESSION,
             refund_reconnected=None,
             secret_key="sk_test_NOT_A_REAL_KEY_FOR_A_DOUBLE",
-            gateway=_GatewayDouble(tape),
+            gateway=_GatewayDouble(tape, raises=gateway_raises),
             one_dollar_cents=100,
             one_dollar_currency="usd",
             terminal_refund_success="succeeded",
@@ -343,3 +350,72 @@ async def test_the_checkout_harness_expires_before_it_certifies(
     )
 
     assert tape.index("expired") < tape.index(EVIDENCE), tape.calls
+
+
+async def test_a_gateway_that_blows_up_still_returns_the_money(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==The case the guarantee was BUILT for, and the one nothing exercised.==
+
+    A timeout, a 500, the network dropping mid-call: the gateway's refund raising is the whole
+    reason phase B wraps it in a ``try``/``finally``. The other execution tests fail the things
+    AROUND the call — a validation, the settlement — and then assume the guarantee holds when the
+    call ITSELF fails. ==That is the same mistake as asserting the alarm sounds without asserting
+    the certificate is absent: proving the neighbouring facts and taking the central one on
+    trust.==
+
+    Three things must be true, and none of them follows from the others:
+
+    * the exception PROPAGATES — a harness that swallowed a gateway failure would report a green
+      run over a refund that never left;
+    * ``ensure_refunded`` ran anyway — the ``finally`` did its job, which is the guarantee itself;
+    * it ran AFTER the attempt, so it is a response to the failure and not a coincidence.
+
+    And nothing is certified: a call that exploded is the last place a run may claim the money
+    went back.
+    """
+    tape = _Recorder()
+    dropped = httpx.ConnectError("the connection dropped mid-refund")
+
+    with pytest.raises(httpx.ConnectError):
+        await _drive(tape, monkeypatch, gateway_raises=dropped)()
+
+    assert "ensure_refunded" in tape.calls, (
+        "the gateway blew up and NOTHING tried to send the money back — the `finally` that exists "
+        f"for exactly this did not run. Tape: {tape.calls}"
+    )
+    assert tape.index("refund") < tape.index("ensure_refunded"), (
+        f"the guarantee ran before the attempt it is meant to cover. Tape: {tape.calls}"
+    )
+    assert EVIDENCE not in tape.calls, (
+        "the run certified a refund whose provider call raised. That block is pasted into "
+        f"live_verifications(). Tape: {tape.calls}"
+    )
+
+
+async def test_a_cleanup_failure_never_replaces_the_gateway_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==The worst pair: the call explodes AND the money cannot be recovered.==
+
+    Here both go wrong at once. The run must shout about the stuck money, and ==the exception that
+    reaches the operator must still be the ORIGINAL one== — the cleanup's own complaint must never
+    replace the failure that explains it, or the report says "money is stuck" while hiding that the
+    gateway is what broke.
+
+    The code says this in a comment (*"a cleanup error must never replace the failure that explains
+    it"*); nothing executed it until now.
+    """
+    tape = _Recorder()
+    dropped = httpx.ConnectError("the connection dropped mid-refund")
+
+    with pytest.raises(httpx.ConnectError):
+        await _drive(
+            tape,
+            monkeypatch,
+            gateway_raises=dropped,
+            settled="100 of 100 cents are STILL NOT refunded",
+        )()
+
+    assert "shout" in tape.calls, f"money was left stuck and nobody was told. Tape: {tape.calls}"
+    assert EVIDENCE not in tape.calls, tape.calls

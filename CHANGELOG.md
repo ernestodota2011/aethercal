@@ -25,7 +25,10 @@ construction nobody thought to exclude.
   check never could: a session refused by provenance is **never** refunded, a validation that fails
   on a genuinely paid session **still** reaches `ensure_refunded`, and a run that could not return
   the money **shouts without certifying** — the alarm is reached, the evidence block is absent, and
-  the attempt precedes the alarm. ==Shouting and certifying in the same breath would put a claim
+  the attempt precedes the alarm. ==And the case the guarantee was BUILT for==: when
+  `gateway.refund` itself raises (a timeout, a 500, the connection dropping), the exception
+  propagates, `ensure_refunded` still runs, it runs *after* the attempt, nothing is certified, and a
+  cleanup that also fails never replaces the original failure. ==Shouting and certifying in the same breath would put a claim
   into `live_verifications()` that the alarm itself contradicts.==
 - Offline and unmarked: no credential, no network, so the money harness's own invariants run on
   every commit instead of only on the day somebody runs it for real.
