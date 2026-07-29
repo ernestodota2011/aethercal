@@ -31,6 +31,8 @@ a poor joke to reintroduce it in the instrument built to measure it.
 
 from __future__ import annotations
 
+import email
+import email.policy
 import json
 import math
 import threading
@@ -485,10 +487,42 @@ def wait_for_drain(
 
 
 @dataclass(frozen=True, slots=True)
+class CalendarInvite:
+    """The iTIP facts a booking email carries in its ``.ics`` part — ==a structured identity.==
+
+    ``uid`` is the booking's ``ical_uid``, stable across the whole lineage; ``method``/``status``
+    are the iTIP verb (``REQUEST``/``CANCEL``, ``CONFIRMED``/``CANCELLED``); ``sequence`` is the
+    RFC 5545 counter the product bumps on every reschedule while keeping the uid.
+
+    Those four fields are what let a confirmation be told apart from the cancellation or reschedule
+    notice that follows it — ==without matching on a subject line, which is locale-dependent tenant
+    data, and without matching on a recipient, which every one of them shares.==
+    """
+
+    uid: str
+    method: str
+    status: str
+    sequence: int
+
+    @property
+    def is_confirmation(self) -> bool:
+        """The FIRST announcement of a booking: an invite, confirmed, at the original sequence.
+
+        A reschedule is also ``REQUEST``/``CONFIRMED`` — it re-invites to the same uid — so the
+        sequence is what separates them. A cancellation is ``CANCEL``/``CANCELLED``. A reminder and
+        a workflow email carry no calendar part at all.
+        """
+        return self.method == "REQUEST" and self.status == "CONFIRMED" and self.sequence == 0
+
+
+@dataclass(frozen=True, slots=True)
 class MailMessage:
     to: str
     subject: str
     created: datetime
+    message_id: str = ""
+    invite: CalendarInvite | None = None
+    """``None`` when the message has no ``text/calendar`` part (reminder, workflow email)."""
 
 
 #: How many messages ONE Mailpit request asks for. ==A page size, never a ceiling.== The difference
@@ -533,6 +567,39 @@ class MailboxRead:
     problem: str = ""
 
 
+#: RFC 5545 folds a long line by inserting a line break plus ONE space or tab. Both continue.
+_FOLD_PREFIXES = (" ", "\t")
+
+
+def _icalendar_properties(text: str) -> dict[str, str]:
+    """The iCalendar content lines of one component, unfolded, keyed by property NAME.
+
+    RFC 5545 folds long lines by inserting CRLF followed by a single space or tab; a reader that
+    does not unfold first sees a truncated value and, worse, sees the continuation as a line of its
+    own. Unfolding happens before anything is matched.
+
+    Only the first occurrence of each property is kept, which is the VCALENDAR-level ``METHOD``
+    followed by the VEVENT's own properties — the single-VEVENT shape this product emits.
+    """
+    unfolded: list[str] = []
+    # `splitlines()` handles CRLF, LF and CR alike, so the unfolding does not depend on which
+    # line ending survived the transport.
+    for line in text.splitlines():
+        if line[:1] in _FOLD_PREFIXES and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    properties: dict[str, str] = {}
+    for line in unfolded:
+        head, separator, value = line.partition(":")
+        if not separator:
+            continue
+        name = head.split(";", 1)[0].strip().upper()
+        if name and name not in properties:
+            properties[name] = value.strip()
+    return properties
+
+
 class Mailbox:
     """Reads Mailpit: the harness's oracle for "the guest was actually told".
 
@@ -571,6 +638,51 @@ class Mailbox:
         return None
 
     @staticmethod
+    def parse_invite(raw_source: str) -> CalendarInvite | None:
+        """Pull the iTIP identity out of an RFC822 source, or ``None`` if it carries no invite.
+
+        ==Parsed with the stdlib ``email`` package, not with a regex over the raw bytes.== The
+        ``.ics`` arrives as a MIME part that may be base64 or quoted-printable encoded, so scanning
+        the source text for ``UID:`` finds nothing on exactly the messages that matter. Walking the
+        parts and asking for the decoded payload is the difference between reading the calendar and
+        reading the envelope it happens to be wrapped in.
+
+        Property matching is ==line-anchored and exact==: an iCalendar content line begins at the
+        start of a line with ``NAME:`` or ``NAME;PARAM:``. A substring search would let ``STATUS``
+        match inside a description, which is how the other branch's ``in source`` check ended up
+        passing over an invariant somebody had deleted.
+        """
+        try:
+            message: Any = email.message_from_string(raw_source, policy=email.policy.default)
+        except Exception:
+            return None
+        for part in message.walk():
+            if part.get_content_type() != "text/calendar":
+                continue
+            try:
+                payload: Any = part.get_payload(decode=True)
+            except Exception:
+                return None
+            if not isinstance(payload, bytes):
+                continue
+            text = payload.decode("utf-8", errors="replace")
+            fields = _icalendar_properties(text)
+            uid = fields.get("UID")
+            method = fields.get("METHOD")
+            status = fields.get("STATUS")
+            raw_sequence = fields.get("SEQUENCE")
+            if uid is None or method is None or status is None or raw_sequence is None:
+                return None
+            try:
+                sequence = int(raw_sequence)
+            except ValueError:
+                return None
+            return CalendarInvite(
+                uid=uid, method=method.upper(), status=status.upper(), sequence=sequence
+            )
+        return None
+
+    @staticmethod
     def parse(item: Any) -> MailMessage | None:
         """One Mailpit envelope, or ``None`` when unreadable (counted, never dropped)."""
         if not isinstance(item, dict):
@@ -588,13 +700,57 @@ class Mailbox:
         except ValueError:
             return None
         return MailMessage(
-            to=address.lower(), subject=str(item.get("Subject", "")), created=created
+            to=address.lower(),
+            subject=str(item.get("Subject", "")),
+            created=created,
+            message_id=str(item.get("ID", "")),
         )
 
     def _incomplete(
         self, *, collected: list[MailMessage], total: int, page: int, unparseable: int, why: str
     ) -> MailboxRead:
         return MailboxRead(collected, False, total, page, self.page_size, unparseable, why)
+
+    def _raw_source(self, message_id: str) -> str:
+        request = urllib.request.Request(
+            f"{self._base}/api/v1/message/{message_id}/raw", method="GET"
+        )
+        with _OPENER.open(request, timeout=30.0) as raw:
+            return raw.read().decode("utf-8", errors="replace")
+
+    def hydrate_invites(self, messages: list[MailMessage]) -> tuple[list[MailMessage], str]:
+        """Attach each message's calendar identity by reading its RFC822 source.
+
+        ==One request per message, and that cost buys the only unambiguous discriminator there is.==
+        The list endpoint returns recipient, subject and timestamp — none of which identify WHICH
+        booking a message announces, nor WHICH announcement it is. The `.ics` part does both.
+
+        Returns the hydrated messages and a problem string (empty when every source was readable).
+        A message whose source cannot be fetched is not silently left un-hydrated: it would then
+        look exactly like a message with no calendar part, which is the reassuring reading.
+        """
+        hydrated: list[MailMessage] = []
+        for message in messages:
+            if not message.message_id:
+                return hydrated, "a message came back with no ID, so its source cannot be read"
+            try:
+                source = self._raw_source(message.message_id)
+            except Exception as exc:
+                return (
+                    hydrated,
+                    f"could not read the source of message {message.message_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+            hydrated.append(
+                MailMessage(
+                    to=message.to,
+                    subject=message.subject,
+                    created=message.created,
+                    message_id=message.message_id,
+                    invite=self.parse_invite(source),
+                )
+            )
+        return hydrated, ""
 
     def read_all(self) -> MailboxRead:  # noqa: PLR0911 - each return names a DISTINCT broken read
         """Page through the WHOLE mailbox, or report why the read is not whole.

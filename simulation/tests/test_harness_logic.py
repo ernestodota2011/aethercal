@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from aethercal_sim.__main__ import (
+    confirmations_by_recipient,
     contender_count,
     measure_confirmations,
     parse_args,
@@ -29,6 +30,7 @@ from aethercal_sim.__main__ import (
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
     EXPECTED_OUTBOX_STATUSES,
+    CalendarInvite,
     ErrorTally,
     Latency,
     Mailbox,
@@ -56,6 +58,7 @@ from aethercal_sim.scenarios import (
     cap_probe_blocker,
     control_outbox_drained,
     decode_delivery,
+    identifier_values,
     is_reschedule_collision,
     judge_cancel_idempotency,
     judge_closed_day,
@@ -69,6 +72,7 @@ from aethercal_sim.scenarios import (
     peak_overlap,
     pick_micro_slot,
     read_offer,
+    sink_events_for_booking,
 )
 from aethercal_sim.traffic import WEEKDAY_WEIGHTS, PlannedBooking, plan_two_weeks, summarise_plan
 from aethercal_sim.world import (
@@ -1087,6 +1091,14 @@ def test_mailbox_counts_unreadable_envelopes_instead_of_dropping_them() -> None:
 # --------------------------------------------------------------------------------------
 
 
+CONFIRMED_INVITE = CalendarInvite(
+    uid="uid-1@aethercal", method="REQUEST", status="CONFIRMED", sequence=0
+)
+CANCELLED_INVITE = CalendarInvite(
+    uid="uid-1@aethercal", method="CANCEL", status="CANCELLED", sequence=1
+)
+
+
 class _StubMailbox:
     """A mailbox that hands back one prepared read, and counts how many times it was asked."""
 
@@ -1097,6 +1109,10 @@ class _StubMailbox:
     def read_all(self) -> MailboxRead:
         self.reads += 1
         return self.read
+
+    def hydrate_invites(self, messages: list[MailMessage]) -> tuple[list[MailMessage], str]:
+        """Already hydrated by the fixture: these tests declare each message's invite directly."""
+        return messages, ""
 
 
 def test_a_confirmation_that_arrives_before_the_201_returns_is_now_measured() -> None:
@@ -1111,13 +1127,26 @@ def test_a_confirmation_that_arrives_before_the_201_returns_is_now_measured() ->
     sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
     booked = [BookedRef("id1", "b", "g1@guests.sim.test", "s", sent.timestamp())]
     read = MailboxRead(
-        [MailMessage("g1@guests.sim.test", "Confirmed", sent + timedelta(milliseconds=50))],
+        [
+            MailMessage(
+                "g1@guests.sim.test",
+                "Confirmed",
+                sent + timedelta(milliseconds=50),
+                message_id="m1",
+                invite=CONFIRMED_INVITE,
+            )
+        ],
         True,
         1,
         1,
         500,
     )
-    latency, _out, coverage = measure_confirmations(_StubMailbox(read), booked)  # type: ignore[arg-type]
+    latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
     assert coverage.matched == 1
     assert coverage.negative_deltas == 0
     assert latency.count == 1
@@ -1129,13 +1158,26 @@ def test_a_genuinely_negative_delta_is_counted_and_voids_rather_than_vanishing()
     sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
     booked = [BookedRef("id1", "b", "g1@guests.sim.test", "s", sent.timestamp())]
     read = MailboxRead(
-        [MailMessage("g1@guests.sim.test", "Confirmed", sent - timedelta(seconds=2))],
+        [
+            MailMessage(
+                "g1@guests.sim.test",
+                "Confirmed",
+                sent - timedelta(seconds=2),
+                message_id="m1",
+                invite=CONFIRMED_INVITE,
+            )
+        ],
         True,
         1,
         1,
         500,
     )
-    latency, _out, coverage = measure_confirmations(_StubMailbox(read), booked)  # type: ignore[arg-type]
+    latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
     assert coverage.negative_deltas == 1
     assert coverage.worst_negative_ms == pytest.approx(-2000.0, abs=1.0)
     assert latency.count == 0
@@ -1149,6 +1191,8 @@ def test_an_incomplete_mailbox_read_is_not_retried_for_ever() -> None:
     _latency, out, coverage = measure_confirmations(
         stub,  # type: ignore[arg-type]
         [BookedRef("id1", "b", "g1@guests.sim.test", "s", 1.0)],
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
     )
     assert out.complete is False
     assert stub.reads == 1
@@ -1794,3 +1838,296 @@ def test_lineage_refuses_to_judge_without_the_race(at_most: bool) -> None:
     )
     assert control.passed is False
     assert "not available" in control.observed
+
+
+# --------------------------------------------------------------------------------------
+# ==S16 -- any mail to the recipient counted as a confirmation.==
+#
+# "Matched" meant *the earliest message to that address*. Every guest also receives a cancellation
+# or reschedule notice, so the rule worked only because confirmations normally arrive first -- ==a
+# property of the ORDER OF EVENTS, not a check.== In the case that matters (confirmation never sent,
+# cancellation sent) the earliest and only message is the cancellation: the booking counted as
+# confirmed, C14 certified a COMPLETE sample over a hole in it, and 2 published the delay of a
+# message sent minutes later for another reason. A delivery failure published as a high latency.
+# --------------------------------------------------------------------------------------
+
+
+def _msg(address: str, when: datetime, invite: CalendarInvite | None, ident: str) -> MailMessage:
+    return MailMessage(address, "subject", when, message_id=ident, invite=invite)
+
+
+def _invite(uid: str, method: str, status: str, sequence: int) -> CalendarInvite:
+    return CalendarInvite(uid=uid, method=method, status=status, sequence=sequence)
+
+
+def test_only_the_CONFIRMATION_is_grouped_not_the_later_notices() -> None:
+    """==The anti-vacuity half: the normal flow still pairs exactly one confirmation.==
+
+    A guest who books and then cancels receives two messages. Only the first is a confirmation, and
+    the cancellation must not be counted as one.
+    """
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    messages = [
+        _msg("g@guests.sim.test", now, _invite("u1", "REQUEST", "CONFIRMED", 0), "m1"),
+        _msg(
+            "g@guests.sim.test",
+            now + timedelta(minutes=5),
+            _invite("u1", "CANCEL", "CANCELLED", 1),
+            "m2",
+        ),
+    ]
+    grouped = confirmations_by_recipient(messages)
+    assert list(grouped) == ["g@guests.sim.test"]
+    assert [m.message_id for m in grouped["g@guests.sim.test"]] == ["m1"]
+
+
+def test_a_RESCHEDULE_notice_is_not_a_confirmation() -> None:
+    """A reschedule re-invites the SAME uid with a bumped sequence; the sequence separates them."""
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    grouped = confirmations_by_recipient(
+        [_msg("g@guests.sim.test", now, _invite("u1", "REQUEST", "CONFIRMED", 3), "m1")]
+    )
+    assert grouped == {}
+
+
+def test_a_message_with_no_calendar_part_is_not_a_confirmation() -> None:
+    """A reminder or a workflow email carries no `.ics` at all."""
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    assert confirmations_by_recipient([_msg("g@guests.sim.test", now, None, "m1")]) == {}
+
+
+def test_a_MISSING_confirmation_with_a_cancellation_present_is_NOT_matched() -> None:
+    """==THE sabotage case: the confirmation was never sent, the cancellation was.==
+
+    Under the old rule this booking counted as confirmed and 2 absorbed the cancellation's
+    timestamp -- minutes later, for another reason. Now it is simply unmatched, and C14 says so.
+    """
+    sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "g@guests.sim.test", "s", sent.timestamp())]
+    read = MailboxRead(
+        [
+            _msg(
+                "g@guests.sim.test",
+                sent + timedelta(minutes=7),
+                _invite("u1", "CANCEL", "CANCELLED", 1),
+                "m1",
+            )
+        ],
+        True,
+        1,
+        1,
+        500,
+    )
+    latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.matched == 0
+    assert coverage.created == 1
+    assert latency.count == 0, "the cancellation's timestamp must not enter the distribution"
+    control = judge_confirmation_coverage(coverage)
+    assert control.passed is False
+    assert "never matched a confirmation" in control.observed
+
+
+def test_the_normal_flow_matches_ONE_confirmation_and_ignores_the_cancellation() -> None:
+    """The other half: confirmation + later cancellation to the same guest still pairs cleanly."""
+    sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "g@guests.sim.test", "s", sent.timestamp())]
+    read = MailboxRead(
+        [
+            _msg(
+                "g@guests.sim.test",
+                sent + timedelta(milliseconds=800),
+                _invite("u1", "REQUEST", "CONFIRMED", 0),
+                "m1",
+            ),
+            _msg(
+                "g@guests.sim.test",
+                sent + timedelta(minutes=7),
+                _invite("u1", "CANCEL", "CANCELLED", 1),
+                "m2",
+            ),
+        ],
+        True,
+        2,
+        1,
+        500,
+    )
+    latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.matched == 1
+    assert latency.count == 1
+    assert latency.samples[0] == pytest.approx(800.0, abs=5.0)
+    assert judge_confirmation_coverage(coverage).passed is True
+
+
+def test_two_confirmations_to_one_recipient_break_the_one_to_one_pairing() -> None:
+    sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "g@guests.sim.test", "s", sent.timestamp())]
+    read = MailboxRead(
+        [
+            _msg("g@guests.sim.test", sent, _invite("u1", "REQUEST", "CONFIRMED", 0), "m1"),
+            _msg("g@guests.sim.test", sent, _invite("u2", "REQUEST", "CONFIRMED", 0), "m2"),
+        ],
+        True,
+        2,
+        1,
+        500,
+    )
+    _latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.duplicate_confirmations == 1
+    control = judge_confirmation_coverage(coverage)
+    assert control.passed is False
+    assert "not one-to-one" in control.observed
+
+
+def test_the_ics_parser_reads_a_real_confirmation_and_ignores_prose() -> None:
+    """==Line-anchored and exact.== A DESCRIPTION mentioning a status must not be read as one."""
+    ics = (
+        "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n"
+        "UID:abc-123@aethercal\r\nSTATUS:CONFIRMED\r\nSEQUENCE:0\r\n"
+        "DESCRIPTION:this mentions STATUS:CANCELLED inside the prose\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR"
+    )
+    source = (
+        "MIME-Version: 1.0\r\nContent-Type: text/calendar; charset=utf-8\r\n"
+        "Subject: Booking confirmed\r\n\r\n" + ics
+    )
+    invite = Mailbox.parse_invite(source)
+    assert invite is not None
+    assert invite.uid == "abc-123@aethercal"
+    assert invite.status == "CONFIRMED"
+    assert invite.is_confirmation is True
+
+
+def test_the_ics_parser_survives_a_base64_encoded_part() -> None:
+    """==The reason this uses the stdlib email parser and not a regex over the source.==
+
+    The `.ics` arrives as a MIME part that may be base64-encoded, so scanning the raw text for
+    `UID:` finds nothing on exactly the messages that matter.
+    """
+    ics = (
+        "BEGIN:VCALENDAR\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\n"
+        "UID:xyz-9@aethercal\r\nSTATUS:CANCELLED\r\nSEQUENCE:2\r\nEND:VEVENT\r\nEND:VCALENDAR"
+    )
+    encoded = base64.b64encode(ics.encode()).decode()
+    source = (
+        "MIME-Version: 1.0\r\nContent-Type: text/calendar; charset=utf-8\r\n"
+        "Content-Transfer-Encoding: base64\r\n\r\n" + encoded
+    )
+    invite = Mailbox.parse_invite(source)
+    assert invite is not None
+    assert invite.uid == "xyz-9@aethercal"
+    assert invite.is_confirmation is False
+
+
+def test_the_ics_parser_unfolds_long_lines() -> None:
+    """RFC 5545 folds long lines; a reader that does not unfold sees a truncated uid."""
+    ics = (
+        "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n"
+        "UID:very-long-identifier-that-was\r\n folded-across-two-lines@aethercal\r\n"
+        "STATUS:CONFIRMED\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR"
+    )
+    source = "MIME-Version: 1.0\r\nContent-Type: text/calendar\r\n\r\n" + ics
+    invite = Mailbox.parse_invite(source)
+    assert invite is not None
+    assert invite.uid == "very-long-identifier-thatwasfolded-across-two-lines@aethercal".replace(
+        "thatwas", "that-was"
+    )
+
+
+def test_a_message_without_a_calendar_part_yields_no_invite() -> None:
+    source = "MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\njust a reminder"
+    assert Mailbox.parse_invite(source) is None
+
+
+# --------------------------------------------------------------------------------------
+# ==The same shape as S16, one instrument over, and nobody reported it.==
+#
+# `sink_events_for_booking` matched with `booking_id.encode() not in raw` -- a substring scan of the
+# delivery's BYTES. A booking's id appears in more places than its own identity field: inside a
+# cancel/reschedule URL, inside a description, or as the predecessor a successor was rescheduled
+# from. Two bookings' events could both be attributed to one of them, and C7's oracle is a COUNT.
+# --------------------------------------------------------------------------------------
+
+
+def test_identifier_values_collects_only_identifier_shaped_keys() -> None:
+    payload = {
+        "event": "booking.cancelled",
+        "data": {"id": "book-1", "event_type_id": "et-9", "guest_email": "g@x.test"},
+    }
+    assert identifier_values(payload) == {"book-1", "et-9"}
+
+
+def test_identifier_values_reaches_into_nested_lists() -> None:
+    payload = {"items": [{"id": "a"}, {"nested": {"booking_id": "b"}}]}
+    assert identifier_values(payload) == {"a", "b"}
+
+
+def test_an_id_that_appears_only_in_a_URL_is_NOT_an_identity_match() -> None:
+    """==The defect, as the payload that used to be counted twice.==
+
+    This delivery is about booking `succ-2`; it merely MENTIONS `book-1` in the cancel link and as
+    the predecessor it replaced. The raw-bytes scan attributed it to `book-1` as well.
+    """
+    payload = {
+        "event": "booking.created",
+        "data": {
+            "id": "succ-2",
+            "cancel_url": "https://book.example/cancel/book-1",
+            "description": "rescheduled from book-1",
+        },
+    }
+    ids = identifier_values(payload)
+    assert "succ-2" in ids
+    assert "book-1" not in ids
+    assert "book-1" in json.dumps(payload), "the id IS in the bytes -- that is the point"
+
+
+def test_sink_events_for_booking_does_not_cross_attribute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """==The CALL SITE, pinned -- the helper's own test could not reach it.==
+
+    Mutating `sink_events_for_booking` back to the raw-bytes scan left the `identifier_values` tests
+    green, because they exercise the helper and never the code that uses it. Fifth time this branch
+    has been taught that a pure test binds the judgement and not the wiring, so this one drives the
+    real function over a stubbed sink.
+
+    `succ-2`'s delivery merely MENTIONS `book-1` in a URL. Attributing it to `book-1` would give
+    that booking two `booking.created` events, and C7's oracle is a count.
+    """
+    captured = [
+        {
+            "body_b64": base64.b64encode(
+                json.dumps({"event": "booking.created", "data": {"id": "book-1"}}).encode()
+            ).decode()
+        },
+        {
+            "body_b64": base64.b64encode(
+                json.dumps(
+                    {
+                        "event": "booking.created",
+                        "data": {
+                            "id": "succ-2",
+                            "cancel_url": "https://book.example/cancel/book-1",
+                        },
+                    }
+                ).encode()
+            ).decode()
+        },
+    ]
+    monkeypatch.setattr("aethercal_sim.scenarios._captured", lambda _url: captured)
+    counts, unreadable = sink_events_for_booking("http://localhost:9099", "book-1")
+    assert unreadable == 0
+    assert counts == {"booking.created": 1}, "the successor's delivery is not book-1's"

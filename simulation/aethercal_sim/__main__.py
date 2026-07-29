@@ -36,7 +36,14 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from .client import Client
-from .measure import Latency, Mailbox, MailboxRead, OutboxSampler, wait_for_drain
+from .measure import (
+    Latency,
+    Mailbox,
+    MailboxRead,
+    MailMessage,
+    OutboxSampler,
+    wait_for_drain,
+)
 from .report import RunContext, render, render_json, verdict_for
 from .scenarios import (
     BookedRef,
@@ -221,7 +228,11 @@ CONFIRMATION_MATCH_POLL_SECONDS = 3.0
 
 
 def measure_confirmations(
-    mailbox: Mailbox, booked: list[BookedRef]
+    mailbox: Mailbox,
+    booked: list[BookedRef],
+    *,
+    timeout_seconds: float = CONFIRMATION_MATCH_TIMEOUT_SECONDS,
+    poll_seconds: float = CONFIRMATION_MATCH_POLL_SECONDS,
 ) -> tuple[Latency, MailboxRead, ConfirmationCoverage]:
     """Match every created booking to its confirmation, and account for the ones that do not match.
 
@@ -244,33 +255,44 @@ def measure_confirmations(
     """
     started = time.monotonic()
     attempts = 0
-    read = mailbox.read_all()
-    first_seen: dict[str, float] = {}
+    read = _read_and_hydrate(mailbox)
+    confirmations: dict[str, list[MailMessage]] = {}
     matched = 0
     while True:
         attempts += 1
-        first_seen = {}
-        for message in read.messages:
-            stamp = message.created.timestamp()
-            if message.to not in first_seen or stamp < first_seen[message.to]:
-                first_seen[message.to] = stamp
-        matched = sum(1 for ref in booked if ref.guest_email.lower() in first_seen)
-        complete = matched >= len(booked)
-        if complete or not read.complete:
+        confirmations = confirmations_by_recipient(read.messages)
+        matched = sum(
+            1 for ref in booked if len(confirmations.get(ref.guest_email.lower(), [])) == 1
+        )
+        if matched >= len(booked) or not read.complete:
             break
-        if time.monotonic() - started >= CONFIRMATION_MATCH_TIMEOUT_SECONDS:
+        if time.monotonic() - started >= timeout_seconds:
             break
-        time.sleep(CONFIRMATION_MATCH_POLL_SECONDS)
-        read = mailbox.read_all()
+        time.sleep(poll_seconds)
+        read = _read_and_hydrate(mailbox)
 
     latency = Latency("booking_to_confirmation_email")
     negatives = 0
     worst_negative = 0.0
+    duplicates = 0
+    seen_uids: dict[str, str] = {}
+    collided_uids = 0
     for ref in booked:
-        stamp = first_seen.get(ref.guest_email.lower())
-        if stamp is None:
+        found = confirmations.get(ref.guest_email.lower(), [])
+        if len(found) > 1:
+            duplicates += 1
             continue
-        delta_ms = (stamp - ref.sent_at_wall) * 1000.0
+        if not found:
+            continue
+        message = found[0]
+        # ==One confirmation must belong to ONE booking.== The recipient is unique per planned
+        # booking, so a uid appearing twice would mean two guests were matched to one announcement.
+        uid = message.invite.uid if message.invite is not None else ""
+        if uid and uid in seen_uids:
+            collided_uids += 1
+            continue
+        seen_uids[uid] = ref.booking_id
+        delta_ms = (message.created.timestamp() - ref.sent_at_wall) * 1000.0
         if delta_ms < 0:
             negatives += 1
             worst_negative = min(worst_negative, delta_ms)
@@ -290,8 +312,60 @@ def measure_confirmations(
             page_size=read.page_size,
             attempts=attempts,
             waited_seconds=time.monotonic() - started,
+            duplicate_confirmations=duplicates,
+            colliding_uids=collided_uids,
+            messages_with_invite=sum(1 for m in read.messages if m.invite is not None),
         ),
     )
+
+
+def _read_and_hydrate(mailbox: Mailbox) -> MailboxRead:
+    """Page the mailbox and attach each message's calendar identity, as ONE read.
+
+    A hydration failure degrades the whole read rather than leaving some messages un-hydrated: an
+    un-hydrated message is indistinguishable from one that legitimately carries no calendar part,
+    and that is the reassuring reading of a failure.
+    """
+    read = mailbox.read_all()
+    if not read.complete:
+        return read
+    hydrated, problem = mailbox.hydrate_invites(read.messages)
+    if problem:
+        return MailboxRead(
+            hydrated,
+            False,
+            read.reported_total,
+            read.pages,
+            read.page_size,
+            read.unparseable,
+            problem,
+        )
+    return MailboxRead(
+        hydrated, True, read.reported_total, read.pages, read.page_size, read.unparseable
+    )
+
+
+def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[MailMessage]]:
+    """Group the CONFIRMATIONS — and only those — by recipient. ==Pure, so it is testable.==
+
+    This replaces "the earliest message to that address". That rule worked by accident: a guest's
+    confirmation does normally arrive before their cancellation or reschedule notice, so taking the
+    earliest usually picked the right one. ==But it is a property of the ORDER OF EVENTS, not a
+    check==, and it says nothing at all in the case that matters — a booking whose confirmation was
+    never sent and whose cancellation was. There the earliest (and only) message is the
+    cancellation, the booking counts as confirmed, C14 reports a complete sample, and §2 publishes
+    the delay of a message sent minutes later for another reason. ==A delivery failure would be
+    published as a high latency.==
+
+    A confirmation is now identified by its iTIP identity: ``METHOD:REQUEST`` + ``STATUS:CONFIRMED``
+    + ``SEQUENCE:0`` in the message's own ``.ics``. Locale-independent, tenant-independent, and not
+    a substring of anything.
+    """
+    grouped: dict[str, list[MailMessage]] = {}
+    for message in messages:
+        if message.invite is not None and message.invite.is_confirmation:
+            grouped.setdefault(message.to, []).append(message)
+    return grouped
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a run IS its phases

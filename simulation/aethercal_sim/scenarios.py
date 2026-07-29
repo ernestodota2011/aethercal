@@ -766,6 +766,26 @@ def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
     return counts, unreadable
 
 
+def identifier_values(payload: Any) -> set[str]:
+    """Every value sitting at an IDENTIFIER-shaped key, anywhere in the payload. ==Pure.==
+
+    Walks the whole structure and collects values under keys named ``id`` or ending in ``_id``.
+    That is what makes "this delivery is about booking X" a statement about the payload's identity
+    fields rather than about its bytes.
+    """
+    found: set[str] = set()
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            name = str(key).lower()
+            if (name == "id" or name.endswith("_id")) and isinstance(value, str | int):
+                found.add(str(value))
+            found |= identifier_values(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            found |= identifier_values(item)
+    return found
+
+
 def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, int], int]:
     """Deliveries by event name for one booking, plus ==how many could not be READ at all.==
 
@@ -794,12 +814,19 @@ def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, i
             # unknowable. Counted, never skipped.
             unreadable += 1
             continue
-        if booking_id.encode() not in raw:
-            continue
         try:
             payload: Any = json.loads(raw)
         except ValueError:
             unreadable += 1
+            continue
+        # ==Matched on the payload's IDENTITY fields, not on a substring of its bytes.==
+        # This used to be `booking_id.encode() not in raw`, which counts a delivery for this booking
+        # whenever the id appears ANYWHERE in it — inside a cancel/reschedule URL, a description, or
+        # a reference to the predecessor a successor was rescheduled from. Two different bookings'
+        # events could therefore both be attributed to one of them, and C7's "exactly one" is a
+        # count. Nobody reported this; it is the same shape as S16 one instrument over: the pairing
+        # rested on a circumstantial property of the bytes instead of on an identity.
+        if booking_id not in identifier_values(payload):
             continue
         event: Any = payload.get("event") if isinstance(payload, dict) else None
         if isinstance(event, str):
@@ -1602,6 +1629,12 @@ class ConfirmationCoverage:
     page_size: int
     attempts: int
     waited_seconds: float
+    duplicate_confirmations: int = 0
+    """Bookings whose recipient received MORE than one confirmation — a broken one-to-one."""
+    colliding_uids: int = 0
+    """Two bookings matched to confirmations carrying the SAME calendar uid: one announcement was
+    counted for two bookings, which is the failure a per-recipient match cannot even see."""
+    messages_with_invite: int = 0
 
 
 def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
@@ -1623,6 +1656,19 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
     Mailpit's own total), every created booking must be matched to a message, and a negative delta
     — which cannot happen legitimately once the reference is the SEND instant — is real clock skew,
     counted and gating rather than silently filtered.
+
+    .. rubric:: And a third subtraction, which was the subtlest of them
+
+    "Matched" meant *the earliest message to that recipient*. Every guest also receives their
+    cancellation or reschedule notice, so that rule worked only because confirmations normally
+    arrive first — ==a property of the order of events, not a check.== In the one case that matters
+    — a booking whose confirmation was never sent and whose cancellation was — the earliest and only
+    message is the cancellation: the booking counted as confirmed, this control certified a COMPLETE
+    sample over a hole in it, and §2 published the delay of a message sent minutes later for another
+    reason. ==A delivery failure would have been published as a high latency.==
+
+    A confirmation is now identified by its iTIP identity in the message's own ``.ics``, the
+    pairing must be one-to-one, and a calendar uid may be claimed by only one booking.
     """
     unmatched = coverage.created - coverage.matched
     reasons: list[str] = []
@@ -1636,6 +1682,16 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
         reasons.append(
             f"{coverage.negative_deltas} confirmation(s) preceded the POST that caused them "
             f"(worst {coverage.worst_negative_ms:.1f}ms) — the two clocks disagree"
+        )
+    if coverage.duplicate_confirmations:
+        reasons.append(
+            f"{coverage.duplicate_confirmations} booking(s) had MORE than one confirmation to the "
+            "same recipient, so the pairing is not one-to-one"
+        )
+    if coverage.colliding_uids:
+        reasons.append(
+            f"{coverage.colliding_uids} booking(s) matched a confirmation whose calendar uid was "
+            "already claimed — one announcement counted for two bookings"
         )
     return Control(
         ident="C14",
@@ -1651,7 +1707,9 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
             f"matched {coverage.matched}/{coverage.created} after {coverage.attempts} read(s) in "
             f"{coverage.waited_seconds:.1f}s; mailbox read complete={coverage.read_complete} "
             f"(reported total {coverage.reported_total}, page size {coverage.page_size}); "
-            f"negative deltas={coverage.negative_deltas}"
+            f"negative deltas={coverage.negative_deltas}; duplicate confirmations="
+            f"{coverage.duplicate_confirmations}; uid collisions={coverage.colliding_uids}; "
+            f"messages carrying a calendar invite={coverage.messages_with_invite}"
             + (f" — {'; '.join(reasons)}" if reasons else "")
         ),
         passed=not reasons,
