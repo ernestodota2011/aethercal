@@ -14,10 +14,17 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `19228cd7` | 2026-07-29 | MEASURED | 239 planned / 204 created, 35 organic collisions, 40-way races, **all fourteen** controls held — and the first run in which every control's own READ is checked before its answer is believed. §1 reconciles with §6 (35 `slot_unavailable` = 35 create-leg + 0 reschedule-leg collisions) and the confirmation sample is proven complete (204 of 204 matched; the mailbox paged to the 272 messages Mailpit itself reports, not to a hardcoded ceiling). Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `ed6db4f8` | 2026-07-29 | MEASURED | 239 planned / 212 created, 27 create-leg + 1 reschedule-leg collisions, 40-way races, **all fourteen** controls held. Every number in it reconciles against another: §6's 539 classified responses = 257 slot reads (both legs) + 239 bookings + 25 cancels + 18 reschedules, and its 28 `slot_unavailable` = 27 + 1. Confirmation sample proven complete (212 of 212 matched; mailbox paged to the 282 messages Mailpit reports). Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Four earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, four times over.
+> [!warning] ==Five earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, five times over.
+>
+> `19228cd7` — withdrawn for a hole in the numbers rather than in a control. ==§6 calls itself
+> "every outcome, successes included" and was short by one response per reschedule attempted==: the
+> follow-up's slots read was the single HTTP call in the organic phase wired to neither instrument,
+> so §2's `slots_read` counted only the create leg. Its own arithmetic shows it — 519 classified =
+> 239 slots + 239 bookings + 24 cancels + 17 reschedules, with 41 reads missing. A taxonomy with a
+> hole in it cannot be reconciled against anything, which is the one job C13 exists to do.
 >
 > `e36c28c3` — the first run under C13 and C14, and it is withdrawn for the reason that keeps
 > recurring one layer further in: ==two of the controls certifying it still trusted reads they had
@@ -57,5 +64,5 @@ all, however good its numbers look — which is why the verdict is the first lin
 > a throwaway container because the operator aimed it there — not because the code refused anything
 > else.
 >
-> Both were replaced rather than annotated: a withdrawn measurement left in the table is one
+> Each was replaced rather than annotated: a withdrawn measurement left in the table is one
 > somebody eventually quotes.
