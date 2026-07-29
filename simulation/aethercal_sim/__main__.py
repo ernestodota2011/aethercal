@@ -63,7 +63,7 @@ from .scenarios import (
 )
 from .scenarios import book as book_slot
 from .traffic import plan_two_weeks, summarise_plan
-from .world import load_stack, provision
+from .world import assert_disposable_stack, load_stack, provision
 
 #: How Spanish-leaning each business's guests are. The third is deliberately bilingual.
 LOCALE_MIX = {"clinica-sonrisa": 0.85, "katy-hvac": 0.15, "estudio-legal": 0.5}
@@ -76,12 +76,17 @@ _SPARE_SLOTS = 4
 #: no-show leg. A budget, never a truncation: a slot that does not fit is not chosen at all.
 NO_SHOW_WAIT_BUDGET_SECONDS = 420.0
 
-_DEFAULT_STACK_FILE = Path(__file__).resolve().parent.parent / ".stack.json"
+#: ==Fixed, not a flag.== `--stack-file` used to let any path be passed, which meant nothing
+#: structural stopped this harness — whose first acts are to purge a mailbox, create businesses and
+#: (via run.sh) `down -v` a database — from being aimed at a live instance. The isolation guarantee
+#: lived in the README and in whatever the operator had been told, i.e. in the two places that do
+#: not execute. The path is now the one file `stack-up.sh` writes, and `assert_disposable_stack`
+#: proves the target really is that stack before anything is touched.
+STACK_FILE = Path(__file__).resolve().parent.parent / ".stack.json"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="aethercal_sim", description="Two-week load simulation.")
-    parser.add_argument("--stack-file", type=Path, default=_DEFAULT_STACK_FILE)
     parser.add_argument("--seed", type=int, default=20260725)
     parser.add_argument("--workers", type=int, default=8, help="simultaneous simulated guests")
     parser.add_argument("--contenders", type=int, default=40, help="threads per adversarial race")
@@ -152,7 +157,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
 
     run_id = uuid.uuid4().hex[:8]
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
-    stack = load_stack(args.stack_file)
+    stack = load_stack(STACK_FILE)
+
+    # ==Nothing below this line may run against anything but this run's throwaway stack.==
+    # The very next statements purge a mailbox and a webhook sink, and provisioning follows. This
+    # check is what makes the isolation a property of the code rather than of the instructions the
+    # operator happened to receive: it verifies the compose project, that every endpoint is
+    # loopback, and that the database carries the 128-bit marker stack-up.sh planted seconds ago.
+    # It raises before any write, so a refusal leaves the target untouched.
+    nonce = assert_disposable_stack(stack)
+    print(f"==> target verified as the throwaway stack (marker {nonce[:8]}...)")
 
     mailbox = Mailbox(stack.mailpit_url)
     mailbox.purge()

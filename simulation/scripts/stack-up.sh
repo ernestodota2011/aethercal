@@ -30,6 +30,7 @@ REPO_ROOT="$(cd "${SIM_DIR}/.." && pwd)"
 E2E_DIR="${REPO_ROOT}/e2e"
 ENV_FILE="${REPO_ROOT}/deploy/.env"
 STACK_FILE="${SIM_DIR}/.stack.json"
+ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
 
 API_URL="http://localhost:8000"
 WORKER_URL="http://127.0.0.1:${SIM_WORKER_HOST_PORT:-8001}"
@@ -49,6 +50,20 @@ SINK_WEBHOOK_URL="http://hooks:9099/hook"
 # reachable, so a guessable token is as good as no token. Test-only; destroyed with the stack.
 METRICS_TOKEN="${AETHERCAL_SIM_METRICS_TOKEN:-sim-local-only-metrics-token-not-a-real-secret}"
 export AETHERCAL_SIM_METRICS_TOKEN="${METRICS_TOKEN}"
+
+# ==The run NONCE: 128 bits that tie this file to the database created below.==
+#
+# The harness refuses to touch a target that cannot prove it is this stack, and this is how the
+# proof is planted: the nonce goes into .stack.json AND into a marker schedule inside the fresh
+# database. A hand-edited .stack.json cannot forge the second half, and a stale simulation stack
+# from an earlier run carries a different nonce — so both are refused. Isolation stops being a
+# promise in a README and becomes something the code derives.
+RUN_NONCE="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d " 
+")"
+if [[ ${#RUN_NONCE} -lt 32 ]]; then
+  echo "ERROR: could not generate a 128-bit nonce from /dev/urandom" >&2
+  exit 1
+fi
 
 # The businesses this run simulates: slug:Name:Timezone. Deliberately a MIX of timezones — a
 # single-timezone instance never exercises the per-tenant conversion the slot grid does, and the
@@ -84,7 +99,17 @@ wait_for_http() {
   return 1
 }
 
-echo "==> rendering ${ENV_FILE} (test-only values)"
+# ==deploy/.env is SHARED repo configuration, and this overwrites it.== The base compose file
+# declares `env_file: .env` per service, so the stack genuinely needs it there; what was missing was
+# any way back. Back it up first and record whether it existed, so `run.sh` can restore the
+# developer's file on the way out even if the boot fails halfway.
+echo "==> rendering ${ENV_FILE} (test-only values; the previous file is backed up)"
+if [[ -f "${ENV_FILE}" ]]; then
+  cp "${ENV_FILE}" "${ENV_BACKUP}"
+  echo "existed" >"${ENV_BACKUP}.state"
+else
+  echo "absent" >"${ENV_BACKUP}.state"
+fi
 cp "${E2E_DIR}/scripts/deploy.env.template" "${ENV_FILE}"
 
 echo "==> resetting any previous SIMULATION stack (project: aethercal-sim)"
@@ -164,6 +189,28 @@ for entry in "${BUSINESSES[@]}"; do
     "${slug}" "${name}" "${timezone}" "${tenant_id}" "${host_user_id}" "${api_key}")"
 done
 
+# ==Plant this run's nonce INSIDE the database, as a schedule the harness reads back.==
+#
+# This is the half of the identity proof a hand-edited .stack.json cannot forge: only the script
+# that just created this database could have written a schedule carrying a nonce generated seconds
+# ago. `aethercal_sim.world.assert_disposable_stack` refuses to create, purge or modify anything
+# until it has read this marker back through the API — which is what turns "never run this against
+# a real instance" from a sentence in a README into something the code derives.
+#
+# The marker carries EMPTY rules, so it offers no availability and cannot affect a single number in
+# the report; it exists only to be recognised.
+echo "==> planting the stack marker (nonce ${RUN_NONCE:0:8}...) in the first business"
+marker_status="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Authorization: Bearer ${first_key}" -H "Content-Type: application/json" \
+  --data "{\"name\": \"sim-marker-${RUN_NONCE}\", \"timezone\": \"UTC\", \"rules\": {}}" \
+  "${API_URL}/api/v1/schedules/")"
+if [[ "${marker_status}" != "201" ]]; then
+  echo "ERROR: could not plant the stack marker (HTTP ${marker_status})." >&2
+  echo "       Without it the harness cannot prove this is a throwaway stack and will refuse to" >&2
+  echo "       run — which is correct behaviour, so this is a hard failure here." >&2
+  exit 1
+fi
+
 # The booking page is started because the shipping stack has one and a simulation that quietly
 # dropped a service would not be running the shipping stack any more. It is pointed at the first
 # business. ==The harness drives the API, not the browser== — a simulation's subject is the server's
@@ -194,6 +241,7 @@ cat >"${STACK_FILE}" <<JSON
   "sinkWebhookUrl": "${SINK_WEBHOOK_URL}",
   "metricsToken": "${METRICS_TOKEN}",
   "composeProject": "aethercal-sim",
+  "nonce": "${RUN_NONCE}",
   "businesses": [${business_json}
   ]
 }

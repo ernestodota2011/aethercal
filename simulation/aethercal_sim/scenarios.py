@@ -531,21 +531,58 @@ def control_taken_slot(stack: StackConfig, business: Business, *, start: str) ->
     )
 
 
-def control_closed_day(stack: StackConfig, business: Business, *, saturday: date) -> Control:
-    """A business closed at weekends must offer NOTHING on a Saturday."""
-    response = fetch_slots(
-        Client(stack.api_url, business.config.api_key),
-        event_type_id=business.event_types["standard"].id,
-        day=saturday,
-        timezone=business.config.timezone,
-    )
+def judge_closed_day(response: Response) -> Control:
+    """==A closed Saturday and a dead API both produce "0 slots". Only one of them is a pass.==
+
+    This control used to read ``len(slot_starts(response)) == 0`` and nothing else, so it went green
+    on a 500, a 401, a connection refused, or a body that was not the slots contract at all. It was
+    not measuring the schedule; it was measuring the *absence of evidence* and calling it evidence
+    of absence — the exact failure this harness exists to catch, one level below the verdict.
+
+    So the emptiness is judged only after the response has proved it is a real, well-formed answer:
+    2xx, a JSON object, and a ``slots`` list actually present. Anything else is an executed,
+    FAILED control that names what came back.
+    """
+    if not response.ok:
+        return Control(
+            ident="C3",
+            guards="the schedule is enforced: a closed weekend offers no slots",
+            expected="a 2xx slots response with 0 slots",
+            observed=(
+                f"the slots query FAILED: {response.status} {response.error_code} "
+                f"{response.text[:120]!r} — an empty offer could not be distinguished from a "
+                "broken one"
+            ),
+            passed=False,
+        )
+    body: Any = response.body
+    if not isinstance(body, dict) or not isinstance(body.get("slots"), list):
+        return Control(
+            ident="C3",
+            guards="the schedule is enforced: a closed weekend offers no slots",
+            expected="a 2xx slots response with 0 slots",
+            observed=f"200 but the body is not the slots contract: {response.text[:140]!r}",
+            passed=False,
+        )
     starts = slot_starts(response)
     return Control(
         ident="C3",
         guards="the schedule is enforced: a closed weekend offers no slots",
-        expected="0 slots offered on a Saturday",
-        observed=f"{len(starts)} slots offered",
+        expected="0 slots offered on a Saturday, from a well-formed 2xx",
+        observed=f"{len(starts)} slots offered (availability={body.get('availability')!r})",
         passed=len(starts) == 0,
+    )
+
+
+def control_closed_day(stack: StackConfig, business: Business, *, saturday: date) -> Control:
+    """A business closed at weekends must offer NOTHING on a Saturday."""
+    return judge_closed_day(
+        fetch_slots(
+            Client(stack.api_url, business.config.api_key),
+            event_type_id=business.event_types["standard"].id,
+            day=saturday,
+            timezone=business.config.timezone,
+        )
     )
 
 
@@ -558,6 +595,11 @@ def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Con
         offer = fetch_slots(
             client, event_type_id=event_type.id, day=day, timezone=business.config.timezone
         )
+        # ==Same trap as C3: a failed query also returns no slots.== "The day left the offer" is a
+        # PASS condition here, so a 500 on the third fetch would have read as the cap biting.
+        if not offer.ok:
+            outcomes.append(f"slots_query_failed({offer.status}/{offer.error_code})")
+            continue
         starts = slot_starts(offer)
         if not starts:
             outcomes.append("no_slots_offered")
@@ -809,44 +851,87 @@ def pick_micro_slot(
     return None
 
 
-def active_bookings_for_guest(
+@dataclass(frozen=True, slots=True)
+class DiaryRead:
+    """The result of reading a guest's live appointments — ==and whether the read is TRUSTWORTHY.==
+
+    ``active`` alone is a trap. An unreadable diary yields an empty list, which looks exactly like
+    "this guest holds no live appointment" — the reassuring answer, produced by failing to look. C9
+    asks "at most one?", and an empty list satisfies that trivially, so a 500 from the bookings
+    endpoint would have *passed* the control guarding against double-booked guests.
+
+    So the read reports its own health and the controls refuse to judge cardinality without it.
+    """
+
+    active: list[str]
+    complete: bool
+    problem: str = ""
+
+
+def active_bookings_for_guest(  # noqa: PLR0911 - each return names a DISTINCT way the read broke
     stack: StackConfig,
     business: Business,
     *,
     guest_email: str,
     date_from: date,
     date_to: date,
-) -> list[str]:
-    """Every ACTIVE booking belonging to one guest in a window, as ``"<id> <status>"`` strings.
+) -> DiaryRead:
+    """Every ACTIVE booking of one guest in a window, plus whether the read can be trusted.
 
     Pages through the envelope rather than trusting one response: ``GET /bookings/`` hard-caps
-    ``limit`` at 500, and a run of this size can exceed that. Reading only the first page would
-    return "0 active" for a lineage that exists further down — the most reassuring possible answer,
-    arrived at by not looking.
+    ``limit`` at 500, and a run of this size exceeds that. Reading only the first page would report
+    "0 active" for a lineage further down — again, the most reassuring possible answer, arrived at
+    by not looking.
+
+    ``complete`` is False on any non-2xx, any body that is not the ``Page`` contract, a non-integer
+    ``total``, or pagination that fails to advance (which would otherwise spin, or silently
+    truncate the diary).
     """
     client = Client(stack.api_url, business.config.api_key)
     query = f"from={date_from.isoformat()}&to={date_to.isoformat()}&limit=500"
     found: list[str] = []
     offset = 0
+    guard = 0
     while True:
-        body: Any = client.get(f"/api/v1/bookings/?{query}&offset={offset}").body
+        guard += 1
+        if guard > 50:
+            return DiaryRead(found, False, "pagination did not terminate after 50 pages")
+        response = client.get(f"/api/v1/bookings/?{query}&offset={offset}")
+        if not response.ok:
+            return DiaryRead(
+                found,
+                False,
+                f"GET /bookings/ answered {response.status} {response.error_code} "
+                f"{response.text[:100]!r}",
+            )
+        body: Any = response.body
         if not isinstance(body, dict):
-            break
-        items: Any = body.get("items", [])
-        if not isinstance(items, list) or not items:
-            break
+            return DiaryRead(found, False, f"body is not an object: {response.text[:100]!r}")
+        items: Any = body.get("items")
+        total: Any = body.get("total")
+        if not isinstance(items, list) or not isinstance(total, int):
+            return DiaryRead(
+                found, False, f"body is not the Page contract: {response.text[:120]!r}"
+            )
         for item in items:
             if not isinstance(item, dict):
-                continue
+                return DiaryRead(found, False, "a page item is not an object")
             if str(item.get("guest_email", "")).lower() != guest_email.lower():
                 continue
             status = str(item.get("status", ""))
             if status in ("pending", "confirmed"):
                 found.append(f"{item.get('id')} {status}")
+        if not items:
+            # An empty page before reaching `total` means the server and the envelope disagree;
+            # trusting it would silently truncate the diary.
+            return (
+                DiaryRead(found, True)
+                if offset >= total
+                else DiaryRead(found, False, f"empty page at offset {offset} of total {total}")
+            )
         offset += len(items)
-        if offset >= int(body.get("total", 0)):
-            break
-    return found
+        if offset >= total:
+            return DiaryRead(found, True)
 
 
 def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window are all required
@@ -872,18 +957,42 @@ def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window 
     successor. A cancel racing a reschedule may legitimately leave one (the reschedule got there
     first) or none (the cancel did) — but never two.
     """
-    active = active_bookings_for_guest(
-        stack, business, guest_email=guest_email, date_from=date_from, date_to=date_to
+    return judge_lineage(
+        active_bookings_for_guest(
+            stack, business, guest_email=guest_email, date_from=date_from, date_to=date_to
+        ),
+        ident=ident,
+        guards=guards,
+        at_most=at_most,
     )
-    passed = len(active) <= 1 if at_most else len(active) == 1
+
+
+def judge_lineage(read: DiaryRead, *, ident: str, guards: str, at_most: bool) -> Control:
+    """Turn a diary read into a verdict. ==Pure, so the broken-source case is testable.==
+
+    Cardinality is judged only on a COMPLETE read. An unreadable diary returns an empty list, and
+    "at most one" is trivially true of nothing — so a failing bookings endpoint would have PASSED
+    the very control that guards against a guest holding two live appointments.
+    """
+    expected = "at most 1 active booking survives" if at_most else "exactly 1 successor survives"
+    if not read.complete:
+        return Control(
+            ident=ident,
+            guards=guards,
+            expected=expected,
+            observed=(
+                f"the diary could not be read completely ({read.problem}) — refusing to judge "
+                "cardinality on a partial read"
+            ),
+            passed=False,
+        )
+    active = read.active
     return Control(
         ident=ident,
         guards=guards,
-        expected=(
-            "at most 1 active booking survives" if at_most else "exactly 1 successor survives"
-        ),
+        expected=expected,
         observed=f"{len(active)} active: {active or 'none'}",
-        passed=passed,
+        passed=len(active) <= 1 if at_most else len(active) == 1,
     )
 
 

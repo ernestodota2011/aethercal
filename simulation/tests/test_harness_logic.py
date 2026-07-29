@@ -9,15 +9,30 @@ passed.
 
 from __future__ import annotations
 
+import json
 from datetime import date
+from typing import Any
 
 import pytest
 
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import ErrorTally, Latency, percentile
 from aethercal_sim.report import REQUIRED_CONTROL_IDS, missing_controls, verdict_for
-from aethercal_sim.scenarios import Control, next_saturday
+from aethercal_sim.scenarios import (
+    Control,
+    DiaryRead,
+    judge_closed_day,
+    judge_lineage,
+    next_saturday,
+)
 from aethercal_sim.traffic import WEEKDAY_WEIGHTS, PlannedBooking, plan_two_weeks, summarise_plan
+from aethercal_sim.world import (
+    EXPECTED_COMPOSE_PROJECT,
+    BusinessConfig,
+    NotADisposableStackError,
+    StackConfig,
+    assert_disposable_stack,
+)
 
 BUSINESSES = ["clinica-sonrisa", "katy-hvac", "estudio-legal"]
 MIX = {"clinica-sonrisa": 0.85, "katy-hvac": 0.15, "estudio-legal": 0.5}
@@ -277,3 +292,138 @@ def test_next_saturday_from_a_monday_is_that_weeks_saturday() -> None:
 def test_next_saturday_of_a_saturday_is_itself() -> None:
     saturday = date(2026, 8, 8)
     assert next_saturday(saturday) == saturday
+
+
+# --------------------------------------------------------------------------------------
+# ==Isolation, enforced rather than promised.==
+#
+# The earlier runs went to a throwaway container because the operator was told to point them there,
+# not because anything stopped them going elsewhere. These assert the refusal happens on the cheap
+# local facts, BEFORE any request or write.
+# --------------------------------------------------------------------------------------
+
+
+def _stack(**overrides: object) -> StackConfig:
+    base: dict[str, Any] = {
+        "api_url": "http://localhost:8000",
+        "worker_url": "http://127.0.0.1:8001",
+        "booking_url": "http://localhost:5001",
+        "mailpit_url": "http://localhost:8025",
+        "sink_url": "http://localhost:9099",
+        "sink_webhook_url": "http://hooks:9099/hook",
+        "metrics_token": "t" * 40,
+        "compose_project": EXPECTED_COMPOSE_PROJECT,
+        "nonce": "a1b2c3d4" * 4,
+        "businesses": [BusinessConfig("b", "B", "UTC", "tid", "uid", "key")],
+    }
+    base.update(overrides)
+    return StackConfig(**base)  # pyright: ignore[reportArgumentType]
+
+
+def test_a_foreign_compose_project_is_refused() -> None:
+    """The shipping project name is the one `down -v` must never be able to reach."""
+    with pytest.raises(NotADisposableStackError, match="compose project"):
+        assert_disposable_stack(_stack(compose_project="aethercal"))
+
+
+@pytest.mark.parametrize(
+    "field", ["api_url", "worker_url", "booking_url", "mailpit_url", "sink_url"]
+)
+def test_a_non_loopback_endpoint_is_refused(field: str) -> None:
+    """A LAN address is, by definition, an instance somebody else is using."""
+    with pytest.raises(NotADisposableStackError, match="not loopback"):
+        assert_disposable_stack(_stack(**{field: "http://192.168.0.250:8000"}))
+
+
+def test_a_public_hostname_is_refused() -> None:
+    """==The concrete case this exists to make impossible.=="""
+    with pytest.raises(NotADisposableStackError, match="not loopback"):
+        assert_disposable_stack(_stack(api_url="https://book.aetherlogik.com"))
+
+
+@pytest.mark.parametrize("nonce", ["", "short", "z" * 32, "A1B2" * 8])
+def test_a_missing_or_malformed_nonce_is_refused(nonce: str) -> None:
+    with pytest.raises(NotADisposableStackError, match="nonce"):
+        assert_disposable_stack(_stack(nonce=nonce))
+
+
+# --------------------------------------------------------------------------------------
+# ==Controls must FAIL on a broken source, never pass.==
+#
+# C3 read `len(starts) == 0` and nothing else, so a 500, a 401 or a refused connection all produced
+# its pass condition: it measured absence of evidence and called it evidence of absence. C9 had the
+# same shape one layer down — an unreadable diary yields an empty list, and "at most one" is
+# trivially true of nothing.
+# --------------------------------------------------------------------------------------
+
+
+def _slots(status: int, body: object) -> Response:
+    return Response(status, body, json.dumps(body), 1.0, extract_error_code(body))
+
+
+def test_c3_passes_only_on_a_wellformed_empty_offer() -> None:
+    control = judge_closed_day(_slots(200, {"slots": [], "availability": "ok"}))
+    assert control.passed and control.ran
+
+
+def test_c3_fails_when_the_offer_is_not_empty() -> None:
+    slot = {"start": "2026-08-08T09:00:00Z", "end": "2026-08-08T09:30:00Z"}
+    assert not judge_closed_day(_slots(200, {"slots": [slot]})).passed
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _slots(500, {"detail": "boom"}),
+        _slots(401, {"detail": {"error": "unauthorized"}}),
+        _slots(503, {"detail": {"error": "availability_unavailable"}}),
+        Response(0, None, "URLError: connection refused", 1.0, "transport_error"),
+    ],
+)
+def test_c3_fails_when_the_slots_query_fails(response: Response) -> None:
+    """==A closed Saturday and a dead API both show zero slots. Only one of them is a pass.=="""
+    control = judge_closed_day(response)
+    assert control.ran is True
+    assert control.passed is False
+    assert "FAILED" in control.observed
+
+
+def test_c3_fails_on_a_200_that_is_not_the_slots_contract() -> None:
+    """A 200 with no `slots` list is not an empty offer — it is a changed contract."""
+    control = judge_closed_day(_slots(200, {"unexpected": "shape"}))
+    assert not control.passed
+    assert "contract" in control.observed
+
+
+@pytest.mark.parametrize("at_most", [True, False])
+def test_lineage_controls_fail_on_an_incomplete_read(at_most: bool) -> None:
+    """==Both C8 and C9 must refuse to judge cardinality on a diary they could not read.==
+
+    C9 (`at_most=True`) is the dangerous one: it asks "at most one?", and an empty list satisfies
+    that trivially — so before this, a 500 from the bookings endpoint PASSED the control guarding
+    against a guest left holding two live appointments.
+    """
+    broken = DiaryRead([], complete=False, problem="GET /bookings/ answered 500")
+    control = judge_lineage(broken, ident="C9", guards="g", at_most=at_most)
+    assert control.ran is True
+    assert control.passed is False
+    assert "could not be read completely" in control.observed
+
+
+def test_lineage_passes_on_a_complete_read_with_one_survivor() -> None:
+    read = DiaryRead(["abc confirmed"], complete=True)
+    assert judge_lineage(read, ident="C8", guards="g", at_most=False).passed
+    assert judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+
+
+def test_lineage_fails_when_two_live_appointments_survive() -> None:
+    """The defect the pair exists to catch, on a read that IS trustworthy."""
+    read = DiaryRead(["a confirmed", "b confirmed"], complete=True)
+    assert not judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+
+
+def test_c9_accepts_zero_survivors_but_c8_does_not() -> None:
+    """A cancel may legitimately win the mixed race; a reschedule race must leave a successor."""
+    read = DiaryRead([], complete=True)
+    assert judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+    assert not judge_lineage(read, ident="C8", guards="g", at_most=False).passed
