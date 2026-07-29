@@ -24,11 +24,14 @@ from aethercal_sim.__main__ import (
 )
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
+    EXPECTED_OUTBOX_STATUSES,
     ErrorTally,
     Latency,
     Mailbox,
     MailboxRead,
     MailMessage,
+    OutboxScrapeError,
+    parse_summary,
     percentile,
 )
 from aethercal_sim.report import REQUIRED_CONTROL_IDS, missing_controls, verdict_for
@@ -1181,3 +1184,153 @@ def test_one_contender_is_refused_by_the_cli_with_exit_2() -> None:
 def test_two_contenders_is_the_smallest_real_race() -> None:
     assert contender_count("2") == 2
     assert parse_args(["--contenders", "2"]).contenders == 2
+
+
+# --------------------------------------------------------------------------------------
+# ==The metrics reader: an absent field is NOT a healthy one.==
+#
+# The module's own docstring has always said "a failed scrape is recorded as a failure, never as a
+# zero" -- and the reader did the opposite one screen down. `outbox.get("due", 0)`,
+# `oldest_due_age_seconds` defaulting to 0.0 and a `by_status` falling back to `{}` turned every
+# absent field into the healthiest possible value, so a renamed field in a future version, a partial
+# response, or an error serialised as JSON all read as BACKLOG 0: C12 would announce "drained", §3
+# would print a flat line, and C5 would have nothing to see. ==A backlog that reaches zero because
+# the field disappeared is indistinguishable from a system that is keeping up.==
+# --------------------------------------------------------------------------------------
+
+
+def _summary(**outbox_overrides: Any) -> dict[str, Any]:
+    """A well-formed payload, shaped like the one the live worker serves."""
+    outbox: dict[str, Any] = {
+        "by_status": dict.fromkeys(EXPECTED_OUTBOX_STATUSES, 0),
+        "due": 0,
+        "oldest_due_age_seconds": 0.0,
+        "expired_leases": 0,
+    }
+    outbox.update(outbox_overrides)
+    return {"outbox": outbox, "drain": {"delivered": 0, "passes": 1, "lost": 0}}
+
+
+def test_a_well_formed_payload_parses() -> None:
+    sample = parse_summary(_summary(due=7, oldest_due_age_seconds=3.5))
+    assert sample.due == 7
+    assert sample.oldest_due_age_seconds == 3.5
+    assert sample.delivered == 0
+
+
+def test_the_real_worker_payload_parses_unchanged() -> None:
+    """==Pins that the strict reader agrees with the permissive one on a GOOD payload.==
+
+    Captured from the live worker during a run: eight statuses, integer counts, a float age, and
+    `drain.delivered`. If the strict parse of this differed from what the permissive reader
+    produced, the published numbers would have moved and the run would owe a re-run. It does not.
+    """
+    observed: dict[str, Any] = {
+        "outbox": {
+            "by_status": {
+                "pending": 230,
+                "claimed": 0,
+                "failed": 0,
+                "delivered": 290,
+                "dead": 0,
+                "skipped": 0,
+                "voided": 37,
+                "unknown": 0,
+            },
+            "due": 0,
+            "oldest_due_age_seconds": 0.0,
+            "expired_leases": 0,
+        },
+        "drain": {"lost": 0, "passes": 39, "delivered": 290, "failed": 0, "dead": 0},
+    }
+    sample = parse_summary(observed)
+    assert sample.due == 0
+    assert sample.rows == 557
+    assert sample.delivered == 290
+
+
+@pytest.mark.parametrize("missing", ["due", "oldest_due_age_seconds", "by_status"])
+def test_an_ABSENT_outbox_field_is_a_scrape_error_not_a_zero(missing: str) -> None:
+    """==The finding, one assertion per field.== Absent must never deserialise to healthy."""
+    payload = _summary()
+    del payload["outbox"][missing]
+    with pytest.raises(OutboxScrapeError, match=missing):
+        parse_summary(payload)
+
+
+@pytest.mark.parametrize("bad", [None, "0", "", [], {}, 3.5, True, -1])
+def test_a_due_of_the_wrong_TYPE_is_a_scrape_error(bad: object) -> None:
+    """No permissive coercion: a string is a server that changed how it serialises, not a zero.
+
+    `True` is in here deliberately -- `bool` is a subclass of `int`, so an unguarded `isinstance`
+    check would have let it through as 1.
+    """
+    with pytest.raises(OutboxScrapeError):
+        parse_summary(_summary(due=bad))
+
+
+@pytest.mark.parametrize("bad", [None, "3.5", [], True, -0.5])
+def test_an_oldest_due_age_of_the_wrong_TYPE_is_a_scrape_error(bad: object) -> None:
+    """The oldest-due age IS the dead-man alarm; a bad value must not silence it with 0.0."""
+    with pytest.raises(OutboxScrapeError):
+        parse_summary(_summary(oldest_due_age_seconds=bad))
+
+
+@pytest.mark.parametrize("bad", [None, "{}", [], 7, "pending"])
+def test_a_by_status_that_is_not_an_object_is_a_scrape_error(bad: object) -> None:
+    """It fell back to an empty map, and `rows` -- C5's durable signal -- sums that to 0."""
+    with pytest.raises(OutboxScrapeError, match="by_status"):
+        parse_summary(_summary(by_status=bad))
+
+
+@pytest.mark.parametrize("bad", [None, "3", 3.0, True, -2])
+def test_a_by_status_VALUE_is_validated_too(bad: object) -> None:
+    """==Not enough that the key exists.== A null or a string where an integer goes is an error.
+
+    This is the level the zero moves down to when only the key is checked: the map is present, the
+    status is there, the shape looks right -- and one series quietly counts as nothing.
+    """
+    statuses: dict[str, Any] = dict.fromkeys(EXPECTED_OUTBOX_STATUSES, 0)
+    statuses["delivered"] = bad
+    with pytest.raises(OutboxScrapeError):
+        parse_summary(_summary(by_status=statuses))
+
+
+def test_a_MISSING_status_is_a_scrape_error() -> None:
+    """`rows` is the sum of these and C5 compares it to work created; a lost series changes it."""
+    statuses: dict[str, Any] = dict.fromkeys(EXPECTED_OUTBOX_STATUSES, 0)
+    del statuses["voided"]
+    with pytest.raises(OutboxScrapeError, match="voided"):
+        parse_summary(_summary(by_status=statuses))
+
+
+def test_an_UNRECOGNISED_status_is_a_scrape_error() -> None:
+    """A status this harness does not know would be summed into `rows` without anyone deciding."""
+    statuses: dict[str, Any] = dict.fromkeys(EXPECTED_OUTBOX_STATUSES, 0)
+    statuses["quarantined"] = 5
+    with pytest.raises(OutboxScrapeError, match="quarantined"):
+        parse_summary(_summary(by_status=statuses))
+
+
+def test_an_absent_drain_delivered_stays_None_rather_than_zero() -> None:
+    """==C5 depends on this three-way reading.== Absent is a changed contract, not a lazy worker."""
+    payload = _summary()
+    del payload["drain"]
+    assert parse_summary(payload).delivered is None
+    payload = _summary()
+    del payload["drain"]["delivered"]
+    assert parse_summary(payload).delivered is None
+
+
+def test_a_mistyped_drain_delivered_is_an_error_not_an_absence() -> None:
+    """A quoted number is not "the field is missing"; it is the contract changing underneath."""
+    payload = _summary()
+    payload["drain"]["delivered"] = "12"
+    with pytest.raises(OutboxScrapeError, match="delivered"):
+        parse_summary(payload)
+
+
+@pytest.mark.parametrize("payload", [None, [], "ok", 7, {"bookings": {}}])
+def test_a_body_without_the_outbox_contract_is_a_scrape_error(payload: object) -> None:
+    with pytest.raises(OutboxScrapeError):
+        parse_summary(payload)

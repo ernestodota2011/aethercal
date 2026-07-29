@@ -16,13 +16,17 @@ number that matters is the **peak** — how far behind the drain fell while the 
 exists only during the run. So :class:`OutboxSampler` polls the operator surface on a background
 thread for the whole run and keeps the series.
 
-==A failed scrape is recorded as a failure, never as a zero.== ``/metrics/summary`` answers 503 when
-no operator token is configured and 401 when the token is wrong; both would deserialise to "no
-numbers", and a sampler that filled in zeros would report a perfectly flat, perfectly healthy queue
-for a run in which it never once managed to look at it. That is precisely the failure the product's
-own ``api/operator.py`` was moved out of the web process to avoid — "RLS would have turned the
-dead-man switch into the corpse" — and it would be a poor joke to reintroduce it in the instrument
-built to measure it.
+==A failed scrape is recorded as a failure, never as a zero.== That sentence is old;
+:func:`parse_summary` is where it became true of the READER too, not just of the transport.
+Until then every absent field was defaulted to its healthiest value, so a renamed field or a
+partial response read as ``backlog 0`` — see that function for what it cost.
+
+``/metrics/summary`` answers 503 when no operator token is configured and 401 when the token is
+wrong; both would deserialise to "no numbers", and a sampler that filled in zeros would report a
+perfectly flat, perfectly healthy queue for a run in which it never once managed to look at it.
+That is precisely the failure the product's own ``api/operator.py`` was moved out of the web
+process to avoid — "RLS would have turned the dead-man switch into the corpse" — and it would be
+a poor joke to reintroduce it in the instrument built to measure it.
 """
 
 from __future__ import annotations
@@ -169,6 +173,132 @@ class OutboxScrapeError(RuntimeError):
     """The operator surface could not be read. Fatal by design — see the module docstring."""
 
 
+#: Every status ``observability.MetricsSnapshot.outbox_by_status`` publishes, which the product
+#: documents as always present: *"Every member of OutboxStatus, whether or not it has rows — a
+#: dashboard cannot alert on a series that does not exist, so absent and zero must never look the
+#: same."* ==The harness holds the product to that sentence.==
+#:
+#: The set is compared EXACTLY, not as a subset. ``rows`` (the durable signal C5 gates on) is the
+#: sum of these, so a status this harness does not know about would be silently excluded from a
+#: total that is then compared against work created — and a renamed one would vanish from it. Either
+#: way the arithmetic would keep working and quietly mean something else. A schema change here must
+#: stop the run and be answered by a human, not absorbed.
+EXPECTED_OUTBOX_STATUSES: frozenset[str] = frozenset(
+    {"pending", "claimed", "failed", "delivered", "dead", "skipped", "voided", "unknown"}
+)
+
+
+def _require_count(container: dict[str, Any], key: str, where: str) -> int:
+    """A required, non-negative integer. ==No coercion: `"5"` and `True` are contract breaches.==
+
+    ``bool`` is checked before ``int`` because it is a subclass of one, so ``True`` would otherwise
+    sail through as ``1``. And a string that happens to parse is not a number the server sent — it
+    is a server that changed how it serialises, which is exactly the event this must surface.
+    """
+    if key not in container:
+        raise OutboxScrapeError(
+            f"{where} carried no '{key}'. ==An absent field is NOT a zero.== Reporting it as one "
+            "would draw the same flat, healthy line as a queue that is genuinely keeping up, which "
+            "is the single failure this instrument exists to make impossible."
+        )
+    value: Any = container[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OutboxScrapeError(
+            f"{where}['{key}'] is {value!r} ({type(value).__name__}), not an integer. The contract "
+            "changed, and coercing it would invent a measurement nobody took."
+        )
+    if value < 0:
+        raise OutboxScrapeError(f"{where}['{key}'] is negative ({value}); that is not a count.")
+    return value
+
+
+def _require_seconds(container: dict[str, Any], key: str, where: str) -> float:
+    """A required, non-negative duration. Accepts ``int``/``float``; rejects ``bool`` and text."""
+    if key not in container:
+        raise OutboxScrapeError(
+            f"{where} carried no '{key}'. ==An absent dead-man reading is NOT 0.0s.== The "
+            "oldest-due age IS the alarm; defaulting it to zero silences it and calls that health."
+        )
+    value: Any = container[key]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise OutboxScrapeError(
+            f"{where}['{key}'] is {value!r} ({type(value).__name__}), not a number."
+        )
+    if value < 0:
+        raise OutboxScrapeError(f"{where}['{key}'] is negative ({value}); that is not an age.")
+    return float(value)
+
+
+def parse_summary(payload: Any) -> OutboxSample:
+    """Turn one ``/metrics/summary`` body into a sample, or refuse it. ==Pure, so it is testable.==
+
+    .. rubric:: The policy this module declares, finally applied to itself
+
+    The module docstring above has always said *"a failed scrape is recorded as a failure, never as
+    a zero"* — and then the reader did the opposite one screen down. ``outbox.get("due", 0)``,
+    ``outbox.get("oldest_due_age_seconds", 0.0)`` and a ``by_status`` that fell back to ``{}``
+    turned **every absent field into the healthiest possible value**. So a renamed field in a future
+    version, a partial response, or an error serialised as JSON would all have read as *backlog 0*:
+    C12 would announce "drained", §3 would print a flat line, and C5 would have nothing to see.
+
+    ==A backlog that reaches zero because the field disappeared is indistinguishable from a system
+    that is keeping up.== That is the defect this whole directory hunts, sitting inside the
+    instrument the drain half of the report is built on.
+
+    Every field is now required and strictly typed, and ``by_status`` is validated to the value —
+    a ``null``, a string where an integer belongs, or a status this harness does not recognise is
+    an :class:`OutboxScrapeError`, never a zero.
+
+    ``drain.delivered`` keeps its deliberate three-way reading: absent is ``None`` (C5 reports
+    "ABSENT" and fails, naming a changed contract), present-but-mistyped is a scrape error, and a
+    real integer is the counter. Absent and zero stay different facts there too.
+    """
+    if not isinstance(payload, dict):
+        raise OutboxScrapeError(f"/metrics/summary returned a non-object body: {payload!r}")
+    outbox: Any = payload.get("outbox")
+    if not isinstance(outbox, dict):
+        raise OutboxScrapeError(
+            f"/metrics/summary carried no 'outbox' object — the contract changed: {payload!r}"
+        )
+
+    by_status_raw: Any = outbox.get("by_status")
+    if not isinstance(by_status_raw, dict):
+        raise OutboxScrapeError(
+            f"outbox['by_status'] is {by_status_raw!r}, not an object. ==An empty map is not a "
+            "quiet queue==; it is a queue nobody counted, and `rows` would sum it to 0."
+        )
+    seen = frozenset(str(key) for key in by_status_raw)
+    if seen != EXPECTED_OUTBOX_STATUSES:
+        missing = sorted(EXPECTED_OUTBOX_STATUSES - seen)
+        extra = sorted(seen - EXPECTED_OUTBOX_STATUSES)
+        raise OutboxScrapeError(
+            f"outbox['by_status'] does not carry the documented status set — the contract changed. "
+            f"Missing: {missing or 'none'}; unrecognised: {extra or 'none'}. `rows` is the sum of "
+            "these and C5 compares it against work created, so a status silently absent from the "
+            "total would keep the arithmetic working while changing what it means."
+        )
+    # ==Validated to the VALUE, not just to the key.== A status that is present but carries `null`,
+    # or `"3"`, is a series the dashboard cannot alert on either; permissive coercion here would put
+    # the zero back one level down from where it was just removed.
+    by_status = {
+        str(key): _require_count(by_status_raw, str(key), "outbox['by_status']")
+        for key in by_status_raw
+    }
+
+    delivered: int | None = None
+    drain: Any = payload.get("drain")
+    if isinstance(drain, dict) and "delivered" in drain:
+        delivered = _require_count(drain, "delivered", "drain")
+
+    return OutboxSample(
+        at=time.time(),
+        due=_require_count(outbox, "due", "outbox"),
+        oldest_due_age_seconds=_require_seconds(outbox, "oldest_due_age_seconds", "outbox"),
+        by_status=by_status,
+        delivered=delivered,
+    )
+
+
 class OutboxSampler:
     """Polls the worker's ``/metrics/summary`` on a background thread for the life of the run.
 
@@ -206,32 +336,7 @@ class OutboxSampler:
                 f"/metrics/summary unreachable: {type(exc).__name__}: {exc}"
             ) from exc
 
-        if not isinstance(payload, dict):
-            raise OutboxScrapeError(f"/metrics/summary returned a non-object body: {payload!r}")
-        outbox: Any = payload.get("outbox")
-        if not isinstance(outbox, dict):
-            raise OutboxScrapeError(
-                f"/metrics/summary carried no 'outbox' object — the contract changed: {payload!r}"
-            )
-        by_status_raw: Any = outbox.get("by_status", {})
-        by_status = (
-            {str(k): int(v) for k, v in by_status_raw.items()}
-            if isinstance(by_status_raw, dict)
-            else {}
-        )
-        # ==`None`, not 0, when the field is absent.== The dead-man control reads this counter to
-        # decide whether the restarted worker really processed the stranded work; a missing field
-        # defaulted to zero would be indistinguishable from a worker that drained nothing, and the
-        # control would blame the product for a contract change.
-        drain: Any = payload.get("drain")
-        delivered_raw: Any = drain.get("delivered") if isinstance(drain, dict) else None
-        return OutboxSample(
-            at=time.time(),
-            due=int(outbox.get("due", 0)),
-            oldest_due_age_seconds=float(outbox.get("oldest_due_age_seconds", 0.0)),
-            by_status=by_status,
-            delivered=int(delivered_raw) if isinstance(delivered_raw, int) else None,
-        )
+        return parse_summary(payload)
 
     def pause(self) -> None:
         """Stop sampling without ending the run.
@@ -257,6 +362,18 @@ class OutboxSampler:
                 except OutboxScrapeError as exc:
                     with self._lock:
                         self._failures.append(str(exc))
+                except Exception as exc:
+                    # ==An unexpected exception used to END this thread, in silence.== Only
+                    # OutboxScrapeError was caught, so anything else — and the old permissive reader
+                    # could raise TypeError on `int(None)` — killed the sampler outright. The run
+                    # carried on, `failures` stayed empty, C12 saw zero unexplained scrape failures
+                    # and §3 reported a peak backlog computed over however many samples had been
+                    # taken before the thread died. Sampling that STOPPED must never present as
+                    # sampling that found nothing wrong.
+                    with self._lock:
+                        self._failures.append(
+                            f"the sampler hit an unexpected {type(exc).__name__}: {exc}"
+                        )
             self._stop.wait(self._interval)
 
     def start(self) -> None:
