@@ -10,6 +10,7 @@ passed.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import threading
 import time
@@ -53,6 +54,7 @@ from aethercal_sim.scenarios import (
     _fire_together,
     cap_probe_blocker,
     control_outbox_drained,
+    decode_delivery,
     is_reschedule_collision,
     judge_cancel_idempotency,
     judge_closed_day,
@@ -1587,3 +1589,21 @@ def test_fire_together_RECORDS_the_overlap_it_creates() -> None:
     # The barrier releases all four together and each holds for 50ms, so they must overlap.
     assert outcome.peak_overlap >= 2
     assert judge_race_concurrency([outcome]).passed is True
+
+
+@pytest.mark.parametrize("corrupt", ["not base64 at all!!", "YWJj*&^%", "###", "AAAA===="])
+def test_a_corrupt_delivery_body_RAISES_rather_than_decoding_to_garbage(corrupt: str) -> None:
+    """==The lax decoder does not fail, it lies.==
+
+    `b64decode` defaults to `validate=False` and DISCARDS characters outside the alphabet, so a
+    corrupted body decodes to plausible garbage: nothing raises, so it is never counted unreadable,
+    and it does not contain the booking id either, so it reads as "a delivery that is not ours" --
+    the one category C7 never looks at. A corrupted duplicate would vanish into it.
+    """
+    with pytest.raises(ValueError):
+        decode_delivery(corrupt)
+
+
+def test_a_well_formed_delivery_body_still_decodes() -> None:
+    payload = b'{"event": "booking.cancelled"}'
+    assert decode_delivery(base64.b64encode(payload).decode()) == payload

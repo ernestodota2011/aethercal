@@ -728,6 +728,21 @@ def _captured(sink_url: str) -> list[dict[str, Any]]:
     )
 
 
+def decode_delivery(body_b64: str) -> bytes:
+    """Un-base64 one captured delivery. ==Strict, because the lax form does not fail — it LIES.==
+
+    ``base64.b64decode`` defaults to ``validate=False``, which *discards* characters outside the
+    alphabet instead of raising. A corrupted body therefore decodes to plausible-looking garbage:
+    it raises nothing, so it is never counted as unreadable, and it does not contain the booking id
+    either, so it reads as "a delivery that is simply not ours". ==A corrupted duplicate would
+    vanish into that third category==, which is the one C7 does not look at.
+
+    ``validate=True`` makes the corruption an error (``binascii.Error``, a subclass of
+    ``ValueError``), so both sink readers file it where it belongs: unreadable, and gating.
+    """
+    return base64.b64decode(body_b64, validate=True)
+
+
 def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
     """Count captured deliveries by event name. Returns ``(counts, unreadable)``.
 
@@ -739,7 +754,7 @@ def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
     unreadable = 0
     for entry in _captured(sink_url):
         try:
-            payload: Any = json.loads(base64.b64decode(str(entry.get("body_b64", ""))))
+            payload: Any = json.loads(decode_delivery(str(entry.get("body_b64", ""))))
         except (ValueError, TypeError):
             unreadable += 1
             continue
@@ -773,7 +788,7 @@ def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, i
     unreadable = 0
     for entry in _captured(sink_url):
         try:
-            raw = base64.b64decode(str(entry.get("body_b64", "")))
+            raw = decode_delivery(str(entry.get("body_b64", "")))
         except (ValueError, TypeError):
             # The body could not even be un-base64'd, so whether it mentions this booking is
             # unknowable. Counted, never skipped.
