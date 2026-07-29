@@ -451,11 +451,20 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 days=5,
             )
         )[: args.contenders]
-    if reschedule_id is None or len(later_starts) < 2:
+    # ==The race must be the size that was ASKED FOR, or say so.== `later_starts` is sliced to
+    # `--contenders`, and the guard used to accept anything from 2 upwards: a thin offer silently
+    # produced a 5-way reschedule race in a run whose §4 header says 40 contenders. The RaceOutcome
+    # would have recorded the true number, so nothing was a lie — but a run that quietly delivers a
+    # fraction of the configured load is a run whose contention claim nobody chose. C15's peak is
+    # measured against the contenders that actually fired, so it could not catch this either.
+    if reschedule_id is None or len(later_starts) < args.contenders:
         why = (
             "its subject never booked"
             if reschedule_id is None
-            else f"only {len(later_starts)} target slots on offer, need 2"
+            else (
+                f"only {len(later_starts)} target slots on offer, need {args.contenders} — the "
+                "reschedule race would have run at a fraction of the configured contention"
+            )
         )
         controls.append(Control.not_run("C8", _C8, "exactly 1 successor survives", why))
     else:
