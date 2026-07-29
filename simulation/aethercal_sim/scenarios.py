@@ -103,6 +103,27 @@ class OfferRead:
     problem: str = ""
 
 
+#: ==The ONLY refusal ordinary organic concurrency can produce on the reschedule path.==
+RESCHEDULE_COLLISION_CODE = "slot_unavailable"
+
+
+def is_reschedule_collision(response: Response) -> bool:
+    """Is this refused reschedule the ordinary crowding race, or a finding?
+
+    ==Extracted so the rule can be tested at all.== It first lived inline in ``run_organic``'s
+    follow-up worker, where the only tests that could reach it built an :class:`OrganicResult` by
+    hand — so they pinned the JUDGE and left the CLASSIFIER unbound. A mutation that deleted the
+    distinction entirely kept every test green, which is the same hollow-test shape this harness
+    hunts in the product: *if breaking it changes nothing, nothing was checking it.*
+
+    The line is drawn by MACHINE CODE, never by status class. ``not_active`` is a 409 too and would
+    mean the lineage was already broken; a 5xx is a finding; a transport error is a finding. Only
+    "somebody took that slot between the read and the move" is traffic — the create leg's
+    ``collisions`` one mutation later.
+    """
+    return not response.ok and response.error_code == RESCHEDULE_COLLISION_CODE
+
+
 def read_offer(response: Response) -> OfferRead:
     """Judge a slots response BEFORE its emptiness is allowed to mean anything.
 
@@ -227,8 +248,30 @@ class OrganicResult:
     follow_ups_attempted: int = 0
     cancelled: int = 0
     cancel_refused: dict[str, int] = field(default_factory=dict)
+    """Any non-2xx cancel. ``cancel_booking`` is IDEMPOTENT, so it has no ordinary refusal — a
+    caller that finds the booking already cancelled still receives 200. Every entry here is a
+    finding."""
     rescheduled: int = 0
+    reschedule_collisions: int = 0
+    """==A reschedule refused ``slot_unavailable``: the same ordinary collision as on the create
+    leg, and it has to be counted as one.==
+
+    The follow-up reads the day's offer and then posts the move, so another simulated guest can take
+    the chosen slot in between — precisely the race that produces ``collisions`` above, one mutation
+    later. The first version of C13 lumped this in with ``reschedule_refused`` and voided the run
+    over it: ==a control going red while the product behaved perfectly==, which is the same defect
+    class as C5 racing its own drain and C7 reporting a timeout as a duplication. The asymmetry was
+    the bug — the create leg had always drawn this distinction, and the follow-up leg simply never
+    inherited it.
+
+    C13 caught it on its first live run (`6662feb5`). ==The published run `b72197a2` had it too, and
+    nothing noticed==: that report shows **32** organic collisions and **35** total
+    `409 slot_unavailable`, and the missing three were reschedule refusals falling out of the
+    function through ``if response.ok:`` — counted nowhere, reconciled against nothing. This
+    category is what makes §6 close against §1 instead of leaving a remainder."""
     reschedule_refused: dict[str, int] = field(default_factory=dict)
+    """Any OTHER non-2xx reschedule, by code — ``not_active``, a 5xx, a transport error. All
+    findings."""
     reschedule_no_target: int = 0
     """A well-formed offer holding no slot other than the one already held. Not an error."""
     reschedule_slots_read_failed: list[str] = field(default_factory=list)
@@ -250,6 +293,7 @@ class OrganicResult:
             "cancelled": self.cancelled,
             "cancel_refused": sum(self.cancel_refused.values()),
             "rescheduled": self.rescheduled,
+            "reschedule_collisions": self.reschedule_collisions,
             "reschedule_refused": sum(self.reschedule_refused.values()),
             "reschedule_no_target": self.reschedule_no_target,
             "reschedule_slots_read_failed": len(self.reschedule_slots_read_failed),
@@ -258,8 +302,15 @@ class OrganicResult:
     def unexpected_organic_failures(self) -> dict[str, int]:
         """Everything in the two taxonomies that is a FINDING rather than ordinary traffic.
 
-        A collision, a full day and a reschedule with nowhere to go are the product behaving; a
-        broken read, a 5xx and an unreadable body are not. Only the second group gates.
+        A collision — on EITHER leg — a full day, and a reschedule with nowhere to go are the
+        product behaving. A broken read, a 5xx, an unreadable body and any refusal the domain does
+        not document for that call are not. Only the second group gates.
+
+        ==The line is drawn by MACHINE CODE, not by status class.== "Any 409 is fine" would be the
+        lazy version of this rule and it would blind the control: a reschedule answering
+        ``not_active`` is a 409 too, and it would mean the lineage was already broken. The single
+        refusal ordinary organic concurrency can produce on the reschedule path is
+        ``slot_unavailable``, so that one — and only that one — is traffic.
         """
         return {
             key: value
@@ -432,6 +483,12 @@ def run_organic(  # noqa: PLR0915 - the taxonomy IS the length: every outcome is
         with lock:
             if response.ok:
                 result.rescheduled += 1
+            elif is_reschedule_collision(response):
+                # ==The same collision the create leg counts, one mutation later.== The offer was
+                # read and then the move was posted; another simulated guest can take that slot in
+                # between. Ordinary organic crowding, not a finding — and the asymmetry with the
+                # create leg was itself the bug that voided run 6662feb5.
+                result.reschedule_collisions += 1
             else:
                 _tick(result.reschedule_refused, response.error_code, response.status)
 

@@ -34,6 +34,7 @@ from aethercal_sim.scenarios import (
     DeadmanObservation,
     DiaryRead,
     OrganicResult,
+    is_reschedule_collision,
     judge_cancel_idempotency,
     judge_closed_day,
     judge_confirmation_coverage,
@@ -516,6 +517,67 @@ def test_c13_fails_when_the_follow_up_leg_loses_an_attempt() -> None:
     result.follow_ups_attempted = 4
     result.cancelled = 3
     assert not judge_organic_accounting(result, planned=10).passed
+
+
+def test_c13_treats_a_reschedule_COLLISION_as_ordinary_traffic() -> None:
+    """==The asymmetry that voided run 6662feb5, pinned so it cannot come back.==
+
+    The follow-up reads the day's offer and then posts the move, so another simulated guest can take
+    the chosen slot in between. That is the create leg's `collisions` one mutation later — the
+    product refusing correctly — and lumping it in with the findings made C13 go red against a
+    perfect system, which is the very defect class C5 and C7 were just fixed for.
+    """
+    result = _organic()
+    result.follow_ups_attempted = 4
+    result.cancelled = 1
+    result.rescheduled = 1
+    result.reschedule_collisions = 2
+    control = judge_organic_accounting(result, planned=10)
+    assert control.passed is True
+    assert "reschedule_collisions': 2" in control.observed
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_slots(409, {"detail": {"error": "slot_unavailable"}}), True),
+        (_slots(409, {"detail": {"error": "not_active"}}), False),
+        (_slots(409, {"detail": {"error": "day_full"}}), False),
+        (_slots(500, {"detail": "boom"}), False),
+        (Response(0, None, "URLError: refused", 1.0, "transport_error"), False),
+        (_slots(200, {"id": "x"}), False),
+    ],
+)
+def test_only_slot_unavailable_is_an_ordinary_reschedule_collision(
+    response: Response, expected: bool
+) -> None:
+    """==The CLASSIFIER, pinned — because the judge's tests could not reach it.==
+
+    This rule lived inline in `run_organic`'s follow-up worker, and the only tests near it built an
+    `OrganicResult` by hand. Deleting the distinction outright left every one of them green: they
+    bound the judge and never the classifier. A mutation run is what surfaced that, which is the
+    point of running one — *if breaking it changes nothing, nothing was checking it.*
+
+    `not_active` and `day_full` are 409s exactly like `slot_unavailable`, so "any 409 is traffic"
+    would blind the control. Only the crowding race is traffic.
+    """
+    assert is_reschedule_collision(response) is expected
+
+
+def test_c13_still_fails_on_a_reschedule_refused_for_ANY_OTHER_reason() -> None:
+    """==The line is drawn by machine code, not by status class.==
+
+    `not_active` is a 409 exactly like `slot_unavailable`, and it would mean the lineage was already
+    broken. "Any 409 is traffic" would have been the lazy fix and it would have blinded the control.
+    """
+    result = _organic()
+    result.follow_ups_attempted = 4
+    result.cancelled = 1
+    result.rescheduled = 1
+    result.reschedule_refused = {"not_active": 2}
+    control = judge_organic_accounting(result, planned=10)
+    assert control.passed is False
+    assert "reschedule_refused" in control.observed
 
 
 def test_c13_fails_when_a_slots_query_broke() -> None:

@@ -187,8 +187,17 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     add(f"- Bookings **created**: **{len(organic.booked)}**")
     add(f"- Cancelled: **{organic.cancelled}** · rescheduled: **{organic.rescheduled}**")
     add(
-        f"- Organic collisions (two guests, one slot → `slot_unavailable`): "
+        f"- Organic collisions on the CREATE leg (two guests, one slot → `slot_unavailable`): "
         f"**{organic.collisions}**"
+    )
+    # ==Reported beside its create-leg twin, because it used to be reported NOWHERE.== A reschedule
+    # refused `slot_unavailable` is the same crowding one mutation later, and it fell out of
+    # `run_organic` through `if response.ok:`. In the published run `b72197a2` that left §6's 35
+    # `slot_unavailable` responses irreconcilable with §1's 32 collisions — a remainder of three
+    # that no category owned and no reader could have chased.
+    add(
+        f"- Organic collisions on the RESCHEDULE leg (the target slot was taken between reading "
+        f"the offer and posting the move): **{organic.reschedule_collisions}**"
     )
     add(
         f"- Attempts that met a fully-booked day (an empty offer from a **well-formed 2xx**): "
