@@ -66,6 +66,8 @@ class _GatewaySpy:
         self.refunds: list[str] = []
         self.keys: list[str] = []
         self.answers: Mapping[str, RefundOutcome] = answers or {}
+        self.lookups: list[str] = []
+        """Refund ids the runner asked the provider about."""
         """What the provider says for a given idempotency key. Anything unlisted succeeds."""
 
     @property
@@ -84,6 +86,19 @@ class _GatewaySpy:
         # generational key exists to work with, so the double must have it — one that always
         # answered "fine" could not tell a retry from a duplicate.
         return self.answers.get(idempotency_key, RefundOutcome.succeeded(None))
+
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """The provider has not changed its mind between the POST and the GET.
+
+        ==That is the honest default for a double==: the lookup exists to catch the case where the
+        provider HAS moved on, and one that always answered "settled" would make every pending test
+        pass for the wrong reason. `_SettlingGatewaySpy` is the one that models movement.
+        """
+        del provider_ref, secrets
+        self.lookups.append(refund_id)
+        return RefundOutcome.pending(refund_id)
 
     @property
     def calls(self) -> int:
@@ -158,6 +173,16 @@ class _StatusGatewaySpy(_GatewaySpy):
         return _stripe_refund_outcome(
             {"id": "re_FROM_THE_PROVIDER", "status": self._provider_status},
             provider_ref=provider_ref,
+        )
+
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """The same status, read back: this double is about the PARTITION, not about movement."""
+        del provider_ref, secrets
+        self.lookups.append(refund_id)
+        return _stripe_refund_outcome(
+            {"id": refund_id, "status": self._provider_status}, provider_ref=refund_id
         )
 
 
@@ -816,3 +841,82 @@ def test_a_nameless_terminal_failure_from_the_provider_is_refused_loudly() -> No
     # Anti-vacuity: the same status WITH an id is a perfectly good terminal failure.
     named = _stripe_refund_outcome({"status": "failed", "id": "re_X"}, provider_ref="pi_NAMELESS")
     assert named == RefundOutcome.failed("re_X")
+
+
+class _SettlingGatewaySpy(_GatewaySpy):
+    """A provider whose refund answers ``pending`` and whose LOOKUP answers something else.
+
+    ==This is the state the webhook was the only escape from.== The POST replays its own answer for
+    ever (that is what an idempotency key buys), so if nothing ever asks the provider directly, a
+    refund that has since succeeded looks pending until the outbox runs out of attempts and
+    dead-letters it as a failure — money back, system saying otherwise.
+    """
+
+    def __init__(self, settles_to: str) -> None:
+        super().__init__()
+        self._settles_to = settles_to
+
+    async def refund(
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        del secrets
+        self.keys.append(idempotency_key)
+        self.refunds.append(provider_ref)
+        return _stripe_refund_outcome(
+            {"id": "re_IN_FLIGHT", "status": "pending"}, provider_ref=provider_ref
+        )
+
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        del provider_ref, secrets
+        self.lookups.append(refund_id)
+        return _stripe_refund_outcome(
+            {"id": refund_id, "status": self._settles_to}, provider_ref=refund_id
+        )
+
+
+async def test_a_pending_refund_is_settled_by_asking_not_only_by_the_webhook(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The finding: `charge.refunded` was the ONLY route to convergence on the success side.==
+
+    Lose that delivery, fail its signature, or settle slower than six attempts of backoff, and a
+    refund that SUCCEEDED is dead-lettered as a failure — which loses no money but summons a human
+    to something that was fine, and invites a second refund.
+
+    No webhook is delivered anywhere in this test. The payment ends REFUNDED because the runner
+    ASKED the provider.
+    """
+    tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
+    gateway = _SettlingGatewaySpy(settles_to=REFUND_SUCCEEDED)
+
+    await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
+
+    assert gateway.lookups == ["re_IN_FLIGHT"], (
+        "the runner never asked the provider, so the only thing that could have settled this "
+        "refund is a webhook that may never arrive"
+    )
+    async with sqlite_maker() as s:
+        payment = (await s.scalars(select(Payment))).one()
+        assert payment.status is PaymentStatus.REFUNDED
+
+
+async def test_a_refund_still_pending_when_asked_is_still_not_refunded(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==Anti-vacuity: the poll must be able to answer "still not settled".==
+
+    A safety net that reported success whatever it found would pass the test above and mark every
+    in-flight refund as money returned — the very defect it exists to prevent.
+    """
+    tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
+    gateway = _SettlingGatewaySpy(settles_to="pending")
+
+    with pytest.raises(RefundNotSettledError):
+        await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
+
+    assert gateway.lookups == ["re_IN_FLIGHT"]
+    async with sqlite_maker() as s:
+        payment = (await s.scalars(select(Payment))).one()
+        assert payment.status is not PaymentStatus.REFUNDED

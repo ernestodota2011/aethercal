@@ -107,6 +107,23 @@ def gateway_method_for(operation: GatewayOperation) -> str:
             assert_never(unreachable)
 
 
+def read_only_gateway_methods() -> frozenset[str]:
+    """Gateway calls that move NO money. ==Declared, so a new one cannot arrive unclassified.==
+
+    :class:`~aethercal.server.services.tenant_credentials.GatewayOperation` names the acts that move
+    money, and every one of them must be VERIFIED against the real provider before a live credential
+    may be stored. A read is not one of those: ``refund_status`` asks the provider a question, and
+    its worst failure is a refund that settles late — the recoverable direction, and not one that
+    can move a guest's money through unexercised code.
+
+    It is DECLARED rather than inferred so the anti-omission lock keeps working: the suite asserts
+    that the protocol's coroutines are EXACTLY the money operations plus these, and that the two
+    sets are disjoint — so a new method on the gateway is not classified as either until somebody
+    has said which it is.
+    """
+    return frozenset({"refund_status"})
+
+
 def implementation_fingerprint(provider: CredentialProvider, operation: GatewayOperation) -> str:
     """A reproducible identity of the CODE that performs ``operation`` for ``provider``.
 
@@ -303,5 +320,6 @@ __all__ = [
     "implementation_fingerprint",
     "module_fingerprint",
     "money_providers",
+    "read_only_gateway_methods",
     "webhook_adapter_for",
 ]

@@ -1018,6 +1018,32 @@ class PaymentGateway(Protocol):
         after paying/cancelling — the business's real booking page, never a dead placeholder.=="""
         ...
 
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """Ask the provider what a refund's status is NOW. ==A read: it moves no money.==
+
+        .. rubric:: ==Why this exists: a webhook is a fast path, not a source of convergence==
+
+        A refund that comes back ``pending`` settles later, and :meth:`refund` cannot be asked again
+        — the provider replays the answer it already gave for that idempotency key, for ever. So the
+        only thing that could resolve a pending refund was the inbound ``charge.refunded`` webhook.
+        ==One delivery away from a refund that SUCCEEDED being dead-lettered as a failure==: a lost
+        webhook, a signature that fails to verify, or a settlement slower than the outbox's attempt
+        budget, and the money is back while the system says it is not — which invites somebody to
+        refund it again.
+
+        This is the safety net under that fast path. The webhook still wins the race almost always;
+        this is what makes the outbox's retry a REAL poll instead of a wait for a message that may
+        never come.
+
+        ``provider_ref`` is taken even though Stripe's own lookup does not need it — Mercado Pago's
+        does (its refunds are addressed under their payment). ==That is the opposite of the
+        ``provider``/``amount_cents`` parameters removed from :meth:`refund`==, which EVERY
+        implementation ignored: this one is load-bearing for an implementation that exists.
+        """
+        ...
+
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> RefundOutcome:
@@ -1194,10 +1220,29 @@ def make_refund_runner(
             # the provider returns the SAME refund for a repeated key rather than a second one (both
             # Stripe and Mercado Pago document this). The money moves once even if this code runs
             # twice.
-            outcome = await gateway.refund(
-                provider_ref=provider_ref,
-                idempotency_key=refund_idempotency_key(provider_ref, after_failed_refund=None),
-                secrets=credential.secrets,
+            async def _settled(outcome: RefundOutcome) -> RefundOutcome:
+                """Resolve a PENDING answer by ASKING, instead of only waiting for the webhook.
+
+                ==The webhook is the fast path; this is the net under it.== `refund` cannot be
+                re-asked (the provider replays its answer for a repeated key), so without this a
+                pending refund converged only if `charge.refunded` arrived — and a lost, late or
+                unverifiable delivery would dead-letter a refund that had SUCCEEDED. A read moves no
+                money, so the worst this costs is one extra call on the uncommon path.
+                """
+                if outcome.status is not RefundStatus.PENDING or outcome.refund_id is None:
+                    return outcome
+                return await gateway.refund_status(
+                    provider_ref=provider_ref,
+                    refund_id=outcome.refund_id,
+                    secrets=credential.secrets,
+                )
+
+            outcome = await _settled(
+                await gateway.refund(
+                    provider_ref=provider_ref,
+                    idempotency_key=refund_idempotency_key(provider_ref, after_failed_refund=None),
+                    secrets=credential.secrets,
+                )
             )
 
             # ==A terminal failure opens a NEW generation of the key (H9).== The provider replays
@@ -1214,12 +1259,14 @@ def make_refund_runner(
                     provider_ref,
                     outcome.refund_id,
                 )
-                outcome = await gateway.refund(
-                    provider_ref=provider_ref,
-                    idempotency_key=refund_idempotency_key(
-                        provider_ref, after_failed_refund=outcome.refund_id
-                    ),
-                    secrets=credential.secrets,
+                outcome = await _settled(
+                    await gateway.refund(
+                        provider_ref=provider_ref,
+                        idempotency_key=refund_idempotency_key(
+                            provider_ref, after_failed_refund=outcome.refund_id
+                        ),
+                        secrets=credential.secrets,
+                    )
                 )
 
             # ==Three states, three answers, and `assert_never` so a fourth cannot arrive quietly.==

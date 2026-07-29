@@ -29,6 +29,7 @@ from conftest import (
     PHASE_A_PURPOSE,
     PROVENANCE_SECRET_ENV,
     STATE_DIR_ENV,
+    _state_path,
     provenance_secret_from_env,
 )
 from live_harness_modules import provider_touching_modules
@@ -155,10 +156,16 @@ EVIDENCE_MARKER = "=== EVIDENCE for live_verifications"
 MUST_BE_ESTABLISHED_BEFORE_CERTIFYING = {
     # The evidence block claimed "expired afterwards" while the expiry still sat in the `finally`
     # BELOW the print — an observation about the future, written as though it had been made.
-    "test_stripe_live_checkout.py": "expire_session(session.checkout_session_id)",
+    "test_stripe_live_checkout.py": (
+        "test_the_gateway_opens_a_real_checkout_session_and_expires_it",
+        "expire_session",
+    ),
     # The evidence block accepted a `pending` refund and then printed "The money went back". The
     # cleanup had been taught that pending is not done; the thing printing the certificate had not.
-    "test_stripe_live_refund.py": "ensure_refunded(payment_intent_id, idempotency_key)",
+    "test_stripe_live_refund.py": (
+        "test_phase_b_refunds_the_real_charge_through_the_gateway",
+        "ensure_refunded",
+    ),
 }
 """For each harness: the call that ESTABLISHES the fact, which must run before the block that
 CERTIFIES it. See :func:`test_no_harness_certifies_a_fact_before_establishing_it`."""
@@ -185,18 +192,15 @@ def test_no_harness_certifies_a_fact_before_establishing_it() -> None:
        specific regression that has now happened twice: somebody moves or adds a print, and the
        certificate goes back to being written before the measurement.
     """
-    for module, establishing_call in MUST_BE_ESTABLISHED_BEFORE_CERTIFYING.items():
+    for module, pair in MUST_BE_ESTABLISHED_BEFORE_CERTIFYING.items():
+        function_name, establishing_call = pair
         source = (pathlib.Path(__file__).parent / module).read_text(encoding="utf-8")
+        function = _function_named(source, function_name)
 
-        assert EVIDENCE_MARKER in source, (
-            f"{module} no longer prints an evidence block, so this guard is watching nothing. If "
-            "the harness moved, move this with it."
-        )
-        assert establishing_call in source, (
-            f"{module} no longer calls `{establishing_call}`, so nothing establishes the fact its "
-            "evidence block certifies."
-        )
-        assert source.index(establishing_call) < source.index(EVIDENCE_MARKER), (
+        established = _first_call(function, establishing_call)
+        certified = _certifying_print(function, EVIDENCE_MARKER)
+
+        assert established < certified, (
             f"{module} composes its EVIDENCE block before `{establishing_call}` has run. That "
             "block is pasted into live_verifications() — certifying a fact that has not been "
             "established yet is how a false record reaches the money guard."
@@ -507,13 +511,83 @@ def test_provenance_is_demanded_before_the_refund_is_sent() -> None:
         encoding="utf-8"
     )
 
-    demand = "require_phase_a_provenance(session, _run_id())"
-    refund_call = "await gateway.refund("
-    assert demand in source, "phase B no longer demands provenance at all"
-    assert refund_call in source, "phase B no longer calls the gateway's refund"
-    assert source.index(demand) < source.index(refund_call), (
+    phase_b = _function_named(source, PHASE_B)
+
+    demanded = _first_call(phase_b, "require_phase_a_provenance")
+    refunded = _first_call(phase_b, "refund")
+
+    assert demanded < refunded, (
         "phase B sends the refund before it has established that the session came from phase A"
     )
+
+
+def _function_named(source: str, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The function ``name`` in ``source``, or a failure that says the guard is watching nothing."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} no longer exists, so this guard is watching nothing")
+
+
+def _call_positions(function: ast.AST, name: str) -> list[tuple[int, int]]:
+    """Where ``name`` is really CALLED inside ``function``. ==Executable code only.==
+
+    .. rubric:: ==The irony this closes: the order guards were satisfiable from a COMMENT==
+
+    These guards pin the money path's invariants — nothing that can abort outside the ``try`` that
+    refunds, no creation outside its recovery, provenance before the refund. They asked those
+    questions with ``in source`` and ``source.index(...)``, which is a substring search over the
+    whole file. ==A mention in a comment, a docstring or a string literal answered them just as
+    well as a call==, so a guard could stay green over an invariant that had been deleted.
+
+    It is the same defect this session already caught once, in the classifier that matched its own
+    source. It was fixed there and left standing here — and it matters more here, because these are
+    the guards over somebody's money.
+
+    So the question is asked of the syntax tree: real :class:`ast.Call` nodes and their positions,
+    which is what an ordering claim actually needs.
+    """
+    return sorted(
+        (inner.lineno, inner.col_offset)
+        for inner in ast.walk(function)
+        if isinstance(inner, ast.Call)
+        and (
+            (isinstance(inner.func, ast.Attribute) and inner.func.attr == name)
+            or (isinstance(inner.func, ast.Name) and inner.func.id == name)
+        )
+    )
+
+
+def _first_call(function: ast.AST, name: str) -> tuple[int, int]:
+    """The first real call to ``name``, or a failure naming what is missing."""
+    positions = _call_positions(function, name)
+    assert positions, (
+        f"`{name}` is not CALLED anywhere in this function. It may still be mentioned in a comment "
+        "or a string — which is exactly what this guard no longer accepts."
+    )
+    return positions[0]
+
+
+def _assignment_position(function: ast.AST, target: str) -> tuple[int, int]:
+    """Where ``target`` is really ASSIGNED — a statement, not a phrase in a comment."""
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(item, ast.Name) and item.id == target for item in node.targets
+        ):
+            return (node.lineno, node.col_offset)
+    raise AssertionError(f"`{target}` is never assigned in this function")
+
+
+def _certifying_print(function: ast.AST, marker: str) -> tuple[int, int]:
+    """Where the EVIDENCE block is printed — a real ``print`` whose text carries ``marker``."""
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "print"):
+            continue
+        if marker in ast.dump(node):
+            return (node.lineno, node.col_offset)
+    raise AssertionError(f"no `print` carrying {marker!r} — the evidence block is gone")
 
 
 CONTROL_FIXTURE = "stripe_reachable"
@@ -656,18 +730,17 @@ def test_the_payment_intent_is_resolved_before_the_guarantee_but_after_provenanc
     source = (pathlib.Path(__file__).parent / "test_stripe_live_refund.py").read_text(
         encoding="utf-8"
     )
-    demand = "require_phase_a_provenance(session, _run_id())"
-    resolve = 'payment_intent_id = session.get("payment_intent")'
-    keyed = "idempotency_key = refund_idempotency_key(payment_intent_id, after_failed_refund=None)"
+    phase_b = _function_named(source, PHASE_B)
 
-    for needle in (demand, resolve, keyed):
-        assert needle in source, f"phase B no longer contains `{needle}`"
+    demanded = _first_call(phase_b, "require_phase_a_provenance")
+    resolved = _assignment_position(phase_b, "payment_intent_id")
+    keyed = _assignment_position(phase_b, "idempotency_key")
 
-    assert source.index(demand) < source.index(resolve), (
+    assert demanded < resolved, (
         "phase B resolves the PaymentIntent before it has established that the session came from "
         "phase A — so a foreign payment becomes a target before anything refuses it"
     )
-    assert source.index(resolve) < source.index(keyed), (
+    assert resolved < keyed, (
         "phase B derives the refund key before resolving the PaymentIntent it is derived from"
     )
 
@@ -687,15 +760,29 @@ def test_an_unresolvable_payment_intent_on_a_paid_session_raises_the_alarm() -> 
         encoding="utf-8"
     )
 
-    assert "MONEY MAY BE HELD" in source, (
-        "phase B no longer shouts when a PAID session's PaymentIntent cannot be resolved. That is "
-        "real money nothing can return automatically, and silence is how nobody goes looking."
+    phase_b = _function_named(source, PHASE_B)
+
+    # ==The alarm has to live INSIDE a call that fails the run==, not merely somewhere in the file:
+    # a comment describing an alarm raises nobody.
+    shouting = [
+        node
+        for node in ast.walk(phase_b)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fail"
+        and "MONEY MAY BE HELD" in ast.dump(node)
+    ]
+    assert shouting, (
+        "phase B no longer shouts, from an executable `pytest.fail`, when a PAID session's "
+        "PaymentIntent cannot be resolved. That is real money nothing can return automatically, "
+        "and silence is how nobody goes looking."
     )
-    assert "{paid_session_id}" in source, (
+    dumped = ast.dump(shouting[0])
+    assert "paid_session_id" in dumped, (
         "the alarm must name the session id — with no PaymentIntent it is the only handle a human "
         "has left"
     )
-    assert "DASHBOARD_SEARCH_URL" in source, (
+    assert "DASHBOARD_SEARCH_URL" in dumped, (
         "the alarm must say WHERE to refund by hand; an alarm without the next action is a shrug"
     )
 
@@ -820,3 +907,25 @@ def test_the_creation_of_a_payable_session_is_inside_its_own_recovery() -> None:
         f"{unrecovered}. A create that fails AFTER Stripe processed it leaves a live $1 invitation "
         "nothing can expire, because the id that names it never came back."
     )
+
+
+def test_a_run_id_cannot_escape_the_state_directory() -> None:
+    """==The run id becomes a FILENAME, so its shape is a boundary.==
+
+    A value carrying a separator or ``..`` would write this run's state — its nonce — outside the
+    directory the harness owns. We generate the run id today, which is why this is cheap rather than
+    urgent; it is checked anyway because ==the ORIGIN changes and the SHAPE does not==. The day
+    somebody wires it to a flag or an environment variable, a check that trusted the origin is
+    already wrong and this one is still right.
+    """
+    hostile = ["../escape", "..", ".", "a/b", "a\\b", "", "v1 v2", "v1;rm", "v1\n"]
+    for value in hostile:
+        with pytest.raises(ValueError, match="is not of the form"):
+            _state_path(value)
+
+
+def test_an_ordinary_run_id_still_works() -> None:
+    """==Anti-vacuity.== An allowlist tightened until it refuses everything would pass the test
+    above while making phase A impossible to run."""
+    for ordinary in ("v1", "v2", "release-42", "run_7"):
+        assert _state_path(ordinary).name == f"phase-a-{ordinary}.json"

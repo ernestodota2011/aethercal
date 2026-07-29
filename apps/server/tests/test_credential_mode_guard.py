@@ -60,6 +60,7 @@ from aethercal.server.integrations.money import (
     current_gateway_implementations,
     gateway_method_for,
     implementation_fingerprint,
+    read_only_gateway_methods,
 )
 from aethercal.server.services import tenant_credentials as credentials
 from aethercal.server.services.payments import PaymentGateway
@@ -769,15 +770,25 @@ class TestTheRuleIsDerived:
         would ride into production on evidence gathered for entirely different calls.
         """
         declared = {gateway_method_for(operation) for operation in GatewayOperation}
+        reads = read_only_gateway_methods()
         on_the_protocol = {
             name
             for name, member in inspect.getmembers(PaymentGateway)
             if inspect.iscoroutinefunction(member)
         }
-        assert declared == on_the_protocol, (
-            "GatewayOperation and the PaymentGateway protocol disagree about what a gateway does. "
-            f"Only on the protocol: {sorted(on_the_protocol - declared)}. "
-            f"Only in the enum: {sorted(declared - on_the_protocol)}."
+
+        assert not (declared & reads), (
+            f"{sorted(declared & reads)} is declared both as a money operation and as a read. It "
+            "cannot be both: one demands verification against the real provider before a live "
+            "credential may be stored, the other carries no such obligation."
+        )
+        assert declared | reads == on_the_protocol, (
+            "the PaymentGateway protocol has a coroutine nobody has classified. Every gateway call "
+            "is either an act that MOVES MONEY (a GatewayOperation, which must be verified before "
+            "a live credential may be stored) or a READ that moves none "
+            "(read_only_gateway_methods). "
+            f"Unclassified: {sorted(on_the_protocol - declared - reads)}. "
+            f"Classified but absent: {sorted((declared | reads) - on_the_protocol)}."
         )
 
 

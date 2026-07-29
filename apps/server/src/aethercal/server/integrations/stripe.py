@@ -298,6 +298,23 @@ class StripeGateway:
         # ``checkout.session.completed`` webhook, which backfills ``provider_ref``.
         return CheckoutSession(checkout_url=str(body["url"]), checkout_session_id=str(body["id"]))
 
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """Read one refund back. ==A GET: no money moves, and no idempotency key is needed.==
+
+        Stripe addresses a refund by its own id, so ``provider_ref`` is not part of the URL; it is
+        in the signature because Mercado Pago's lookup needs it. See
+        :meth:`PaymentGateway.refund_status`.
+        """
+        del provider_ref  # Stripe's refunds are addressable on their own; Mercado Pago's are not
+        secret_key = secrets["secret_key"]
+        async with self._client(secret_key) as client:
+            response = await client.get(f"/refunds/{refund_id}")
+            response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=refund_id)
+
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> RefundOutcome:

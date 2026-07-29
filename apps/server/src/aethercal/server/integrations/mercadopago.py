@@ -788,6 +788,22 @@ class MercadoPagoGateway:
         # something this cut can verify without an account — see the module docstring.
         return CheckoutSession(checkout_url=init_point, checkout_session_id=idempotency_key)
 
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """Read one refund back. ==A GET: no money moves.==
+
+        Mercado Pago addresses a refund UNDER its payment, which is why the seam carries
+        ``provider_ref`` at all. Written to the documented shape and, like the rest of this adapter,
+        never exercised against a real account.
+        """
+        access_token = secrets["access_token"]
+        async with self._client(access_token) as client:
+            response = await client.get(f"/v1/payments/{provider_ref}/refunds/{refund_id}")
+            response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=provider_ref)
+
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
     ) -> RefundOutcome:

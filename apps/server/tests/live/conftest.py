@@ -47,6 +47,7 @@ import hmac
 import json
 import os
 import pathlib
+import re
 import secrets
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
@@ -323,11 +324,40 @@ def stripe_reachable(secret_key: str, unauthenticated_stripe_api: httpx.Client) 
     return response.status_code
 
 
+RUN_ID_SHAPE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+"""What a run id may be made of. ==An ALLOWLIST, and it is not about who supplies it today.==
+
+The run id becomes part of a filename, so a value carrying a separator or ``..`` would write outside
+the state directory. Today we generate it, which is why this is cheap rather than urgent — but
+==the ORIGIN is what changes and the SHAPE is what lasts==: the day somebody wires it to an
+environment variable or a flag, a check that trusted the origin is already wrong, and a check on the
+form is still right.
+"""
+
+
 def _state_path(run_id: str) -> pathlib.Path:
-    """The file holding one phase-A run's nonce and the session it opened."""
+    """The file holding one phase-A run's nonce and the session it opened.
+
+    Two independent refusals, because either alone can be argued around: the run id must MATCH the
+    allowlist, and the resolved path must still be INSIDE the state directory. The second catches
+    what the first cannot anticipate — a symlinked directory, a platform that reads a name
+    differently — and neither depends on knowing where the value came from.
+    """
+    if not RUN_ID_SHAPE.match(run_id):
+        raise ValueError(
+            f"the run id {run_id!r} is not of the form {RUN_ID_SHAPE.pattern}: it becomes part "
+            "of a filename, and a separator or `..` in it would write this run's state outside the "
+            "state directory. Letters, digits, `-` and `_` only."
+        )
     directory = pathlib.Path(os.environ.get(STATE_DIR_ENV, "").strip() or DEFAULT_STATE_DIR)
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"phase-a-{run_id}.json"
+    path = (directory / f"phase-a-{run_id}.json").resolve()
+    if not path.is_relative_to(directory.resolve()):  # pragma: no cover - belt to the allowlist
+        raise ValueError(
+            f"the state file for run id {run_id!r} resolves outside {directory}; refusing to touch "
+            "anything the harness does not own"
+        )
+    return path
 
 
 def _read_state(run_id: str) -> dict[str, Any]:

@@ -295,6 +295,31 @@ differently, so it could only be overruled and never discharged.
   - The live harness had the same binary read in its **evidence** path (`not terminally_failed`) and
     would have certified a pending refund into `live_verifications()`; it now requires
     `RefundStatus.SUCCEEDED`.
+- **A pending refund converges by ASKING, not only by waiting for a webhook.** `charge.refunded`
+  was the single route to convergence on the success side, so one lost delivery, one signature that
+  failed to verify, or a settlement slower than six attempts of backoff would dead-letter a refund
+  that had **succeeded** — no money lost, but a human summoned to something that was fine, and
+  invited to refund it again. `PaymentGateway.refund_status` reads one refund back (a GET: it moves
+  no money) and the runner consults it whenever an answer is pending, so the outbox's retry is a
+  real poll. The webhook stays the fast path; this is the net under it.
+  - The gateway protocol now holds **two kinds** of call, and the anti-omission lock knows it: money
+    operations (`GatewayOperation`, each of which must be verified against the real provider before
+    a live credential may be stored) and declared **reads** (`read_only_gateway_methods`). The suite
+    asserts the protocol's coroutines are exactly those two sets, disjoint — so a new gateway method
+    is unclassified until somebody says which it is, and a read carries no verification burden
+    because its worst failure is a refund that settles late.
+- **The live harness's order guards are parsed, not grepped.** They pinned the money path's
+  invariants — nothing that can abort outside the `try` that refunds, no creation outside its
+  recovery, provenance before the refund — with `in source` / `source.index(...)`, a substring
+  search over the whole file. ==A mention in a comment or a string literal satisfied them exactly as
+  well as a call==, so a guard could stay green over an invariant that had been deleted. They now
+  locate real `ast.Call` nodes inside the specific function and compare their positions; the alarm
+  guard requires its text inside an executable `pytest.fail`, not merely somewhere in the file.
+- **The live harness's run id is validated by shape.** It becomes part of a filename, so a separator
+  or `..` would write a run's state (its nonce) outside the directory the harness owns. It is
+  checked against an allowlist (`[A-Za-z0-9_-]+`) *and* the resolved path is required to stay inside
+  the state directory. We generate the run id today — the check is on the **form** because the
+  origin is what changes.
 - **A terminal refund failure can no longer be nameless.** The new generation is derived from the
   failed refund's id, so a terminal failure without one leaves nothing to derive it from — and the
   code would have claimed a second attempt it never made. `RefundOutcome.failed()` takes a
