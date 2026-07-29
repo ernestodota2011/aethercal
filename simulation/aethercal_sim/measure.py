@@ -402,6 +402,15 @@ class OutboxSampler:
         rather than filed as an unexplained failure C12 would then void the run over.
         """
         with self._in_flight:
+            # ==The pause is re-checked HERE, under the lock `pause()` waits on.== `_loop` tests
+            # `_paused` outside it, so a thread that had already passed that test could acquire this
+            # lock and fire its request after `pause()` had returned — and the dead-man stops the
+            # worker on the very next line, so that request fails and is recorded as a real failure
+            # caused by the control itself. Third pass over this: S13 made `pause()` a barrier, S19
+            # made `stop()` prove it stopped, and the decision to scrape was still being taken
+            # outside the lock that serialises them.
+            if self._paused.is_set():
+                return
             self._record_scrape()
 
     def _record_scrape(self) -> None:

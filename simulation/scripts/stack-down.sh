@@ -43,15 +43,10 @@ docker compose \
 # The same restore `run.sh` performs from its trap, deliberately identical: two ways to put the
 # file back that drift apart are worse than one, because the path nobody exercises is the one that
 # is broken on the day it is needed.
+# shellcheck source=restore-env.sh
+source "${SIM_DIR}/scripts/restore-env.sh"
 if [[ -f "${ENV_BACKUP}.state" ]]; then
-  if [[ "$(cat "${ENV_BACKUP}.state")" == "existed" ]]; then
-    mv -f "${ENV_BACKUP}" "${ENV_FILE}" 2>/dev/null || true
-    echo "==> restored the previous deploy/.env"
-  else
-    rm -f "${ENV_FILE}"
-    echo "==> removed the deploy/.env the simulation created (there was none before)"
-  fi
-  rm -f "${ENV_BACKUP}.state" "${ENV_BACKUP}"
+  aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}"
 else
   echo "==> no deploy/.env backup to restore"
 fi

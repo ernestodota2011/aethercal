@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -79,9 +80,16 @@ from aethercal_sim.scenarios import (
     read_offer,
     sink_events_for_booking,
 )
-from aethercal_sim.traffic import WEEKDAY_WEIGHTS, PlannedBooking, plan_two_weeks, summarise_plan
+from aethercal_sim.traffic import (
+    WEEKDAY_WEIGHTS,
+    PlannedBooking,
+    allocate_by_weight,
+    plan_two_weeks,
+    summarise_plan,
+)
 from aethercal_sim.world import (
     EXPECTED_COMPOSE_PROJECT,
+    SINK_WEBHOOK_URL,
     BusinessConfig,
     NotADisposableStackError,
     StackConfig,
@@ -364,7 +372,6 @@ def _stack(**overrides: object) -> StackConfig:
         "booking_url": "http://localhost:5001",
         "mailpit_url": "http://localhost:8025",
         "sink_url": "http://localhost:9099",
-        "sink_webhook_url": "http://hooks:9099/hook",
         "metrics_token": "t" * 40,
         "compose_project": EXPECTED_COMPOSE_PROJECT,
         "nonce": "a1b2c3d4" * 4,
@@ -1563,7 +1570,12 @@ def test_a_failure_from_the_deliberate_outage_is_NOT_counted_against_c12() -> No
 
     pauser = threading.Thread(target=sampler.pause, daemon=True)
     pauser.start()
-    time.sleep(0.05)  # let pause() set the flag and block on the in-flight lock
+    # ==Wait for the STATE, never for a duration.== `_paused` is itself a `threading.Event`,
+    # so the moment `pause()` sets it is directly observable; sleeping 50ms only ASSUMED it had
+    # happened, which made this test its own race -- it could pass or fail without ever having
+    # produced the interleaving it names. A green from a race that never ran is exactly the
+    # shape this branch has spent itself removing, and it had reached the tests that guard it.
+    assert sampler._paused.wait(timeout=5), "pause() never set the paused state"
     sampler.release.set()
     worker.join(timeout=5)
     pauser.join(timeout=5)
@@ -1584,7 +1596,12 @@ def test_a_sample_completing_after_a_pause_is_discarded_and_COUNTED() -> None:
 
     pauser = threading.Thread(target=sampler.pause, daemon=True)
     pauser.start()
-    time.sleep(0.05)
+    # ==Wait for the STATE, never for a duration.== `_paused` is itself a `threading.Event`,
+    # so the moment `pause()` sets it is directly observable; sleeping 50ms only ASSUMED it had
+    # happened, which made this test its own race -- it could pass or fail without ever having
+    # produced the interleaving it names. A green from a race that never ran is exactly the
+    # shape this branch has spent itself removing, and it had reached the tests that guard it.
+    assert sampler._paused.wait(timeout=5), "pause() never set the paused state"
     sampler.release.set()
     worker.join(timeout=5)
     pauser.join(timeout=5)
@@ -2285,3 +2302,108 @@ def test_stop_is_silent_when_the_thread_really_finished() -> None:
     sampler._thread = _Finished()  # type: ignore[assignment]
     sampler.stop()
     assert sampler.failures == []
+
+
+# --------------------------------------------------------------------------------------
+# S21/S22/S24/S25 -- the fourth slice of the gate.
+# --------------------------------------------------------------------------------------
+
+
+def test_no_request_is_started_once_a_pause_has_begun() -> None:
+    """==S21, deterministic: the thread that already passed the loop's check must still not fire.==
+
+    `_loop` tests `_paused` OUTSIDE the in-flight lock, so a thread that had passed that test could
+    acquire the lock and send its request after `pause()` returned -- and the dead-man stops the
+    worker on the very next line, so that request fails and is recorded as a REAL failure caused by
+    the control itself. Calling `_scrape_once` directly IS a thread in exactly that position.
+    """
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+    calls = 0
+
+    def counting_scrape() -> OutboxSample:
+        nonlocal calls
+        calls += 1
+        raise OutboxScrapeError("the worker is down -- this must never be reached")
+
+    sampler.scrape = counting_scrape  # type: ignore[method-assign]
+    sampler._paused.set()  # the pause began between the loop's check and this lock
+    sampler._scrape_once()
+    assert calls == 0, "a request was issued after pause() had begun"
+    assert sampler.failures == []
+    assert sampler.discarded_at_pause == 0
+
+
+def test_a_scrape_still_runs_when_nothing_is_paused() -> None:
+    """The anti-vacuity half: unpaused, the sampler still works."""
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+    calls = 0
+
+    def counting_scrape() -> OutboxSample:
+        nonlocal calls
+        calls += 1
+        return OutboxSample(at=0.0, due=0, oldest_due_age_seconds=0.0, by_status={}, delivered=0)
+
+    sampler.scrape = counting_scrape  # type: ignore[method-assign]
+    sampler._scrape_once()
+    assert calls == 1
+    assert len(sampler.samples) == 1
+
+
+def test_c5_refuses_a_baseline_that_was_not_drained() -> None:
+    """==S22: aggregate counters cannot attribute a delivery to the batch this control created.==
+
+    With work already queued when C5 starts, "the restarted worker delivered >= 6" is equally true
+    of six intents that were sitting there before it began. Two histories, one number.
+    """
+    control = judge_drain_deadman(_deadman(baseline_due=4))
+    assert control.passed is False
+    assert "baseline was not drained" in control.observed
+
+
+def test_c5_accepts_a_drained_baseline() -> None:
+    assert judge_drain_deadman(_deadman(baseline_due=0)).passed is True
+
+
+def test_the_webhook_destination_is_derived_not_configurable() -> None:
+    """==S24: what is never accepted needs no validation.==
+
+    The sink URL used to arrive in `.stack.json` and be handed to the product verbatim -- the one
+    endpoint `assert_disposable_stack` never checked, and the only one dialled by the SERVER rather
+    than by this client, so no amount of loopback checking constrained it.
+    """
+    assert SINK_WEBHOOK_URL == "http://hooks:9099/hook"
+    assert not hasattr(StackConfig, "sink_webhook_url")
+    assert "sink_webhook_url" not in _stack().__slots__
+
+
+@pytest.mark.parametrize("total", [0, 1, 7, 40, 239, 1000])
+@pytest.mark.parametrize("days", [1, 2, 5, 10, 14])
+def test_the_allocation_sums_to_the_total_EXACTLY(total: int, days: int) -> None:
+    """==S25: the plan's headline number must be an identity, not an expectation.==
+
+    Independent per-day rounding is unbiased per day and says nothing about the sum, so "239
+    planned" could describe a plan that was never 239 -- the number §1 quotes and C13 reconciles
+    against.
+    """
+    weights = [WEEKDAY_WEIGHTS[i % 5] for i in range(days)]
+    weights = [w / sum(weights) for w in weights]
+    counts = allocate_by_weight(total=total, weights=weights, rng=random.Random(20260725))
+    assert sum(counts) == total
+    assert len(counts) == days
+    assert all(c >= 0 for c in counts)
+
+
+def test_the_allocation_is_deterministic_for_a_seed() -> None:
+    """The tie-break uses the SEEDED rng, so the plan stays reproducible."""
+    weights = [0.2] * 5
+    first = allocate_by_weight(total=13, weights=weights, rng=random.Random(7))
+    second = allocate_by_weight(total=13, weights=weights, rng=random.Random(7))
+    assert first == second
+    assert sum(first) == 13
+
+
+def test_the_plan_total_matches_the_request_for_many_seeds() -> None:
+    """End to end: what the planner produces is what was asked for, every time."""
+    for seed in range(12):
+        plan = _plan(seed=seed, per_week=40)
+        assert len(plan) == 40 * 2 * len(BUSINESSES)

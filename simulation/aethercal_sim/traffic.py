@@ -111,6 +111,37 @@ def _guest_email(name: str, seq: int) -> str:
     return f"{handle}.{seq}@guests.sim.test"
 
 
+def allocate_by_weight(*, total: int, weights: list[float], rng: random.Random) -> list[int]:
+    """Split ``total`` across ``weights`` so the parts sum to ``total`` EXACTLY. ==Pure.==
+
+    The planner used to round each day independently — ``int(expected) + (1 if rng.random() <
+    frac)`` — which is unbiased per day and says nothing about the sum. Fourteen independent coin
+    flips do not have to land on the requested total, so "239 planned" could describe a plan that
+    was never 239. ==§1 quotes that number and C13 reconciles against it==, which held only because
+    C13 compares what the plan PRODUCED, not what was ASKED for; the two were free to differ.
+
+    Largest remainder instead: every day takes its integer part, and the leftover — always fewer
+    than ``len(weights)`` items — goes to the largest fractional parts. ==Ties are broken with the
+    SEEDED rng==, never by list order, so the determinism the whole plan rests on survives while
+    the total becomes an identity rather than an expectation.
+    """
+    if total <= 0 or not weights:
+        return [0] * len(weights)
+    exact = [total * weight for weight in weights]
+    counts = [int(value) for value in exact]
+    remainder = total - sum(counts)
+    if remainder <= 0:
+        return counts
+    # Shuffle first so equal fractional parts are ordered by the seed rather than by index, then
+    # sort by fraction descending — Python's sort is stable, so the shuffle IS the tie-break.
+    order = list(range(len(weights)))
+    rng.shuffle(order)
+    order.sort(key=lambda index: exact[index] - counts[index], reverse=True)
+    for index in order[:remainder]:
+        counts[index] += 1
+    return counts
+
+
 def plan_two_weeks(
     *,
     business_slugs: list[str],
@@ -139,13 +170,12 @@ def plan_two_weeks(
 
     for business_slug in business_slugs:
         spanish_share = locale_mix.get(business_slug, 0.5)
-        for day in weekdays_in_window:
-            share = WEEKDAY_WEIGHTS[day.weekday()] / weight_total
-            expected = target_total * share
-            # Round STOCHASTICALLY so the fractional part is not systematically lost: 3.4 becomes 3
-            # or 4 with the right frequency, and the two-week total lands on target instead of
-            # drifting low on every single day of the window.
-            count = int(expected) + (1 if rng.random() < (expected - int(expected)) else 0)
+        per_day = allocate_by_weight(
+            total=target_total,
+            weights=[WEEKDAY_WEIGHTS[day.weekday()] / weight_total for day in weekdays_in_window],
+            rng=rng,
+        )
+        for day, count in zip(weekdays_in_window, per_day, strict=True):
             for _ in range(count):
                 seq += 1
                 locale = "es" if rng.random() < spanish_share else "en"

@@ -440,512 +440,550 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
 
     sampler = OutboxSampler(stack.worker_url, stack.metrics_token, interval_seconds=0.5)
     sampler.start()
-
-    # ---- Phase 1: the organic two-week load -------------------------------------------------
-    # The window opens on the next Monday, so a 14-day plan covers exactly two working weeks.
-    today = date.today()
-    window_start = today + timedelta(days=(7 - today.weekday()) % 7 or 7)
-    plan = plan_two_weeks(
-        business_slugs=[business.slug for business in world.businesses],
-        locale_mix=LOCALE_MIX,
-        start=window_start,
-        seed=args.seed,
-        bookings_per_business_per_week=args.per_week,
-    )
-    summary = summarise_plan(plan)
-    print(f"==> phase 1: {summary['total']} planned bookings, {args.workers} concurrent guests")
-    organic = run_organic(world, stack, plan, workers=args.workers, seed=args.seed)
-    print(
-        f"    created {len(organic.booked)} · cancelled {organic.cancelled} · "
-        f"rescheduled {organic.rescheduled} · organic collisions {organic.collisions}"
-    )
-
-    # ---- Phase 2: adversarial concurrency ---------------------------------------------------
-    print(f"==> phase 2: adversarial races, {args.contenders} contenders")
-    target = world.businesses[0]
-    client = Client(stack.api_url, target.config.api_key)
-    races = []
-    controls: list[Control] = []
-    cancel_race_events: dict[str, int] = {}
-
-    # A far-future week nothing else in the run has touched, so each race starts from clean slots.
-    race_day = window_start + timedelta(days=21)
-    offer = fetch_slots(
-        client,
-        event_type_id=target.event_types["standard"].id,
-        day=race_day,
-        timezone=target.config.timezone,
-        days=5,
-    )
-    starts = slot_starts(offer)
-    needed = args.contenders + _SPARE_SLOTS
-    if len(starts) < needed:
-        print(f"ERROR: {len(starts)} slots on offer, need {needed}", file=sys.stderr)
-        sampler.stop()
-        return 2
-
-    same_slot = race_same_slot(stack, target, start=starts[0], contenders=args.contenders)
-    races.append(same_slot)
-    print(f"    same slot: {same_slot.winners} winner(s) of {same_slot.contenders}")
-    # ==C10 — THE claim of the whole report, wired to the verdict.== Until this existed the
-    # same-slot race lived in a table and nowhere else: the run would have stamped MEASURED with
-    # five winners on one slot, because nothing ever compared its result against anything.
-    controls.append(
-        control_single_winner(
-            same_slot,
-            ident="C10",
-            guards="RF-04 itself: N simultaneous bookings of ONE slot leave exactly one",
-            expected_refusal="slot_unavailable",
+    # ==The sampler is a THREAD, so its shutdown cannot depend on the happy path.== Every
+    # `return` and every raise between here and the verdict used to leave it running: the two
+    # explicit `stop()` calls covered the paths somebody remembered. A background thread that
+    # outlives the run keeps scraping a stack `run.sh` is already tearing down, and its failures
+    # land in a report nobody reads. One `finally` owns the lifecycle now.
+    try:
+        # ---- Phase 1: the organic two-week load -------------------------------------------------
+        # The window opens on the next Monday, so a 14-day plan covers exactly two working weeks.
+        today = date.today()
+        window_start = today + timedelta(days=(7 - today.weekday()) % 7 or 7)
+        plan = plan_two_weeks(
+            business_slugs=[business.slug for business in world.businesses],
+            locale_mix=LOCALE_MIX,
+            start=window_start,
+            seed=args.seed,
+            bookings_per_business_per_week=args.per_week,
         )
-    )
-
-    # ==The control for the oracle.== Same burst, same code path, N different slots → N winners.
-    distinct = race_distinct_slots(
-        stack, target, starts=starts[1 : 1 + args.contenders], tag=run_id
-    )
-    races.append(distinct)
-    controls.append(
-        Control(
-            ident="C2",
-            guards="the race oracle itself: it CAN see more than one winner",
-            expected=f"{distinct.contenders} winners on {distinct.contenders} distinct slots",
-            observed=f"{distinct.winners} winners, refusals {distinct.refusals_by_code}",
-            passed=distinct.winners == distinct.contenders,
+        summary = summarise_plan(plan)
+        print(f"==> phase 1: {summary['total']} planned bookings, {args.workers} concurrent guests")
+        organic = run_organic(world, stack, plan, workers=args.workers, seed=args.seed)
+        print(
+            f"    created {len(organic.booked)} · cancelled {organic.cancelled} · "
+            f"rescheduled {organic.rescheduled} · organic collisions {organic.collisions}"
         )
-    )
-    print(f"    distinct slots (control): {distinct.winners} winner(s) of {distinct.contenders}")
 
-    # C1 — the slot the same-slot race just filled must now be refused.
-    controls.append(control_taken_slot(stack, target, start=starts[0]))
+        # ---- Phase 2: adversarial concurrency ---------------------------------------------------
+        print(f"==> phase 2: adversarial races, {args.contenders} contenders")
+        target = world.businesses[0]
+        client = Client(stack.api_url, target.config.api_key)
+        races = []
+        controls: list[Control] = []
+        cancel_race_events: dict[str, int] = {}
 
-    def subject(index: int, label: str) -> str | None:
-        """Book one fresh booking for a mutation race; ``None`` if it could not be created."""
-        response = book_slot(
+        # A far-future week nothing else in the run has touched, so each race starts from clean
+        # slots.
+        race_day = window_start + timedelta(days=21)
+        offer = fetch_slots(
             client,
             event_type_id=target.event_types["standard"].id,
-            start=starts[index],
-            guest_name=f"{label} Race Subject",
-            guest_email=f"{label.lower()}.subject.{run_id}@guests.sim.test",
-            guest_timezone="UTC",
-            locale="en",
+            day=race_day,
+            timezone=target.config.timezone,
+            days=5,
         )
-        return str(response.body["id"]) if response.ok else None
+        starts = slot_starts(offer)
+        needed = args.contenders + _SPARE_SLOTS
+        if len(starts) < needed:
+            print(f"ERROR: {len(starts)} slots on offer, need {needed}", file=sys.stderr)
+            return 2
 
-    # ==Every control below is appended on EVERY path.== They used to live inside the `if` that
-    # created their subject, so a booking that failed to be created did not produce a failing
-    # control — it produced no control at all, and the report announced "7 of 7 held" for a run
-    # that had quietly stopped asking two of its questions. A missing prerequisite is now a
-    # NOT RUN row (and an INCOMPLETE verdict), which is a fact; silence was not.
-    _C7 = "an idempotent cancel emits exactly ONE booking.cancelled webhook"
-    _C8 = "a reschedule race leaves ONE successor, not two live appointments"
-    _C9 = "a cancel racing a reschedule never leaves TWO live appointments"
-
-    cancel_id = subject(args.contenders + 1, "Cancel")
-    if cancel_id is None:
+        same_slot = race_same_slot(stack, target, start=starts[0], contenders=args.contenders)
+        races.append(same_slot)
+        print(f"    same slot: {same_slot.winners} winner(s) of {same_slot.contenders}")
+        # ==C10 — THE claim of the whole report, wired to the verdict.== Until this existed the
+        # same-slot race lived in a table and nowhere else: the run would have stamped MEASURED with
+        # five winners on one slot, because nothing ever compared its result against anything.
         controls.append(
-            Control.not_run("C7", _C7, "exactly 1 booking.cancelled", "its subject never booked")
-        )
-    else:
-        races.append(race_cancel(stack, target, booking_id=cancel_id, contenders=args.contenders))
-        # ==Observed, not slept through.== This used to be `time.sleep(12)` and a single read: a
-        # webhook arriving at 13 seconds made C7 fail in a way INDISTINGUISHABLE from the
-        # duplication it exists to detect. `observe_cancel_webhooks` drains the outbox first (so
-        # every queued delivery has been attempted), polls until the event appears or an explicit
-        # deadline passes, then keeps watching long enough for a late duplicate to be caught.
-        cancel_observation = observe_cancel_webhooks(stack.sink_url, cancel_id, sampler=sampler)
-        cancel_race_events = cancel_observation.counts
-        print(f"    cancel race: drained={cancel_observation.drained} events={cancel_race_events}")
-        controls.append(judge_cancel_idempotency(cancel_observation, ident="C7", guards=_C7))
-
-    reschedule_id = subject(args.contenders + 2, "Reschedule")
-    later_starts: list[str] = []
-    if reschedule_id is not None:
-        later_starts = slot_starts(
-            fetch_slots(
-                client,
-                event_type_id=target.event_types["standard"].id,
-                day=race_day + timedelta(days=7),
-                timezone=target.config.timezone,
-                days=5,
-            )
-        )[: args.contenders]
-    # ==The race must be the size that was ASKED FOR, or say so.== `later_starts` is sliced to
-    # `--contenders`, and the guard used to accept anything from 2 upwards: a thin offer silently
-    # produced a 5-way reschedule race in a run whose §4 header says 40 contenders. The RaceOutcome
-    # would have recorded the true number, so nothing was a lie — but a run that quietly delivers a
-    # fraction of the configured load is a run whose contention claim nobody chose. C15's peak is
-    # measured against the contenders that actually fired, so it could not catch this either.
-    if reschedule_id is None or len(later_starts) < args.contenders:
-        why = (
-            "its subject never booked"
-            if reschedule_id is None
-            else (
-                f"only {len(later_starts)} target slots on offer, need {args.contenders} — the "
-                "reschedule race would have run at a fraction of the configured contention"
-            )
-        )
-        controls.append(Control.not_run("C8", _C8, "exactly 1 successor survives", why))
-    else:
-        reschedule_race = race_reschedule(
-            stack, target, booking_id=reschedule_id, starts=later_starts
-        )
-        races.append(reschedule_race)
-        # ==What the race LEFT BEHIND, which is the invariant that matters.== One HTTP winner is
-        # not the contract; one live appointment is — but the diary alone cannot tell "one successor
-        # survived" from "nothing happened and the original is still there", so the race and the
-        # subject's own id go in as the discriminators.
-        controls.append(
-            control_lineage_after_race(
-                stack,
-                target,
-                ident="C8",
-                guards=_C8,
-                guest_email=f"reschedule.subject.{run_id}@guests.sim.test",
-                date_from=race_day,
-                date_to=race_day + timedelta(days=28),
-                race=reschedule_race,
-                original_id=reschedule_id,
+            control_single_winner(
+                same_slot,
+                ident="C10",
+                guards="RF-04 itself: N simultaneous bookings of ONE slot leave exactly one",
+                expected_refusal="slot_unavailable",
             )
         )
 
-    mixed_id = subject(args.contenders + 3, "Mixed")
-    spare_starts: list[str] = []
-    if mixed_id is not None:
-        spare_starts = slot_starts(
-            fetch_slots(
-                client,
-                event_type_id=target.event_types["standard"].id,
-                day=race_day + timedelta(days=14),
-                timezone=target.config.timezone,
-                days=5,
-            )
+        # ==The control for the oracle.== Same burst, same code path, N different slots → N winners.
+        distinct = race_distinct_slots(
+            stack, target, starts=starts[1 : 1 + args.contenders], tag=run_id
         )
-    if mixed_id is None or not spare_starts:
-        why = "its subject never booked" if mixed_id is None else "no target slot on offer"
-        controls.append(Control.not_run("C9", _C9, "at most 1 active booking survives", why))
-    else:
-        mixed_race = race_cancel_vs_reschedule(
-            stack, target, booking_id=mixed_id, start=spare_starts[0]
-        )
-        races.append(mixed_race)
-        # ==Both calls answering 200 here is CORRECT, so the winner count is not the oracle.== The
-        # reschedule swaps in a successor; the cancel then finds the predecessor already cancelled
-        # and is an idempotent no-op. Either order is legitimate — what must never happen is the
-        # guest ending up holding two live appointments.
-        controls.append(
-            control_lineage_after_race(
-                stack,
-                target,
-                ident="C9",
-                guards=_C9,
-                guest_email=f"mixed.subject.{run_id}@guests.sim.test",
-                date_from=race_day,
-                date_to=race_day + timedelta(days=28),
-                race=mixed_race,
-                original_id=mixed_id,
-                at_most=True,
-            )
-        )
-
-    # ---- Phase 3: the remaining controls ----------------------------------------------------
-    print("==> phase 3: controls")
-    controls.append(control_closed_day(stack, target, saturday=next_saturday(window_start)))
-    controls.append(control_day_cap(stack, target, day=window_start + timedelta(days=35)))
-
-    # ---- The no-show leg: an appointment that REALLY ends inside this run --------------------
-    #
-    # ==The slot is chosen by when it ENDS, and the wait is never truncated.== This used to take
-    # the first offered slot and then cap the wait with `min(...)`: if that slot ended after the
-    # cap, the harness stopped waiting early, marked the no-show anyway, and filed whatever came
-    # back as the outcome — so a `409 not_ended`, which is the guard correctly refusing, would have
-    # been recorded as the result of a POSITIVE test. Picking by end time removes the need for a
-    # cap: either a slot fits the budget and is waited out in full, or none does and C11 says NOT
-    # RUN.
-    _C6 = "the no-show guard: an appointment that has not ended cannot be a no-show"
-    _C11 = "the no-show transition itself, against a real end time"
-    no_show_outcome = "not attempted"
-    micro = target.event_types["micro"]
-    # ==The window opens YESTERDAY, and that is not padding — it is a timezone bug this control
-    # caught.== The slots window is a range of DATES resolved against the event type's schedule
-    # timezone, while `date.today()` here is the harness's UTC date. For a business in
-    # America/New_York every UTC instant between 00:00 and 04:00 belongs to the PREVIOUS local day,
-    # so "today (UTC) onwards" returned a first slot two hours out and the leg correctly reported
-    # that nothing ended within budget. One day back and three wide covers every offset on earth
-    # (±14 h), so "now" is always inside the window.
-    #
-    # ==The lax version hid this entirely:== it took `starts[0]`, truncated its wait with
-    # `min(...)`,
-    # marked the no-show two hours early, and would have filed the resulting `409 not_ended` — the
-    # guard correctly refusing — as the observed outcome of the POSITIVE test.
-    micro_start = pick_micro_slot(
-        slot_starts(
-            fetch_slots(
-                client,
-                event_type_id=micro.id,
-                day=date.today() - timedelta(days=1),
-                timezone="UTC",
-                days=3,
-            )
-        ),
-        duration_seconds=micro.duration_seconds,
-        budget_seconds=NO_SHOW_WAIT_BUDGET_SECONDS,
-        now=datetime.now(UTC),
-    )
-    micro_booking = (
-        book_slot(
-            client,
-            event_type_id=micro.id,
-            start=micro_start,
-            guest_name="No Show Subject",
-            guest_email=f"noshow.{run_id}@guests.sim.test",
-            guest_timezone="UTC",
-            locale="en",
-        )
-        if micro_start is not None
-        else None
-    )
-    if micro_booking is None or not micro_booking.ok:
-        why = (
-            f"no offered slot ends within {NO_SHOW_WAIT_BUDGET_SECONDS:.0f}s"
-            if micro_booking is None
-            else f"the micro slot could not be booked ({micro_booking.status})"
-        )
-        no_show_outcome = f"NOT RUN — {why}"
-        controls.append(Control.not_run("C6", _C6, "409 not_ended", why))
-        controls.append(Control.not_run("C11", _C11, "200 and status becomes no_show", why))
-    else:
-        micro_id = str(micro_booking.body["id"])
-        # C6 first: while the appointment is still running, a no-show must be REFUSED.
-        controls.append(control_no_show_before_end(stack, target, booking_id=micro_id))
-        end_at = datetime.fromisoformat(str(micro_booking.body["end"]).replace("Z", "+00:00"))
-        wait = (end_at - datetime.now(UTC)).total_seconds() + 5
-        if wait > 0:
-            print(f"    waiting {wait:.0f}s for the micro appointment to really end")
-            time.sleep(wait)
-        marked = client.post(f"/api/v1/bookings/{micro_id}/no-show")
-        # ==Assert the EFFECT, not just the status.== A 200 whose row is still `confirmed` would
-        # be a silent no-op, which is this repo's signature defect; so the booking is re-read.
-        after = client.get(f"/api/v1/bookings/{micro_id}")
-        final_status = str(after.body.get("status")) if isinstance(after.body, dict) else "unknown"
-        no_show_outcome = f"{marked.status} {marked.error_code or 'ok'} → status={final_status}"
+        races.append(distinct)
         controls.append(
             Control(
-                ident="C11",
-                guards=_C11,
-                expected="200, and the booking's status really becomes no_show",
-                observed=no_show_outcome,
-                passed=marked.ok and final_status == "no_show",
+                ident="C2",
+                guards="the race oracle itself: it CAN see more than one winner",
+                expected=f"{distinct.contenders} winners on {distinct.contenders} distinct slots",
+                observed=f"{distinct.winners} winners, refusals {distinct.refusals_by_code}",
+                passed=distinct.winners == distinct.contenders,
             )
         )
+        print(
+            f"    distinct slots (control): {distinct.winners} winner(s) of {distinct.contenders}"
+        )
 
-    # C5 — the drain dead-man. It stops the worker, so it runs last.
-    drain_stats: dict[str, float] = {}
-    if args.compose_cmd:
-        print("==> control C5: stopping the worker to prove the backlog metric is live")
+        # C1 — the slot the same-slot race just filled must now be refused.
+        controls.append(control_taken_slot(stack, target, start=starts[0]))
 
-        def make_work() -> int:
-            """Strand real work behind the stopped worker, and report HOW MUCH really landed.
-
-            ==The count is returned rather than assumed.== C5's pass conditions are stated against
-            the work that was actually created, so a probe that booked four of its six slots is
-            judged against four. A constant written in two places is a constant that eventually
-            disagrees with itself, and here the disagreement would show as the metric "missing"
-            work that was never made.
-            """
-            offer_now = fetch_slots(
+        def subject(index: int, label: str) -> str | None:
+            """Book one fresh booking for a mutation race; ``None`` if it could not be created."""
+            response = book_slot(
                 client,
                 event_type_id=target.event_types["standard"].id,
-                day=window_start + timedelta(days=28),
-                timezone=target.config.timezone,
-                days=3,
+                start=starts[index],
+                guest_name=f"{label} Race Subject",
+                guest_email=f"{label.lower()}.subject.{run_id}@guests.sim.test",
+                guest_timezone="UTC",
+                locale="en",
             )
-            created = 0
-            for index, start in enumerate(slot_starts(offer_now)[:6]):
-                probe = book_slot(
+            return str(response.body["id"]) if response.ok else None
+
+        # ==Every control below is appended on EVERY path.== They used to live inside the `if` that
+        # created their subject, so a booking that failed to be created did not produce a failing
+        # control — it produced no control at all, and the report announced "7 of 7 held" for a run
+        # that had quietly stopped asking two of its questions. A missing prerequisite is now a
+        # NOT RUN row (and an INCOMPLETE verdict), which is a fact; silence was not.
+        _C7 = "an idempotent cancel emits exactly ONE booking.cancelled webhook"
+        _C8 = "a reschedule race leaves ONE successor, not two live appointments"
+        _C9 = "a cancel racing a reschedule never leaves TWO live appointments"
+
+        cancel_id = subject(args.contenders + 1, "Cancel")
+        if cancel_id is None:
+            controls.append(
+                Control.not_run(
+                    "C7", _C7, "exactly 1 booking.cancelled", "its subject never booked"
+                )
+            )
+        else:
+            races.append(
+                race_cancel(stack, target, booking_id=cancel_id, contenders=args.contenders)
+            )
+            # ==Observed, not slept through.== This used to be `time.sleep(12)` and a single read: a
+            # webhook arriving at 13 seconds made C7 fail in a way INDISTINGUISHABLE from the
+            # duplication it exists to detect. `observe_cancel_webhooks` drains the outbox first (so
+            # every queued delivery has been attempted), polls until the event appears or an
+            # explicit
+            # deadline passes, then keeps watching long enough for a late duplicate to be caught.
+            cancel_observation = observe_cancel_webhooks(stack.sink_url, cancel_id, sampler=sampler)
+            cancel_race_events = cancel_observation.counts
+            print(
+                f"    cancel race: drained={cancel_observation.drained} events={cancel_race_events}"
+            )
+            controls.append(judge_cancel_idempotency(cancel_observation, ident="C7", guards=_C7))
+
+        reschedule_id = subject(args.contenders + 2, "Reschedule")
+        later_starts: list[str] = []
+        if reschedule_id is not None:
+            later_starts = slot_starts(
+                fetch_slots(
                     client,
                     event_type_id=target.event_types["standard"].id,
-                    start=start,
-                    guest_name=f"Deadman Probe {index}",
-                    guest_email=f"deadman.{run_id}.{index}@guests.sim.test",
-                    guest_timezone="UTC",
-                    locale="en",
+                    day=race_day + timedelta(days=7),
+                    timezone=target.config.timezone,
+                    days=5,
                 )
-                created += 1 if probe.ok else 0
-            return created
+            )[: args.contenders]
+        # ==The race must be the size that was ASKED FOR, or say so.== `later_starts` is sliced to
+        # `--contenders`, and the guard used to accept anything from 2 upwards: a thin offer
+        # silently
+        # produced a 5-way reschedule race in a run whose §4 header says 40 contenders. The
+        # RaceOutcome
+        # would have recorded the true number, so nothing was a lie — but a run that quietly
+        # delivers a
+        # fraction of the configured load is a run whose contention claim nobody chose. C15's peak
+        # is
+        # measured against the contenders that actually fired, so it could not catch this either.
+        if reschedule_id is None or len(later_starts) < args.contenders:
+            why = (
+                "its subject never booked"
+                if reschedule_id is None
+                else (
+                    f"only {len(later_starts)} target slots on offer, need {args.contenders} — the "
+                    "reschedule race would have run at a fraction of the configured contention"
+                )
+            )
+            controls.append(Control.not_run("C8", _C8, "exactly 1 successor survives", why))
+        else:
+            reschedule_race = race_reschedule(
+                stack, target, booking_id=reschedule_id, starts=later_starts
+            )
+            races.append(reschedule_race)
+            # ==What the race LEFT BEHIND, which is the invariant that matters.== One HTTP winner is
+            # not the contract; one live appointment is — but the diary alone cannot tell "one
+            # successor
+            # survived" from "nothing happened and the original is still there", so the race and the
+            # subject's own id go in as the discriminators.
+            controls.append(
+                control_lineage_after_race(
+                    stack,
+                    target,
+                    ident="C8",
+                    guards=_C8,
+                    guest_email=f"reschedule.subject.{run_id}@guests.sim.test",
+                    date_from=race_day,
+                    date_to=race_day + timedelta(days=28),
+                    race=reschedule_race,
+                    original_id=reschedule_id,
+                )
+            )
 
-        control, drain_stats = control_drain_deadman(
-            sampler,
-            stop_worker=lambda: _compose(args.compose_cmd, stack.metrics_token, "stop", "worker"),
-            start_worker=lambda: _compose(args.compose_cmd, stack.metrics_token, "start", "worker"),
-            make_work=make_work,
+        mixed_id = subject(args.contenders + 3, "Mixed")
+        spare_starts: list[str] = []
+        if mixed_id is not None:
+            spare_starts = slot_starts(
+                fetch_slots(
+                    client,
+                    event_type_id=target.event_types["standard"].id,
+                    day=race_day + timedelta(days=14),
+                    timezone=target.config.timezone,
+                    days=5,
+                )
+            )
+        if mixed_id is None or not spare_starts:
+            why = "its subject never booked" if mixed_id is None else "no target slot on offer"
+            controls.append(Control.not_run("C9", _C9, "at most 1 active booking survives", why))
+        else:
+            mixed_race = race_cancel_vs_reschedule(
+                stack, target, booking_id=mixed_id, start=spare_starts[0]
+            )
+            races.append(mixed_race)
+            # ==Both calls answering 200 here is CORRECT, so the winner count is not the oracle.==
+            # The
+            # reschedule swaps in a successor; the cancel then finds the predecessor already
+            # cancelled
+            # and is an idempotent no-op. Either order is legitimate — what must never happen is the
+            # guest ending up holding two live appointments.
+            controls.append(
+                control_lineage_after_race(
+                    stack,
+                    target,
+                    ident="C9",
+                    guards=_C9,
+                    guest_email=f"mixed.subject.{run_id}@guests.sim.test",
+                    date_from=race_day,
+                    date_to=race_day + timedelta(days=28),
+                    race=mixed_race,
+                    original_id=mixed_id,
+                    at_most=True,
+                )
+            )
+
+        # ---- Phase 3: the remaining controls ----------------------------------------------------
+        print("==> phase 3: controls")
+        controls.append(control_closed_day(stack, target, saturday=next_saturday(window_start)))
+        controls.append(control_day_cap(stack, target, day=window_start + timedelta(days=35)))
+
+        # ---- The no-show leg: an appointment that REALLY ends inside this run --------------------
+        #
+        # ==The slot is chosen by when it ENDS, and the wait is never truncated.== This used to take
+        # the first offered slot and then cap the wait with `min(...)`: if that slot ended after the
+        # cap, the harness stopped waiting early, marked the no-show anyway, and filed whatever came
+        # back as the outcome — so a `409 not_ended`, which is the guard correctly refusing, would
+        # have
+        # been recorded as the result of a POSITIVE test. Picking by end time removes the need for a
+        # cap: either a slot fits the budget and is waited out in full, or none does and C11 says
+        # NOT
+        # RUN.
+        _C6 = "the no-show guard: an appointment that has not ended cannot be a no-show"
+        _C11 = "the no-show transition itself, against a real end time"
+        no_show_outcome = "not attempted"
+        micro = target.event_types["micro"]
+        # ==The window opens YESTERDAY, and that is not padding — it is a timezone bug this control
+        # caught.== The slots window is a range of DATES resolved against the event type's schedule
+        # timezone, while `date.today()` here is the harness's UTC date. For a business in
+        # America/New_York every UTC instant between 00:00 and 04:00 belongs to the PREVIOUS local
+        # day,
+        # so "today (UTC) onwards" returned a first slot two hours out and the leg correctly
+        # reported
+        # that nothing ended within budget. One day back and three wide covers every offset on earth
+        # (±14 h), so "now" is always inside the window.
+        #
+        # ==The lax version hid this entirely:== it took `starts[0]`, truncated its wait with
+        # `min(...)`,
+        # marked the no-show two hours early, and would have filed the resulting `409 not_ended` —
+        # the
+        # guard correctly refusing — as the observed outcome of the POSITIVE test.
+        micro_start = pick_micro_slot(
+            slot_starts(
+                fetch_slots(
+                    client,
+                    event_type_id=micro.id,
+                    day=date.today() - timedelta(days=1),
+                    timezone="UTC",
+                    days=3,
+                )
+            ),
+            duration_seconds=micro.duration_seconds,
+            budget_seconds=NO_SHOW_WAIT_BUDGET_SECONDS,
+            now=datetime.now(UTC),
         )
-        controls.append(control)
-    else:
+        micro_booking = (
+            book_slot(
+                client,
+                event_type_id=micro.id,
+                start=micro_start,
+                guest_name="No Show Subject",
+                guest_email=f"noshow.{run_id}@guests.sim.test",
+                guest_timezone="UTC",
+                locale="en",
+            )
+            if micro_start is not None
+            else None
+        )
+        if micro_booking is None or not micro_booking.ok:
+            why = (
+                f"no offered slot ends within {NO_SHOW_WAIT_BUDGET_SECONDS:.0f}s"
+                if micro_booking is None
+                else f"the micro slot could not be booked ({micro_booking.status})"
+            )
+            no_show_outcome = f"NOT RUN — {why}"
+            controls.append(Control.not_run("C6", _C6, "409 not_ended", why))
+            controls.append(Control.not_run("C11", _C11, "200 and status becomes no_show", why))
+        else:
+            micro_id = str(micro_booking.body["id"])
+            # C6 first: while the appointment is still running, a no-show must be REFUSED.
+            controls.append(control_no_show_before_end(stack, target, booking_id=micro_id))
+            end_at = datetime.fromisoformat(str(micro_booking.body["end"]).replace("Z", "+00:00"))
+            wait = (end_at - datetime.now(UTC)).total_seconds() + 5
+            if wait > 0:
+                print(f"    waiting {wait:.0f}s for the micro appointment to really end")
+                time.sleep(wait)
+            marked = client.post(f"/api/v1/bookings/{micro_id}/no-show")
+            # ==Assert the EFFECT, not just the status.== A 200 whose row is still `confirmed` would
+            # be a silent no-op, which is this repo's signature defect; so the booking is re-read.
+            after = client.get(f"/api/v1/bookings/{micro_id}")
+            final_status = (
+                str(after.body.get("status")) if isinstance(after.body, dict) else "unknown"
+            )
+            no_show_outcome = f"{marked.status} {marked.error_code or 'ok'} → status={final_status}"
+            controls.append(
+                Control(
+                    ident="C11",
+                    guards=_C11,
+                    expected="200, and the booking's status really becomes no_show",
+                    observed=no_show_outcome,
+                    passed=marked.ok and final_status == "no_show",
+                )
+            )
+
+        # C5 — the drain dead-man. It stops the worker, so it runs last.
+        drain_stats: dict[str, float] = {}
+        if args.compose_cmd:
+            print("==> control C5: stopping the worker to prove the backlog metric is live")
+
+            def make_work() -> int:
+                """Strand real work behind the stopped worker, and report HOW MUCH really landed.
+
+                ==The count is returned rather than assumed.== C5's pass conditions are
+                stated against the work that was actually created, so a probe that booked four
+                of its six slots is judged against four. A constant written in two places is
+                one that eventually disagrees with itself, and here the disagreement would show
+                as the metric "missing" work that was never made.
+                """
+                offer_now = fetch_slots(
+                    client,
+                    event_type_id=target.event_types["standard"].id,
+                    day=window_start + timedelta(days=28),
+                    timezone=target.config.timezone,
+                    days=3,
+                )
+                created = 0
+                for index, start in enumerate(slot_starts(offer_now)[:6]):
+                    probe = book_slot(
+                        client,
+                        event_type_id=target.event_types["standard"].id,
+                        start=start,
+                        guest_name=f"Deadman Probe {index}",
+                        guest_email=f"deadman.{run_id}.{index}@guests.sim.test",
+                        guest_timezone="UTC",
+                        locale="en",
+                    )
+                    created += 1 if probe.ok else 0
+                return created
+
+            control, drain_stats = control_drain_deadman(
+                sampler,
+                stop_worker=lambda: _compose(
+                    args.compose_cmd, stack.metrics_token, "stop", "worker"
+                ),
+                start_worker=lambda: _compose(
+                    args.compose_cmd, stack.metrics_token, "start", "worker"
+                ),
+                make_work=make_work,
+            )
+            controls.append(control)
+        else:
+            controls.append(
+                Control.not_run(
+                    "C5",
+                    "the backlog metric is LIVE (a dead drain is visible, and recovers)",
+                    "due climbs while the worker is stopped, then returns to 0",
+                    "no --compose-cmd was given, so the worker could not be stopped",
+                )
+            )
+
+        # ---- Drain, then measure booking → confirmation ------------------------------------------
+        print("==> waiting for the outbox to drain")
+        drained, drain_wait = wait_for_drain(sampler, timeout_seconds=300.0)
+        # ==C12 — a failed drain now INVALIDATES the run.== `drained` was computed, printed in §3
+        # and
+        # then ignored: a run whose queue never emptied still stamped MEASURED, while the
+        # booking→confirmation figures silently described only the messages that escaped. Scrape
+        # failures gate too, because a backlog series with holes in it understates its own peak.
+        # (C5's
+        # deliberate outage pauses the sampler, so those never land in this count.)
         controls.append(
-            Control.not_run(
-                "C5",
-                "the backlog metric is LIVE (a dead drain is visible, and recovers)",
-                "due climbs while the worker is stopped, then returns to 0",
-                "no --compose-cmd was given, so the worker could not be stopped",
+            control_outbox_drained(
+                drained=drained,
+                waited_seconds=drain_wait,
+                scrape_failures=len(sampler.failures),
             )
         )
 
-    # ---- Drain, then measure booking → confirmation ------------------------------------------
-    print("==> waiting for the outbox to drain")
-    drained, drain_wait = wait_for_drain(sampler, timeout_seconds=300.0)
-    sampler.stop()
-    # ==C12 — a failed drain now INVALIDATES the run.== `drained` was computed, printed in §3 and
-    # then ignored: a run whose queue never emptied still stamped MEASURED, while the
-    # booking→confirmation figures silently described only the messages that escaped. Scrape
-    # failures gate too, because a backlog series with holes in it understates its own peak. (C5's
-    # deliberate outage pauses the sampler, so those never land in this count.)
-    controls.append(
-        control_outbox_drained(
-            drained=drained,
-            waited_seconds=drain_wait,
-            scrape_failures=len(sampler.failures),
+        # ---- C13: the organic phase has to add up before its numbers mean anything --------------
+        controls.append(judge_organic_accounting(organic, planned=summary["total"]))
+        # ---- C15: and §4's bursts have to have really overlapped, or its winner counts mean
+        # nothing
+        controls.append(judge_race_concurrency(races))
+
+        drain_latency, mail_read, coverage = measure_confirmations(mailbox, organic.booked)
+        controls.append(judge_confirmation_coverage(coverage))
+
+        sink_counts, sink_unreadable = count_sink_events(stack.sink_url)
+
+        context = RunContext(
+            run_id=run_id,
+            seed=args.seed,
+            started_at=started_at,
+            finished_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            host_description=_host_description(),
+            stack_description=(
+                "throwaway docker compose project `aethercal-sim` "
+                "(deploy/docker-compose.yml + e2e/compose.e2e.yml + simulation/compose.sim.yml)"
+            ),
+            workers=args.workers,
+            contenders=args.contenders,
         )
-    )
+        args.out.write_text(
+            render(
+                context=context,
+                plan_summary=summary,
+                organic=organic,
+                races=races,
+                controls=controls,
+                sampler=sampler,
+                drain_stats=drain_stats,
+                drain_latency=drain_latency,
+                no_show_outcome=no_show_outcome,
+                sink_counts=sink_counts,
+                sink_unreadable=sink_unreadable,
+                mail_read=mail_read,
+                coverage=coverage,
+                drained=drained,
+                drain_wait_seconds=drain_wait,
+            ),
+            encoding="utf-8",
+        )
+        args.json_out.write_text(
+            render_json(
+                {
+                    "run_id": run_id,
+                    "seed": args.seed,
+                    "verdict": verdict_for(controls),
+                    "plan": summary,
+                    "created": len(organic.booked),
+                    "cancelled": organic.cancelled,
+                    "rescheduled": organic.rescheduled,
+                    "organic_collisions": organic.collisions,
+                    # ==The whole taxonomy, not just the flattering members of it.== A diff
+                    # between two
+                    # runs must be able to show a category appearing, which is why the
+                    # create/follow-up
+                    # outcomes travel in the machine-readable twin rather than only in the prose.
+                    "organic_outcomes": {
+                        "planned": summary["total"],
+                        "create": organic.create_outcomes(),
+                        "follow_up": organic.follow_up_outcomes(),
+                        "follow_ups_attempted": organic.follow_ups_attempted,
+                        "unexpected_failures": organic.unexpected_organic_failures(),
+                        "slots_read_failures": organic.slots_read_failed[:10],
+                        "booking_unreadable": organic.booking_unreadable[:10],
+                    },
+                    "confirmations": {
+                        "created": coverage.created,
+                        "matched": coverage.matched,
+                        "superseded": coverage.superseded,
+                        "unaccounted": coverage.unaccounted,
+                        "duplicate_confirmations": coverage.duplicate_confirmations,
+                        "colliding_uids": coverage.colliding_uids,
+                        "negative_deltas": coverage.negative_deltas,
+                        "worst_negative_ms": coverage.worst_negative_ms,
+                        "mailbox_read_complete": coverage.read_complete,
+                        "mailbox_read_problem": coverage.read_problem,
+                        "mailbox_reported_total": coverage.reported_total,
+                        "mailbox_page_size": coverage.page_size,
+                        "mailbox_readable_messages": len(mail_read.messages),
+                        "mailbox_unparseable": mail_read.unparseable,
+                        "mailbox_pages": mail_read.pages,
+                        "reads": coverage.attempts,
+                        "waited_seconds": coverage.waited_seconds,
+                    },
+                    "latency": {
+                        latency.name: latency.summary()
+                        for latency in (
+                            organic.slots_latency,
+                            organic.booking_latency,
+                            organic.cancel_latency,
+                            organic.reschedule_latency,
+                            drain_latency,
+                        )
+                    },
+                    "races": [
+                        {
+                            "name": race.name,
+                            "contenders": race.contenders,
+                            "winners": race.winners,
+                            "refusals": race.refusals_by_code,
+                            "unexpected": race.unexpected,
+                            "peak_overlap": race.peak_overlap,
+                        }
+                        for race in races
+                    ],
+                    "controls": [
+                        {
+                            "id": control.ident,
+                            "passed": control.passed,
+                            "ran": control.ran,
+                            "observed": control.observed,
+                        }
+                        for control in controls
+                    ],
+                    "outbox": {
+                        "peak_due": sampler.peak_due(),
+                        "peak_oldest_age_seconds": sampler.peak_oldest_age(),
+                        "samples": len(sampler.samples),
+                        "scrape_failures": len(sampler.failures),
+                        "discarded_at_pause": sampler.discarded_at_pause,
+                        "drained": drained,
+                        "deadman": drain_stats,
+                    },
+                    "sink": sink_counts,
+                    "cancel_race_sink_events": cancel_race_events,
+                    "errors": [
+                        {"status": status, "code": code, "count": count}
+                        for status, code, count in organic.tally.rows()
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
 
-    # ---- C13: the organic phase has to add up before its numbers mean anything --------------
-    controls.append(judge_organic_accounting(organic, planned=summary["total"]))
-    # ---- C15: and §4's bursts have to have really overlapped, or its winner counts mean nothing
-    controls.append(judge_race_concurrency(races))
-
-    drain_latency, mail_read, coverage = measure_confirmations(mailbox, organic.booked)
-    controls.append(judge_confirmation_coverage(coverage))
-
-    sink_counts, sink_unreadable = count_sink_events(stack.sink_url)
-
-    context = RunContext(
-        run_id=run_id,
-        seed=args.seed,
-        started_at=started_at,
-        finished_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        host_description=_host_description(),
-        stack_description=(
-            "throwaway docker compose project `aethercal-sim` "
-            "(deploy/docker-compose.yml + e2e/compose.e2e.yml + simulation/compose.sim.yml)"
-        ),
-        workers=args.workers,
-        contenders=args.contenders,
-    )
-    args.out.write_text(
-        render(
-            context=context,
-            plan_summary=summary,
-            organic=organic,
-            races=races,
-            controls=controls,
-            sampler=sampler,
-            drain_stats=drain_stats,
-            drain_latency=drain_latency,
-            no_show_outcome=no_show_outcome,
-            sink_counts=sink_counts,
-            sink_unreadable=sink_unreadable,
-            mail_read=mail_read,
-            coverage=coverage,
-            drained=drained,
-            drain_wait_seconds=drain_wait,
-        ),
-        encoding="utf-8",
-    )
-    args.json_out.write_text(
-        render_json(
-            {
-                "run_id": run_id,
-                "seed": args.seed,
-                "verdict": verdict_for(controls),
-                "plan": summary,
-                "created": len(organic.booked),
-                "cancelled": organic.cancelled,
-                "rescheduled": organic.rescheduled,
-                "organic_collisions": organic.collisions,
-                # ==The whole taxonomy, not just the flattering members of it.== A diff between two
-                # runs must be able to show a category appearing, which is why the create/follow-up
-                # outcomes travel in the machine-readable twin rather than only in the prose.
-                "organic_outcomes": {
-                    "planned": summary["total"],
-                    "create": organic.create_outcomes(),
-                    "follow_up": organic.follow_up_outcomes(),
-                    "follow_ups_attempted": organic.follow_ups_attempted,
-                    "unexpected_failures": organic.unexpected_organic_failures(),
-                    "slots_read_failures": organic.slots_read_failed[:10],
-                    "booking_unreadable": organic.booking_unreadable[:10],
-                },
-                "confirmations": {
-                    "created": coverage.created,
-                    "matched": coverage.matched,
-                    "superseded": coverage.superseded,
-                    "unaccounted": coverage.unaccounted,
-                    "duplicate_confirmations": coverage.duplicate_confirmations,
-                    "colliding_uids": coverage.colliding_uids,
-                    "negative_deltas": coverage.negative_deltas,
-                    "worst_negative_ms": coverage.worst_negative_ms,
-                    "mailbox_read_complete": coverage.read_complete,
-                    "mailbox_read_problem": coverage.read_problem,
-                    "mailbox_reported_total": coverage.reported_total,
-                    "mailbox_page_size": coverage.page_size,
-                    "mailbox_readable_messages": len(mail_read.messages),
-                    "mailbox_unparseable": mail_read.unparseable,
-                    "mailbox_pages": mail_read.pages,
-                    "reads": coverage.attempts,
-                    "waited_seconds": coverage.waited_seconds,
-                },
-                "latency": {
-                    latency.name: latency.summary()
-                    for latency in (
-                        organic.slots_latency,
-                        organic.booking_latency,
-                        organic.cancel_latency,
-                        organic.reschedule_latency,
-                        drain_latency,
-                    )
-                },
-                "races": [
-                    {
-                        "name": race.name,
-                        "contenders": race.contenders,
-                        "winners": race.winners,
-                        "refusals": race.refusals_by_code,
-                        "unexpected": race.unexpected,
-                        "peak_overlap": race.peak_overlap,
-                    }
-                    for race in races
-                ],
-                "controls": [
-                    {
-                        "id": control.ident,
-                        "passed": control.passed,
-                        "ran": control.ran,
-                        "observed": control.observed,
-                    }
-                    for control in controls
-                ],
-                "outbox": {
-                    "peak_due": sampler.peak_due(),
-                    "peak_oldest_age_seconds": sampler.peak_oldest_age(),
-                    "samples": len(sampler.samples),
-                    "scrape_failures": len(sampler.failures),
-                    "discarded_at_pause": sampler.discarded_at_pause,
-                    "drained": drained,
-                    "deadman": drain_stats,
-                },
-                "sink": sink_counts,
-                "cancel_race_sink_events": cancel_race_events,
-                "errors": [
-                    {"status": status, "code": code, "count": count}
-                    for status, code, count in organic.tally.rows()
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    verdict = verdict_for(controls)
-    print(f"==> {verdict}: wrote {args.out} and {args.json_out}")
-    # A VOID run must not exit 0 — it would go green in any pipeline that ever wraps this.
-    return 0 if verdict == "MEASURED" else 1
+        verdict = verdict_for(controls)
+        print(f"==> {verdict}: wrote {args.out} and {args.json_out}")
+        # A VOID run must not exit 0 — it would go green in any pipeline that ever wraps this.
+        return 0 if verdict == "MEASURED" else 1
+    finally:
+        sampler.stop()
 
 
 if __name__ == "__main__":

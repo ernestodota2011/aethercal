@@ -41,16 +41,11 @@ ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
 # script's job because it owns the whole lifecycle — the stack must go on reading the simulation's
 # values until it is torn down. The trap fires on success, on failure and on Ctrl-C, so a boot that
 # dies halfway no longer leaves shared repo configuration replaced by test-only values.
+# shellcheck source=restore-env.sh
+source "${SIM_DIR}/scripts/restore-env.sh"
+
 restore_env() {
-  [[ -f "${ENV_BACKUP}.state" ]] || return 0
-  if [[ "$(cat "${ENV_BACKUP}.state")" == "existed" ]]; then
-    mv -f "${ENV_BACKUP}" "${ENV_FILE}" 2>/dev/null || true
-    echo "==> restored the previous deploy/.env"
-  else
-    rm -f "${ENV_FILE}"
-    echo "==> removed the deploy/.env this run created (there was none before)"
-  fi
-  rm -f "${ENV_BACKUP}.state" "${ENV_BACKUP}"
+  aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}"
 }
 
 cleanup() {

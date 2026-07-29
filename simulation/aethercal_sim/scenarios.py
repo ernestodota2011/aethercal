@@ -1211,6 +1211,16 @@ def judge_drain_deadman(observation: DeadmanObservation) -> Control:
     reasons: list[str] = []
     if observation.work_created <= 0:
         reasons.append("no work was created during the outage, so nothing was ever stranded")
+    if observation.baseline_due != 0:
+        # ==Aggregate counters cannot attribute a delivery to the batch this control created.==
+        # With work already queued when C5 starts, "the restarted worker delivered >= 6" is equally
+        # true of six intents that were sitting there before it began. Two histories, one number —
+        # and only one of them is the history the control claims to test. A drained baseline is what
+        # makes the delta mean THIS batch.
+        reasons.append(
+            f"the baseline was not drained (due={observation.baseline_due}): deliveries cannot be "
+            "attributed to the work this control stranded rather than to the backlog it inherited"
+        )
     if not observation.surface_unreachable:
         reasons.append(
             "the operator surface still ANSWERED during the outage — the worker never stopped"

@@ -66,12 +66,27 @@ class StackConfig:
     booking_url: str
     mailpit_url: str
     sink_url: str
-    sink_webhook_url: str
     metrics_token: str
     compose_project: str
     nonce: str
     businesses: list[BusinessConfig]
 
+
+#: ==Where the product is told to POST its webhooks, DERIVED rather than accepted.==
+#:
+#: This used to be read from `.stack.json` and used verbatim to register webhooks — the one value
+#: the isolation check never looked at. `assert_disposable_stack` proves the API, worker, booking
+#: page, mailbox and sink are all loopback, and then the harness handed the product an arbitrary
+#: URL out of a file and asked it to send traffic there. A stale `.stack.json` from another run, or
+#: a typo, would have pointed a real instance's webhooks somewhere unverified — and unlike every
+#: other endpoint here, this one is dialled by the SERVER, so no amount of loopback checking on the
+#: client side constrains it.
+#:
+#: A value the harness can compute has no business being configurable: what is never accepted needs
+#: no validation. It is the sink's name on the compose network, fixed by `e2e/compose.e2e.yml` —
+#: and it must stay globally routable, because the delivery worker's SSRF guard rejects private
+#: addresses.
+SINK_WEBHOOK_URL = "http://hooks:9099/hook"
 
 #: The only Compose project this harness may ever act on.
 EXPECTED_COMPOSE_PROJECT = "aethercal-sim"
@@ -219,7 +234,6 @@ def load_stack(path: Path) -> StackConfig:
         booking_url=str(raw["bookingUrl"]),
         mailpit_url=str(raw["mailpitUrl"]),
         sink_url=str(raw["sinkUrl"]),
-        sink_webhook_url=str(raw["sinkWebhookUrl"]),
         metrics_token=str(raw["metricsToken"]),
         compose_project=str(raw.get("composeProject", "")),
         nonce=str(raw.get("nonce", "")),
@@ -362,7 +376,7 @@ def provision(stack: StackConfig, *, run_id: str) -> World:
             "POST",
             "/api/v1/webhooks",
             {
-                "url": stack.sink_webhook_url,
+                "url": SINK_WEBHOOK_URL,
                 "events": ["booking.created", "booking.cancelled", "booking.rescheduled"],
             },
         )
