@@ -14,10 +14,19 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `ef379d88` | 2026-07-29 | MEASURED | 239 planned / 207 created, 32 create-leg + 2 reschedule-leg collisions, 40-way races, **all fourteen** controls held. Every published number derives from another: §6's 533 classified = 255 slot reads (both legs) + 239 bookings + 23 cancels + 16 reschedules, and its 34 `slot_unavailable` = 32 + 2. Confirmations 207 of 207, mailbox paged to the 269 messages Mailpit reports, 0 negative deltas. 501 backlog samples, **0** scrape failures and **0** reads discarded at the deliberate-outage boundary. Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `2cbac654` | 2026-07-29 | MEASURED | 239 planned / 207 created, 32 create-leg + 1 reschedule-leg collisions, 40-way races, **all fifteen** controls held. ==The first run in which the adversarial bursts' simultaneity is MEASURED rather than assumed: peak **40 of 40** requests in flight at once on every 40-way race== (C15). Every published number derives from another: §6's 536 classified = 256 slot reads (both legs) + 239 bookings + 24 cancels + 17 reschedules, and its 33 `slot_unavailable` = 32 + 1. Confirmations 207 of 207, 0 negative deltas; 509 backlog samples, 0 scrape failures, 0 boundary discards. Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Six earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, six times over.
+> [!warning] ==Seven earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, seven times over.
+>
+> `ef379d88` — withdrawn because §4's central premise was never measured. Its winner counts are
+> exactly what a correct 40-way race produces **and exactly what a harness that had serialised its
+> threads would produce too**: N different slots booked one after another still yields N winners,
+> and one slot booked N times in sequence still leaves exactly one. ==C2 and C10 were satisfiable by
+> a run in which nothing overlapped==, and the `threading.Barrier` meant to prevent that was a
+> mechanism nobody observed. C15 measures it now, and the replacement run records a peak of 40
+> requests in flight at once — which is the first time this directory can say that rather than
+> assume it.
 >
 > `ed6db4f8` — the only one withdrawn without a defect in it. Every number it published was correct
 > and reconciled, and its own JSON shows the two later fixes never bit in it: **0 scrape failures**,
