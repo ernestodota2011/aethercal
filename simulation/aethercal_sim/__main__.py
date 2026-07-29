@@ -257,14 +257,22 @@ def measure_confirmations(
     attempts = 0
     read = _read_and_hydrate(mailbox)
     confirmations: dict[str, list[MailMessage]] = {}
+    superseded_by: dict[str, int] = {}
     matched = 0
     while True:
         attempts += 1
         confirmations = confirmations_by_recipient(read.messages)
+        superseded_by = superseding_notices_by_recipient(read.messages)
         matched = sum(
             1 for ref in booked if len(confirmations.get(ref.guest_email.lower(), [])) == 1
         )
-        if matched >= len(booked) or not read.complete:
+        accounted = sum(
+            1
+            for ref in booked
+            if confirmations.get(ref.guest_email.lower())
+            or superseded_by.get(ref.guest_email.lower())
+        )
+        if accounted >= len(booked) or not read.complete:
             break
         if time.monotonic() - started >= timeout_seconds:
             break
@@ -275,14 +283,31 @@ def measure_confirmations(
     negatives = 0
     worst_negative = 0.0
     duplicates = 0
+    superseded = 0
+    unaccounted = 0
     seen_uids: dict[str, str] = {}
     collided_uids = 0
     for ref in booked:
-        found = confirmations.get(ref.guest_email.lower(), [])
+        address = ref.guest_email.lower()
+        found = confirmations.get(address, [])
         if len(found) > 1:
             duplicates += 1
             continue
         if not found:
+            # ==No confirmation is not automatically a loss, and a live run PROVED it.== The product
+            # retires a still-queued confirmation when the booking is cancelled or rescheduled
+            # before the outbox sends it — the row goes to `voided`, "a booking transition retired
+            # it before it ran". A first version of this control demanded a confirmation for every
+            # booking and turned a clean run VOID over 25 of them, against 40 voided outbox rows.
+            # That is the defect this branch keeps removing: a control that fails while the product
+            # is behaving correctly.
+            #
+            # So the discriminator is whether the guest was told ANYTHING. Told nothing at all is
+            # still a lost message, and still gates.
+            if superseded_by.get(address):
+                superseded += 1
+            else:
+                unaccounted += 1
             continue
         message = found[0]
         # ==One confirmation must belong to ONE booking.== The recipient is unique per planned
@@ -314,6 +339,8 @@ def measure_confirmations(
             waited_seconds=time.monotonic() - started,
             duplicate_confirmations=duplicates,
             colliding_uids=collided_uids,
+            superseded=superseded,
+            unaccounted=unaccounted,
             messages_with_invite=sum(1 for m in read.messages if m.invite is not None),
         ),
     )
@@ -343,6 +370,23 @@ def _read_and_hydrate(mailbox: Mailbox) -> MailboxRead:
     return MailboxRead(
         hydrated, True, read.reported_total, read.pages, read.page_size, read.unparseable
     )
+
+
+def superseding_notices_by_recipient(messages: list[MailMessage]) -> dict[str, int]:
+    """Announcements that SUPERSEDE a confirmation, by recipient. ==Pure, so it is testable.==
+
+    A cancellation (``CANCEL``/``CANCELLED``) or a reschedule (``REQUEST`` at a bumped sequence).
+    Their presence is what makes "this booking has no confirmation" an accounted outcome rather
+    than a lost message — see :func:`measure_confirmations`.
+    """
+    grouped: dict[str, int] = {}
+    for message in messages:
+        invite = message.invite
+        if invite is None or invite.is_confirmation:
+            continue
+        if invite.method == "CANCEL" or invite.sequence > 0:
+            grouped[message.to] = grouped.get(message.to, 0) + 1
+    return grouped
 
 
 def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[MailMessage]]:

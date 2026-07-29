@@ -1635,6 +1635,15 @@ class ConfirmationCoverage:
     """Two bookings matched to confirmations carrying the SAME calendar uid: one announcement was
     counted for two bookings, which is the failure a per-recipient match cannot even see."""
     messages_with_invite: int = 0
+    superseded: int = 0
+    """Bookings with no confirmation whose guest received a cancellation or reschedule instead.
+
+    ==Accounted, not lost.== The product retires a still-queued confirmation when the booking is
+    cancelled or rescheduled before the outbox sends it (the row goes to ``voided``), so demanding a
+    confirmation for every booking fails a CORRECT run — verified against a live one that carried
+    40 voided outbox rows and 25 such guests."""
+    unaccounted: int = 0
+    """Bookings whose guest received NOTHING at all. A real loss, and the one that gates."""
 
 
 def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
@@ -1670,14 +1679,16 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
     A confirmation is now identified by its iTIP identity in the message's own ``.ics``, the
     pairing must be one-to-one, and a calendar uid may be claimed by only one booking.
     """
-    unmatched = coverage.created - coverage.matched
     reasons: list[str] = []
     if not coverage.read_complete:
         reasons.append(f"the mailbox read was INCOMPLETE ({coverage.read_problem})")
     if coverage.created <= 0:
         reasons.append("no organic booking was created, so the distribution describes nothing")
-    if unmatched:
-        reasons.append(f"{unmatched} created booking(s) never matched a confirmation")
+    if coverage.unaccounted:
+        reasons.append(
+            f"{coverage.unaccounted} created booking(s) never matched a confirmation and their "
+            "guest received NOTHING — those messages are simply missing"
+        )
     if coverage.negative_deltas:
         reasons.append(
             f"{coverage.negative_deltas} confirmation(s) preceded the POST that caused them "
@@ -1704,7 +1715,8 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
             "matched, with 0 negative deltas"
         ),
         observed=(
-            f"matched {coverage.matched}/{coverage.created} after {coverage.attempts} read(s) in "
+            f"matched {coverage.matched}/{coverage.created} (superseded {coverage.superseded}, "
+            f"unaccounted {coverage.unaccounted}) after {coverage.attempts} read(s) in "
             f"{coverage.waited_seconds:.1f}s; mailbox read complete={coverage.read_complete} "
             f"(reported total {coverage.reported_total}, page size {coverage.page_size}); "
             f"negative deltas={coverage.negative_deltas}; duplicate confirmations="

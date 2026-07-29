@@ -974,10 +974,25 @@ def test_c14_fails_when_the_mailbox_read_was_truncated() -> None:
     assert "INCOMPLETE" in control.observed
 
 
-def test_c14_fails_when_bookings_have_no_confirmation() -> None:
-    control = judge_confirmation_coverage(_coverage(matched=180))
+def test_c14_fails_when_a_guest_was_told_NOTHING() -> None:
+    """==The loss that still gates: no confirmation AND no superseding notice.=="""
+    control = judge_confirmation_coverage(_coverage(matched=180, unaccounted=27))
     assert not control.passed
-    assert "27 created booking(s) never matched" in control.observed
+    assert "guest received NOTHING" in control.observed
+
+
+def test_c14_accepts_a_confirmation_the_product_deliberately_retired() -> None:
+    """==Verified against a live run, which is the only reason this exception exists.==
+
+    The product retires a still-queued confirmation when the booking is cancelled or rescheduled
+    before the outbox sends it (the row goes to `voided`). A first version of this control demanded
+    a confirmation for every booking and turned a CLEAN run VOID over 25 of them, against 40 voided
+    outbox rows. A control that fails while the product behaves correctly is the defect, not the
+    finding.
+    """
+    control = judge_confirmation_coverage(_coverage(matched=180, superseded=27))
+    assert control.passed is True
+    assert "superseded 27" in control.observed
 
 
 def test_c14_fails_on_a_confirmation_that_preceded_its_own_cause() -> None:
@@ -1926,10 +1941,30 @@ def test_a_MISSING_confirmation_with_a_cancellation_present_is_NOT_matched() -> 
     )
     assert coverage.matched == 0
     assert coverage.created == 1
+    assert coverage.superseded == 1, "the guest WAS told — the confirmation was retired, not lost"
+    assert coverage.unaccounted == 0
+    # ==The substantive protection, and the whole point of S16.== Under the old rule this booking
+    # counted as confirmed and §2 absorbed the cancellation's timestamp — seven minutes late, for
+    # another reason entirely. A delivery failure published as a high latency.
     assert latency.count == 0, "the cancellation's timestamp must not enter the distribution"
+
+
+def test_a_booking_whose_guest_got_NO_MAIL_AT_ALL_gates() -> None:
+    """No confirmation and nothing superseding it: the message is simply missing."""
+    sent = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "silent@guests.sim.test", "s", sent.timestamp())]
+    read = MailboxRead([], True, 0, 1, 500)
+    _latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.unaccounted == 1
+    assert coverage.superseded == 0
     control = judge_confirmation_coverage(coverage)
     assert control.passed is False
-    assert "never matched a confirmation" in control.observed
+    assert "guest received NOTHING" in control.observed
 
 
 def test_the_normal_flow_matches_ONE_confirmation_and_ignores_the_cancellation() -> None:
