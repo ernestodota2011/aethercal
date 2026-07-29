@@ -9,13 +9,14 @@ passed.
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from aethercal_sim.__main__ import measure_confirmations
+from aethercal_sim.__main__ import measure_confirmations, parse_args, positive_int
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
     ErrorTally,
@@ -1115,3 +1116,39 @@ def test_an_incomplete_mailbox_read_is_not_retried_for_ever() -> None:
     assert stub.reads == 1
     assert coverage.attempts == 1
     assert not judge_confirmation_coverage(coverage).passed
+
+
+# --------------------------------------------------------------------------------------
+# ==The CLI cannot be asked for a run that measures nothing.==
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-40"])
+def test_the_run_shape_refuses_non_positive_values(raw: str) -> None:
+    """`--contenders 0` builds a `Barrier(0)`; `--workers 0` a pool of none."""
+    with pytest.raises(argparse.ArgumentTypeError, match="1 or more"):
+        positive_int(raw)
+
+
+def test_the_run_shape_refuses_a_non_integer() -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match="not an integer"):
+        positive_int("eight")
+
+
+@pytest.mark.parametrize("flag", ["--workers", "--contenders", "--per-week"])
+def test_the_cli_exits_2_rather_than_running_a_degenerate_simulation(flag: str) -> None:
+    """==Exit 2, not a traceback and emphatically not a green run.==
+
+    `--contenders 1` is the nastiest of these: it would not crash. A one-way race has exactly one
+    winner whatever the product does, so C10 would pass and C2 -- the control whose whole job is to
+    prove the harness can see MORE than one winner -- would be firing a single request at a single
+    slot and confirming it.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args([flag, "0"])
+    assert excinfo.value.code == 2
+
+
+def test_the_cli_accepts_the_documented_defaults() -> None:
+    args = parse_args([])
+    assert (args.workers, args.contenders, args.per_week, args.seed) == (8, 40, 40, 20260725)

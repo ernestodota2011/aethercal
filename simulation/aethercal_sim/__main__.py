@@ -90,12 +90,43 @@ NO_SHOW_WAIT_BUDGET_SECONDS = 420.0
 STACK_FILE = Path(__file__).resolve().parent.parent / ".stack.json"
 
 
+def positive_int(raw: str) -> int:
+    """An argparse type that refuses zero and negatives. ==A run's shape cannot be non-positive.==
+
+    ``--workers 0`` builds a ``ThreadPoolExecutor(max_workers=0)`` and ``--contenders 0`` builds a
+    ``threading.Barrier(0)``; ``--contenders 1`` is worse than either, because it "succeeds" while
+    testing nothing — a one-way race has exactly one winner whatever the product does, and C2, the
+    control that exists to catch a harness which is not really concurrent, would be firing a single
+    request at a single slot and confirming it.
+
+    Rejected at the CLI, where the message can say what was wrong, instead of surfacing as a
+    traceback or, worse, as a green run. ``argparse`` turns the raised error into exit code 2.
+    """
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be 1 or more, got {value}. A simulation with no guests, no contenders or no "
+            "planned bookings measures nothing, and a run that measures nothing must not be able "
+            "to report a verdict."
+        )
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="aethercal_sim", description="Two-week load simulation.")
     parser.add_argument("--seed", type=int, default=20260725)
-    parser.add_argument("--workers", type=int, default=8, help="simultaneous simulated guests")
-    parser.add_argument("--contenders", type=int, default=40, help="threads per adversarial race")
-    parser.add_argument("--per-week", type=int, default=40, help="bookings per business per week")
+    parser.add_argument(
+        "--workers", type=positive_int, default=8, help="simultaneous simulated guests"
+    )
+    parser.add_argument(
+        "--contenders", type=positive_int, default=40, help="threads per adversarial race"
+    )
+    parser.add_argument(
+        "--per-week", type=positive_int, default=40, help="bookings per business per week"
+    )
     parser.add_argument("--compose-cmd", default="", help="docker compose invocation (for C5)")
     parser.add_argument("--allow-missing-drain-control", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("simulation-report.md"))
