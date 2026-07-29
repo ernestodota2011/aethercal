@@ -231,14 +231,30 @@ async def test_the_evidence_is_printed_only_after_the_money_is_confirmed_back(
 
     await _drive(tape, monkeypatch)()
 
+    # ==The anti-vacuity half of `…shouted_about_and_never_certified`.== That test asserts the
+    # block is ABSENT when the money is stuck; without this one, it would pass just as well over a
+    # harness that had stopped certifying anything at all.
+    assert EVIDENCE in tape.calls, tape.calls
     assert tape.index("ensure_refunded") < tape.index(EVIDENCE), tape.calls
 
 
-async def test_money_left_behind_is_shouted_about(monkeypatch: pytest.MonkeyPatch) -> None:
-    """==Anti-vacuity for the alarm: it has to be REACHABLE.==
+async def test_money_left_behind_is_shouted_about_and_never_certified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==Three facts, and proving one of them proved nothing about the other two.==
 
-    When the cleanup reports that money is still held, the run must shout. A guard that only
-    checked the alarm's TEXT could not tell whether anything ever calls it.
+    The first cut asserted only that the alarm SOUNDS. A run that shouted *and also printed the
+    evidence block* would have passed it — and that block is what a human pastes into
+    ``live_verifications()``, so it would have certified "the money went back" in the same breath
+    as "the money is still held". ==Certifying while alarming is worse than not alarming==: the
+    register ends up holding a claim the alarm itself contradicts.
+
+    So all three are asserted:
+
+    * the alarm is REACHED — an alarm nothing calls is a string in a file;
+    * the certificate is NOT written — the run that could not return the money certifies nothing;
+    * the attempt comes BEFORE the alarm — shouting without having tried to return the money is a
+      report about something nobody did.
     """
     tape = _Recorder()
 
@@ -246,6 +262,15 @@ async def test_money_left_behind_is_shouted_about(monkeypatch: pytest.MonkeyPatc
         await _drive(tape, monkeypatch, settled="42 of 100 cents are STILL NOT refunded")()
 
     assert "shout" in tape.calls, tape.calls
+    assert EVIDENCE not in tape.calls, (
+        "the run printed the EVIDENCE block while reporting that money was still held. That block "
+        f"is pasted into live_verifications(); this one would certify a refund that did not "
+        f"happen. Tape: {tape.calls}"
+    )
+    assert tape.index("ensure_refunded") < tape.index("shout"), (
+        "the alarm fired before anything tried to send the money back, so it reports on an attempt "
+        f"that was never made. Tape: {tape.calls}"
+    )
 
 
 # ======================================================================================

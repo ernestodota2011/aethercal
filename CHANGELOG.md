@@ -22,8 +22,11 @@ construction nobody thought to exclude.
 
 - `tests/live/test_phase_b_execution_order.py` drives phase B and the checkout harness with doubles
   that RECORD, and asserts the sequence that actually happened. It also asserts what an ordering
-  check never could: a session refused by provenance is **never** refunded, and a validation that
-  fails on a genuinely paid session **still** reaches `ensure_refunded`.
+  check never could: a session refused by provenance is **never** refunded, a validation that fails
+  on a genuinely paid session **still** reaches `ensure_refunded`, and a run that could not return
+  the money **shouts without certifying** — the alarm is reached, the evidence block is absent, and
+  the attempt precedes the alarm. ==Shouting and certifying in the same breath would put a claim
+  into `live_verifications()` that the alarm itself contradicts.==
 - Offline and unmarked: no credential, no network, so the money harness's own invariants run on
   every commit instead of only on the day somebody runs it for real.
 - The AST guards stay for claims about SHAPE ("the guarantee is the last statement", "the creation
