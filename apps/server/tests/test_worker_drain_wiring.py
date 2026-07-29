@@ -50,7 +50,7 @@ class _GatewaySpy:
         # A provider that accepted the refund and named none: the runner reads this, so a double
         # that returned nothing would be asserting that the drain works against a shape no gateway
         # produces.
-        return RefundOutcome(refund_id=None, terminally_failed=False)
+        return RefundOutcome.succeeded(None)
 
     async def create_checkout_session(
         self, **_: object

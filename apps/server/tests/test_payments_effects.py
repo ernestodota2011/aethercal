@@ -23,6 +23,8 @@ from aethercal.server.integrations.money import (
     build_gateway_implementations,
     current_gateway_implementations,
 )
+from aethercal.server.integrations.stripe import REFUND_SUCCEEDED
+from aethercal.server.integrations.stripe import _refund_outcome as _stripe_refund_outcome
 from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
@@ -31,7 +33,10 @@ from aethercal.server.services.outbox import (
     refund_idempotency_key,
 )
 from aethercal.server.services.payments import (
+    MalformedRefundResponseError,
+    RefundNotSettledError,
     RefundOutcome,
+    RefundStatus,
     build_money_runners,
     make_expire_hold_runner,
     make_refund_runner,
@@ -78,9 +83,7 @@ class _GatewaySpy:
         # the answer already given; an unseen key gets a fresh refund. That is the property the
         # generational key exists to work with, so the double must have it — one that always
         # answered "fine" could not tell a retry from a duplicate.
-        return self.answers.get(
-            idempotency_key, RefundOutcome(refund_id=None, terminally_failed=False)
-        )
+        return self.answers.get(idempotency_key, RefundOutcome.succeeded(None))
 
     @property
     def calls(self) -> int:
@@ -132,6 +135,30 @@ async def _stripe_credential(session: AsyncSession, tenant_id: uuid.UUID) -> Non
         fernet_key=_KEY,
         current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
     )
+
+
+class _StatusGatewaySpy(_GatewaySpy):
+    """A gateway that answers with a PROVIDER STATUS STRING, mapped by the real adapter.
+
+    ==The mapping is the thing under test==, so the double must not hand the runner a ready-made
+    outcome: it hands back what Stripe would say, and ``integrations.stripe`` decides what that
+    means. A double that skipped the mapping would be asserting that the test agrees with itself.
+    """
+
+    def __init__(self, provider_status: str) -> None:
+        super().__init__()
+        self._provider_status = provider_status
+
+    async def refund(
+        self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        del secrets
+        self.keys.append(idempotency_key)
+        self.refunds.append(provider_ref)
+        return _stripe_refund_outcome(
+            {"id": "re_FROM_THE_PROVIDER", "status": self._provider_status},
+            provider_ref=provider_ref,
+        )
 
 
 def _refund_work(tenant_id: uuid.UUID, booking_id: uuid.UUID) -> OutboxWork:
@@ -441,7 +468,7 @@ class _MercadoPagoGatewaySpy:
         assert secrets["access_token"].startswith("TEST-")
         del idempotency_key
         self.refunds.append(provider_ref)
-        return RefundOutcome(refund_id=None, terminally_failed=False)
+        return RefundOutcome.succeeded(None)
 
     async def create_checkout_session(
         self, **_: object
@@ -603,7 +630,7 @@ async def test_a_terminally_failed_refund_is_reissued_on_a_new_key(
     """
     tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
     base = refund_idempotency_key(_REF, after_failed_refund=None)
-    gateway = _GatewaySpy(answers={base: RefundOutcome("re_DEAD", terminally_failed=True)})
+    gateway = _GatewaySpy(answers={base: RefundOutcome.failed("re_DEAD")})
 
     await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
 
@@ -629,7 +656,7 @@ async def test_the_new_key_is_derived_from_the_failure_and_not_from_the_attempt(
     generation is a function of the observed failure and not of how many times we have tried.
     """
     base = refund_idempotency_key(_REF, after_failed_refund=None)
-    answers = {base: RefundOutcome("re_DEAD", terminally_failed=True)}
+    answers = {base: RefundOutcome.failed("re_DEAD")}
 
     tenant_one, booking_one = await _a_paid_booking(sqlite_maker)
     first = _GatewaySpy(answers=answers)
@@ -659,13 +686,19 @@ async def test_a_refund_still_in_flight_keeps_its_key(
     """
     tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
     base = refund_idempotency_key(_REF, after_failed_refund=None)
-    gateway = _GatewaySpy(answers={base: RefundOutcome("re_PENDING", terminally_failed=False)})
+    gateway = _GatewaySpy(answers={base: RefundOutcome.pending("re_PENDING")})
 
-    await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
+    with pytest.raises(RefundNotSettledError, match="still in flight"):
+        await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
 
     assert gateway.keys == [base], (
         "an in-flight refund was treated as a dead one and a SECOND refund was issued beside it"
     )
+    async with sqlite_maker() as s:
+        payment = (await s.scalars(select(Payment))).one()
+        assert payment.status is not PaymentStatus.REFUNDED, (
+            "a refund still in flight was recorded as money returned"
+        )
 
 
 async def test_two_terminal_failures_do_not_mark_the_payment_refunded(
@@ -682,9 +715,9 @@ async def test_two_terminal_failures_do_not_mark_the_payment_refunded(
     base = refund_idempotency_key(_REF, after_failed_refund=None)
     gateway = _GatewaySpy(
         answers={
-            base: RefundOutcome("re_DEAD", terminally_failed=True),
-            refund_idempotency_key(_REF, after_failed_refund="re_DEAD"): RefundOutcome(
-                "re_DEAD_TOO", terminally_failed=True
+            base: RefundOutcome.failed("re_DEAD"),
+            refund_idempotency_key(_REF, after_failed_refund="re_DEAD"): RefundOutcome.failed(
+                "re_DEAD_TOO"
             ),
         }
     )
@@ -698,3 +731,88 @@ async def test_two_terminal_failures_do_not_mark_the_payment_refunded(
             "the payment was recorded as refunded after two terminal failures: the guest's money "
             "is still on their card and the system says otherwise"
         )
+
+
+# ======================================================================================
+# H10/H11 — three states, and a terminal failure that can always be named.
+# ======================================================================================
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "why"),
+    [
+        ("pending", "the commonest in-flight state: it may still go either way"),
+        ("requires_action", "in flight and waiting on somebody: still not money returned"),
+        ("a_status_stripe_invents_next_year", "unknown reads as pending, never as done"),
+    ],
+)
+async def test_a_refund_that_has_not_settled_never_marks_the_payment_refunded(
+    sqlite_maker: async_sessionmaker[AsyncSession], provider_status: str, why: str
+) -> None:
+    """==The finding: "not terminally failed" was read as "the money went back".==
+
+    The outcome was a single boolean, so the half that was not a failure absorbed two facts that are
+    not the same — *succeeded* and *still in flight*. Every state below therefore marked the payment
+    REFUNDED while the money had not moved: the defect fixed one layer up (a failure recorded as a
+    success), reappearing as a pending recorded as a success.
+
+    Each case is driven through the REAL adapter mapping (the provider's own status string), so what
+    is under test is the partition and not a hand-made outcome.
+    """
+    tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
+    gateway = _StatusGatewaySpy(provider_status)
+
+    with pytest.raises(RefundNotSettledError):
+        await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
+
+    async with sqlite_maker() as s:
+        payment = (await s.scalars(select(Payment))).one()
+        assert payment.status is not PaymentStatus.REFUNDED, why
+
+
+async def test_a_confirmed_success_does_mark_the_payment_refunded(
+    sqlite_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """==The anti-vacuity half.== A runner that never marked anything refunded would pass every test
+    above while making the product unable to complete a refund at all.
+
+    Stripe's own word for it, through the same adapter mapping — not a hand-made outcome.
+    """
+    tenant_id, booking_id = await _a_paid_booking(sqlite_maker)
+    gateway = _StatusGatewaySpy(REFUND_SUCCEEDED)
+
+    await _runner(sqlite_maker, gateway)(_refund_work(tenant_id, booking_id), NOW)
+
+    async with sqlite_maker() as s:
+        payment = (await s.scalars(select(Payment))).one()
+        assert payment.status is PaymentStatus.REFUNDED
+
+
+def test_a_terminal_failure_cannot_be_built_without_naming_the_refund() -> None:
+    """==H11, closed by the TYPE rather than by a check somebody must remember.==
+
+    The next idempotency generation is derived from the failed refund's id. A terminal failure that
+    names none leaves nothing to derive it from — so the code would either issue nothing and claim
+    it had, or issue blind. Neither is expressible: ``RefundOutcome.failed`` takes a non-optional
+    id, and the dataclass refuses the state even when built field by field.
+    """
+    with pytest.raises(ValueError, match="must name the refund"):
+        RefundOutcome(status=RefundStatus.FAILED, refund_id=None)
+
+    # And the states that do NOT need naming still do not require it.
+    assert RefundOutcome.succeeded(None).refund_id is None
+    assert RefundOutcome.pending(None).refund_id is None
+
+
+def test_a_nameless_terminal_failure_from_the_provider_is_refused_loudly() -> None:
+    """The other side of H11: the provider, not our code, produced the unusable answer.
+
+    The adapter refuses it by name, so nothing downstream has to invent a generation or pretend a
+    second attempt happened. The alert names the payment reference — an identifier, never a secret.
+    """
+    with pytest.raises(MalformedRefundResponseError, match="pi_NAMELESS"):
+        _stripe_refund_outcome({"status": "failed"}, provider_ref="pi_NAMELESS")
+
+    # Anti-vacuity: the same status WITH an id is a perfectly good terminal failure.
+    named = _stripe_refund_outcome({"status": "failed", "id": "re_X"}, provider_ref="pi_NAMELESS")
+    assert named == RefundOutcome.failed("re_X")

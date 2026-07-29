@@ -78,6 +78,7 @@ import pytest
 from aethercal.server.integrations.money import implementation_fingerprint
 from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.services.outbox import refund_idempotency_key
+from aethercal.server.services.payments import RefundStatus
 from aethercal.server.services.tenant_credentials import CredentialProvider, GatewayOperation
 
 REFUND = GatewayOperation.REFUND
@@ -432,12 +433,14 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
             idempotency_key=idempotency_key,
             secrets={"secret_key": secret_key},
         )
-        # ==The provider's own verdict, before anything else is read as progress.== A refund that
-        # comes back terminally failed moved no money, and certifying REFUND on the strength of a
-        # 200 is how a dead refund reaches `live_verifications()` as evidence.
-        assert not outcome.terminally_failed, (
-            f"the gateway's refund ended terminally failed at Stripe ({outcome.refund_id!r}), so "
-            "the money did NOT go back and this run verifies nothing"
+        # ==The provider's own verdict, and it must be SUCCEEDED — not merely "not failed".==
+        # `not terminally_failed` was the same binary read the runner had: it accepted a PENDING
+        # refund as proof the money went back, in the one path whose output is pasted into
+        # `live_verifications()`. Evidence may only rest on a terminal success.
+        assert outcome.status is RefundStatus.SUCCEEDED, (
+            f"the gateway's refund came back {outcome.status.value!r} at Stripe "
+            f"({outcome.refund_id!r}). Only a terminal success may be certified: a pending refund "
+            "can still fail, and this run would verify nothing"
         )
 
         # ==Settle FIRST, certify second.== `ensure_refunded` is the only thing here that knows

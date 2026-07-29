@@ -49,13 +49,20 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession, RefundOutcome
+from aethercal.server.services.payments import (
+    CheckoutSession,
+    MalformedRefundResponseError,
+    RefundOutcome,
+)
 
 _logger = logging.getLogger(__name__)
 
 _STRIPE_SIGNATURE_HEADER = "Stripe-Signature"
 _STRIPE_API_BASE = "https://api.stripe.com/v1"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
+
+REFUND_SUCCEEDED = "succeeded"
+"""The ONE Stripe refund status that means the money is back. ==Read, never retyped.=="""
 
 TERMINAL_REFUND_FAILURES = frozenset({"failed", "canceled"})
 """Stripe refund statuses that are TERMINAL and moved NO money. ==The vocabulary lives here.==
@@ -67,6 +74,39 @@ this rather than spelling it again, so the two cannot drift.
 
 _CHECKOUT_SESSION_FLOOR = timedelta(minutes=30)
 """Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes in the future."""
+
+
+def _refund_outcome(body: object, *, provider_ref: str) -> RefundOutcome:
+    """Read the provider's answer into the domain's THREE states.
+
+    ==An unknown status is PENDING, not success and not failure==, and both halves of that matter:
+
+    * calling it a FAILURE issues another refund, which pays a guest twice;
+    * calling it a SUCCESS marks the payment refunded while the money may still be sitting there.
+
+    Pending is the only reading that claims nothing — the runner retries and the provider's own
+    confirmation settles it.
+
+    A terminal failure with no id is refused outright (:class:`MalformedRefundResponseError`): the
+    next idempotency generation is derived from that id, so without it no retry can be issued — and
+    none may be claimed.
+    """
+    refund_id = body.get("id") if isinstance(body, dict) else None
+    named = str(refund_id) if refund_id is not None and refund_id != "" else None
+    status = body.get("status") if isinstance(body, dict) else None
+
+    if status == REFUND_SUCCEEDED:
+        return RefundOutcome.succeeded(named)
+    if status in TERMINAL_REFUND_FAILURES:
+        if named is None:
+            raise MalformedRefundResponseError(
+                f"the refund of {provider_ref} came back {status!r} — terminal, no money moved — "
+                "and the provider named no refund. There is nothing to derive the next idempotency "
+                "generation from, so no fresh refund can be issued and none is claimed. This needs "
+                "a human at the provider's dashboard."
+            )
+        return RefundOutcome.failed(named)
+    return RefundOutcome.pending(named)
 
 
 def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
@@ -284,15 +324,12 @@ class StripeGateway:
             )
             response.raise_for_status()
             body = response.json()
-        # ==An unknown shape reads as NOT terminally failed.== The consequence of "failed" is that
-        # the runner opens a new generation and issues ANOTHER refund, so guessing that way round
-        # pays a guest twice. Silence means "no new refund", which is the recoverable error.
-        refund_id = body.get("id") if isinstance(body, dict) else None
-        status = body.get("status") if isinstance(body, dict) else None
-        return RefundOutcome(
-            refund_id=str(refund_id) if isinstance(refund_id, str) else None,
-            terminally_failed=status in TERMINAL_REFUND_FAILURES,
-        )
+        return _refund_outcome(body, provider_ref=provider_ref)
 
 
-__all__ = ["TERMINAL_REFUND_FAILURES", "StripeGateway", "StripeWebhookAdapter"]
+__all__ = [
+    "REFUND_SUCCEEDED",
+    "TERMINAL_REFUND_FAILURES",
+    "StripeGateway",
+    "StripeWebhookAdapter",
+]

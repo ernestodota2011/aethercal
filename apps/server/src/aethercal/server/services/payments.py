@@ -57,7 +57,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, assert_never, cast
 
 from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
@@ -881,6 +881,52 @@ class CheckoutSession:
     checkout_session_id: str
 
 
+class MalformedRefundResponseError(RuntimeError):
+    """The provider called a refund terminally FAILED and named no refund. ==Unusable, so refused.==
+
+    A terminal failure is only actionable if it can be NAMED: the id is what opens the next
+    idempotency generation. Without it there is nothing to derive one from, so the honest answer is
+    that this response cannot be acted on — not a second refund issued blind, and not a claim that a
+    fresh attempt was made when none was.
+
+    Raised by the adapter rather than smuggled through as "pending": pending means *it may yet
+    succeed*, and the provider has just said the opposite.
+    """
+
+
+class RefundNotSettledError(RuntimeError):
+    """The refund exists and has not reached a terminal state. ==Not a failure — not done either.==
+
+    Raised so the outbox RETRIES rather than recording a payment as refunded on the strength of a
+    refund still in flight. See :func:`make_refund_runner` for why retrying is a real route to
+    terminal here and not a busy-wait.
+    """
+
+
+class RefundStatus(StrEnum):
+    """What the provider says about ONE refund. ==Three states, because there are three.==
+
+    .. rubric:: ==The partition was binary, and the middle state fell into the wrong half==
+
+    :class:`RefundOutcome` carried a single ``terminally_failed`` flag, so "not failed" absorbed two
+    facts that are not the same: *the money went back* and *the money has not gone back yet*. A
+    ``pending`` refund therefore marked the payment ``REFUNDED`` — the very defect that had just
+    been fixed one layer up (a failure recorded as a success), reappearing as a pending recorded as
+    a success. ==The handling was not wrong; the partition was.==
+    """
+
+    SUCCEEDED = "succeeded"
+    """Terminal, and the money moved. The ONLY state that may mark a payment refunded."""
+
+    PENDING = "pending"
+    """In flight. It may still go either way, so it is neither done nor failed — and issuing another
+    refund beside it is how a guest gets paid twice."""
+
+    FAILED = "failed"
+    """Terminal, and the money did NOT move. Retrying the same key replays this for ever, so it is
+    the state that opens a new idempotency generation."""
+
+
 @dataclass(frozen=True, slots=True)
 class RefundOutcome:
     """What the provider said about the refund a :meth:`PaymentGateway.refund` call produced.
@@ -890,22 +936,52 @@ class RefundOutcome:
     from one on its way to succeeding. That is what made a failed refund unretryable: the runner had
     nothing to derive a new idempotency generation from, and nothing to stop it recording the
     payment as refunded.
+
+    ==Build it through :meth:`succeeded`, :meth:`pending` or :meth:`failed`==, never by naming the
+    fields: :meth:`failed` takes a NON-OPTIONAL id, so a terminal failure that cannot be named is
+    not expressible. That is the type doing the work a validation would otherwise have to remember.
     """
+
+    status: RefundStatus
+    """Which of the three states the provider reported."""
 
     refund_id: str | None
     """The provider's id for the refund this call created — or REPLAYED, on a repeated key.
 
-    ``None`` when the provider named none, which is the one case a new generation cannot be derived
-    from: see :func:`~aethercal.server.services.outbox.refund_idempotency_key`.
+    Optional for a success or a pending (nothing downstream needs to name them), and ==guaranteed
+    present for a FAILURE==, because that id is what
+    :func:`~aethercal.server.services.outbox.refund_idempotency_key` derives the next generation
+    from.
     """
 
-    terminally_failed: bool
-    """==The money did NOT move, and this refund will never move it.==
+    def __post_init__(self) -> None:
+        """The belt to the constructors' braces: a FAILURE always names its refund.
 
-    Terminal, so retrying the same key replays this answer for ever. Anything still in flight
-    (``pending``, ``requires_action``) is NOT this: it may yet succeed, and issuing another refund
-    beside it is how a guest gets paid twice.
-    """
+        The classmethods make the invariant unexpressible for anyone who uses them; this catches the
+        caller who builds the dataclass directly, so the guarantee holds for every instance rather
+        than for the polite ones.
+        """
+        if self.status is RefundStatus.FAILED and not self.refund_id:
+            raise ValueError(
+                "a terminally failed refund must name the refund that failed: the next idempotency "
+                "generation is derived from that id, and without it no retry can be issued and "
+                "none may be claimed"
+            )
+
+    @classmethod
+    def succeeded(cls, refund_id: str | None) -> RefundOutcome:
+        """Terminal, and the money moved."""
+        return cls(status=RefundStatus.SUCCEEDED, refund_id=refund_id)
+
+    @classmethod
+    def pending(cls, refund_id: str | None) -> RefundOutcome:
+        """In flight: neither done nor failed."""
+        return cls(status=RefundStatus.PENDING, refund_id=refund_id)
+
+    @classmethod
+    def failed(cls, refund_id: str) -> RefundOutcome:
+        """Terminal, and the money did NOT move. ==The id is not optional here.=="""
+        return cls(status=RefundStatus.FAILED, refund_id=refund_id)
 
 
 class PaymentGateway(Protocol):
@@ -1130,7 +1206,7 @@ def make_refund_runner(
             # returns and the retry reports success. The generation is named by the FAILURE's id,
             # so it is a function of observed state — stable while the state is, which is what
             # keeps a crash-retry from issuing a second refund.
-            if outcome.terminally_failed and outcome.refund_id is not None:
+            if outcome.status is RefundStatus.FAILED:
                 _logger.error(
                     "ALERT: the refund of payment %s (%s) failed TERMINALLY at the provider "
                     "(refund %s); issuing a fresh one on a new idempotency generation",
@@ -1146,22 +1222,42 @@ def make_refund_runner(
                     secrets=credential.secrets,
                 )
 
-            # ==ONE new generation per drain, not a chain.== A card that rejects refunds keeps
-            # rejecting them; issuing them in a loop until one sticks is a machine arguing with a
-            # bank. So a second terminal failure RAISES: the outbox retries this whole runner
-            # (replaying both calls and creating nothing new — the keys are stable), and its
-            # attempt ceiling dead-letters it with an alert for a human. The payment is NOT marked
-            # refunded, because it was not.
-            if outcome.terminally_failed:
-                raise RuntimeError(
-                    f"the refund of {provider_ref} failed terminally at the provider "
-                    f"(refund {outcome.refund_id!r}), and so did the fresh one issued after it. "
-                    "The guest's money has NOT come back and no further refund will be issued "
-                    "automatically — this needs a human at the provider's dashboard."
-                )
-
-            payment.status = PaymentStatus.REFUNDED
-            _logger.info("refund runner: refunded payment %s (%s)", payment.id, provider_ref)
+            # ==Three states, three answers, and `assert_never` so a fourth cannot arrive quietly.==
+            # This used to be `if terminally_failed: … else: mark refunded`, and the `else`
+            # swallowed PENDING — a refund still in flight recorded as money returned.
+            match outcome.status:
+                case RefundStatus.SUCCEEDED:
+                    payment.status = PaymentStatus.REFUNDED
+                    _logger.info(
+                        "refund runner: refunded payment %s (%s)", payment.id, provider_ref
+                    )
+                case RefundStatus.PENDING:
+                    # ==Not done, so not recorded as done.== Raising makes the outbox retry with
+                    # backoff, and the retry is a REAL route to terminal rather than a busy-wait:
+                    # the provider replays this call's answer, but `charge.refunded` lands
+                    # independently and marks the payment REFUNDED — so the next attempt
+                    # short-circuits on the status re-check above and completes cleanly. A refund
+                    # that never settles exhausts the attempts and dead-letters with an alert. Both
+                    # directions end somewhere; neither ends in a silent "refunded".
+                    raise RefundNotSettledError(
+                        f"the refund of {provider_ref} (refund {outcome.refund_id!r}) is still in "
+                        "flight at the provider: the money has NOT come back yet, so this payment "
+                        "is not marked refunded. Retrying until the confirmation lands."
+                    )
+                case RefundStatus.FAILED:
+                    # ==ONE new generation per drain, not a chain.== A card that rejects refunds
+                    # keeps rejecting them; issuing them in a loop until one sticks is a machine
+                    # arguing with a bank. The outbox retries this runner (replaying both calls and
+                    # creating nothing new — the keys are stable) and its ceiling dead-letters with
+                    # an alert for a human.
+                    raise RuntimeError(
+                        f"the refund of {provider_ref} failed terminally at the provider "
+                        f"(refund {outcome.refund_id!r}), and so did the fresh one issued after "
+                        "it. The guest's money has NOT come back and no further refund will be "
+                        "issued automatically — this needs a human at the provider's dashboard."
+                    )
+                case _ as unreachable:  # pragma: no cover - unreachable while the match is total
+                    assert_never(unreachable)
 
     return _run
 
@@ -1410,9 +1506,12 @@ __all__ = [
     "CancelEffects",
     "CheckoutSession",
     "ConfirmEffects",
+    "MalformedRefundResponseError",
     "ParkedPaymentReport",
     "PaymentGateway",
+    "RefundNotSettledError",
     "RefundOutcome",
+    "RefundStatus",
     "apply_dispute_event",
     "apply_paid_event",
     "apply_refunded_event",

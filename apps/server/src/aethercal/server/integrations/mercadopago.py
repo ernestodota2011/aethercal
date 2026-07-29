@@ -76,9 +76,16 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession, RefundOutcome
+from aethercal.server.services.payments import (
+    CheckoutSession,
+    MalformedRefundResponseError,
+    RefundOutcome,
+)
 
 _logger = logging.getLogger(__name__)
+
+REFUND_SUCCEEDED = "approved"
+"""Mercado Pago's word for a refund that moved the money. Its vocabulary, not Stripe's."""
 
 TERMINAL_REFUND_FAILURES = frozenset({"rejected", "cancelled", "canceled"})
 """Mercado Pago refund statuses that are TERMINAL and moved NO money.
@@ -182,6 +189,39 @@ class MercadoPagoPaymentStatus(StrEnum):
     """The whole charge went back — ours echoed, or the operator's out of band."""
     CHARGED_BACK = "charged_back"
     """The card issuer pulled the money back. A dispute by another name."""
+
+
+def _refund_outcome(body: object, *, provider_ref: str) -> RefundOutcome:
+    """Read the provider's answer into the domain's THREE states.
+
+    ==An unknown status is PENDING, not success and not failure==, and both halves of that matter:
+
+    * calling it a FAILURE issues another refund, which pays a guest twice;
+    * calling it a SUCCESS marks the payment refunded while the money may still be sitting there.
+
+    Pending is the only reading that claims nothing — the runner retries and the provider's own
+    confirmation settles it.
+
+    A terminal failure with no id is refused outright (:class:`MalformedRefundResponseError`): the
+    next idempotency generation is derived from that id, so without it no retry can be issued — and
+    none may be claimed.
+    """
+    refund_id = body.get("id") if isinstance(body, dict) else None
+    named = str(refund_id) if refund_id is not None and refund_id != "" else None
+    status = body.get("status") if isinstance(body, dict) else None
+
+    if status == REFUND_SUCCEEDED:
+        return RefundOutcome.succeeded(named)
+    if status in TERMINAL_REFUND_FAILURES:
+        if named is None:
+            raise MalformedRefundResponseError(
+                f"the refund of {provider_ref} came back {status!r} — terminal, no money moved — "
+                "and the provider named no refund. There is nothing to derive the next idempotency "
+                "generation from, so no fresh refund can be issued and none is claimed. This needs "
+                "a human at the provider's dashboard."
+            )
+        return RefundOutcome.failed(named)
+    return RefundOutcome.pending(named)
 
 
 def _kind_for_status(status: MercadoPagoPaymentStatus) -> WebhookEventKind | None:
@@ -773,14 +813,7 @@ class MercadoPagoGateway:
             )
             response.raise_for_status()
             body = response.json()
-        # Same reading as Stripe's, and the same asymmetry: an unrecognised status is NOT a terminal
-        # failure, because the consequence of calling it one is a second refund.
-        refund_id = body.get("id") if isinstance(body, dict) else None
-        status = body.get("status") if isinstance(body, dict) else None
-        return RefundOutcome(
-            refund_id=str(refund_id) if refund_id is not None else None,
-            terminally_failed=status in TERMINAL_REFUND_FAILURES,
-        )
+        return _refund_outcome(body, provider_ref=provider_ref)
 
 
 def _iso8601(moment: datetime) -> str:
@@ -794,6 +827,7 @@ def _iso8601(moment: datetime) -> str:
 
 
 __all__ = [
+    "REFUND_SUCCEEDED",
     "TERMINAL_REFUND_FAILURES",
     "MercadoPagoError",
     "MercadoPagoGateway",

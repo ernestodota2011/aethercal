@@ -274,6 +274,33 @@ differently, so it could only be overruled and never discharged.
     person, not a hundred attempts.
   - An unrecognised provider status reads as **not** terminally failed, in both adapters: the
     consequence of calling it a failure is another refund, so the safe direction is silence.
+- **A refund still in flight is no longer recorded as money returned.** The fix above left
+  `RefundOutcome` **binary** — terminally failed, or not — and the "not" absorbed two facts that are
+  not the same: *the money went back* and *it has not gone back yet*. So a `pending`,
+  `requires_action` or unrecognised status marked the payment `REFUNDED` while the money was still
+  sitting there. ==It is the same defect one layer up, wearing the other half of the partition==: a
+  failure recorded as a success, then a pending recorded as a success. The handling was not wrong;
+  the partition was.
+  - `RefundStatus` models **three** states (`succeeded`, `pending`, `failed`) and the runner
+    dispatches on them with `assert_never`, so a fourth cannot arrive quietly — the same lock the
+    money's *direction* already had.
+  - `PaymentStatus.REFUNDED` is set **only** on a terminal success. A pending raises
+    `RefundNotSettledError` so the outbox retries with backoff — and that retry is a real route to
+    terminal, not a busy-wait: `charge.refunded` lands independently and marks the payment refunded,
+    so the next attempt short-circuits on the status re-check and completes; a refund that never
+    settles exhausts the attempts and dead-letters with an alert. Both directions end somewhere.
+  - An **unknown** provider status reads as `pending` in both adapters, because that is the only
+    reading that claims nothing: calling it a failure issues a second refund, calling it a success
+    records money that has not moved.
+  - The live harness had the same binary read in its **evidence** path (`not terminally_failed`) and
+    would have certified a pending refund into `live_verifications()`; it now requires
+    `RefundStatus.SUCCEEDED`.
+- **A terminal refund failure can no longer be nameless.** The new generation is derived from the
+  failed refund's id, so a terminal failure without one leaves nothing to derive it from — and the
+  code would have claimed a second attempt it never made. `RefundOutcome.failed()` takes a
+  **non-optional** id (with the dataclass refusing the state even when built field by field), and an
+  adapter that receives a nameless terminal failure raises `MalformedRefundResponseError` naming the
+  payment reference, rather than issuing a refund blind.
 - **The live harness's provenance mark is authenticated, not published.**
   `require_phase_a_provenance` demanded a fixed, public `success_url` prefix — every character of it
   in this repository — so any session in the account could carry it and pass the one barrier between

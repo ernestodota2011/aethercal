@@ -56,7 +56,11 @@ from typing import Any
 import httpx
 import pytest
 
-from aethercal.server.integrations.stripe import TERMINAL_REFUND_FAILURES, StripeGateway
+from aethercal.server.integrations.stripe import (
+    REFUND_SUCCEEDED,
+    TERMINAL_REFUND_FAILURES,
+    StripeGateway,
+)
 from aethercal.server.services.payments import CheckoutSession
 
 SECRET_KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
@@ -97,8 +101,10 @@ RUN_ID_ENV = "AETHERCAL_LIVE_STRIPE_RUN_ID"
 CHECKOUT_PURPOSE = "checkout"
 """The zero-cost harness's segment. Nothing payable is ever left standing under it."""
 
-REFUND_SUCCEEDED = "succeeded"
-"""==The ONLY status that means the money is back.== Terminal, and the money has actually moved."""
+"""==The ONLY status that means the money is back.== Imported from the adapter beside
+:data:`REFUND_DEAD_ENDS`, for the same reason: the gateway is the code that reads Stripe's
+vocabulary off the API, and a second spelling here would be free to drift from the one production
+acts on."""
 
 REFUND_DEAD_ENDS = TERMINAL_REFUND_FAILURES
 """Terminal and the money did NOT move — so these count as zero, never as progress.
