@@ -76,9 +76,26 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession
+from aethercal.server.services.payments import (
+    CheckoutSession,
+    MalformedRefundResponseError,
+    RefundOutcome,
+)
 
 _logger = logging.getLogger(__name__)
+
+REFUND_SUCCEEDED = "approved"
+"""Mercado Pago's word for a refund that moved the money. Its vocabulary, not Stripe's."""
+
+TERMINAL_REFUND_FAILURES = frozenset({"rejected", "cancelled", "canceled"})
+"""Mercado Pago refund statuses that are TERMINAL and moved NO money.
+
+==Deliberately NARROW.== Everything not listed here — including a status this adapter has never
+seen — reads as "not terminally failed", so the runner does NOT open a new generation and does NOT
+issue a second refund. Guessing the other way pays a guest twice; guessing this way delays a refund
+the outbox will retry. Like the rest of this adapter it is written to the documented vocabulary and
+has never been exercised against a real account.
+"""
 
 _MP_API_BASE = "https://api.mercadopago.com"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
@@ -172,6 +189,39 @@ class MercadoPagoPaymentStatus(StrEnum):
     """The whole charge went back — ours echoed, or the operator's out of band."""
     CHARGED_BACK = "charged_back"
     """The card issuer pulled the money back. A dispute by another name."""
+
+
+def _refund_outcome(body: object, *, provider_ref: str) -> RefundOutcome:
+    """Read the provider's answer into the domain's THREE states.
+
+    ==An unknown status is PENDING, not success and not failure==, and both halves of that matter:
+
+    * calling it a FAILURE issues another refund, which pays a guest twice;
+    * calling it a SUCCESS marks the payment refunded while the money may still be sitting there.
+
+    Pending is the only reading that claims nothing — the runner retries and the provider's own
+    confirmation settles it.
+
+    A terminal failure with no id is refused outright (:class:`MalformedRefundResponseError`): the
+    next idempotency generation is derived from that id, so without it no retry can be issued — and
+    none may be claimed.
+    """
+    refund_id = body.get("id") if isinstance(body, dict) else None
+    named = str(refund_id) if refund_id is not None and refund_id != "" else None
+    status = body.get("status") if isinstance(body, dict) else None
+
+    if status == REFUND_SUCCEEDED:
+        return RefundOutcome.succeeded(named)
+    if status in TERMINAL_REFUND_FAILURES:
+        if named is None:
+            raise MalformedRefundResponseError(
+                f"the refund of {provider_ref} came back {status!r} — terminal, no money moved — "
+                "and the provider named no refund. There is nothing to derive the next idempotency "
+                "generation from, so no fresh refund can be issued and none is claimed. This needs "
+                "a human at the provider's dashboard."
+            )
+        return RefundOutcome.failed(named)
+    return RefundOutcome.pending(named)
 
 
 def _kind_for_status(status: MercadoPagoPaymentStatus) -> WebhookEventKind | None:
@@ -738,9 +788,25 @@ class MercadoPagoGateway:
         # something this cut can verify without an account — see the module docstring.
         return CheckoutSession(checkout_url=init_point, checkout_session_id=idempotency_key)
 
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """Read one refund back. ==A GET: no money moves.==
+
+        Mercado Pago addresses a refund UNDER its payment, which is why the seam carries
+        ``provider_ref`` at all. Written to the documented shape and, like the rest of this adapter,
+        never exercised against a real account.
+        """
+        access_token = secrets["access_token"]
+        async with self._client(access_token) as client:
+            response = await client.get(f"/v1/payments/{provider_ref}/refunds/{refund_id}")
+            response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=provider_ref)
+
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         """Refund the payment ``provider_ref`` IN FULL, on the business's own token.
 
         ==There is no ``amount`` in the body, and no ``amount_cents`` in the signature== — Mercado
@@ -762,6 +828,8 @@ class MercadoPagoGateway:
                 headers={"X-Idempotency-Key": idempotency_key},
             )
             response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=provider_ref)
 
 
 def _iso8601(moment: datetime) -> str:
@@ -775,6 +843,8 @@ def _iso8601(moment: datetime) -> str:
 
 
 __all__ = [
+    "REFUND_SUCCEEDED",
+    "TERMINAL_REFUND_FAILURES",
     "MercadoPagoError",
     "MercadoPagoGateway",
     "MercadoPagoPaymentStatus",

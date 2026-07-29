@@ -47,6 +47,7 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.guc import reset_tenant_binding, tenant_scope
 from aethercal.server.db.models import Tenant, User
 from aethercal.server.db.roles import DbRole
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
 from aethercal.server.scheduler import build_drain_executor, resolve_senders_for
 from aethercal.server.services import tenant_senders
@@ -158,6 +159,9 @@ async def _seed_business(
                 provider=CredentialProvider.WHATSAPP,
                 secrets=_BUSINESS_WHATSAPP,
                 fernet_key=_KEY,
+                current_implementations=current_gateway_implementations(
+                    CredentialProvider.WHATSAPP
+                ),
             )
         if smtp:
             await store_credential(
@@ -166,6 +170,7 @@ async def _seed_business(
                 provider=CredentialProvider.SMTP,
                 secrets=_BUSINESS_SMTP,
                 fernet_key=_KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
             )
         return tenant.id
 

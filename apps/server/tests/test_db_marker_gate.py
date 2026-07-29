@@ -80,7 +80,7 @@ _NOTHING: list[bool] = []
 def test_which_runs_target_the_database_suite(
     markexpr: str, db_marked: list[bool], targets: bool
 ) -> None:
-    assert _root_conftest().targets_the_db_suite(markexpr, db_marked) is targets
+    assert _root_conftest().targets_only_the_marked(markexpr, db_marked) is targets
 
 
 def test_pytest_m_db_without_a_database_exits_non_zero() -> None:

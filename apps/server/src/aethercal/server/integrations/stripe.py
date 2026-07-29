@@ -8,10 +8,19 @@
   half is pure crypto + JSON and is UNIT-TESTED== against Stripe's documented format — no network.
 
 * :class:`StripeGateway` — the outgoing API calls (open a Checkout Session, issue a refund) over
-  HTTPS, on the BUSINESS's own ``sk_test_`` key (BYOK). ==This half is NOT verified against live
-  Stripe== in this cut — same honest treatment as the Twilio adapter in Tanda A. It is written to
-  Stripe's test-mode API shape and exercised only with a stubbed transport; a real ``sk_test_`` key
-  and a network round-trip are the B-08 gate's job, in TEST mode, with **zero real charges**.
+  HTTPS, on the BUSINESS's own key (BYOK). ==This half is NOT verified against real Stripe== — the
+  same honest treatment as the Twilio adapter in Tanda A. It is written to Stripe's documented API
+  shape and exercised only with a stubbed transport.
+
+  ==That last sentence is a CLAIM, and it is deliberately not MADE here.== Prose in a module
+  docstring is exactly what let *"Stripe, in TEST MODE"* be a filename for a cut in which nothing
+  enforced it. The machine-readable statement lives in
+  :func:`~aethercal.server.services.tenant_credentials.live_verifications`, **per operation**, and
+  the BYOK credential door reads it: while an operation of this gateway has no record of having been
+  run for real, a live Stripe credential is refused. Producing such a record is what
+  ``apps/server/tests/live/`` is for: the checkout half at zero cost, the refund half at the price
+  of a real $1 charge that a person pays and the harness returns. ==Keep the status THERE and not in
+  this paragraph==, or the two will drift and only one of them will be load-bearing.
 
 .. rubric:: Why the ``Stripe-Signature`` timestamp tolerance is NOT enforced here
 
@@ -40,7 +49,11 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession
+from aethercal.server.services.payments import (
+    CheckoutSession,
+    MalformedRefundResponseError,
+    RefundOutcome,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -48,8 +61,52 @@ _STRIPE_SIGNATURE_HEADER = "Stripe-Signature"
 _STRIPE_API_BASE = "https://api.stripe.com/v1"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
 
+REFUND_SUCCEEDED = "succeeded"
+"""The ONE Stripe refund status that means the money is back. ==Read, never retyped.=="""
+
+TERMINAL_REFUND_FAILURES = frozenset({"failed", "canceled"})
+"""Stripe refund statuses that are TERMINAL and moved NO money. ==The vocabulary lives here.==
+
+Anything else is either ``succeeded`` (done) or still in flight (``pending``, ``requires_action``)
+— and treating in-flight as failed is how a guest gets refunded twice. The live harness imports
+this rather than spelling it again, so the two cannot drift.
+"""
+
 _CHECKOUT_SESSION_FLOOR = timedelta(minutes=30)
 """Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes in the future."""
+
+
+def _refund_outcome(body: object, *, provider_ref: str) -> RefundOutcome:
+    """Read the provider's answer into the domain's THREE states.
+
+    ==An unknown status is PENDING, not success and not failure==, and both halves of that matter:
+
+    * calling it a FAILURE issues another refund, which pays a guest twice;
+    * calling it a SUCCESS marks the payment refunded while the money may still be sitting there.
+
+    Pending is the only reading that claims nothing — the runner retries and the provider's own
+    confirmation settles it.
+
+    A terminal failure with no id is refused outright (:class:`MalformedRefundResponseError`): the
+    next idempotency generation is derived from that id, so without it no retry can be issued — and
+    none may be claimed.
+    """
+    refund_id = body.get("id") if isinstance(body, dict) else None
+    named = str(refund_id) if refund_id is not None and refund_id != "" else None
+    status = body.get("status") if isinstance(body, dict) else None
+
+    if status == REFUND_SUCCEEDED:
+        return RefundOutcome.succeeded(named)
+    if status in TERMINAL_REFUND_FAILURES:
+        if named is None:
+            raise MalformedRefundResponseError(
+                f"the refund of {provider_ref} came back {status!r} — terminal, no money moved — "
+                "and the provider named no refund. There is nothing to derive the next idempotency "
+                "generation from, so no fresh refund can be issued and none is claimed. This needs "
+                "a human at the provider's dashboard."
+            )
+        return RefundOutcome.failed(named)
+    return RefundOutcome.pending(named)
 
 
 def _parse_stripe_signature(header: str) -> tuple[str | None, list[str]]:
@@ -172,8 +229,11 @@ class StripeGateway:
     """Stripe's outgoing API — checkout + refund, on the business's own key. ==NOT verified live.==
 
     ``transport`` is injectable so a unit test can stub the HTTP round-trip; production passes
-    ``None`` and a fresh :class:`httpx.AsyncClient` is used per call. The calls follow Stripe's
-    test-mode API shape but have not been exercised against a real ``sk_test_`` key in this cut.
+    ``None`` and a fresh :class:`httpx.AsyncClient` is used per call.
+
+    ==Which of these calls has ever met the real API is recorded in
+    :func:`~aethercal.server.services.tenant_credentials.live_verifications`, not here== — see this
+    module's docstring for why the fact does not live in a sentence.
     """
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
@@ -238,14 +298,37 @@ class StripeGateway:
         # ``checkout.session.completed`` webhook, which backfills ``provider_ref``.
         return CheckoutSession(checkout_url=str(body["url"]), checkout_session_id=str(body["id"]))
 
+    async def refund_status(
+        self, *, provider_ref: str, refund_id: str, secrets: Mapping[str, str]
+    ) -> RefundOutcome:
+        """Read one refund back. ==A GET: no money moves, and no idempotency key is needed.==
+
+        Stripe addresses a refund by its own id, so ``provider_ref`` is not part of the URL; it is
+        in the signature because Mercado Pago's lookup needs it. See
+        :meth:`PaymentGateway.refund_status`.
+        """
+        del provider_ref  # Stripe's refunds are addressable on their own; Mercado Pago's are not
+        secret_key = secrets["secret_key"]
+        async with self._client(secret_key) as client:
+            response = await client.get(f"/refunds/{refund_id}")
+            response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=refund_id)
+
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         """Refund the PaymentIntent ``provider_ref`` in full, on the business's own key.
 
         ==No ``provider`` and no ``amount_cents``.== Both used to be taken and immediately
         ``del``'d; see :meth:`PaymentGateway.refund` for why an ignored parameter was not harmless
         here. A full refund keys on the PaymentIntent alone.
+
+        ==It reads the refund back out of the response, and that is not decoration.== Stripe answers
+        ``200`` for a refund it has merely ACCEPTED; the status may be ``pending``, and it may end
+        ``failed``. Returning ``None``, as this did, told the runner only that the HTTP call worked
+        — so a terminally failed refund was recorded as a success, and its idempotency key replayed
+        that same dead refund on every retry for ever.
         """
         secret_key = secrets["secret_key"]
         async with self._client(secret_key) as client:
@@ -257,6 +340,13 @@ class StripeGateway:
                 headers={"Idempotency-Key": idempotency_key},
             )
             response.raise_for_status()
+            body = response.json()
+        return _refund_outcome(body, provider_ref=provider_ref)
 
 
-__all__ = ["StripeGateway", "StripeWebhookAdapter"]
+__all__ = [
+    "REFUND_SUCCEEDED",
+    "TERMINAL_REFUND_FAILURES",
+    "StripeGateway",
+    "StripeWebhookAdapter",
+]

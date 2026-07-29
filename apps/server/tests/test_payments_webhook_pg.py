@@ -32,6 +32,7 @@ from aethercal.server.db.models import (
     Tenant,
     User,
 )
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
@@ -123,6 +124,7 @@ async def _seed(
             provider=CredentialProvider.STRIPE,
             secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": _SECRET},
             fernet_key=_KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         return slug, booking.id
 
