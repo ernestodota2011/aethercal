@@ -14,10 +14,18 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `dc008532` | 2026-07-29 | MEASURED | 239 planned / 209 created, 30 create-leg + 2 reschedule-leg collisions, 40-way races, **all fifteen** controls held. ==A confirmation is now identified by its calendar identity (`UID`/`METHOD`/`STATUS`/`SEQUENCE` in the `.ics`), one-to-one with its booking== — not by "the earliest mail to that address". §6's 537 classified = 257 slot reads (both legs) + 239 bookings + 23 cancels + 18 reschedules; its 32 `slot_unavailable` = 30 + 2. Confirmations: 187 matched, **22 superseded** (the product retires a queued confirmation when the booking is cancelled or rescheduled first), 0 unaccounted, 0 duplicates, 0 negative deltas. Peak 40 of 40 requests in flight (C15). 361 backlog samples, 0 scrape failures. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
+| `e4a99ccc` | 2026-07-29 | MEASURED | 239 planned / 212 created, 27 create-leg + 1 reschedule-leg collisions, 40-way races, **all fifteen** controls held. §6's 537 classified = 257 slot reads (both legs) + 239 bookings + 23 cancels + 18 reschedules; its 28 `slot_unavailable` = 27 + 1. Confirmations identified by calendar identity: **188 matched, 24 superseded, 0 unaccounted**, 0 duplicates, 0 uid collisions, 0 negative deltas, 0 unparseable envelopes. Peak **40 of 40** requests in flight (C15). 485 backlog samples, 0 scrape failures, 0 boundary discards. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Nine earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, nine times over.
+> [!warning] ==Ten earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, ten times over.
+>
+> `dc008532` — withdrawn because three of the instruments certifying it could still pass over a
+> loss. The mailbox read called itself COMPLETE while silently failing to parse envelopes (the total
+> added up and the list was short); `stop()` could return while the sampler was still writing, so
+> §3 and C12 were assembled over a changing state; and C4 judged its third probe with
+> `"day_full" in ...`, where the broken-read outcome embeds the response BODY — so a failed query
+> whose body merely mentioned `day_full` satisfied the cap. ==None of the three fired in that run;
+> all three could have, and nothing in it would have said so.==
 >
 > `925780c6` — withdrawn because §2 was measuring the wrong messages. A booking was "matched" to
 > *the earliest mail to its guest*, and every guest also receives their cancellation or reschedule
