@@ -521,26 +521,70 @@ class RaceOutcome:
     refusals_by_code: dict[str, int]
     unexpected: list[str]
     latency: Latency
+    intervals: list[tuple[float, float]] = field(default_factory=list)
+    """``(started, finished)`` per contender, on one monotonic clock. ==The evidence of overlap.==
+
+    Counting winners cannot establish that anything was simultaneous, and that gap is why these are
+    recorded: see :func:`peak_overlap` and C15."""
 
     @property
     def refusals(self) -> int:
         return sum(self.refusals_by_code.values())
 
+    @property
+    def peak_overlap(self) -> int:
+        """The largest number of these requests that were in flight at the same instant."""
+        return peak_overlap(self.intervals)
+
+
+def peak_overlap(intervals: list[tuple[float, float]]) -> int:
+    """How many intervals were open simultaneously, at the busiest instant. ==Pure and testable.==
+
+    A sweep over the endpoints. ==Ends are counted BEFORE starts at an identical timestamp==, so a
+    request that finishes exactly as the next begins is a handover, not an overlap.
+
+    That tie-break is the whole difference between this measuring something and measuring nothing,
+    and the first version had it backwards. It counted starts first, reasoning that the generous
+    reading "favours the harness" — which is precisely wrong for a control that demands a MINIMUM
+    overlap: a strictly serial burst `(0,1), (1,2), (2,3)` then scored 2 and sailed through the very
+    gate built to catch serialisation. ==Whichever way a tie is broken must be the way that can
+    FAIL==, or the threshold is decorative. A unit test over abutting intervals caught it.
+    """
+    events: list[tuple[float, int]] = []
+    for started, finished in intervals:
+        events.append((started, 1))
+        events.append((finished, -1))
+    events.sort(key=lambda event: (event[0], event[1]))
+    best = current = 0
+    for _, delta in events:
+        current += delta
+        best = max(best, current)
+    return best
+
 
 def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcome:
-    """Release N prepared calls at the same instant and classify what came back."""
+    """Release N prepared calls at the same instant, classify what came back, and ==time it.==
+
+    The ``(started, finished)`` pair per call is what lets a later control assert the burst really
+    overlapped. Without it the barrier is a mechanism nobody observes, and every claim in §4 about
+    simultaneity rests on the code being read rather than on the run being measured.
+    """
     barrier = threading.Barrier(len(calls))
     responses: list[Response] = []
+    intervals: list[tuple[float, float]] = []
     lock = threading.Lock()
     latency = Latency(name)
 
     def run(call: Callable[[], Response]) -> None:
         # Every thread blocks here until the last one arrives; then all are released together.
         barrier.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
+        started = time.perf_counter()
         response = call()
+        finished = time.perf_counter()
         latency.record(response.elapsed_ms)
         with lock:
             responses.append(response)
+            intervals.append((started, finished))
 
     with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix="race") as pool:
         list(pool.map(run, calls))
@@ -564,6 +608,7 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
         refusals_by_code=refusals,
         unexpected=unexpected,
         latency=latency,
+        intervals=intervals,
     )
 
 
@@ -1334,6 +1379,58 @@ def control_outbox_drained(
             f"unexplained scrape failures={scrape_failures}"
         ),
         passed=passed,
+    )
+
+
+def judge_race_concurrency(races: list[RaceOutcome]) -> Control:
+    """==C15 — the bursts really OVERLAPPED, which no winner count can establish.==
+
+    C2 fires the same code path at N distinct slots and demands N winners, and the README used to
+    present that as proof the harness "did not only ever really send one". ==It is not.== Booking N
+    different slots strictly one after another also yields N winners. C2 proves the ORACLE can
+    count past one; it says nothing about whether anything was simultaneous.
+
+    Worse, the same blind spot covers the headline. A harness that had quietly serialised its
+    threads would book the same slot N times in sequence and leave *exactly one winner*, because
+    the first takes the slot and the rest are refused on their own — so C10 passes too, C2 passes,
+    and §4 reports a 40-way adversarial burst that never happened. The `threading.Barrier` is the
+    mechanism meant to prevent that, and until now nothing OBSERVED that it worked: the guarantee
+    lived in the code being read, which is the same place the isolation guarantee lived before it
+    was derived.
+
+    So each barrier-released race now carries ``(started, finished)`` per contender on one
+    monotonic clock, and this asserts that at least two of those intervals were open at the same
+    instant. ==Two is the falsifiable core of the claim== — a serialised harness peaks at exactly
+    one — and the measured peak is reported per race so a reader sees how far past the minimum the
+    run actually got, rather than being told a threshold was cleared.
+
+    A single-contender race is excluded: it cannot overlap with anything and `contender_count`
+    already refuses one at the CLI.
+    """
+    contended = [race for race in races if race.contenders > 1]
+    peaks = {race.name: race.peak_overlap for race in contended}
+    serialised = sorted(name for name, peak in peaks.items() if peak < 2)
+    missing = sorted(race.name for race in contended if not race.intervals)
+    reasons: list[str] = []
+    if not contended:
+        reasons.append("no multi-contender race ran, so no simultaneity was exercised at all")
+    if missing:
+        reasons.append(f"no timing was recorded for {missing} — overlap is unfalsifiable there")
+    if serialised:
+        reasons.append(
+            f"{serialised} peaked at ONE request in flight: the burst was a QUEUE, not a race, "
+            "and every 'exactly one winner' it produced would be meaningless"
+        )
+    return Control(
+        ident="C15",
+        guards=(
+            "the adversarial bursts were really SIMULTANEOUS — the barrier worked, rather than "
+            "being trusted"
+        ),
+        expected="every multi-contender race has >= 2 requests in flight at the same instant",
+        observed=f"peak overlap by race: {peaks or 'none'}"
+        + (f" — FAILED: {'; '.join(reasons)}" if reasons else ""),
+        passed=not reasons,
     )
 
 

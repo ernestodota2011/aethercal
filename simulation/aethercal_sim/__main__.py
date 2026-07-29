@@ -55,6 +55,7 @@ from .scenarios import (
     judge_cancel_idempotency,
     judge_confirmation_coverage,
     judge_organic_accounting,
+    judge_race_concurrency,
     next_saturday,
     observe_cancel_webhooks,
     pick_micro_slot,
@@ -671,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
 
     # ---- C13: the organic phase has to add up before its numbers mean anything --------------
     controls.append(judge_organic_accounting(organic, planned=summary["total"]))
+    # ---- C15: and §4's bursts have to have really overlapped, or its winner counts mean nothing
+    controls.append(judge_race_concurrency(races))
 
     drain_latency, mail_read, coverage = measure_confirmations(mailbox, organic.booked)
     controls.append(judge_confirmation_coverage(coverage))
@@ -765,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                         "winners": race.winners,
                         "refusals": race.refusals_by_code,
                         "unexpected": race.unexpected,
+                        "peak_overlap": race.peak_overlap,
                     }
                     for race in races
                 ],

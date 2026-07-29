@@ -101,7 +101,12 @@ REQUIRED_CONTROL_IDS: frozenset[str] = frozenset(
         # is exactly why they had to become controls rather than prose, since the report already
         # CARRIED a warning about the second and a run that shipped with it still said MEASURED.
         "C13",
+        # ==C15 closes the last claim resting on code-reading rather than measurement.== §4 says
+        # the bursts fire together; nothing observed that they did. A harness that serialised its
+        # threads would still leave exactly one winner on one slot (C10) and N winners on N slots
+        # (C2), and report an adversarial burst that never happened.
         "C14",
+        "C15",
     }
 )
 
@@ -342,13 +347,23 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         "then fire together. Two weeks of organic bookings would never collide like this."
     )
     add("")
-    add("| race | contenders | winners | refusals | by code |")
-    add("|---|---:|---:|---:|---|")
+    add("| race | contenders | winners | refusals | by code | peak in flight |")
+    add("|---|---:|---:|---:|---|---:|")
     for race in races:
         add(
             f"| `{race.name}` | {race.contenders} | **{race.winners}** | {race.refusals} "
-            f"| `{race.refusals_by_code}` |"
+            f"| `{race.refusals_by_code}` | **{race.peak_overlap}** |"
         )
+    add("")
+    # ==The last column is the one that makes the rest of this section mean anything.== A harness
+    # that had quietly serialised its threads produces exactly one winner on one slot and N winners
+    # on N slots — the same table — while never overlapping a single request. C15 gates on it.
+    add(
+        "`peak in flight` is the largest number of that race's requests open at the same instant, "
+        "measured from per-request start/end timestamps on one monotonic clock. A serialised "
+        "harness peaks at **1**; **C15** requires at least 2, and the winner counts above are "
+        "evidence of nothing without it."
+    )
     add("")
     unexpected = [(race.name, message) for race in races for message in race.unexpected]
     if unexpected:

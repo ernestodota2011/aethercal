@@ -52,6 +52,7 @@ invalidate that document.
 | **C12** | the drain finished, readably | `due == 0` before the run ends, with zero unexplained scrape failures |
 | **C13** | ==§1 itself: the organic phase is fully explained== | every planned intent lands in a known outcome, the outcomes **sum to the plan**, and no request failed unexpectedly |
 | **C14** | ==§2's slowest row: the confirmation sample is whole== | the mailbox was read to its own reported total and **every** created booking matched a message, with no negative deltas |
+| **C15** | ==§4's premise: the bursts really OVERLAPPED== | every multi-contender race had **≥2 requests in flight at the same instant**, measured per request |
 
 > [!danger] ==A phase whose failures have nowhere to go will always report a quiet fortnight.==
 > **C13** and **C14** exist because §1 and §2 were produced by code that could lose its own
@@ -107,10 +108,21 @@ invalidate that document.
 
 **C2 and C5 audit the harness rather than the product**, and they are the two that matter most.
 
-- Without **C2**, "exactly one winner" is worthless. A harness that had silently serialised its
-  threads, or that counted winners wrongly, reports exactly one winner *whatever the product does*.
-  C2 runs the identical code path at distinct slots and demands N winners, so a run can tell "the
-  product refused 39 requests" apart from "the harness only ever really sent one".
+- Without **C2**, "exactly one winner" is worthless. A harness that counted winners wrongly reports
+  exactly one winner *whatever the product does*. C2 runs the identical code path at distinct slots
+  and demands N winners, so the run can tell that the ORACLE is able to count past one.
+- ==**C2 does NOT prove the requests were simultaneous, and this file used to claim it did.**== That
+  sentence read "so a run can tell *the product refused 39 requests* apart from *the harness only
+  ever really sent one*" — and it is false. Booking N **different** slots strictly one after another
+  also yields N winners; so does booking **one** slot N times in sequence yield exactly one winner,
+  because the first takes it and the rest are refused on their own merits. A harness that had
+  quietly serialised its threads therefore satisfies C2 **and** C10 while never overlapping a single
+  request, and §4 would report a 40-way adversarial burst that never happened. The
+  `threading.Barrier` is the mechanism meant to prevent that and nothing OBSERVED that it worked —
+  the guarantee lived in the code being read, which is exactly where the isolation guarantee lived
+  before it was derived. **C15** measures it: every race records `(started, finished)` per contender
+  on one monotonic clock, and at least two intervals must be open at the same instant. A serialised
+  harness peaks at 1.
 - Without **C5**, every backlog number is unfalsifiable. An instrument wired to a constant zero draws
   exactly the same flat, healthy graph as a queue that is genuinely keeping up. C5 strands real work
   by stopping the worker, then restarts it and demands the metric *see* that work and clear it — the

@@ -13,6 +13,7 @@ import argparse
 import json
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -48,6 +49,8 @@ from aethercal_sim.scenarios import (
     DiaryRead,
     OfferRead,
     OrganicResult,
+    RaceOutcome,
+    _fire_together,
     cap_probe_blocker,
     control_outbox_drained,
     is_reschedule_collision,
@@ -58,7 +61,9 @@ from aethercal_sim.scenarios import (
     judge_drain_deadman,
     judge_lineage,
     judge_organic_accounting,
+    judge_race_concurrency,
     next_saturday,
+    peak_overlap,
     pick_micro_slot,
     read_offer,
 )
@@ -1461,3 +1466,124 @@ def test_a_real_failure_while_NOT_paused_still_reaches_c12() -> None:
     )
     assert control.passed is False
     assert "scrape failures=1" in control.observed
+
+
+# --------------------------------------------------------------------------------------
+# ==C15 -- the bursts really overlapped, which no winner count can establish.==
+#
+# C2 fires the same code path at N distinct slots and demands N winners, and that was presented as
+# proof the harness "did not only ever really send one". It is not: booking N different slots
+# strictly one after another also yields N winners. And the same blind spot covers the headline --
+# a serialised harness booking ONE slot N times in sequence leaves exactly one winner too, so C10
+# passes, C2 passes, and 4 reports a 40-way burst that never happened.
+# --------------------------------------------------------------------------------------
+
+
+def _race(name: str, intervals: list[tuple[float, float]], *, winners: int = 1) -> RaceOutcome:
+    return RaceOutcome(
+        name=name,
+        contenders=max(len(intervals), 1),
+        winners=winners,
+        refusals_by_code={},
+        unexpected=[],
+        latency=Latency(name),
+        intervals=intervals,
+    )
+
+
+def test_peak_overlap_counts_simultaneous_intervals() -> None:
+    assert peak_overlap([(0.0, 1.0), (0.5, 1.5), (0.9, 2.0)]) == 3
+    assert peak_overlap([(0.0, 1.0), (0.5, 1.5)]) == 2
+    assert peak_overlap([(0.0, 1.0)]) == 1
+    assert peak_overlap([]) == 0
+
+
+def test_peak_overlap_of_a_strictly_serial_burst_is_one() -> None:
+    """==The signature of a harness that queued instead of racing.=="""
+    serial = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
+    assert peak_overlap(serial) == 1
+
+
+def test_c15_passes_on_a_genuinely_concurrent_burst() -> None:
+    overlapping = [(0.0, 1.0), (0.01, 1.02), (0.02, 0.98)]
+    control = judge_race_concurrency([_race("race_same_slot", overlapping)])
+    assert control.passed is True
+    assert "race_same_slot" in control.observed
+
+
+def test_c15_FAILS_a_serialised_burst_that_every_other_control_would_pass() -> None:
+    """==The defect, stated as the run that would otherwise read green.==
+
+    These are the timings of a harness whose threads never overlapped. Its winner counts are
+    exactly what a correct 40-way race produces, so C2 and C10 are satisfied by it.
+    """
+    serial = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
+    control = judge_race_concurrency([_race("race_same_slot", serial)])
+    assert control.ran is True
+    assert control.passed is False
+    assert "QUEUE, not a race" in control.observed
+
+
+def test_c15_fails_if_ANY_contended_race_serialised() -> None:
+    """One good race does not vouch for the others; each burst carries its own claim."""
+    good = _race("control_race_distinct_slots", [(0.0, 1.0), (0.1, 1.1)])
+    bad = _race("race_cancel_same_booking", [(5.0, 6.0), (6.0, 7.0)])
+    control = judge_race_concurrency([good, bad])
+    assert control.passed is False
+    assert "race_cancel_same_booking" in control.observed
+
+
+def test_c15_fails_when_a_race_recorded_no_timing_at_all() -> None:
+    """==Absent evidence is not evidence.== An untimed burst cannot support the claim either."""
+    control = judge_race_concurrency([_race("race_same_slot", [])])
+    assert control.passed is False
+
+
+def test_c15_ignores_a_single_contender_race() -> None:
+    """A lone call cannot overlap with anything and is not asked to."""
+    solo = RaceOutcome(
+        name="solo",
+        contenders=1,
+        winners=1,
+        refusals_by_code={},
+        unexpected=[],
+        latency=Latency("solo"),
+        intervals=[(0.0, 1.0)],
+    )
+    good = _race("race_same_slot", [(0.0, 1.0), (0.1, 1.1)])
+    assert judge_race_concurrency([solo, good]).passed is True
+
+
+def test_c15_refuses_a_run_with_no_contended_race_at_all() -> None:
+    assert judge_race_concurrency([]).passed is False
+
+
+def test_race_outcome_exposes_its_own_peak() -> None:
+    assert _race("r", [(0.0, 1.0), (0.5, 1.5)]).peak_overlap == 2
+
+
+def test_fire_together_RECORDS_the_overlap_it_creates() -> None:
+    """==The RECORDER, pinned -- because the judge's tests could not reach it.==
+
+    `test_c15_fails_when_a_race_recorded_no_timing_at_all` builds a RaceOutcome with no intervals by
+    hand, so deleting the `intervals.append(...)` line left it green: it bound the judge and never
+    the recording. Same shape as `read_offer`, `is_reschedule_collision` and `cap_probe_blocker` --
+    a mutation run is what surfaces it every time.
+
+    This drives the real barrier and the real thread pool over trivial in-process callables (no
+    socket), so the overlap it asserts is one the harness actually produced.
+    """
+
+    def make() -> Callable[[], Response]:
+        def call() -> Response:
+            time.sleep(0.05)
+            return Response(201, {"id": "x"}, "", 50.0, None)
+
+        return call
+
+    outcome = _fire_together([make() for _ in range(4)], "probe_race")
+    assert len(outcome.intervals) == 4
+    assert outcome.winners == 4
+    # The barrier releases all four together and each holds for 50ms, so they must overlap.
+    assert outcome.peak_overlap >= 2
+    assert judge_race_concurrency([outcome]).passed is True
