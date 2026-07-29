@@ -377,9 +377,13 @@ async def test_a_gateway_that_blows_up_still_returns_the_money(
     tape = _Recorder()
     dropped = httpx.ConnectError("the connection dropped mid-refund")
 
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(httpx.ConnectError) as raised:
         await _drive(tape, monkeypatch, gateway_raises=dropped)()
 
+    assert raised.value is dropped, (
+        "the propagating exception is not the one the gateway raised — something between it and "
+        "the operator replaced it"
+    )
     assert "ensure_refunded" in tape.calls, (
         "the gateway blew up and NOTHING tried to send the money back — the `finally` that exists "
         f"for exactly this did not run. Tape: {tape.calls}"
@@ -409,7 +413,7 @@ async def test_a_cleanup_failure_never_replaces_the_gateway_failure(
     tape = _Recorder()
     dropped = httpx.ConnectError("the connection dropped mid-refund")
 
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(httpx.ConnectError) as raised:
         await _drive(
             tape,
             monkeypatch,
@@ -417,5 +421,14 @@ async def test_a_cleanup_failure_never_replaces_the_gateway_failure(
             settled="100 of 100 cents are STILL NOT refunded",
         )()
 
+    # ==IDENTITY, not class.== Both stories end in a `ConnectError`: the gateway's, and a cleanup
+    # that raised its own on the way out. The class is compatible with the thing being proved AND
+    # with the thing being feared, so it distinguishes nothing — which is the defect this whole
+    # test exists to catch, appearing inside the test itself.
+    assert raised.value is dropped, (
+        "the exception that reached the operator is not the one the gateway raised. A cleanup "
+        "failure replaced the failure that explains it, so the report names the stuck money and "
+        "hides that the provider call is what broke."
+    )
     assert "shout" in tape.calls, f"money was left stuck and nobody was told. Tape: {tape.calls}"
     assert EVIDENCE not in tape.calls, tape.calls

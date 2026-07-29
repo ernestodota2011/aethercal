@@ -28,7 +28,7 @@ construction nobody thought to exclude.
   the attempt precedes the alarm. ==And the case the guarantee was BUILT for==: when
   `gateway.refund` itself raises (a timeout, a 500, the connection dropping), the exception
   propagates, `ensure_refunded` still runs, it runs *after* the attempt, nothing is certified, and a
-  cleanup that also fails never replaces the original failure. ==Shouting and certifying in the same breath would put a claim
+  cleanup that also fails never replaces the original failure — asserted by IDENTITY (`is`), not by class: both stories end in a `ConnectError`, so the class is compatible with the thing being proved AND the thing being feared. ==Shouting and certifying in the same breath would put a claim
   into `live_verifications()` that the alarm itself contradicts.==
 - Offline and unmarked: no credential, no network, so the money harness's own invariants run on
   every commit instead of only on the day somebody runs it for real.
