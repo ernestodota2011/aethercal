@@ -14,10 +14,17 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `ed6db4f8` | 2026-07-29 | MEASURED | 239 planned / 212 created, 27 create-leg + 1 reschedule-leg collisions, 40-way races, **all fourteen** controls held. Every number in it reconciles against another: §6's 539 classified responses = 257 slot reads (both legs) + 239 bookings + 25 cancels + 18 reschedules, and its 28 `slot_unavailable` = 27 + 1. Confirmation sample proven complete (212 of 212 matched; mailbox paged to the 282 messages Mailpit reports). Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `ef379d88` | 2026-07-29 | MEASURED | 239 planned / 207 created, 32 create-leg + 2 reschedule-leg collisions, 40-way races, **all fourteen** controls held. Every published number derives from another: §6's 533 classified = 255 slot reads (both legs) + 239 bookings + 23 cancels + 16 reschedules, and its 34 `slot_unavailable` = 32 + 2. Confirmations 207 of 207, mailbox paged to the 269 messages Mailpit reports, 0 negative deltas. 501 backlog samples, **0** scrape failures and **0** reads discarded at the deliberate-outage boundary. Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Five earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, five times over.
+> [!warning] ==Six earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, six times over.
+>
+> `ed6db4f8` — the only one withdrawn without a defect in it. Every number it published was correct
+> and reconciled, and its own JSON shows the two later fixes never bit in it: **0 scrape failures**,
+> so `pause()`'s race never recorded a boundary failure, and full durable readings, so the metrics
+> reader never met a malformed payload. It is withdrawn because the reader and the sampler changed
+> underneath it and §3 grew a line it does not carry. ==A certificate should be produced by the code
+> it certifies==, and this directory has withdrawn five reports for weaker reasons than that.
 >
 > `19228cd7` — withdrawn for a hole in the numbers rather than in a control. ==§6 calls itself
 > "every outcome, successes included" and was short by one response per reschedule attempted==: the
