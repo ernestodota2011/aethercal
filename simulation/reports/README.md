@@ -14,10 +14,19 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `e36c28c3` | 2026-07-29 | MEASURED | 239 planned / 200 created, 39 create-leg + 3 reschedule-leg collisions, 40-way races, **all fourteen** controls held. The first run whose §1 **reconciles** with §6 (42 `slot_unavailable` = 39 + 3) and whose confirmation sample is **proven** complete (200 of 200 matched; the mailbox paged to its own reported total instead of to a hardcoded ceiling). Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `19228cd7` | 2026-07-29 | MEASURED | 239 planned / 204 created, 35 organic collisions, 40-way races, **all fourteen** controls held — and the first run in which every control's own READ is checked before its answer is believed. §1 reconciles with §6 (35 `slot_unavailable` = 35 create-leg + 0 reschedule-leg collisions) and the confirmation sample is proven complete (204 of 204 matched; the mailbox paged to the 272 messages Mailpit itself reports, not to a hardcoded ceiling). Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Three earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, three times over.
+> [!warning] ==Four earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, four times over.
+>
+> `e36c28c3` — the first run under C13 and C14, and it is withdrawn for the reason that keeps
+> recurring one layer further in: ==two of the controls certifying it still trusted reads they had
+> not checked.== C4's third probe passes when the day has left the offer, so an empty offer is the
+> answer it *hopes for* — and it tested only `response.ok`, so a 2xx whose body was not the slots
+> contract read as the cap biting. C7 skipped any sink delivery whose base64 or JSON failed to
+> decode, so a duplicate `booking.cancelled` with an unparseable body was invisible to the count it
+> then called "exactly one". Neither fired in that run; both could have, and nothing would have
+> said so.
 >
 > `b72197a2` — the first run whose isolation was *derived*, and its controls were sound as far as
 > they went. What they did not go to was the two phases that produce §1 and §2. The organic worker
