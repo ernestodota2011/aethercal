@@ -876,6 +876,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 "confirmations": {
                     "created": coverage.created,
                     "matched": coverage.matched,
+                    "superseded": coverage.superseded,
+                    "unaccounted": coverage.unaccounted,
+                    "duplicate_confirmations": coverage.duplicate_confirmations,
+                    "colliding_uids": coverage.colliding_uids,
                     "negative_deltas": coverage.negative_deltas,
                     "worst_negative_ms": coverage.worst_negative_ms,
                     "mailbox_read_complete": coverage.read_complete,

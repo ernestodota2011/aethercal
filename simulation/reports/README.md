@@ -14,10 +14,19 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `925780c6` | 2026-07-29 | MEASURED | 239 planned / 206 created, 33 create-leg + 2 reschedule-leg collisions, 40-way races, **all fifteen** controls held. Simultaneity measured: peak **40 of 40** requests in flight at once on every 40-way race (C15). ==C8/C9 now name the survivor and the subject side by side== — a fully-failed race leaves the ORIGINAL alive, which is what "one successor survived" used to look like. Every published number derives from another: §6's 531 classified = 253 slot reads (both legs) + 239 bookings + 25 cancels + 14 reschedules, and its 35 `slot_unavailable` = 33 + 2. Confirmations 206 of 206, 0 negative deltas; 336 backlog samples, 0 scrape failures, 0 boundary discards. Records the same real observability limit as its predecessors: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `dc008532` | 2026-07-29 | MEASURED | 239 planned / 209 created, 30 create-leg + 2 reschedule-leg collisions, 40-way races, **all fifteen** controls held. ==A confirmation is now identified by its calendar identity (`UID`/`METHOD`/`STATUS`/`SEQUENCE` in the `.ics`), one-to-one with its booking== — not by "the earliest mail to that address". §6's 537 classified = 257 slot reads (both legs) + 239 bookings + 23 cancels + 18 reschedules; its 32 `slot_unavailable` = 30 + 2. Confirmations: 187 matched, **22 superseded** (the product retires a queued confirmation when the booking is cancelled or rescheduled first), 0 unaccounted, 0 duplicates, 0 negative deltas. Peak 40 of 40 requests in flight (C15). 361 backlog samples, 0 scrape failures. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Eight earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, eight times over.
+> [!warning] ==Nine earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, nine times over.
+>
+> `925780c6` — withdrawn because §2 was measuring the wrong messages. A booking was "matched" to
+> *the earliest mail to its guest*, and every guest also receives their cancellation or reschedule
+> notice — so the rule worked only because confirmations normally arrive first, ==a property of the
+> order of events rather than a check.== For a booking whose confirmation was retired and whose
+> cancellation was sent, the earliest and only message is the cancellation: it counted as confirmed
+> and §2 absorbed a timestamp minutes late, for another reason. Its published
+> `booking_to_confirmation_email` p50 of 6175.8 ms carried those; the replacement, over confirmations
+> only, is **4583.7 ms**.
 >
 > `2cbac654` — withdrawn because C8 and C9 could pass over a system that never moved. If every
 > request in the mutation race had failed, the ORIGINAL booking would still be sitting there, and a
