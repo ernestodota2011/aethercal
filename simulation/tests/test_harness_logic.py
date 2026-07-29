@@ -10,7 +10,9 @@ passed.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
+import inspect
 import json
 import pathlib
 import random
@@ -2636,3 +2638,79 @@ def test_run_sh_sale_distinto_de_cero_si_el_teardown_falla() -> None:
     assert "run_status != 0 ? run_status : teardown_status" in cuerpo, (
         "un teardown fallido debe salir != 0 SIN tapar un fallo previo de la corrida"
     )
+
+
+def test_error_tally_lee_bajo_el_lock_y_no_toca_counts_directo() -> None:
+    """REGRESION: `record` tomaba el lock y `total`/`failures`/`rows` NO.
+
+    ==Se afirma sobre la FORMA, y aqui eso es lo correcto — con su motivo medido.==
+    Intente un test de carrera real (6 escritores estrenando claves contra 4
+    lectores) y ==pasaba IGUAL sin el lock, tres corridas seguidas==: en CPython
+    `list(d.items())` es una sola llamada en C que no suelta el GIL, asi que la
+    lectura es atomica de hecho y la carrera no es reproducible. Enviar aquel test
+    habria sido peor que no tener ninguno: habria AFIRMADO una cobertura que no
+    tenia. El lock se queda porque el hecho sigue siendo cierto donde no hay GIL
+    (free-threading, PyPy) y cuesta nada; lo que se puede fijar es que las lecturas
+    pasen por la instantanea protegida, y eso se le pregunta al AST.
+    """
+    fuente = (
+        pathlib.Path(inspect.getsourcefile(ErrorTally) or "")  # type: ignore[arg-type]
+    ).read_text(encoding="utf-8")
+    clase = next(
+        nodo
+        for nodo in ast.walk(ast.parse(fuente))
+        if isinstance(nodo, ast.ClassDef) and nodo.name == "ErrorTally"
+    )
+    metodos = {
+        m.name: m for m in clase.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    # la instantanea toma el lock
+    con_lock = [
+        n
+        for n in ast.walk(metodos["_snapshot"])
+        if isinstance(n, ast.With)
+        and any(
+            isinstance(i.context_expr, ast.Attribute) and i.context_expr.attr == "_lock"
+            for i in n.items
+        )
+    ]
+    assert con_lock, "_snapshot debe leer bajo self._lock"
+
+    # y ningun lector toca self.counts por su cuenta
+    for nombre in ("total", "failures", "rows"):
+        directo = [
+            n
+            for n in ast.walk(metodos[nombre])
+            if isinstance(n, ast.Attribute)
+            and n.attr == "counts"
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "self"
+        ]
+        assert not directo, f"{nombre}() lee self.counts sin pasar por _snapshot"
+        llama = [
+            n
+            for n in ast.walk(metodos[nombre])
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_snapshot"
+        ]
+        assert llama, f"{nombre}() no usa la instantanea protegida"
+
+
+def test_error_tally_sigue_contando_bien_con_escritura_concurrente() -> None:
+    """Humo, no discriminante (ver arriba): 6 escritores y el total tiene que ser
+    exacto. No prueba el lock; prueba que la instrumentacion no pierde cuentas."""
+    tally = ErrorTally()
+    escritores, por_escritor = 6, 500
+
+    def escribir(nucleo: int) -> None:
+        for i in range(por_escritor):
+            tally.record(Response(409, {}, "", 1.0, f"c{nucleo}_{i}"))
+
+    hilos = [threading.Thread(target=escribir, args=(n,)) for n in range(escritores)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    assert tally.total() == escritores * por_escritor

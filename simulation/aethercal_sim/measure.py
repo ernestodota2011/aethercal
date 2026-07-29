@@ -111,15 +111,27 @@ class ErrorTally:
         with self._lock:
             self.counts[key] += 1
 
+    def _snapshot(self) -> list[tuple[tuple[int, str], int]]:
+        """Copia bajo el lock. ==Escribir protegido y LEER sin proteger no es proteger.==
+
+        `record` corre desde 8 invitados organicos y desde rafagas de 40 hilos; iterar
+        `counts` mientras otro hilo lo muta puede reventar con "dictionary changed size
+        during iteration" o —peor, porque es silencioso— devolver un total que no
+        corresponde a ningun instante real. La taxonomia de §6 y la reconciliacion de
+        C13 se calculan sobre esto.
+        """
+        with self._lock:
+            return list(self.counts.items())
+
     def total(self) -> int:
-        return sum(self.counts.values())
+        return sum(count for _, count in self._snapshot())
 
     def failures(self) -> int:
-        return sum(count for (status, _), count in self.counts.items() if not 200 <= status < 300)
+        return sum(count for (status, _), count in self._snapshot() if not 200 <= status < 300)
 
     def rows(self) -> list[tuple[int, str, int]]:
         return sorted(
-            ((status, code, count) for (status, code), count in self.counts.items()),
+            ((status, code, count) for (status, code), count in self._snapshot()),
             key=lambda row: (-row[2], row[0], row[1]),
         )
 
