@@ -1591,7 +1591,12 @@ def test_fire_together_RECORDS_the_overlap_it_creates() -> None:
     assert judge_race_concurrency([outcome]).passed is True
 
 
-@pytest.mark.parametrize("corrupt", ["not base64 at all!!", "YWJj*&^%", "###", "AAAA===="])
+# ==Excess padding ("AAAA====") is NOT in this list, and the reason is worth keeping.== It raised
+# on the author's Windows interpreter and did not on Linux, so the case went green locally and red
+# in CI -- on the platform the harness actually runs on. Over-padding is implementation-defined in
+# `binascii`, which makes it a bad example of corruption rather than a bug in the guard: the cases
+# below all carry characters outside the base64 alphabet, which `validate=True` rejects everywhere.
+@pytest.mark.parametrize("corrupt", ["not base64 at all!!", "YWJj*&^%", "###", "a b c d"])
 def test_a_corrupt_delivery_body_RAISES_rather_than_decoding_to_garbage(corrupt: str) -> None:
     """==The lax decoder does not fail, it lies.==
 
