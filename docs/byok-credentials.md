@@ -195,6 +195,13 @@ what has actually been exercised, and the door reads it.
 While any ❌ remains for a provider, `aethercal-admin credentials set` accepts only a provably
 test-mode credential (`sk_test_…`, `TEST-…`) and names the operations that are still unproven.
 
+**What verification does *not* relax:** the value must be a recognisable key of that provider —
+`sk_test_…`/`sk_live_…` for Stripe, `TEST-…`/`APP_USR-…` for Mercado Pago — **always**, verified or
+not. That check used to ride on the test-mode prefix, so it vanished the moment a provider became
+fully verified, leaving a truncated paste or a key from another account to be stored unexamined at
+exactly the point real money starts moving. The two questions are now separate: *is this a key of
+this provider?* (permanent) and *is this the right mode for what we have proved?* (relaxes).
+
 #### Why per operation, and not one flag per provider
 
 Because the two cost different things to prove, and a single flag would have to lie about one of
@@ -265,7 +272,16 @@ The barriers on the money phase are structural, not procedural:
 
 The run prints an evidence block. **That block, not a boolean, is what goes into
 `live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
-carrying the mode, the date and what was observed. Writing one requires having done the run.
+carrying the mode, the date, the **implementation fingerprint** and what was observed. Writing one
+requires having done the run.
+
+> [!NOTE]
+> **A verification is about an implementation, not about a provider's name.** Each record names the
+> fingerprint of the exact gateway method it exercised, and the test suite re-computes it — so
+> editing `StripeGateway.refund` **invalidates that operation's verification** and demands a fresh
+> run. Without it, the register would go on saying "verified" about code nobody has ever run. The
+> hash covers the method's source, so even a cosmetic edit forces a re-run: a needless free run
+> costs minutes, a false "still verified" costs somebody's money.
 
 > [!WARNING]
 > **A verification performed in TEST mode does not authorise a LIVE credential.** Each record states

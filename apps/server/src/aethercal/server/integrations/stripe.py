@@ -18,8 +18,9 @@
   :func:`~aethercal.server.services.tenant_credentials.live_verifications`, **per operation**, and
   the BYOK credential door reads it: while an operation of this gateway has no record of having been
   run for real, a live Stripe credential is refused. Producing such a record is what
-  ``apps/server/tests/live/`` is for — zero-cost calls only. ==Keep the status THERE and not in this
-  paragraph==, or the two will drift and only one of them will be load-bearing.
+  ``apps/server/tests/live/`` is for: the checkout half at zero cost, the refund half at the price
+  of a real $1 charge that a person pays and the harness returns. ==Keep the status THERE and not in
+  this paragraph==, or the two will drift and only one of them will be load-bearing.
 
 .. rubric:: Why the ``Stripe-Signature`` timestamp tolerance is NOT enforced here
 

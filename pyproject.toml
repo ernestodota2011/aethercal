@@ -125,10 +125,17 @@ markers = [
     # evidence `live_verifications()` records before a live payment credential may be stored.
     # They skip unless the provider's key is exported, so the default matrix never dials out; the
     # repo-root conftest turns `-m live_provider` WITHOUT a key into a hard error rather than a
-    # green run of nothing. ==Zero-cost calls only: create a Checkout Session, read it, expire it.
-    # No charge, no refund, no money moves.== They are the one exception to the repo-wide network
-    # guard (see pytest_network_guard.py) and are never run in CI.
-    "live_provider: exercises a REAL provider API (set AETHERCAL_LIVE_STRIPE_SECRET_KEY); zero-cost calls only, never in CI",
+    # green run of nothing. They are the one exception to the repo-wide network guard (see
+    # pytest_network_guard.py) and are never run in CI.
+    #
+    # ==NOT all of it is free, and this description used to say it was.== The checkout harness is
+    # zero-cost: create a Checkout Session, read it, expire it. The REFUND harness cannot be — live
+    # mode has no test cards, so verifying a refund needs a REAL $1 charge, paid by a person, and
+    # refunded. Those phases sit behind their OWN separate opt-ins
+    # (AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE, AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION) and never
+    # run on the strength of the API key alone. ==A money warning that understates the risk is
+    # worse than none: it gets read, and it reassures.==
+    "live_provider: exercises a REAL provider API (set AETHERCAL_LIVE_STRIPE_SECRET_KEY). Checkout is zero-cost; the refund phases need their own opt-ins and DO move real money ($1, charged and refunded). Never in CI",
 ]
 
 [tool.coverage.run]

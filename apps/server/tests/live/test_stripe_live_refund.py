@@ -71,8 +71,12 @@ from typing import Any
 import httpx
 import pytest
 
+from aethercal.server.integrations.money import implementation_fingerprint
 from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.services.outbox import refund_dedupe_key
+from aethercal.server.services.tenant_credentials import CredentialProvider, GatewayOperation
+
+REFUND = GatewayOperation.REFUND
 
 pytestmark = pytest.mark.live_provider
 
@@ -386,6 +390,9 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
         print(
             "\n=== EVIDENCE for live_verifications(CredentialProvider.STRIPE) ===\n"
             "  operation   : GatewayOperation.REFUND\n"
+            f"  implement.  : {implementation_fingerprint(CredentialProvider.STRIPE, REFUND)}\n"
+            "                ==The code this run exercised.== Editing that method invalidates this "
+            "record and demands a fresh run — which, for refund, means another real charge.\n"
             f"  mode        : ProviderMode.{mode}  <- Stripe's own `livemode`, on the paid "
             "session.\n"
             "                ==Only ProviderMode.LIVE authorises a live credential.==\n"

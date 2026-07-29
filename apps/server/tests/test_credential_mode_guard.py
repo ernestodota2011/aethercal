@@ -49,13 +49,13 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from datetime import date
-from typing import assert_never
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant
+from aethercal.server.integrations.money import gateway_method_for, implementation_fingerprint
 from aethercal.server.services import tenant_credentials as credentials
 from aethercal.server.services.payments import PaymentGateway
 from aethercal.server.services.tenant_credentials import (
@@ -66,7 +66,9 @@ from aethercal.server.services.tenant_credentials import (
     LiveCredentialRefusedError,
     LiveVerification,
     ProviderMode,
+    UnrecognisedCredentialError,
     credential_class,
+    credential_key_families,
     declared_test_mode_prefixes,
     gateway_operations,
     live_verifications,
@@ -135,6 +137,9 @@ def _exercised(
         LiveVerification(
             operation=operation,
             mode=mode,
+            # The CURRENT fingerprint: these tests are about mode and coverage, so their records
+            # must not also look stale. Staleness has its own tests below.
+            implementation=implementation_fingerprint(CredentialProvider.STRIPE, operation),
             verified_on=date(2026, 7, 25),
             evidence="synthetic: arranged by a test, nothing was run against any provider",
         )
@@ -239,6 +244,73 @@ class TestTheDoorFollowsTheRegister:
         """
         _exercised(monkeypatch, *GatewayOperation)
         await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+    async def test_rubbish_is_refused_even_when_every_operation_is_verified(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==The type check must OUTLIVE the mode check, and it used to die with it.==
+
+        There was one check on the shape of a payment key — the TEST-mode prefix — so a fully
+        verified provider had ``required_test_mode_prefixes`` return ``{}`` and ==nothing looked at
+        ``secret_key`` at all==. That state is the one where real money moves, which makes it the
+        worst possible moment for a validation to disappear.
+
+        A truncated paste, a key from another account, a webhook secret in the wrong field: all of
+        them stored without a murmur, to be discovered when somebody tried to pay.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        with pytest.raises(UnrecognisedCredentialError):
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.STRIPE,
+                {"secret_key": "whsec_THIS_IS_A_WEBHOOK_SECRET", "webhook_secret": "whsec_FAKE"},
+            )
+
+    async def test_a_restricted_key_is_refused_in_every_state_of_the_register(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==Fail closed, permanently.== ``rk_live_`` is a real Stripe key and not one we accept.
+
+        The allowlist reasoning survives verification intact: a restricted key, a publishable key or
+        a prefix Stripe invents next year is refused because it is not on the list — never admitted
+        because nobody thought to forbid it. Verification lifts the TEST restriction, nothing more.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        with pytest.raises(UnrecognisedCredentialError):
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.STRIPE,
+                {"secret_key": "rk_live_NOT_A_REAL_KEY", "webhook_secret": "whsec_FAKE"},
+            )
+
+    async def test_rubbish_is_reported_as_rubbish_not_as_a_mode_problem(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==Each refusal answers its own question==, even while the mode guard is fully armed.
+
+        Telling an operator that a webhook secret "is not a test-mode credential" sends them to
+        rotate a key that was never a key. The type check runs first and says what is actually
+        wrong.
+        """
+        _exercised(monkeypatch)  # nothing verified: the mode guard is armed
+        with pytest.raises(UnrecognisedCredentialError):
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.STRIPE,
+                {"secret_key": "not-a-key-at-all", "webhook_secret": "whsec_FAKE"},
+            )
 
     async def test_a_test_mode_key_is_accepted_in_every_state_of_the_register(
         self,
@@ -346,20 +418,21 @@ class TestTheRegisterAsItStandsToday:
         )
 
 
-def _gateway_method_for(operation: GatewayOperation) -> str:
-    """The ``PaymentGateway`` method each operation names. ==Exhaustive, and that is the lock.==
+def _records_whose_code_has_changed(provider: CredentialProvider) -> list[str]:
+    """Verifications whose implementation no longer matches the code in the tree.
 
-    A member added to :class:`GatewayOperation` without saying which call it stands for does not
-    type-check here, and the test below turns this mapping into a two-way check against the protocol
-    itself.
+    ==The check production cannot make itself.== ``services`` may not import ``integrations``, so
+    the register stores the fingerprint as an opaque string and the tie is made here — exactly as
+    it is for :class:`GatewayOperation` and the ``PaymentGateway`` protocol.
     """
-    match operation:
-        case GatewayOperation.CHECKOUT:
-            return "create_checkout_session"
-        case GatewayOperation.REFUND:
-            return "refund"
-        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
-            assert_never(unreachable)
+    # Through the MODULE, not this file's own imported name: that is how the door resolves the
+    # register, so it is how a test arranging the register must read it back. A direct import here
+    # would quietly bypass every `monkeypatch` and the arranged states would never be seen.
+    return [
+        f"{provider.value}/{record.operation.value}"
+        for record in credentials.live_verifications(provider)
+        if record.implementation != implementation_fingerprint(provider, record.operation)
+    ]
 
 
 class TestTheRuleIsDerived:
@@ -388,6 +461,55 @@ class TestTheRuleIsDerived:
             f"to while their gateway is unverified: {undeclared}"
         )
 
+    def test_every_money_provider_declares_a_key_family(self) -> None:
+        """==The permanent check must exist for every provider that moves money.==
+
+        A money provider with no declared family has no type validation at all — and, once verified,
+        no validation of any kind. Walked from the enum, so a third processor fails here on the day
+        it is added.
+        """
+        undeclared = [
+            provider.value
+            for provider in CredentialProvider
+            if credential_class(provider) is CredentialClass.MONEY
+            and not credential_key_families(provider)
+        ]
+        assert not undeclared, (
+            "these money providers declare no recognisable key family, so once their gateway is "
+            f"verified nothing at all would check what gets stored: {undeclared}"
+        )
+
+    def test_the_test_mode_prefix_is_one_of_the_recognised_families(self) -> None:
+        """==The two guards must agree, or the door is unsatisfiable.==
+
+        The mode guard demands a TEST prefix; the type guard demands a recognised family. If the
+        first named a prefix the second rejects, ==no value on earth could be stored== while the
+        provider was unverified — a door locked from both sides, discovered by whoever tried to
+        configure it.
+        """
+        for provider in CredentialProvider:
+            families = credential_key_families(provider)
+            for field, test_prefix in declared_test_mode_prefixes(provider).items():
+                assert field in families, (
+                    f"{provider.value} guards the mode of {field!r} but declares no key family for "
+                    "it, so the permanent type check does not cover the field the mode check does"
+                )
+                assert test_prefix.startswith(families[field]), (
+                    f"{provider.value}'s test-mode prefix {test_prefix!r} is not one of its "
+                    f"recognised families {families[field]}: while unverified, the type "
+                    "guard would reject exactly what the mode guard demands"
+                )
+
+    def test_every_key_family_field_is_one_the_provider_actually_requires(self) -> None:
+        """A permanent guard on an OPTIONAL field is skipped by leaving the field out — same trap
+        as the mode guard's, and it needs the same lock."""
+        for provider in CredentialProvider:
+            guarded = set(credential_key_families(provider))
+            assert guarded <= required_fields(provider), (
+                f"{provider.value} type-checks {guarded - required_fields(provider)}, which "
+                "it does not require — so the check is skipped by leaving the field out"
+            )
+
     def test_every_guarded_field_is_one_the_provider_actually_requires(self) -> None:
         """==A guard on an OPTIONAL field is a guard that is skipped by omitting the field.==
 
@@ -407,6 +529,7 @@ class TestTheRuleIsDerived:
         for provider in CredentialProvider:
             declared_test_mode_prefixes(provider)
             required_test_mode_prefixes(provider)
+            credential_key_families(provider)
             gateway_operations(provider)
             live_verifications(provider)
 
@@ -461,6 +584,60 @@ class TestTheRuleIsDerived:
                     f"({record.verified_on}); it must be the day the harness actually ran"
                 )
 
+    def test_no_verification_outlives_the_code_it_exercised(self) -> None:
+        """==A verification is about an IMPLEMENTATION, not about a provider's name.==
+
+        Rewrite ``StripeGateway.refund`` and, without this, the register goes on saying "verified"
+        about code ==nobody has ever run== — the evidence quietly outliving its subject, which is
+        ``feedback_justificacion_caduca`` in its purest form. Re-running the harness is the only way
+        to make the claim true again, and this is what demands it.
+        """
+        stale = [
+            name
+            for provider in CredentialProvider
+            for name in _records_whose_code_has_changed(provider)
+        ]
+        assert not stale, (
+            f"these verifications name code that has since changed: {stale}. The adapter was "
+            "edited after it was exercised, so the evidence no longer describes what would run. "
+            "Re-run the harness for those operations and record the new fingerprint — or, if the "
+            "edit was cosmetic, that re-run is cheap and the alternative is trusting a guess."
+        )
+
+    def test_a_verification_whose_code_changed_is_detected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """==The anti-vacuity half.== With an empty register the test above proves nothing yet.
+
+        So the state is arranged: a record that claims a fingerprint the tree does not produce. It
+        must be caught. Without this, a broken staleness check would sit green until the day
+        somebody added the first real verification — and then fail to protect it.
+        """
+        monkeypatch.setattr(
+            credentials,
+            "live_verifications",
+            lambda provider: (
+                LiveVerification(
+                    operation=GatewayOperation.CHECKOUT,
+                    mode=ProviderMode.LIVE,
+                    implementation="0000000000000000",  # not what any adapter hashes to
+                    verified_on=date(2026, 7, 25),
+                    evidence="synthetic: a verification of code that no longer exists",
+                ),
+            ),
+        )
+
+        assert _records_whose_code_has_changed(CredentialProvider.STRIPE) == ["stripe/checkout"]
+
+    def test_a_verification_of_the_current_code_is_not_flagged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: a CURRENT fingerprint must pass, or every verification would be stale
+        forever and the register could never be filled in at all."""
+        _exercised(monkeypatch, GatewayOperation.CHECKOUT)
+
+        assert _records_whose_code_has_changed(CredentialProvider.STRIPE) == []
+
     def test_every_gateway_operation_has_an_enum_member(self) -> None:
         """==The anti-omission lock for a THIRD operation, read off the protocol itself.==
 
@@ -473,7 +650,7 @@ class TestTheRuleIsDerived:
         operation ``gateway_operations`` does not list, so it is never counted as unverified — it
         would ride into production on evidence gathered for entirely different calls.
         """
-        declared = {_gateway_method_for(operation) for operation in GatewayOperation}
+        declared = {gateway_method_for(operation) for operation in GatewayOperation}
         on_the_protocol = {
             name
             for name, member in inspect.getmembers(PaymentGateway)

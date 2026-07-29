@@ -26,6 +26,8 @@ list in the test — so the lock cannot be satisfied by editing a fixture.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 from typing import assert_never
 
 from aethercal.server.integrations.mercadopago import MercadoPagoGateway, MercadoPagoWebhookAdapter
@@ -35,6 +37,7 @@ from aethercal.server.services.payments import PaymentGateway
 from aethercal.server.services.tenant_credentials import (
     CredentialClass,
     CredentialProvider,
+    GatewayOperation,
     credential_class,
 )
 
@@ -83,6 +86,51 @@ def gateway_for(provider: CredentialProvider) -> PaymentGateway:
             raise NotAMoneyProviderError(_not_money(provider))
         case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
             assert_never(unreachable)
+
+
+def gateway_method_for(operation: GatewayOperation) -> str:
+    """Which gateway call each domain operation names. ==Exhaustive, and it lives HERE.==
+
+    ``GatewayOperation`` is in ``services`` because the credential door reads it, and the gateways
+    are in ``integrations``; this module is the one place that legitimately knows both. A third
+    operation (F5's partial refund, a capture) does not type-check until somebody has said which
+    call it stands for.
+    """
+    match operation:
+        case GatewayOperation.CHECKOUT:
+            return "create_checkout_session"
+        case GatewayOperation.REFUND:
+            return "refund"
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
+def implementation_fingerprint(provider: CredentialProvider, operation: GatewayOperation) -> str:
+    """A reproducible identity of the CODE that performs ``operation`` for ``provider``.
+
+    .. rubric:: ==Why a verification has to name the code it exercised==
+
+    ``live_verifications`` records that somebody ran the adapter against the real API on a given
+    day. It did NOT record *which adapter* — so the day after somebody rewrites
+    ``StripeGateway.refund``, the register still says "verified", about code ==no human being has
+    ever run==. The evidence would go on authorising a live credential for an implementation that
+    did not exist when the evidence was gathered. That is ``feedback_justificacion_caduca`` exactly:
+    a justification about a moving target, written once.
+
+    So each record carries this fingerprint, and ``tests/test_credential_mode_guard.py`` re-computes
+    it and refuses any record whose implementation has changed underneath it. Editing the method
+    ==invalidates its verification== and demands a fresh run, which is the only honest outcome.
+
+    .. rubric:: What it hashes, and why the bluntness is deliberate
+
+    The method's own source text. Any edit changes it — including a comment or a reformat — so this
+    will occasionally demand a re-run a human would judge unnecessary. ==That asymmetry is chosen==:
+    a false "re-run the free checkout harness" costs minutes; a false "still verified" costs
+    somebody's money, through code nobody has exercised. The cheap error is the one to make.
+    """
+    gateway = gateway_for(provider)  # raises NotAMoneyProviderError for an INFRA provider
+    method = getattr(type(gateway), gateway_method_for(operation))
+    return hashlib.sha256(inspect.getsource(method).encode("utf-8")).hexdigest()[:16]
 
 
 def _not_money(provider: CredentialProvider) -> str:
@@ -134,6 +182,8 @@ __all__ = [
     "build_payment_gateways",
     "build_webhook_adapters",
     "gateway_for",
+    "gateway_method_for",
+    "implementation_fingerprint",
     "money_providers",
     "webhook_adapter_for",
 ]

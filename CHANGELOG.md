@@ -206,6 +206,16 @@ differently, so it could only be overruled and never discharged.
   live credential.** Test mode is a different backend — different keys, no card networks, no money —
   so a free test-mode round-trip proves the transport and buys nothing the money guard will spend.
   Without this, the cheap and obvious way to "verify" would have paid for real money.
+- **The credential TYPE check no longer expires when verification completes.** It used to ride on
+  the test-mode prefix, so a fully verified provider had nothing checking `secret_key` at all — a
+  truncated paste or a key from another account stored unexamined, at exactly the moment real money
+  starts moving. `credential_key_families()` is permanent and separate; only the restriction to the
+  TEST variant relaxes. A value that is not a recognisable key is now `UnrecognisedCredentialError`,
+  reported as itself rather than as a mode problem.
+- **Each verification names the implementation it exercised** (`implementation_fingerprint`, a hash
+  of the gateway method's source). Editing `StripeGateway.refund` invalidates that operation's
+  verification and demands a fresh run — otherwise the register would go on saying "verified" about
+  code nobody has ever run.
 - The live suite is the one exception to the repo-wide network guard, and the exception is an
   **allowlist**: `api.stripe.com:443` and nothing else, with SMTP and the Google API still shut. A
   marked test reaching anywhere else is refused exactly as an ordinary test would be.

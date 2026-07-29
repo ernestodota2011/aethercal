@@ -171,6 +171,25 @@ class IncompleteCredentialError(CredentialError):
     """
 
 
+class UnrecognisedCredentialError(CredentialError):
+    """A value is not a recognisable key of that provider AT ALL. ==Checked for ever, not for now.==
+
+    ==Distinct from :class:`LiveCredentialRefusedError`, and the distinction is the point.== The
+    other says *this is a real key, in the wrong mode for what we have proved* — a statement about
+    evidence, which changes as evidence accumulates. This says *this is not a key*, which no amount
+    of verification will ever make untrue.
+
+    They were the same check once, and that is precisely how the type validation came to have an
+    expiry date: it rode on the mode guard, so it disappeared the moment a provider became fully
+    verified — leaving a truncated paste or a key from the wrong account to be stored unexamined, at
+    exactly the moment the system began moving real money.
+
+    Reported separately for the same reason :class:`IncompleteCredentialError` is: telling an
+    operator that rubbish "is not a test-mode credential" sends them to rotate a key that was never
+    a key. ==Each refusal answers its own question.==
+    """
+
+
 class LiveCredentialRefusedError(CredentialError):
     """A money credential was live, and this gateway has operations nobody has ever run for real.
 
@@ -376,6 +395,18 @@ class LiveVerification:
     mode: ProviderMode
     """==Which world it was exercised in.== Only :attr:`ProviderMode.LIVE` authorises a live key."""
 
+    implementation: str
+    """==WHICH CODE was exercised== — ``integrations.money.implementation_fingerprint``.
+
+    Without it a verification outlives the thing it verified: rewrite ``StripeGateway.refund``
+    tomorrow and the register still says "verified", about code nobody has ever run. The fingerprint
+    is re-computed by ``tests/test_credential_mode_guard.py``, so an edit to the method
+    ==invalidates its verification== and demands a fresh run.
+
+    It is a plain string here rather than a computed call because ``services`` may not import
+    ``integrations`` — the tie is made from the test, as it is for :class:`GatewayOperation`.
+    """
+
     verified_on: date
     """The day the harness was run against the real API."""
 
@@ -516,8 +547,48 @@ def declared_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, st
             assert_never(unreachable)
 
 
+def credential_key_families(provider: CredentialProvider) -> Mapping[str, tuple[str, ...]]:
+    """field → every prefix that is a RECOGNISABLE key for it. ==Always enforced, forever.==
+
+    .. rubric:: ==The hole this closes: the type check used to evaporate on success==
+
+    There was only ever one check on the SHAPE of a payment key, and it was the TEST-mode prefix —
+    so the moment a provider became fully verified, :func:`required_test_mode_prefixes` returned
+    ``{}`` and ==nothing looked at ``secret_key`` at all any more==. A truncated paste, a key from
+    somebody else's account, a webhook secret dropped in the wrong field, or plain rubbish would
+    have been stored without a murmur. ==The validation vanished exactly when the system started
+    moving real money==, which is the worst possible moment to relax one.
+
+    Two questions were tangled together, and they are now separate:
+
+    * **what KIND of thing is this?** — permanent, and answered here. A Stripe secret key is
+      ``sk_test_…`` or ``sk_live_…``; nothing else is one, whatever the register says;
+    * **is this the right MODE for what has been proved?** — temporary, and answered by
+      :func:`required_test_mode_prefixes`, which relaxes as evidence accumulates.
+
+    Still an ALLOWLIST, for the reason it always was: a restricted key (``rk_live_``), a publishable
+    key, a prefix Stripe introduces next year or a fat-fingered paste is refused because it is not
+    on the list — never admitted because nobody thought to forbid it.
+    """
+    match provider:
+        case CredentialProvider.STRIPE:
+            return {"secret_key": ("sk_test_", "sk_live_")}
+        case CredentialProvider.MERCADO_PAGO:
+            return {"access_token": ("TEST-", "APP_USR-")}
+        case CredentialProvider.SMTP | CredentialProvider.WHATSAPP | CredentialProvider.SMS:
+            # No test/live distinction in the value and no house format either: an SMTP host is
+            # whatever the business's mail provider calls it.
+            return {}
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
 def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
     """What the door ENFORCES right now. ==DERIVED from what has been verified, not declared.==
+
+    ==This relaxes; :func:`credential_key_families` never does.== What evidence lifts is the
+    restriction to the TEST variant — never the requirement that the value be a recognisable key of
+    that provider at all.
 
     One sentence, and the whole of the money guard reads off it: ==*a provider whose gateway still
     has an unexercised operation must present a provably TEST-mode credential; a provider whose
@@ -598,6 +669,25 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
             "\n"
             f"Required for {provider.value}: {', '.join(sorted(required_fields(provider)))}."
         )
+
+    # ==FIRST, and permanently: is this a key of this provider at all?== This check does NOT relax
+    # when the register fills up. It used to be welded to the mode guard below, so it evaporated the
+    # day a provider became fully verified — the one moment it mattered most.
+    for field, families in credential_key_families(provider).items():
+        if not str(present[field]).startswith(families):
+            raise UnrecognisedCredentialError(
+                f"the {provider.value} `{field}` is not a recognisable {provider.value} key.\n"
+                "\n"
+                f"It must begin with one of: {', '.join(families)}. A value that is merely close — "
+                "a truncated paste, a publishable or restricted key, a webhook secret in the wrong "
+                "field, a key from another account — is refused here rather than stored and "
+                "discovered at the moment somebody tries to pay.\n"
+                "\n"
+                "==This check never relaxes.== Verifying the gateway against the real API lifts "
+                "the restriction to TEST-mode keys; it does not make a non-key acceptable.\n"
+                "\n"
+                "(The value is not shown — it is a secret, wrong shape or not.)"
+            )
 
     for field, prefix in required_test_mode_prefixes(provider).items():
         if not str(present[field]).startswith(prefix):
@@ -934,9 +1024,11 @@ __all__ = [
     "MissingCredentialError",
     "ProviderMode",
     "ResolvedCredential",
+    "UnrecognisedCredentialError",
     "WrongCredentialClassError",
     "authorises_live_credentials",
     "credential_class",
+    "credential_key_families",
     "declared_test_mode_prefixes",
     "delete_credential",
     "gateway_operations",

@@ -47,7 +47,11 @@ from typing import Any
 import httpx
 import pytest
 
+from aethercal.server.integrations.money import implementation_fingerprint
 from aethercal.server.integrations.stripe import StripeGateway
+from aethercal.server.services.tenant_credentials import CredentialProvider, GatewayOperation
+
+CHECKOUT = GatewayOperation.CHECKOUT
 
 pytestmark = pytest.mark.live_provider
 
@@ -158,6 +162,10 @@ async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(  # noqa
         print(
             "\n=== EVIDENCE for live_verifications(CredentialProvider.STRIPE) ===\n"
             "  operation   : GatewayOperation.CHECKOUT\n"
+            f"  implement.  : {implementation_fingerprint(CredentialProvider.STRIPE, CHECKOUT)}\n"
+            "                ==The code this run exercised.== Editing that method invalidates this "
+            "record and demands a fresh run: a verification is about an implementation, not about "
+            "a provider's name.\n"
             f"  mode        : ProviderMode.{mode}  <- Stripe's own `livemode`, on the session it "
             "created.\n"
             "                ==Only ProviderMode.LIVE authorises a live credential.== A TEST run "

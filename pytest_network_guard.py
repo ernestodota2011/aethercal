@@ -181,9 +181,13 @@ deleted in a hurry by whoever needs to ship, which is a worse outcome than the o
   ``conftest.py`` gate agreeing the key is really there. An ordinary run, a forgotten fake, a
   mis-wired fixture — ==the incident this plugin was written for== — carries none of those and still
   walks straight into the door;
-* and it is not a licence to spend. The live suite makes zero-cost calls only, and it neuters
-  ``StripeGateway.refund`` on itself so the one operation that moves money cannot be reached even by
-  mistake. That belt lives with the tests, because it is a fact about them, not about the network.
+* and it is not a licence to spend — though it is no longer a licence to spend *nothing*, and this
+  paragraph used to say it was. The checkout harness makes zero-cost calls only; the REFUND harness
+  moves **real money** ($1, charged by a person and refunded), because live mode has no test cards.
+  What keeps that honest is not this guard: ``StripeGateway.refund`` is unplugged across the whole
+  live directory except in the one phase whose purpose is to exercise it, that phase carries its own
+  separate opt-ins, and the money is re-checked in a ``finally``. Those belts live with the tests,
+  because they are facts about the tests and not about the network.
 """
 
 

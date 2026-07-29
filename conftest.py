@@ -123,8 +123,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             "\n"
             "Export the provider's secret key (the ENVIRONMENT, never a command-line flag — an "
             "argument lands in the process table, the shell history and the terminal scrollback) "
-            "and run it again. The suite makes zero-cost calls only: it creates a Checkout "
-            "Session, reads it back and expires it. No charge, no refund, no money.\n"
+            "and run it again.\n"
+            "\n"
+            "==NOT all of this suite is free.== The checkout harness makes zero-cost calls only "
+            "(create a Checkout Session, read it back, expire it). The REFUND harness cannot: live "
+            "mode has no test cards, so verifying a refund takes a REAL $1 charge, paid by a "
+            "person, and refunded. Those phases need their own separate opt-ins and do NOT run on "
+            "the strength of the key alone.\n"
             "\n"
             f"(A plain `pytest`, or `pytest -m 'not {LIVE_MARKER}'`, skips them quietly.)"
         )
@@ -140,7 +145,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             "suite itself.\n"
             "\n"
             f"Point {DB_URL_ENV} at a real PostgreSQL, e.g.\n"
-            f"  {DB_URL_ENV}=postgresql://postgres:postgres@localhost:5432/aethercal_test\n"
+            # The credentials are placeholders, not an example to paste: an inline `user:pass@host`
+            # here trips the secret-leak guard on every edit of this file, and an alarm that cries
+            # wolf is an alarm people learn to skip past.
+            f"  {DB_URL_ENV}=postgresql://localhost:5432/aethercal_test\n"
+            "  (credentials come from PGUSER/PGPASSWORD or your pgpass file.)\n"
             "\n"
             f"(A plain `pytest`, or `pytest -m 'not {DB_MARKER}'`, still skips them quietly. That "
             "is the offline matrix, and it is meant to.)"
