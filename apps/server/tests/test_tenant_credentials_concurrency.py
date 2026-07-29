@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.server.crypto import decrypt_secret, derive_fernet_key
 from aethercal.server.db.guc import bind_tenant
 from aethercal.server.db.models import Tenant, TenantCredential
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
 pytestmark = pytest.mark.db
@@ -84,6 +85,7 @@ async def test_two_concurrent_first_writes_leave_one_row_and_raise_no_integrity_
                 provider=CredentialProvider.STRIPE,
                 secrets=STRIPE_A,
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
             # Force the INSERT to the database, still uncommitted: this is the concurrent
             # transaction's real mid-flight state, and what makes the race below deterministic.
@@ -104,6 +106,7 @@ async def test_two_concurrent_first_writes_leave_one_row_and_raise_no_integrity_
                 provider=CredentialProvider.STRIPE,
                 secrets=STRIPE_B,
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
             await session.commit()
 

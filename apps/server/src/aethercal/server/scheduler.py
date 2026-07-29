@@ -599,8 +599,15 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
     # stranding a guest's money.
     fernet_keys = getattr(app.state, "fernet_keys", None)
     gateways = getattr(app.state, "payment_gateways", None)
+    # The fingerprints of the gateway code in THIS process (H6). Read defensively like the rest;
+    # `build_money_runners` degrades a missing map to `{}` rather than refusing to build, because a
+    # refund that cannot run strands a paid guest's money.
+    implementations = getattr(app.state, "payment_implementations", None)
     refund_runner, expire_hold_runner = build_money_runners(
-        exec_maker=pools.exec_maker, gateways=gateways, fernet_keys=fernet_keys
+        exec_maker=pools.exec_maker,
+        gateways=gateways,
+        fernet_keys=fernet_keys,
+        implementations=implementations,
     )
     return make_booking_effect_executor(
         sessionmaker=pools.exec_maker,

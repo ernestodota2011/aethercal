@@ -9,6 +9,7 @@ modules this repo has.
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import socket
 from typing import Any, NoReturn
@@ -63,6 +64,38 @@ def _is_loopback(address: Any) -> bool:
         return False
 
 
+def _guarded_connect_ex(sock: socket.socket, address: Any) -> int:
+    """``connect_ex`` is the OTHER door in the socket, and it was standing open.
+
+    ==Guarding ``connect`` alone was a hole with a well-known name.== ``connect_ex`` does the same
+    thing and reports failure as an errno instead of raising, so any caller that prefers it — and
+    asyncio's selector loop is one — walked straight past the floor and out into the world.
+
+    .. rubric:: ==It returns an errno; it does NOT raise, and that is not a softening==
+
+    Raising here would be the louder refusal, and it would break the event loop's own plumbing:
+    ``loop.sock_connect`` calls ``connect_ex`` and reads the code. A guard that takes the
+    interpreter down with it is a guard that gets switched off. ``EACCES`` is what the kernel itself
+    returns for a destination policy forbids, so the caller meets a refusal it already handles.
+
+    The socket is left for its owner to close: a ``connect_ex`` caller reads a return code and
+    cleans up, unlike the ``connect`` caller below, which may raise straight past its descriptor.
+
+    ==What matters is identical either way: nothing leaves the machine.== The real ``connect_ex`` is
+    never reached, so no packet is sent — the refusal happens before the syscall, not after it.
+    """
+    if _is_loopback(address):
+        return _REAL_SOCKET_CONNECT_EX(sock, address)
+    return errno.EACCES
+
+
+def _guarded_live_connect_ex(sock: socket.socket, address: Any) -> int:
+    """The same door, for a live-provider test: the allowlist decides, and nothing else."""
+    if _is_allowed_live_address(address):
+        return _REAL_SOCKET_CONNECT_EX(sock, address)
+    return errno.EACCES
+
+
 def _guarded_connect(sock: socket.socket, address: Any) -> Any:
     """Refuse anything that is not this machine talking to itself.
 
@@ -82,6 +115,7 @@ def _guarded_connect(sock: socket.socket, address: Any) -> Any:
 
 
 _REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
 
 
 def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
@@ -103,8 +137,146 @@ def _forbidden(*_args: object, **_kwargs: object) -> NoReturn:
     )
 
 
+LIVE_PROVIDER_ALLOWED_DESTINATIONS = frozenset({("api.stripe.com", 443)})
+"""==Where a ``live_provider`` test may go. Everything else is refused, marker or no marker.==
+
+The first cut of the live exception simply stopped patching ``httpx`` and the socket floor, which
+opened ==arbitrary egress==: any host, any port, for any test carrying the marker. That is a much
+larger hole than the one being asked for. What the verification harness actually needs is *one host
+on one port*, so that is what it gets.
+
+==Named hosts, not addresses.== The allowlist is the thing a reader can check against the harness's
+purpose (*"why does a payment test need `api.stripe.com`?"* answers itself; *"why does it need
+`104.18.…`?"* does not). Stripe sits behind a CDN whose addresses rotate, so a pinned IP list would
+be wrong within the week; the socket floor resolves these names at connect time instead.
+
+Widening this is a deliberate edit with a reviewer attached — and ``test_live_suite_gate`` pins the
+contents, so growing it silently is not one of the available moves.
+"""
+
+LIVE_PROVIDER_MARKER = "live_provider"
+"""==The ONE marker that may reach a provider's real API, and it is not merely "an exception".==
+
+.. rubric:: Why a hole in a fail-closed guard is the honest answer here
+
+This plugin closes the door because an unverified payment adapter must never reach a real provider
+BY ACCIDENT. But the product's money guard
+(:func:`~aethercal.server.services.tenant_credentials.live_verifications`) refuses a live credential
+until somebody has DELIBERATELY exercised that adapter against the real API — so with no way through
+this door at all, the evidence could never be gathered and ==the money guard would be permanent by
+construction==: not fail-closed, merely stuck. A guard that can never be discharged is one that gets
+deleted in a hurry by whoever needs to ship, which is a worse outcome than the one it prevents.
+
+.. rubric:: What the hole is NOT
+
+* it is not "the guard is off", and it is not even "HTTP is open". SMTP and the Google API stay
+  shut — those write to a real person's inbox and to somebody's real calendar, and wanting to talk
+  to Stripe is no reason at all to open them. The HTTP doors and the socket floor are not removed
+  either: they are ==re-pointed at an ALLOWLIST== of one host on one port
+  (:data:`LIVE_PROVIDER_ALLOWED_DESTINATIONS`). A live-marked test that reaches for any other
+  destination is refused exactly as an ordinary test would be;
+* it is not reachable by inattention, which is the property that actually matters. It takes the
+  marker on the test, that marker registered in ``pyproject.toml`` under ``--strict-markers``, the
+  provider's key exported into the environment, and (for ``-m live_provider``) the root
+  ``conftest.py`` gate agreeing the key is really there. An ordinary run, a forgotten fake, a
+  mis-wired fixture — ==the incident this plugin was written for== — carries none of those and still
+  walks straight into the door;
+* and it is not a licence to spend — though it is no longer a licence to spend *nothing*, and this
+  paragraph used to say it was. The checkout harness makes zero-cost calls only; the REFUND harness
+  moves **real money** ($1, charged by a person and refunded), because live mode has no test cards.
+  What keeps that honest is not this guard: ``StripeGateway.refund`` is unplugged across the whole
+  live directory except in the one phase whose purpose is to exercise it, that phase carries its own
+  separate opt-ins, and the money is re-checked in a ``finally``. Those belts live with the tests,
+  because they are facts about the tests and not about the network.
+"""
+
+
+_REAL_ASYNC_HANDLE = httpx.AsyncHTTPTransport.handle_async_request
+_REAL_SYNC_HANDLE = httpx.HTTPTransport.handle_request
+"""Captured at IMPORT, before any test can patch them: the only honest way back to the real door."""
+
+
+def _forbidden_destination(destination: str) -> NoReturn:
+    raise RealNetworkForbiddenError(
+        f"a live-provider test tried to reach {destination}, which is NOT on the allowlist.\n"
+        "\n"
+        "The `live_provider` marker does not open the network — it re-points the guard at "
+        f"{sorted(LIVE_PROVIDER_ALLOWED_DESTINATIONS)}. Everything else is refused exactly as it "
+        "would be for an ordinary test, because a marker that granted arbitrary egress would be a "
+        "far larger hole than the one the verification harness needs.\n"
+        "\n"
+        "If a harness genuinely needs another destination, add it to "
+        "LIVE_PROVIDER_ALLOWED_DESTINATIONS deliberately — `test_live_suite_gate` pins the "
+        "contents, so it cannot grow by accident.\n"
+        "\n"
+        "See pytest_network_guard.py."
+    )
+
+
+def _require_allowed_url(url: httpx.URL) -> None:
+    """The allowlist check at the layer where the destination still has a NAME."""
+    port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    if (url.host, port) not in LIVE_PROVIDER_ALLOWED_DESTINATIONS:
+        _forbidden_destination(f"{url.scheme}://{url.host}:{port}")
+
+
+async def _live_guarded_async_request(
+    transport: httpx.AsyncHTTPTransport, request: httpx.Request
+) -> httpx.Response:
+    _require_allowed_url(request.url)
+    return await _REAL_ASYNC_HANDLE(transport, request)
+
+
+def _live_guarded_request(transport: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
+    _require_allowed_url(request.url)
+    return _REAL_SYNC_HANDLE(transport, request)
+
+
+def _is_allowed_live_address(address: Any) -> bool:
+    """Whether a raw socket address belongs to an allowlisted destination. ==Resolved, not pinned.==
+
+    The floor beneath the HTTP filter, and it has to answer the same question one layer lower, where
+    the destination is an ADDRESS and the allowlist is a set of NAMES. So each allowed host is
+    resolved *at connect time* — the same moment the client resolved it, through the same OS
+    resolver and cache — and the address is matched against the answer. A pinned IP list would be
+    wrong within the week (Stripe is behind a CDN), and a name recorded once at session start can go
+    stale mid-run.
+
+    ==A host that will not resolve is refused, not excused==: `getaddrinfo` failing means we cannot
+    show this address belongs to an allowed destination, and "cannot show" is a refusal at a door.
+    """
+    if _is_loopback(address):
+        return True
+    if not isinstance(address, tuple) or len(address) < 2:
+        return True  # AF_UNIX or a socketpair: it cannot leave the machine by construction
+    host, port = str(address[0]), address[1]
+    for allowed_host, allowed_port in LIVE_PROVIDER_ALLOWED_DESTINATIONS:
+        if port != allowed_port:
+            continue
+        try:
+            infos = socket.getaddrinfo(allowed_host, allowed_port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            continue
+        if host in {str(info[4][0]) for info in infos}:
+            return True
+    return False
+
+
+def _guarded_live_connect(sock: socket.socket, address: Any) -> Any:
+    """The socket floor for a live-provider test: loopback, the allowlist, and nothing else.
+
+    ==Without this, the HTTP filter above would be a fence with no posts.== A test could reach any
+    host in the world through ``urllib``, a raw socket, or any stack that does not go through
+    ``httpx`` — which is the whole reason this plugin has a floor in the first place.
+    """
+    if _is_allowed_live_address(address):
+        return _REAL_SOCKET_CONNECT(sock, address)
+    sock.close()
+    _forbidden_destination(f"the raw address {address!r}")
+
+
 @pytest.fixture(autouse=True)
-def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _forbid_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """==Make reaching the real network IMPOSSIBLE, rather than remembering not to.==
 
     .. rubric:: The incident this exists for
@@ -195,11 +367,30 @@ def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     an injected Google service), so this sits below both fakes and races neither. And the database,
     per the rubric above. That asymmetry is deliberate: this closes the doors that TOUCH THE WORLD,
     not the one that stores.
+
+    .. rubric:: ==And the one way through, for the one suite whose job is to walk through it==
+
+    A ``live_provider``-marked test (see :data:`LIVE_PROVIDER_MARKER`) keeps the two doors that
+    write to PEOPLE — SMTP and the Google API — shut, and gets the HTTP doors and the socket floor
+    ==re-pointed at an allowlist rather than removed== (:data:`LIVE_PROVIDER_ALLOWED_DESTINATIONS`).
+    Every door is still patched for every test; what differs is what the patch permits.
+
+    ==The order below is what makes the narrowing real rather than described:== the two human-facing
+    doors are shut FIRST, unconditionally, so no later edit to the branching can take them with it.
     """
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     monkeypatch.setattr(aiosmtplib.SMTP, "connect", _forbidden, raising=True)
     monkeypatch.setattr(httplib2.Http, "request", _forbidden, raising=True)
+    if request.node.get_closest_marker(LIVE_PROVIDER_MARKER) is not None:
+        monkeypatch.setattr(
+            httpx.AsyncHTTPTransport, "handle_async_request", _live_guarded_async_request
+        )
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _live_guarded_request)
+        monkeypatch.setattr(socket.socket, "connect", _guarded_live_connect, raising=True)
+        monkeypatch.setattr(socket.socket, "connect_ex", _guarded_live_connect_ex, raising=True)
+        return
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _forbidden, raising=True)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _forbidden, raising=True)
     # ==And the floor beneath all three.== The three above are known doors; this is the rule that
     # makes a door nobody has built yet unusable too. See the class docstring.
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect, raising=True)
+    monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex, raising=True)

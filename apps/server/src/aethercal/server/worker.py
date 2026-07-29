@@ -70,7 +70,10 @@ from aethercal.server.db.engine import build_async_engine, build_sessionmaker
 from aethercal.server.db.migrate import assert_schema_at_head
 from aethercal.server.db.pools import WorkerPools
 from aethercal.server.db.roles import DbRole, assert_engine_role
-from aethercal.server.integrations.money import build_payment_gateways
+from aethercal.server.integrations.money import (
+    build_gateway_implementations,
+    build_payment_gateways,
+)
 from aethercal.server.scheduler import (
     WEBHOOK_HTTP_TIMEOUT_SECONDS,
     build_interval_scheduler,
@@ -241,6 +244,10 @@ def create_worker_app(settings: Settings) -> FastAPI:
     # ``secrets["secret_key"]`` for ever. The runner now SELECTS by provider. Neither gateway's HTTP
     # half is verified against a live account in this cut.
     app.state.payment_gateways = build_payment_gateways()
+    # ==The twin of the map above (H6).== Which code would run for each operation, hashed once at
+    # boot. The credential door checked this when the key was STORED; the use gate re-asks it on
+    # every charge, because a gateway edited since is code nobody has exercised moving real money.
+    app.state.payment_implementations = build_gateway_implementations()
     app.state.webhook_allowlist = settings.private_target_allowlist()
     warn_if_loopback_is_allowlisted(app.state.webhook_allowlist)
 

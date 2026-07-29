@@ -177,16 +177,183 @@ aethercal-admin credentials delete --tenant-slug acme --provider stripe
 If a business genuinely needs both configured at once, that needs a **per-tenant preference field**
 (a column, a migration and an admin control) — a product decision, not a default.
 
-### Neither payment adapter has been verified against a live account
+### Which payment operations have been run against the real API — and what that gates
 
 > [!WARNING]
 > **Zero real charges have ever been made from this codebase.** Read this before you switch either
 > provider on for real money.
 
-| Provider | Verified against a live account? |
+**A live payment credential is refused while any operation of that provider's gateway has never been
+run against the real API.** Not a prefix rule and not a build flag: the product keeps a register of
+what has actually been exercised, and the door reads it.
+
+| Provider | `checkout` | `refund` | A live credential is |
+|---|---|---|---|
+| `stripe` | ❌ never run | ❌ never run | **refused** — the gateway has only ever spoken to a stubbed transport |
+| `mercado_pago` | ❌ never run | ❌ never run | **refused** — no Mercado Pago account exists for this project at all |
+
+While any ❌ remains for a provider, `aethercal-admin credentials set` accepts only a provably
+test-mode credential (`sk_test_…`, `TEST-…`) and names the operations that are still unproven.
+
+**What verification does *not* relax:** the value must be a recognisable key of that provider —
+`sk_test_…`/`sk_live_…` for Stripe, `TEST-…`/`APP_USR-…` for Mercado Pago — **always**, verified or
+not. That check used to ride on the test-mode prefix, so it vanished the moment a provider became
+fully verified, leaving rubbish to be stored unexamined at exactly the point real money starts
+moving. The two questions are now separate: *is this a key of this provider?* (permanent) and *is
+this the right mode for what we have proved?* (relaxes).
+
+> [!NOTE]
+> **A prefix is not a key, and the check now says exactly how far it reaches.** The value must carry
+> the prefix, at least 12 more characters, and nothing but letters, digits, `-` or `_` — so
+> `sk_live_` typed on its own, a paste truncated to a stub, and a value that picked up a line break
+> or its surrounding quotes are all refused. (`startswith` alone accepted the bare prefix while the
+> error message promised it caught "a truncated paste".)
+>
+> **What it cannot decide:** whether a well-formed key is genuine, current, or *yours*. A key from
+> another account has exactly the right shape. Only an authenticated call to the provider settles
+> that, and this door makes none — configuring a credential must not depend on the provider being
+> reachable. So a wrong-account key is stored and fails when somebody tries to pay, and the refusal
+> text says that rather than implying otherwise.
+
+#### Why per operation, and not one flag per provider
+
+Because the two cost different things to prove, and a single flag would have to lie about one of
+them:
+
+* a **Checkout Session** can be created, read back and expired against the real API for **nothing**.
+  No card, no charge, no money;
+* a **refund** cannot be proved without a real charge to refund. That evidence has a price, and
+  somebody has to decide to pay it.
+
+So a run that exercises checkout says nothing whatever about refund — and refund is the path whose
+failure lands on a guest who has **already paid**. Marking "Stripe: verified" after the cheap half
+would record something false about the expensive half, silently.
+
+#### Running the verification harness
+
+Every run takes its key from the **environment, never a flag** — an argument lands in the process
+table (`ps`), the shell's history file and the terminal scrollback:
+
+```bash
+read -rs AETHERCAL_LIVE_STRIPE_SECRET_KEY && export AETHERCAL_LIVE_STRIPE_SECRET_KEY
+```
+
+**1 — `checkout`, free.** Creates a Checkout Session through the real `StripeGateway`, reads it back
+through a *separate* request (so the confirmation comes from Stripe rather than from a return
+value), and expires it so nothing payable is left standing:
+
+```bash
+uv run pytest apps/server/tests/live/test_stripe_live_checkout.py -m live_provider -s
+```
+
+**Zero-cost calls only** — and `StripeGateway.refund` is unplugged for the whole directory, so the
+one operation that moves money is unreachable rather than merely unused.
+
+**2 — `refund`, and this one moves real money.** In live mode there are **no test cards**: a live
+Checkout Session is completed by a person with a real card, and no API call can pay it. So the
+refund run is cut where the human is, and it is **$1, refunded**:
+
+```bash
+# Phase A — opens a payable $1 session and prints its URL. Needs its own opt-in, because it
+# deliberately leaves the session OPEN so somebody can pay it.
+AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE=1 \
+  uv run pytest apps/server/tests/live/test_stripe_live_refund.py -m live_provider -s
+
+# ...pay it with a real card, then:
+
+# Phase B — runs the REAL StripeGateway.refund and confirms with a separate request.
+AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION=cs_live_… \
+  uv run pytest apps/server/tests/live/test_stripe_live_refund.py -m live_provider -s
+```
+
+`-s` in every case, because the evidence is printed and pytest swallows the output of passing tests.
+
+The barriers on the money phase are structural, not procedural:
+
+| Barrier | How it is enforced |
 |---|---|
-| `stripe` | ❌ **no** — written to Stripe's documented test-mode API, covered only by contract tests |
-| `mercado_pago` | ❌ **no** — no Mercado Pago account exists for this project; built against Mercado Pago's documented API and its official SDKs |
+| **$1 hard cap** | the session opener takes **no `amount_cents`** — there is no figure to mistype. A units bug is what turns $1 into $100 |
+| **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one. To open a new one on purpose, set `AETHERCAL_LIVE_STRIPE_RUN_ID=v2` — phase A names that command itself if the replayed session has lapsed |
+| **the refund is idempotent, a DEAD refund is retryable, and a PENDING one is neither** | phase B uses production's own `refund_idempotency_key`, so a retry gets the same refund and never a second. The provider's answer is read into **three** states: only a terminal `succeeded` may be certified; a terminal failure opens a **new generation** named by that failure's id; anything still in flight is ==neither done nor failed== and is never recorded as money returned |
+| **a failed creation is resolved, not assumed away** | if the create call fails *after* Stripe processed it, a payable $1 session is standing with no id to name it. The shared creation seam replays the identical request on the **same idempotency key** — Stripe returns the session it made, which is then expired — and if the replay also fails the run shouts the idempotency key for a manual check. Both harnesses create through that one seam |
+| **the money always comes back — *all* of it** | the `finally` reads what was actually **captured**, sums only refunds that are `succeeded` (`pending` is *in flight*, not done), issues the remainder on its own derived key, and polls to a terminal state. ==A partial or pending refund is a failure, not a pass== |
+| **the guarantee opens before any validation can abort** | phase B resolves the PaymentIntent immediately after the provenance check and puts **everything else** — currency, `paid`, amount, the gateway call — inside the `try` whose `finally` refunds. Those checks used to run *before* it, so a mismatch on a genuinely paid session ended the run with the dollar still on the card. If the PaymentIntent cannot be resolved at all on a `paid` session, the run **shouts the session id** for a manual refund |
+| **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
+| **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
+| **nothing payable is left unvalidated** | phase A validates amount, currency, mode and status **after** creating the session and **expires it on any failure** — a session is left open only once it has passed. The pay-URL it prints is Stripe's own, checked against the gateway's |
+| **phase B refunds only what phase A opened** | the session carries an **HMAC** applied at creation (over the purpose, the run id and a per-run nonce, keyed by `AETHERCAL_LIVE_STRIPE_PROVENANCE_SECRET` — from the environment, never the repo), and phase B demands it with `hmac.compare_digest` **plus** an exact match on the session id phase A wrote down. The mark says *I made one*; the id says *it was THIS one*. ==A public prefix proved neither==, and without the signing key the harness refuses to run |
+| **the evidence cannot outrun the fact** | the evidence block is composed **only after** the refund has reached a terminal `succeeded` (and the checkout session has actually been expired). ==A `pending` refund is never certified as money returned== |
+| **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
+| **no evidence without its control** | every provider-touching test takes the `stripe_reachable` fixture, which demands Stripe's own `401` for a key Stripe never issued before the test body runs. It used to be a test standing *beside* the run it vouched for — so `pytest <file>::<test>` produced evidence with the control never executed. ==A fixture cannot be selected around==, and an offline AST guard fails if any live test omits it |
+
+The run prints an evidence block. **That block, not a boolean, is what goes into
+`live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
+carrying the mode, the date, the **implementation fingerprint** and what was observed. Writing one
+requires having done the run.
+
+> [!NOTE]
+> **A verification is about an implementation, not about a provider's name.** Each record names the
+> fingerprint of the exact gateway method it exercised, and **the door re-computes it on every
+> credential write** — so editing `StripeGateway.refund` **invalidates that operation's
+> verification** and the next live credential is refused, in the operator's own command. Without it,
+> the register would go on saying "verified" about code nobody has ever run. The hash covers the
+> method's source, so even a cosmetic edit forces a re-run: a needless free run costs minutes, a
+> false "still verified" costs somebody's money.
+>
+> **The fingerprint covers the gateway's whole MODULE, not just the method.** It hashed the method's
+> own text, and `StripeGateway.refund` is four lines that delegate: the request is built by
+> `self._client` out of `_STRIPE_API_BASE` and `_HTTP_TIMEOUT`. Repointing the API base left the
+> hash identical, so a verification reading "exercised against the real Stripe" would have gone on
+> authorising a live key for code now talking somewhere else. The cost of the blunt unit is that an
+> edit to either half of the module invalidates **both** of that provider's operations — chosen
+> deliberately: an incomplete dependency analysis fails as a false "still verified", and that one
+> costs somebody's money. What it still does not cover is stated in the function's own docstring
+> (other modules, `httpx`, an injected transport, the runtime environment).
+>
+> That comparison used to live in the test suite alone — `services` cannot import
+> `integrations.money`, so the door could not compute a fingerprint. The evidence therefore expired in CI and **stayed valid
+> in production**. The dependency is now inverted rather than dropped: `cli.run_credentials_set`
+> (the layer that can see both) passes `current_gateway_implementations(provider)` into the door,
+> and the parameter has no default — a caller cannot omit it, and any partial answer makes the door
+> *stricter*, never laxer.
+
+> [!IMPORTANT]
+> **The evidence is checked again when the credential is USED, not only when it is stored.** The
+> door runs once, on the day somebody types the key; a gateway edited a month later would keep
+> charging real cards on a verification that no longer describes it. So every charge and every
+> refund re-asks the question against the code in *that* process — and the answer is deliberately
+> **asymmetric**:
+>
+> | Direction | Stale evidence | Why |
+> |---|---|---|
+> | **taking** payment (`checkout`) | **refused** (402) | charging through unexercised code fails *silently* — every status code says success. The refusal costs new bookings, is visible immediately, and clears at **zero cost** by re-running the free checkout harness |
+> | **returning** payment (`refund`) | **allowed, and alarmed** | blocking does not prevent the harm, it *is* the harm: "the guest's money does not come back", produced with certainty on a card already charged. An unexercised refund's realistic failure is loud (the gateway raises, the outbox retries, the intent dead-letters with an alert) |
+>
+> Only a **live** credential is gated: a test-mode key is untouched, so a self-hoster on `sk_test_`
+> never sees this. What stays exposed is stated rather than implied — an edited-but-unexercised
+> `refund` does run against real money, accepted because refusing guarantees the worse outcome.
+
+> [!WARNING]
+> **A verification performed in TEST mode does not authorise a LIVE credential.** Each record states
+> the `ProviderMode` it was gathered in, and only `LIVE` counts towards opening the door. Test mode
+> is a *different backend* — different keys, no card networks, no money — so a free test-mode
+> round-trip proves the request shape and the transport and says nothing about the world where the
+> money is. The harness reports the mode Stripe itself declared (`livemode`) rather than assuming it.
+
+> [!NOTE]
+> The live suite is the one exception to the repo-wide network guard, and the exception is narrow:
+> it may reach **`api.stripe.com:443` and nothing else**. SMTP and the Google API stay shut for it
+> too — a charge can be refunded, an email cannot be unsent.
+
+> [!IMPORTANT]
+> **Verifying `checkout` alone does not open the door.** A stored credential is not scoped to an
+> operation — it is the row `refund` will read weeks later, for a guest who has already paid — so the
+> door stays shut until every operation the gateway performs has a record. The practical consequence
+> today: even after a successful checkout run, a live Stripe credential is still refused, because
+> `refund` remains unexercised. That is the honest reading of the evidence, and it is exactly what a
+> single "verified" flag would have hidden.
+
+The Mercado Pago adapter is not waiting on a harness. It is waiting on an **account**.
 
 The Mercado Pago adapter builds its `x-signature` manifest exactly as Mercado Pago's own SDKs build
 it, and derives a payment's meaning by fetching `GET /v1/payments/{id}` rather than trusting the
@@ -197,9 +364,9 @@ It also **refuses a currency whose minor unit it cannot prove** (CLP, COP, and a
 `unit_price`, and that conversion is a 100× error in a currency with no minor unit. The canonical
 table (`GET /currencies`) needs an account to read, so the adapter refuses rather than guesses.
 
-Before either adapter is trusted with real money it needs a run against a real account (test mode,
-zero real charges): the shapes above are documented, not observed. See `integrations/mercadopago.py`
-— "What is NOT proven".
+The shapes above are **documented, not observed** — and that is now the product's rule rather than
+this page's advice: until a run against a real account records what it saw, the register above keeps
+the live credential out. See `integrations/mercadopago.py` — "What is NOT proven".
 
 ---
 
@@ -292,6 +459,8 @@ not a rotation: it is a re-encryption under the key you believe you have just re
 | Concern | Module |
 |---|---|
 | Precedence, and the money asymmetry | `services/tenant_credentials.py` |
+| Which operations have been run for real (the register the live door reads) | `live_verifications()` in `services/tenant_credentials.py` |
+| The verification harness that produces the evidence | `apps/server/tests/live/` |
 | Key rotation | `services/key_rotation.py` |
 | Which columns hold ciphertext | `db/encrypted.py` |
 | Key derivation | `crypto.py` |
