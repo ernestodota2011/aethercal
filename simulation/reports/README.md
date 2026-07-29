@@ -14,10 +14,20 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `e4a99ccc` | 2026-07-29 | MEASURED | 239 planned / 212 created, 27 create-leg + 1 reschedule-leg collisions, 40-way races, **all fifteen** controls held. §6's 537 classified = 257 slot reads (both legs) + 239 bookings + 23 cancels + 18 reschedules; its 28 `slot_unavailable` = 27 + 1. Confirmations identified by calendar identity: **188 matched, 24 superseded, 0 unaccounted**, 0 duplicates, 0 uid collisions, 0 negative deltas, 0 unparseable envelopes. Peak **40 of 40** requests in flight (C15). 485 backlog samples, 0 scrape failures, 0 boundary discards. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
+| `bd6232d4` | 2026-07-29 | MEASURED | **240** planned / 212 created, 45 follow-ups, 40-way races, **all fifteen** controls held. ==The plan total is now an identity: 240 = 40/week × 2 weeks × 3 businesses, exactly==, where independent per-day rounding had been quietly producing 239. §6's 550 classified reconciles with §1; 29 `slot_unavailable` split across both legs. Confirmations 188 matched + 24 superseded = 212, 0 unaccounted, 0 duplicates, 0 uid collisions, 0 unparseable envelopes. C5 on a **drained baseline** (due=0), 6 stranded, 6 delivered. Peak 40 of 40 in flight (C15). 391 samples, 0 scrape failures. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Ten earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, ten times over.
+> [!warning] ==Eleven earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, eleven times over.
+>
+> `e4a99ccc` — withdrawn after a gate run **by slices** (one file per review) found seven defects
+> that no full-diff run had seen, three of them high and one a security gap. The two that touch its
+> numbers: ==its "239 planned" was never the 240 that was asked for== — per-day volume was rounded
+> independently, which is unbiased per day and says nothing about the sum, and §1 quotes that number
+> while C13 reconciles against it; and C5 did not require a **drained baseline**, so "the restarted
+> worker delivered ≥ 6" was equally true of six intents that had been queued before it began. The
+> rest could not fire in it but could have: a scrape starting after `pause()` returned, a sampler
+> left running by any early return, and a webhook destination read from the stack file and handed
+> to the product without ever being checked.
 >
 > `dc008532` — withdrawn because three of the instruments certifying it could still pass over a
 > loss. The mailbox read called itself COMPLETE while silently failing to parse envelopes (the total
