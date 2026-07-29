@@ -16,7 +16,12 @@ from typing import Any
 
 import pytest
 
-from aethercal_sim.__main__ import measure_confirmations, parse_args, positive_int
+from aethercal_sim.__main__ import (
+    contender_count,
+    measure_confirmations,
+    parse_args,
+    positive_int,
+)
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
     ErrorTally,
@@ -1152,3 +1157,27 @@ def test_the_cli_exits_2_rather_than_running_a_degenerate_simulation(flag: str) 
 def test_the_cli_accepts_the_documented_defaults() -> None:
     args = parse_args([])
     assert (args.workers, args.contenders, args.per_week, args.seed) == (8, 40, 40, 20260725)
+
+
+@pytest.mark.parametrize("raw", ["0", "1", "-3"])
+def test_a_race_needs_at_least_two_contenders(raw: str) -> None:
+    """==The defect the previous commit DESCRIBED and did not guard.==
+
+    `--contenders 1` does not crash, which is what makes it the dangerous value: `Barrier(1)`
+    releases immediately, every race reports "exactly one winner" whatever the product does, and
+    C2 -- the control that exists to prove more than one winner is observable -- fires a single
+    request at a single slot and confirms it. The run reads MEASURED having tested no concurrency.
+    """
+    with pytest.raises(argparse.ArgumentTypeError):
+        contender_count(raw)
+
+
+def test_one_contender_is_refused_by_the_cli_with_exit_2() -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(["--contenders", "1"])
+    assert excinfo.value.code == 2
+
+
+def test_two_contenders_is_the_smallest_real_race() -> None:
+    assert contender_count("2") == 2
+    assert parse_args(["--contenders", "2"]).contenders == 2

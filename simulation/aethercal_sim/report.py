@@ -257,6 +257,13 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         add(_latency_row(drain_latency))
     add("")
     add(
+        "`slots_read` covers **both** legs of the organic phase — the read a guest makes before "
+        "booking and the one before a reschedule. The second reached neither instrument, "
+        "so this row counted only the create leg and §6 was short by one response per reschedule "
+        "attempted, while calling itself *every outcome*."
+    )
+    add("")
+    add(
         "`booking_create` is the guest's own wait for a 201. "
         "`booking_to_confirmation_email` is a **different and slower** question: it crosses the "
         "outbox and is produced by the worker, not by the request that returned 201."

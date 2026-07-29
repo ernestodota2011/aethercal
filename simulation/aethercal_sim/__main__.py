@@ -115,6 +115,30 @@ def positive_int(raw: str) -> int:
     return value
 
 
+def contender_count(raw: str) -> int:
+    """==A race needs at least TWO contenders, and this is the type that says so.==
+
+    The previous commit named this defect in its own message — *"`--contenders 1` is the one worth
+    naming, because it does NOT crash"* — and then shipped a validator that accepted 1. Describing
+    a hazard is not guarding it; that is the exact shape this whole directory exists to hunt, and
+    it landed in the fix for it.
+
+    One contender is the dangerous value precisely because nothing breaks. ``Barrier(1)`` releases
+    immediately, the same-slot race reports one winner of one, and C10 passes — while C2, whose
+    entire job is to prove the harness CAN see more than one winner, would be firing a single
+    request at a single slot and confirming it did. The run would read `MEASURED` having tested no
+    concurrency at all.
+    """
+    value = positive_int(raw)
+    if value < 2:
+        raise argparse.ArgumentTypeError(
+            f"a race needs at least 2 contenders, got {value}. With one, `Barrier(1)` releases "
+            "immediately and every race reports 'exactly one winner' whatever the product does — "
+            "including C2, the control that exists to prove the opposite is observable."
+        )
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="aethercal_sim", description="Two-week load simulation.")
     parser.add_argument("--seed", type=int, default=20260725)
@@ -122,7 +146,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers", type=positive_int, default=8, help="simultaneous simulated guests"
     )
     parser.add_argument(
-        "--contenders", type=positive_int, default=40, help="threads per adversarial race"
+        "--contenders", type=contender_count, default=40, help="threads per adversarial race"
     )
     parser.add_argument(
         "--per-week", type=positive_int, default=40, help="bookings per business per week"

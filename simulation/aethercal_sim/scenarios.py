@@ -456,13 +456,22 @@ def run_organic(  # noqa: PLR0915 - the taxonomy IS the length: every outcome is
             return
 
         event_type = business.event_types[item.event_key]
+        # ==Recorded, like every other request the organic phase makes.== This read was the one
+        # HTTP call in the phase that reached neither instrument, so §2's `slots_read` counted only
+        # the create leg and §6 — which calls itself "every outcome, successes included" — was
+        # short by one response per reschedule attempted. A taxonomy with a hole in it cannot be
+        # reconciled against anything, which is the whole job C13 was given.
         offer = read_offer(
-            fetch_slots(
-                client,
-                event_type_id=event_type.id,
-                day=item.day,
-                timezone=item.guest_timezone,
-                days=3,
+            record(
+                result.slots_latency,
+                result.tally,
+                fetch_slots(
+                    client,
+                    event_type_id=event_type.id,
+                    day=item.day,
+                    timezone=item.guest_timezone,
+                    days=3,
+                ),
             )
         )
         if not offer.complete:
