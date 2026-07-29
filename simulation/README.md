@@ -8,6 +8,7 @@ numbers together with the controls that make them believable.
 ```bash
 simulation/scripts/run.sh              # up → simulate → report → down
 simulation/scripts/run.sh --keep       # leave the stack up to inspect afterwards
+simulation/scripts/stack-down.sh       # the exit for a --keep run: down -v AND restore deploy/.env
 ```
 
 A run writes `simulation-report.md` (for a person) and `simulation-report.json` (for diffing one run
@@ -49,6 +50,28 @@ invalidate that document.
 | **C10** | ==the headline claim itself (RF-04)== | the same-slot race left **exactly one** winner, the rest `slot_unavailable`, nothing unexpected |
 | **C11** | the no-show transition | `200` **and** the booking's status really becomes `no_show` |
 | **C12** | the drain finished, readably | `due == 0` before the run ends, with zero unexplained scrape failures |
+| **C13** | ==§1 itself: the organic phase is fully explained== | every planned intent lands in a known outcome, the outcomes **sum to the plan**, and no request failed unexpectedly |
+| **C14** | ==§2's slowest row: the confirmation sample is whole== | the mailbox was read to its own reported total and **every** created booking matched a message, with no negative deltas |
+
+> [!danger] ==A phase whose failures have nowhere to go will always report a quiet fortnight.==
+> **C13** and **C14** exist because §1 and §2 were produced by code that could lose its own
+> failures — and both losses moved the numbers in the **flattering** direction, which is exactly why
+> nobody was ever going to notice them:
+>
+> - The organic worker filed a slots query that **failed** as `no_slots_offered`, which §1 prints as
+>   *"attempts that met a fully-booked day"*, and dropped any non-2xx booking that was not a
+>   collision with a bare `if not response.ok: return`. ==An instance 500-ing its way through the
+>   whole run presented as a slightly quieter one, and the verdict still said `MEASURED`.== Now every
+>   planned intent ends in exactly one category and the categories must **reconcile against the
+>   plan** — the same lesson `REQUIRED_CONTROL_IDS` learned one level up: a count derived from the
+>   list it summarises cannot see its own omissions.
+> - The mailbox was read with a hardcoded `limit=20000` — equal to the `MP_MAX_MESSAGES` the overlay
+>   sets, compared against nothing — and confirmations whose timestamp preceded the booking's
+>   reference instant were discarded by a bare `if delta_ms >= 0`. ==A latency sample that loses
+>   members reports a FASTER product, and only the fastest confirmations can precede their own
+>   POST==, so that filter trimmed precisely the left tail. The report already **carried a warning**
+>   that drain latency had *n* samples for *m* bookings — and a run shipped `MEASURED` with it.
+>   That is the whole difference between prose and a control.
 
 > [!warning] ==Ask of every control: *would this still pass if the API stopped answering?*==
 > If the answer is yes, it is not measuring — it is assuming. Two of these failed that question:
@@ -57,6 +80,30 @@ invalidate that document.
 > "at most one live appointment?", which an unreadable diary satisfies trivially with an empty list.
 > Both now require a well-formed 2xx first and **fail, naming what broke**, on anything else. C4's
 > third probe had the same shape and was hardened with them.
+>
+> ==C3's version of that judgement was INLINED, so the organic phase never inherited it.== It now
+> lives in one function (`read_offer`) that both call, because a rule enforced at one of its call
+> sites is a rule with a hole in it — and that hole was §1's biggest number.
+
+> [!warning] ==And the mirror question: *could this FAIL while the product is perfect?*==
+> A control that can go red by luck is not a control either; worse, its failure accuses the product
+> of a fault belonging to the harness. Two failed this one, and both were fixed by changing the
+> ORACLE rather than the sequence:
+>
+> - **C7** slept a fixed 12 seconds and read the sink once. A webhook arriving at 13 seconds read as
+>   `0`, which is ==indistinguishable from the duplication C7 exists to detect== — a timeout
+>   reported as a defect, lying in both directions at once. It now drains the outbox first (so every
+>   queued delivery has been *attempted*), polls to an explicit deadline, then keeps watching
+>   through a settling window so a late duplicate is still caught — and the report distinguishes
+>   *"nothing arrived within N s"* from *"more than one arrived"*.
+> - **C5** required `first_reading.due > baseline`, where `due` is an **instantaneous gauge** and
+>   the restarted worker both serves that metric and drains the queue. On a fast tick it finishes
+>   draining before the first scrape is answered, and the control failed a system that behaved
+>   perfectly. It now judges on **durable** signals that cannot be missed by arriving late: the
+>   DB-derived row count grew by at least the work stranded, and the restarted worker's
+>   `drain.delivered` counter (zero at boot, monotonic after) accounts for it. Catching the gauge
+>   mid-climb is still recorded as corroboration — it is simply no longer decided by a coin toss
+>   against the system under test.
 
 **C2 and C5 audit the harness rather than the product**, and they are the two that matter most.
 
@@ -123,6 +170,17 @@ it. It **backs the existing file up first**, and `run.sh` restores it from a `tr
 on success, on failure, and on Ctrl-C. A boot that dies halfway no longer leaves shared repo
 configuration replaced by test-only values.
 
+> [!danger] ==`--keep` has no "way out", and that turned the backup into a one-shot.==
+> A `--keep` run deliberately leaves the stack up **and** the backup in place, because the stack
+> that is still running goes on reading the test-only `deploy/.env`. Start `stack-up.sh` again in
+> that state and its `cp` copied the **simulation's** env over the saved original — destroying the
+> only copy of the developer's file, silently, inside the step whose entire purpose is to preserve
+> it. The two events are far enough apart in time that nobody connects them.
+>
+> So a leftover `${ENV_BACKUP}.state` is now a **hard stop**: `stack-up.sh` refuses to start and
+> names the way out, and `scripts/stack-down.sh` is that way out — it tears the throwaway stack down
+> **and** restores `deploy/.env`, which a bare `docker compose down -v` never did.
+
 ## What a run does
 
 1. **Provision** — three businesses across two timezones, each with four event types (see
@@ -168,6 +226,7 @@ about running more than one worker.
 |---|---|
 | `compose.sim.yml` | Third overlay on the shipping stack: the renamed project, the operator token, a bigger mailbox |
 | `scripts/stack-up.sh` | Boots the throwaway stack, creates the businesses, writes `.stack.json` |
+| `scripts/stack-down.sh` | Tears it down **and gives `deploy/.env` back** — the exit a `--keep` run otherwise has none of |
 | `scripts/run.sh` | The one command: up → simulate → report → down |
 | `aethercal_sim/client.py` | Stdlib HTTP and the stopwatch. Never raises on a status — a refusal is data |
 | `aethercal_sim/world.py` | `.stack.json`, and the businesses and event types a run is built on |

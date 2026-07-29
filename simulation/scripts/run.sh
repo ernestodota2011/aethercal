@@ -55,9 +55,14 @@ restore_env() {
 
 cleanup() {
   if ((KEEP == 1)); then
+    # ==One teardown command, and it is the one that also restores deploy/.env.== This used to
+    # print a bare `down -v`, which drops the containers and leaves shared repo configuration
+    # replaced by the simulation's own — and leaves the backup sitting exactly where the NEXT
+    # `stack-up.sh` would have overwritten it with test-only values. stack-down.sh does both.
     echo "==> --keep: leaving the stack up. Tear it down with:"
-    echo "    ${COMPOSE_CMD} down -v"
-    echo "    deploy/.env stays in place for it; your original is at ${ENV_BACKUP}"
+    echo "    ${SIM_DIR}/scripts/stack-down.sh"
+    echo "    deploy/.env stays in place while it runs; your original is at ${ENV_BACKUP}"
+    echo "    (stack-up.sh will REFUSE to start again until that backup has been restored)"
     return
   fi
   echo "==> tearing down the throwaway stack"

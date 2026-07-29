@@ -25,8 +25,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .measure import Latency, OutboxSampler
-from .scenarios import Control, OrganicResult, RaceOutcome
+from .measure import Latency, MailboxRead, OutboxSampler
+from .scenarios import ConfirmationCoverage, Control, OrganicResult, RaceOutcome
 
 
 @dataclass(slots=True)
@@ -80,7 +80,29 @@ def _latency_row(latency: Latency) -> str:
 #:
 #: Adding a control means adding its id here. That is the intended friction.
 REQUIRED_CONTROL_IDS: frozenset[str] = frozenset(
-    {"C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12"}
+    {
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+        "C5",
+        "C6",
+        "C7",
+        "C8",
+        "C9",
+        "C10",
+        "C11",
+        "C12",
+        # ==C13 and C14 close the last two routes from a broken run to a green verdict.== Each
+        # guards a phase whose failures had nowhere to go: the organic load could 500 its way
+        # through the whole fortnight and present as a quiet one (C13), and the confirmation sample
+        # could be truncated by a mailbox ceiling or trimmed by a silent non-negative filter and
+        # still be published as the whole distribution (C14). §1 and §2 are their subjects — which
+        # is exactly why they had to become controls rather than prose, since the report already
+        # CARRIED a warning about the second and a run that shipped with it still said MEASURED.
+        "C13",
+        "C14",
+    }
 )
 
 
@@ -121,8 +143,8 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     no_show_outcome: str,
     sink_counts: dict[str, int],
     sink_unreadable: int,
-    mail_total: int,
-    mail_unparseable: int,
+    mail_read: MailboxRead,
+    coverage: ConfirmationCoverage,
     drained: bool,
     drain_wait_seconds: float,
 ) -> str:
@@ -168,8 +190,43 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         f"- Organic collisions (two guests, one slot → `slot_unavailable`): "
         f"**{organic.collisions}**"
     )
-    add(f"- Attempts that met a fully-booked day (no slots offered): {organic.no_slots_offered}")
+    add(
+        f"- Attempts that met a fully-booked day (an empty offer from a **well-formed 2xx**): "
+        f"{organic.no_slots_offered}"
+    )
     add("")
+    # ==Every planned intent, in one closed taxonomy that has to add up (C13).== The three
+    # categories above used to be the whole accounting, and two `return` statements fell outside
+    # them: a slots query that FAILED was counted as a full day, and a booking that answered
+    # anything but 201/`slot_unavailable` was dropped without trace. A phase that can lose its own
+    # failures reports a quieter fortnight the worse the instance behaves.
+    add("**Every planned intent, accounted for** — the categories must sum to what was planned:")
+    add("")
+    add("| leg | outcome | n |")
+    add("|---|---|---:|")
+    for outcome, count in organic.create_outcomes().items():
+        add(f"| create | `{outcome}` | {count} |")
+    for outcome, count in organic.follow_up_outcomes().items():
+        add(f"| follow-up | `{outcome}` | {count} |")
+    add("")
+    add(
+        f"Create outcomes sum to **{sum(organic.create_outcomes().values())}** of "
+        f"**{plan_summary['total']}** planned · follow-up outcomes sum to "
+        f"**{sum(organic.follow_up_outcomes().values())}** of "
+        f"**{organic.follow_ups_attempted}** attempted. **C13** is the control on that arithmetic."
+    )
+    add("")
+    unexpected_organic = organic.unexpected_organic_failures()
+    if unexpected_organic:
+        add(
+            "> [!danger] ==Unexpected failures during the organic phase: "
+            f"`{unexpected_organic}`.== "
+            "A collision or a full day is the product working; a broken read, a 5xx or an "
+            "unreadable body is a finding, and C13 refuses the run over it."
+        )
+        for problem in (organic.slots_read_failed + organic.booking_unreadable)[:5]:
+            add(f"> - {problem}")
+        add("")
 
     # ---- 2. latency ----
     add("## 2. Latency (milliseconds, measured client-side, nearest-rank percentiles)")
@@ -196,6 +253,18 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         "outbox and is produced by the worker, not by the request that returned 201."
     )
     add("")
+    add(
+        "==`booking_to_confirmation_email` is measured from the instant the POST was **sent**, not "
+        "the instant it returned.== It used to be the latter, which made the reference later than "
+        "an event it is supposed to precede: the worker can send the mail while the guest's own "
+        "response is still in flight. Those confirmations produced a negative delta and were "
+        "dropped by a bare `if delta_ms >= 0`. Only the FASTEST can precede their own POST, so the "
+        "discard removed exactly the left tail and every percentile in this row moved UP. "
+        f"Negative deltas in this run: **{coverage.negative_deltas}** — and a non-zero "
+        "count is now "
+        "clock skew, reported and gating (**C14**), never a silent filter."
+    )
+    add("")
 
     # ---- 3. the outbox ----
     add("## 3. The outbox and the drain")
@@ -212,9 +281,23 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     )
     if drain_stats:
         add(f"- Dead-man control figures: `{drain_stats}`")
+    # ==The mailbox read reports its own completeness, because a truncated one used to look small.==
+    # The reader asked for `limit=20000` in a single request and compared it to nothing; past that
+    # ceiling the list simply stopped, and a latency sample that loses members reports a FASTER
+    # product. It is paged to Mailpit's own total now, and C14 gates on reaching it.
     add(
-        f"- Confirmation emails in the mailbox: **{mail_total}** "
-        f"(unreadable timestamps: {mail_unparseable})"
+        f"- Messages in the mailbox: **{mail_read.reported_total}** as Mailpit reports them · "
+        f"**{len(mail_read.messages)}** read back over **{mail_read.pages}** page(s) of "
+        f"{mail_read.page_size} (unreadable envelopes: {mail_read.unparseable})"
+    )
+    add(
+        f"- Mailbox read **complete: {'yes' if mail_read.complete else 'NO'}**"
+        + (f" — {mail_read.problem}" if mail_read.problem else "")
+    )
+    add(
+        f"- Confirmations matched to a created booking: **{coverage.matched} of "
+        f"{coverage.created}** (in {coverage.attempts} read(s), {coverage.waited_seconds:.1f}s) · "
+        f"confirmations that PRECEDED their own POST: **{coverage.negative_deltas}**"
     )
     add(
         f"- Webhook deliveries captured at the sink, by event: `{sink_counts}` "
@@ -330,11 +413,20 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     )
     add(
         "- **Latency under this load, on this hardware.** The distributions in §2, at the sample "
-        "sizes shown there."
+        "sizes shown there — and, for `booking_to_confirmation_email`, over a sample proven "
+        "COMPLETE rather than over whatever survived a mailbox ceiling and a non-negative filter "
+        "(C14)."
+    )
+    add(
+        "- **The organic load really was this load.** Every planned intent lands in one explained "
+        "outcome and the outcomes reconcile against the plan (C13), so §1 cannot be describing a "
+        "quiet fortnight that was really a failing one."
     )
     add(
         "- **The drain keeps up, and a dead drain would be visible.** Peak backlog in §3, with the "
-        "dead-man control (C5) proving the metric is live rather than a constant zero."
+        "dead-man control (C5) proving the metric is live rather than a constant zero — judged on "
+        "signals that DURABLY account for the stranded work, not on catching an instantaneous "
+        "gauge before the drain clears it."
     )
     add(
         "- **Both locales and several guest timezones exercise the same paths** without a distinct "
@@ -407,10 +499,12 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     if drain_latency.count < len(organic.booked):
         add("")
         add(
-            f"> [!warning] Drain latency has **{drain_latency.count}** samples for "
-            f"**{len(organic.booked)}** bookings. The rest could not be matched to a message in "
-            "the mailbox, so §2's `booking_to_confirmation_email` row describes the matched "
-            "subset only."
+            f"> [!danger] Drain latency has **{drain_latency.count}** samples for "
+            f"**{len(organic.booked)}** bookings, so §2's `booking_to_confirmation_email` row "
+            "describes a SUBSET. ==This used to be a warning and nothing else, which is how a run "
+            "shipped MEASURED while its headline latency quietly described whatever had "
+            "survived.== "
+            "It is **C14** now: a gap here voids the run rather than annotating it."
         )
     add("")
     return "\n".join(lines)

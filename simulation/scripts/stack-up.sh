@@ -103,6 +103,27 @@ wait_for_http() {
 # declares `env_file: .env` per service, so the stack genuinely needs it there; what was missing was
 # any way back. Back it up first and record whether it existed, so `run.sh` can restore the
 # developer's file on the way out even if the boot fails halfway.
+#
+# ==A LEFTOVER BACKUP IS A HARD STOP.== `run.sh --keep` deliberately leaves the stack up AND the
+# backup in place, because the stack that is still running goes on reading the test-only
+# `deploy/.env`. Start this script again in that state and the `cp` below would copy the
+# SIMULATION's env over the saved original — destroying the only copy of the developer's file,
+# silently, in the very step whose name is "back it up". The `--keep` and the next boot are far
+# enough apart in time that nobody connects them, which is exactly the shape of accident worth
+# making impossible instead of documenting.
+if [[ -e "${ENV_BACKUP}.state" ]]; then
+  echo "ERROR: ${ENV_BACKUP}.state already exists, so a previous run (most likely" >&2
+  echo "       \`run.sh --keep\`) still holds your original deploy/.env. Starting now would" >&2
+  echo "       overwrite that backup with this simulation's own env file and lose the original." >&2
+  echo "" >&2
+  echo "       Restore it and tear the leftover stack down with:" >&2
+  echo "" >&2
+  echo "         ${SIM_DIR}/scripts/stack-down.sh" >&2
+  echo "" >&2
+  echo "       If you are certain the backup is stale, remove ${ENV_BACKUP}.state by hand." >&2
+  exit 1
+fi
+
 echo "==> rendering ${ENV_FILE} (test-only values; the previous file is backed up)"
 if [[ -f "${ENV_FILE}" ]]; then
   cp "${ENV_FILE}" "${ENV_BACKUP}"

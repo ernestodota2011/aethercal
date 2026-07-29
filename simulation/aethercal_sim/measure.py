@@ -132,10 +132,37 @@ def record(latency: Latency, tally: ErrorTally, response: Response) -> Response:
 
 @dataclass(frozen=True, slots=True)
 class OutboxSample:
+    """One read of the operator surface — ==both the gauges and the counters, on purpose.==
+
+    ``due`` and ``oldest_due_age_seconds`` are INSTANTANEOUS: they describe the queue at the instant
+    of the scrape and say nothing about the instant before it. ``rows`` and ``delivered`` are
+    CUMULATIVE, and that difference is what the dead-man control turned out to need — a gauge can
+    be back at rest before the first observer arrives, and then the observation reports "nothing
+    happened" about something that did.
+    """
+
     at: float
     due: int
     oldest_due_age_seconds: float
     by_status: dict[str, int]
+    delivered: int | None = None
+    """``drain.delivered`` — intents this WORKER PROCESS has delivered since it booted.
+
+    ==Process-local and reset by a restart, which is exactly why it is useful here.== After the
+    dead-man control restarts the worker it starts from zero and only grows, so "the restarted
+    worker processed the stranded work" can be read at any later moment and still be true. ``None``
+    means the payload carried no ``drain.delivered`` at all — a changed contract, kept distinct
+    from a delivered count of zero, because "absent" and "0" must never look the same."""
+
+    @property
+    def rows(self) -> int:
+        """Total outbox rows the DB-derived snapshot can see, across every status.
+
+        ==Cumulative and durable across a worker restart==, unlike ``due``. It is what proves the
+        snapshot really reads the table rather than answering a constant: work that appeared while
+        the drain was down is still visible in it long after the drain caught up.
+        """
+        return sum(self.by_status.values())
 
 
 class OutboxScrapeError(RuntimeError):
@@ -192,11 +219,18 @@ class OutboxSampler:
             if isinstance(by_status_raw, dict)
             else {}
         )
+        # ==`None`, not 0, when the field is absent.== The dead-man control reads this counter to
+        # decide whether the restarted worker really processed the stranded work; a missing field
+        # defaulted to zero would be indistinguishable from a worker that drained nothing, and the
+        # control would blame the product for a contract change.
+        drain: Any = payload.get("drain")
+        delivered_raw: Any = drain.get("delivered") if isinstance(drain, dict) else None
         return OutboxSample(
             at=time.time(),
             due=int(outbox.get("due", 0)),
             oldest_due_age_seconds=float(outbox.get("oldest_due_age_seconds", 0.0)),
             by_status=by_status,
+            delivered=int(delivered_raw) if isinstance(delivered_raw, int) else None,
         )
 
     def pause(self) -> None:
@@ -285,22 +319,59 @@ class MailMessage:
     created: datetime
 
 
+#: How many messages ONE Mailpit request asks for. ==A page size, never a ceiling.== The difference
+#: is the whole of :class:`MailboxRead` — see its docstring.
+MAILBOX_PAGE_SIZE = 500
+
+#: A read needing more pages than this is not a big mailbox, it is a loop that will not terminate.
+_MAX_MAILBOX_PAGES = 400
+
+
+@dataclass(frozen=True, slots=True)
+class MailboxRead:
+    """Every message the mailbox held — and ==whether the read can be trusted to BE every message.==
+
+    ``complete`` exists because of a defect this reader used to have. It asked for ``limit=20000``
+    in a single request: a number chosen once, equal to the ``MP_MAX_MESSAGES`` the compose overlay
+    happens to set, and compared against nothing. A mailbox holding more came back **silently
+    truncated** — the list simply stopped — and ``booking_to_confirmation_email`` was then computed
+    over whichever subset survived. ==A latency sample that loses members reports a FASTER
+    product==, so the failure mode of that ceiling was to improve the published numbers, and the
+    verdict never learned that anything had been lost.
+
+    The class already reasoned correctly about exactly this shape for ``unparseable`` — "a Mailpit
+    upgrade that renamed the field would present as *the drain got faster*" — and then left the
+    ceiling unwatched three lines below it. So the ceiling is gone: :meth:`Mailbox.read_all` pages
+    until it has collected the total Mailpit itself reports, and reports here when it could not.
+    An incomplete read is a fact the verdict acts on (C14), never a shorter list.
+    """
+
+    messages: list[MailMessage]
+    complete: bool
+    reported_total: int
+    """How many messages Mailpit says it holds — the bound this read is reconciled against, taken
+    from the server rather than chosen by the client."""
+    pages: int
+    page_size: int
+    unparseable: int = 0
+    """Messages whose recipient or ``Created`` timestamp this client could not read.
+
+    Surfaced rather than swallowed: dropping them silently would shrink the drain-latency sample
+    without saying so."""
+    problem: str = ""
+
+
 class Mailbox:
     """Reads Mailpit: the harness's oracle for "the guest was actually told".
 
     ==The confirmation is what makes a booking real to a guest, and it is produced by the WORKER,
     not by the request that returned 201.== So "the booking POST was fast" and "the guest has their
     appointment" are two different measurements, and only this one crosses the outbox.
-
-    ``unparseable`` counts messages whose ``Created`` timestamp this client could not read. It is
-    surfaced in the report instead of being swallowed: dropping them silently would shrink the
-    drain-latency sample without saying so, and a Mailpit upgrade that renamed the field would
-    present as "the drain got faster" — fewer, luckier samples — rather than as a broken oracle.
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, *, page_size: int = MAILBOX_PAGE_SIZE) -> None:
         self._base = base_url.rstrip("/")
-        self.unparseable = 0
+        self.page_size = page_size
 
     def _get(self, path: str) -> Any:
         request = urllib.request.Request(f"{self._base}{path}", method="GET")
@@ -312,57 +383,128 @@ class Mailbox:
         with _OPENER.open(request, timeout=30.0):
             pass
 
-    def messages(self, limit: int = 20000) -> list[MailMessage]:
-        """Every message currently held, flattened to what the harness needs."""
-        payload: Any = self._get(f"/api/v1/messages?limit={limit}")
-        if not isinstance(payload, dict):
-            return []
-        raw_messages: Any = payload.get("messages", [])
-        if not isinstance(raw_messages, list):
-            return []
-        out: list[MailMessage] = []
-        unparseable = 0
-        for item in raw_messages:
-            if not isinstance(item, dict):
-                unparseable += 1
-                continue
-            recipients: Any = item.get("To", [])
-            address = ""
-            if isinstance(recipients, list) and recipients:
-                first: Any = recipients[0]
-                if isinstance(first, dict):
-                    address = str(first.get("Address", ""))
-            try:
-                created = datetime.fromisoformat(
-                    str(item.get("Created", "")).replace("Z", "+00:00")
-                )
-            except ValueError:
-                unparseable += 1
-                continue
-            if not address:
-                unparseable += 1
-                continue
-            out.append(
-                MailMessage(
-                    to=address.lower(), subject=str(item.get("Subject", "")), created=created
-                )
-            )
-        self.unparseable = unparseable
-        return out
+    @staticmethod
+    def reported_total(payload: dict[str, Any]) -> int | None:
+        """Mailpit's own count of what it holds — the only number that can bound a read of it.
 
-    def count(self) -> int:
-        """How many messages the mailbox is holding, as Mailpit itself reports it.
-
-        Used to assert the mailbox never ROLLED: Mailpit evicts the oldest messages once
-        ``MP_MAX_MESSAGES`` is reached, which would delete the confirmations belonging to the
-        earliest bookings — and the drain-latency distribution would then be computed over the tail
-        of the run only, a better-looking number produced purely by losing data.
+        ``messages_count`` is the total matching the (empty) filter and ``total`` is the
+        mailbox-wide count; older builds publish only the second, so both are tried in that order.
+        ``None`` means the envelope carried neither, which is a CHANGED CONTRACT and emphatically
+        not a mailbox of zero.
         """
-        payload: Any = self._get("/api/v1/messages?limit=1")
-        if not isinstance(payload, dict):
-            return 0
         for key in ("messages_count", "total"):
             value: Any = payload.get(key)
             if isinstance(value, int):
                 return value
-        return 0
+        return None
+
+    @staticmethod
+    def parse(item: Any) -> MailMessage | None:
+        """One Mailpit envelope, or ``None`` when unreadable (counted, never dropped)."""
+        if not isinstance(item, dict):
+            return None
+        recipients: Any = item.get("To", [])
+        address = ""
+        if isinstance(recipients, list) and recipients:
+            first: Any = recipients[0]
+            if isinstance(first, dict):
+                address = str(first.get("Address", ""))
+        if not address:
+            return None
+        try:
+            created = datetime.fromisoformat(str(item.get("Created", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return MailMessage(
+            to=address.lower(), subject=str(item.get("Subject", "")), created=created
+        )
+
+    def _incomplete(
+        self, *, collected: list[MailMessage], total: int, page: int, unparseable: int, why: str
+    ) -> MailboxRead:
+        return MailboxRead(collected, False, total, page, self.page_size, unparseable, why)
+
+    def read_all(self) -> MailboxRead:  # noqa: PLR0911 - each return names a DISTINCT broken read
+        """Page through the WHOLE mailbox, or report why the read is not whole.
+
+        ==There is no ``limit`` parameter, on purpose.== How much this read should return is a
+        property of what the run produced, not a constant somebody picked in advance; the only
+        defensible bound is the total Mailpit itself publishes, and reaching it is the loop's
+        termination condition. A failed request, an envelope that is not the contract, a page that
+        does not advance, or a total never reached each return ``complete=False`` with the reason
+        attached — because the one thing a truncated mailbox must never look like is a small one.
+        """
+        collected: list[MailMessage] = []
+        unparseable = 0
+        start = 0
+        total = 0
+        for page in range(1, _MAX_MAILBOX_PAGES + 1):
+            query = f"/api/v1/messages?start={start}&limit={self.page_size}"
+            try:
+                payload: Any = self._get(query)
+            except Exception as exc:
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=f"GET {query} failed: {type(exc).__name__}: {exc}",
+                )
+            if not isinstance(payload, dict):
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=f"the messages envelope is not an object: {payload!r}",
+                )
+            reported = self.reported_total(payload)
+            if reported is None:
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=(
+                        "the messages envelope carried neither `messages_count` nor `total`, so "
+                        "this read has nothing to reconcile against — the contract changed"
+                    ),
+                )
+            total = reported
+            raw_messages: Any = payload.get("messages")
+            if not isinstance(raw_messages, list):
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=f"`messages` is not a list: {raw_messages!r}",
+                )
+            for item in raw_messages:
+                message = self.parse(item)
+                if message is None:
+                    unparseable += 1
+                else:
+                    collected.append(message)
+            start += len(raw_messages)
+            if not raw_messages:
+                # An empty page BEFORE the reported total means the server and its own envelope
+                # disagree; trusting it truncates the mailbox, which is the whole defect.
+                if start >= total:
+                    return MailboxRead(collected, True, total, page, self.page_size, unparseable)
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=f"an empty page at start {start} of a reported total of {total}",
+                )
+            if start >= total:
+                return MailboxRead(collected, True, total, page, self.page_size, unparseable)
+        return self._incomplete(
+            collected=collected,
+            total=total,
+            page=_MAX_MAILBOX_PAGES,
+            unparseable=unparseable,
+            why=f"pagination did not terminate after {_MAX_MAILBOX_PAGES} pages",
+        )

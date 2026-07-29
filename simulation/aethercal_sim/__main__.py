@@ -36,9 +36,11 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from .client import Client
-from .measure import Latency, Mailbox, OutboxSampler, wait_for_drain
+from .measure import Latency, Mailbox, MailboxRead, OutboxSampler, wait_for_drain
 from .report import RunContext, render, render_json, verdict_for
 from .scenarios import (
+    BookedRef,
+    ConfirmationCoverage,
     Control,
     control_closed_day,
     control_day_cap,
@@ -50,7 +52,11 @@ from .scenarios import (
     control_taken_slot,
     count_sink_events,
     fetch_slots,
+    judge_cancel_idempotency,
+    judge_confirmation_coverage,
+    judge_organic_accounting,
     next_saturday,
+    observe_cancel_webhooks,
     pick_micro_slot,
     race_cancel,
     race_cancel_vs_reschedule,
@@ -58,7 +64,6 @@ from .scenarios import (
     race_reschedule,
     race_same_slot,
     run_organic,
-    sink_events_for_booking,
     slot_starts,
 )
 from .scenarios import book as book_slot
@@ -147,6 +152,90 @@ Pass the compose invocation, e.g.
 
 or pass --allow-missing-drain-control to run anyway; C5 is then reported as NOT RUN and the
 verdict becomes INCOMPLETE."""
+
+
+#: How long the confirmation reconciliation keeps re-reading the mailbox before giving up.
+#:
+#: ==A deadline, not a sleep.== C12 has already established that the outbox drained, so every
+#: confirmation has been HANDED to SMTP by the time this starts; this window only covers Mailpit
+#: finishing its own write. It ends the moment the set is complete, and a timeout is reported as a
+#: timeout rather than as a smaller sample.
+CONFIRMATION_MATCH_TIMEOUT_SECONDS = 30.0
+CONFIRMATION_MATCH_POLL_SECONDS = 3.0
+
+
+def measure_confirmations(
+    mailbox: Mailbox, booked: list[BookedRef]
+) -> tuple[Latency, MailboxRead, ConfirmationCoverage]:
+    """Match every created booking to its confirmation, and account for the ones that do not match.
+
+    .. rubric:: The two silent subtractions this replaces
+
+    The previous version read the mailbox once with a hardcoded ``limit=20000`` and then filtered
+    the deltas with a bare ``if delta_ms >= 0``. Both losses were invisible to the verdict, and
+    ==both moved the published latency in the same, flattering direction==: a truncated mailbox
+    drops samples, and a non-negative filter drops specifically the FASTEST ones — the only
+    confirmations that can precede a reference instant stamped after the POST returned.
+
+    Now the mailbox is PAGED to its own reported total (:meth:`Mailbox.read_all`), the reference is
+    the instant the POST was SENT (:class:`BookedRef`), and what remains is reconciled: how many of
+    the created bookings were found, and how many deltas came back negative anyway. Both feed C14,
+    so an incomplete sample cannot be published as a complete one.
+
+    Negative deltas are still kept OUT of the distribution — a negative latency is not a latency —
+    but they are counted, named in the report, and they void the run. The difference between that
+    and the old behaviour is the whole point: ==the filter is no longer free.==
+    """
+    started = time.monotonic()
+    attempts = 0
+    read = mailbox.read_all()
+    first_seen: dict[str, float] = {}
+    matched = 0
+    while True:
+        attempts += 1
+        first_seen = {}
+        for message in read.messages:
+            stamp = message.created.timestamp()
+            if message.to not in first_seen or stamp < first_seen[message.to]:
+                first_seen[message.to] = stamp
+        matched = sum(1 for ref in booked if ref.guest_email.lower() in first_seen)
+        complete = matched >= len(booked)
+        if complete or not read.complete:
+            break
+        if time.monotonic() - started >= CONFIRMATION_MATCH_TIMEOUT_SECONDS:
+            break
+        time.sleep(CONFIRMATION_MATCH_POLL_SECONDS)
+        read = mailbox.read_all()
+
+    latency = Latency("booking_to_confirmation_email")
+    negatives = 0
+    worst_negative = 0.0
+    for ref in booked:
+        stamp = first_seen.get(ref.guest_email.lower())
+        if stamp is None:
+            continue
+        delta_ms = (stamp - ref.sent_at_wall) * 1000.0
+        if delta_ms < 0:
+            negatives += 1
+            worst_negative = min(worst_negative, delta_ms)
+            continue
+        latency.record(delta_ms)
+    return (
+        latency,
+        read,
+        ConfirmationCoverage(
+            created=len(booked),
+            matched=matched,
+            negative_deltas=negatives,
+            worst_negative_ms=worst_negative,
+            read_complete=read.complete,
+            read_problem=read.problem,
+            reported_total=read.reported_total,
+            page_size=read.page_size,
+            attempts=attempts,
+            waited_seconds=time.monotonic() - started,
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a run IS its phases
@@ -284,18 +373,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         )
     else:
         races.append(race_cancel(stack, target, booking_id=cancel_id, contenders=args.contenders))
-        # Let the drain deliver whatever was queued, then ask the sink the question that matters.
-        time.sleep(12)
-        cancel_race_events = sink_events_for_booking(stack.sink_url, cancel_id)
-        controls.append(
-            Control(
-                ident="C7",
-                guards=_C7,
-                expected="exactly 1 booking.cancelled at the sink for this booking",
-                observed=f"{cancel_race_events}",
-                passed=cancel_race_events.get("booking.cancelled", 0) == 1,
-            )
-        )
+        # ==Observed, not slept through.== This used to be `time.sleep(12)` and a single read: a
+        # webhook arriving at 13 seconds made C7 fail in a way INDISTINGUISHABLE from the
+        # duplication it exists to detect. `observe_cancel_webhooks` drains the outbox first (so
+        # every queued delivery has been attempted), polls until the event appears or an explicit
+        # deadline passes, then keeps watching long enough for a late duplicate to be caught.
+        cancel_observation = observe_cancel_webhooks(stack.sink_url, cancel_id, sampler=sampler)
+        cancel_race_events = cancel_observation.counts
+        print(f"    cancel race: drained={cancel_observation.drained} events={cancel_race_events}")
+        controls.append(judge_cancel_idempotency(cancel_observation, ident="C7", guards=_C7))
 
     reschedule_id = subject(args.contenders + 2, "Reschedule")
     later_starts: list[str] = []
@@ -464,7 +550,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
     if args.compose_cmd:
         print("==> control C5: stopping the worker to prove the backlog metric is live")
 
-        def make_work() -> None:
+        def make_work() -> int:
+            """Strand real work behind the stopped worker, and report HOW MUCH really landed.
+
+            ==The count is returned rather than assumed.== C5's pass conditions are stated against
+            the work that was actually created, so a probe that booked four of its six slots is
+            judged against four. A constant written in two places is a constant that eventually
+            disagrees with itself, and here the disagreement would show as the metric "missing"
+            work that was never made.
+            """
             offer_now = fetch_slots(
                 client,
                 event_type_id=target.event_types["standard"].id,
@@ -472,8 +566,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 timezone=target.config.timezone,
                 days=3,
             )
+            created = 0
             for index, start in enumerate(slot_starts(offer_now)[:6]):
-                book_slot(
+                probe = book_slot(
                     client,
                     event_type_id=target.event_types["standard"].id,
                     start=start,
@@ -482,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     guest_timezone="UTC",
                     locale="en",
                 )
+                created += 1 if probe.ok else 0
+            return created
 
         control, drain_stats = control_drain_deadman(
             sampler,
@@ -517,21 +614,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         )
     )
 
-    drain_latency = Latency("booking_to_confirmation_email")
-    first_seen: dict[str, float] = {}
-    for message in mailbox.messages():
-        stamp = message.created.timestamp()
-        if message.to not in first_seen or stamp < first_seen[message.to]:
-            first_seen[message.to] = stamp
-    for ref in organic.booked:
-        stamp = first_seen.get(ref.guest_email.lower())
-        if stamp is None:
-            continue
-        delta_ms = (stamp - ref.created_at_wall) * 1000.0
-        # A negative delta means the two clocks disagree, not that mail arrived before it was sent.
-        # Recording it would silently drag the whole distribution down.
-        if delta_ms >= 0:
-            drain_latency.record(delta_ms)
+    # ---- C13: the organic phase has to add up before its numbers mean anything --------------
+    controls.append(judge_organic_accounting(organic, planned=summary["total"]))
+
+    drain_latency, mail_read, coverage = measure_confirmations(mailbox, organic.booked)
+    controls.append(judge_confirmation_coverage(coverage))
 
     sink_counts, sink_unreadable = count_sink_events(stack.sink_url)
 
@@ -561,8 +648,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
             no_show_outcome=no_show_outcome,
             sink_counts=sink_counts,
             sink_unreadable=sink_unreadable,
-            mail_total=mailbox.count(),
-            mail_unparseable=mailbox.unparseable,
+            mail_read=mail_read,
+            coverage=coverage,
             drained=drained,
             drain_wait_seconds=drain_wait,
         ),
@@ -579,6 +666,33 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 "cancelled": organic.cancelled,
                 "rescheduled": organic.rescheduled,
                 "organic_collisions": organic.collisions,
+                # ==The whole taxonomy, not just the flattering members of it.== A diff between two
+                # runs must be able to show a category appearing, which is why the create/follow-up
+                # outcomes travel in the machine-readable twin rather than only in the prose.
+                "organic_outcomes": {
+                    "planned": summary["total"],
+                    "create": organic.create_outcomes(),
+                    "follow_up": organic.follow_up_outcomes(),
+                    "follow_ups_attempted": organic.follow_ups_attempted,
+                    "unexpected_failures": organic.unexpected_organic_failures(),
+                    "slots_read_failures": organic.slots_read_failed[:10],
+                    "booking_unreadable": organic.booking_unreadable[:10],
+                },
+                "confirmations": {
+                    "created": coverage.created,
+                    "matched": coverage.matched,
+                    "negative_deltas": coverage.negative_deltas,
+                    "worst_negative_ms": coverage.worst_negative_ms,
+                    "mailbox_read_complete": coverage.read_complete,
+                    "mailbox_read_problem": coverage.read_problem,
+                    "mailbox_reported_total": coverage.reported_total,
+                    "mailbox_page_size": coverage.page_size,
+                    "mailbox_readable_messages": len(mail_read.messages),
+                    "mailbox_unparseable": mail_read.unparseable,
+                    "mailbox_pages": mail_read.pages,
+                    "reads": coverage.attempts,
+                    "waited_seconds": coverage.waited_seconds,
+                },
                 "latency": {
                     latency.name: latency.summary()
                     for latency in (

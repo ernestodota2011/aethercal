@@ -44,7 +44,15 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from .client import Client, Response
-from .measure import ErrorTally, Latency, OutboxSampler, OutboxScrapeError, record
+from .measure import (
+    ErrorTally,
+    Latency,
+    OutboxSample,
+    OutboxSampler,
+    OutboxScrapeError,
+    record,
+    wait_for_drain,
+)
 from .traffic import PlannedBooking
 from .world import Business, StackConfig, World
 
@@ -76,6 +84,47 @@ def slot_starts(response: Response) -> list[str]:
     return [str(slot["start"]) for slot in slots if isinstance(slot, dict) and "start" in slot]
 
 
+@dataclass(frozen=True, slots=True)
+class OfferRead:
+    """The day's offer — and ==whether "no slots" was an ANSWER or a failure to obtain one.==
+
+    :func:`slot_starts` returns ``[]`` for a closed Saturday, for a 500, for a 401, for a refused
+    connection, and for a body that is not the slots contract at all. Five different facts wearing
+    one shape — and every caller that branched on ``if not starts`` silently chose the most
+    flattering reading of them: ==a broken instrument filed as a fully-booked day.==
+
+    ``complete`` separates the two. It is the harness's own question — *would this still look the
+    same if the API stopped answering?* — asked of the hottest read in the run, where the answer
+    was yes in three places at once.
+    """
+
+    starts: list[str]
+    complete: bool
+    problem: str = ""
+
+
+def read_offer(response: Response) -> OfferRead:
+    """Judge a slots response BEFORE its emptiness is allowed to mean anything.
+
+    A well-formed answer is a 2xx whose body is an object carrying a ``slots`` LIST. Anything else
+    is a read that FAILED, and this names how — so a caller counts it as its own outcome instead of
+    as a day with nothing left in it.
+    """
+    if not response.ok:
+        return OfferRead(
+            [],
+            False,
+            f"the slots query FAILED: {response.status} {response.error_code} "
+            f"{response.text[:120]!r}",
+        )
+    body: Any = response.body
+    if not isinstance(body, dict) or not isinstance(body.get("slots"), list):
+        return OfferRead(
+            [], False, f"200 but the body is not the slots contract: {response.text[:140]!r}"
+        )
+    return OfferRead(slot_starts(response), True)
+
+
 def book(  # noqa: PLR0913 - the booking contract IS these fields; bundling them hides the payload
     client: Client,
     *,
@@ -101,18 +150,32 @@ def book(  # noqa: PLR0913 - the booking contract IS these fields; bundling them
 
 @dataclass(frozen=True, slots=True)
 class BookedRef:
-    """A booking the run really created, and the wall-clock instant its 201 came back.
+    """A booking the run really created, and the wall-clock instant its POST was SENT.
 
-    ``created_at_wall`` is :func:`time.time`, not a monotonic counter, because it is subtracted from
+    ``sent_at_wall`` is :func:`time.time`, not a monotonic counter, because it is subtracted from
     Mailpit's own ``Created`` timestamp to measure drain latency. Both are read on the same host, so
     they share one clock.
+
+    ==It is stamped BEFORE the request goes out, and that is the whole point of the field's name.==
+    It used to be stamped after the 201 came back, which made the reference instant later than the
+    event it is supposed to precede: the worker can pick the intent up, send the mail and have
+    Mailpit stamp it while the guest's own HTTP response is still in flight. Those confirmations
+    produced a NEGATIVE delta and were then dropped by a bare ``if delta_ms >= 0``, with a comment
+    blaming clocks that were never checked.
+
+    The bias is not random. Only the FASTEST confirmations can precede their own POST, so the
+    discard removed exactly the left tail — and every published percentile moved UP. ==A silent
+    filter whose selection criterion is "too good" is the worst kind of instrument: it is
+    conservative in the direction that never gets questioned.== Referenced to the send instant a
+    confirmation cannot legitimately precede its cause, so a negative delta now means one thing
+    only — the two clocks really disagree — which is counted, reported, and gates the run (C14).
     """
 
     booking_id: str
     business_slug: str
     guest_email: str
     start: str
-    created_at_wall: float
+    sent_at_wall: float
 
 
 # --------------------------------------------------------------------------------------
@@ -122,21 +185,97 @@ class BookedRef:
 
 @dataclass(slots=True)
 class OrganicResult:
+    """Every planned intent's fate, in ==one exhaustive taxonomy that must add up.==
+
+    .. rubric:: Why the categories are a closed set, and why the count is reconciled
+
+    This used to record three outcomes (booked, collision, no-slots) and let everything else fall
+    off the end of the function. Two ``return`` statements did the falling: a slots query that
+    FAILED produced no starts and was counted as ``no_slots_offered`` — *the day was full* — and a
+    booking that answered anything other than 201 or ``slot_unavailable`` was discarded by a bare
+    ``if not response.ok: return``. ==A 500 storm through the whole organic phase would have shown
+    up as a quiet day with a slightly smaller "created" number, and the verdict would still have
+    read MEASURED.==
+
+    So every planned item now terminates in exactly one category below, and C13 asserts that the
+    categories SUM to the number of items planned. That reconciliation is what makes the taxonomy
+    load-bearing rather than decorative: a future edit that adds a fourth silent ``return`` breaks
+    the arithmetic instead of shrinking a number nobody audits. ==An outcome that fits no known
+    category is a failure of the control, not a silence.==
+    """
+
     booked: list[BookedRef] = field(default_factory=list)
     slots_latency: Latency = field(default_factory=lambda: Latency("slots_read"))
     booking_latency: Latency = field(default_factory=lambda: Latency("booking_create"))
     cancel_latency: Latency = field(default_factory=lambda: Latency("booking_cancel"))
     reschedule_latency: Latency = field(default_factory=lambda: Latency("booking_reschedule"))
     tally: ErrorTally = field(default_factory=ErrorTally)
+
+    # ---- the create leg: one category per planned booking ----
     collisions: int = 0
     """Organic ``slot_unavailable`` refusals — two simulated guests wanting the same time."""
     no_slots_offered: int = 0
-    """Attempts that met an empty offer (a fully booked day). Not an error; reported separately."""
+    """Attempts that met an empty offer **from a well-formed 2xx** — a genuinely full day."""
+    slots_read_failed: list[str] = field(default_factory=list)
+    """==Attempts whose slots query BROKE.== Formerly indistinguishable from a full day."""
+    booking_refused: dict[str, int] = field(default_factory=dict)
+    """Non-2xx bookings that were not a collision, by code. Formerly discarded in silence."""
+    booking_unreadable: list[str] = field(default_factory=list)
+    """A 2xx that is not the booking contract. Used to raise in the pool and kill the run."""
+
+    # ---- the follow-up leg: one category per follow-up actually attempted ----
+    follow_ups_attempted: int = 0
     cancelled: int = 0
+    cancel_refused: dict[str, int] = field(default_factory=dict)
     rescheduled: int = 0
+    reschedule_refused: dict[str, int] = field(default_factory=dict)
+    reschedule_no_target: int = 0
+    """A well-formed offer holding no slot other than the one already held. Not an error."""
+    reschedule_slots_read_failed: list[str] = field(default_factory=list)
+
+    def create_outcomes(self) -> dict[str, int]:
+        """The create leg's taxonomy, flattened to counts. ==Must sum to the plan's length.=="""
+        return {
+            "booked": len(self.booked),
+            "collisions": self.collisions,
+            "no_slots_offered": self.no_slots_offered,
+            "slots_read_failed": len(self.slots_read_failed),
+            "booking_refused": sum(self.booking_refused.values()),
+            "booking_unreadable": len(self.booking_unreadable),
+        }
+
+    def follow_up_outcomes(self) -> dict[str, int]:
+        """The follow-up leg's taxonomy. ==Must sum to ``follow_ups_attempted``.=="""
+        return {
+            "cancelled": self.cancelled,
+            "cancel_refused": sum(self.cancel_refused.values()),
+            "rescheduled": self.rescheduled,
+            "reschedule_refused": sum(self.reschedule_refused.values()),
+            "reschedule_no_target": self.reschedule_no_target,
+            "reschedule_slots_read_failed": len(self.reschedule_slots_read_failed),
+        }
+
+    def unexpected_organic_failures(self) -> dict[str, int]:
+        """Everything in the two taxonomies that is a FINDING rather than ordinary traffic.
+
+        A collision, a full day and a reschedule with nowhere to go are the product behaving; a
+        broken read, a 5xx and an unreadable body are not. Only the second group gates.
+        """
+        return {
+            key: value
+            for key, value in {
+                "slots_read_failed": len(self.slots_read_failed),
+                "booking_refused": sum(self.booking_refused.values()),
+                "booking_unreadable": len(self.booking_unreadable),
+                "cancel_refused": sum(self.cancel_refused.values()),
+                "reschedule_refused": sum(self.reschedule_refused.values()),
+                "reschedule_slots_read_failed": len(self.reschedule_slots_read_failed),
+            }.items()
+            if value
+        }
 
 
-def run_organic(
+def run_organic(  # noqa: PLR0915 - the taxonomy IS the length: every outcome is one branch
     world: World,
     stack: StackConfig,
     plan: list[PlannedBooking],
@@ -153,25 +292,38 @@ def run_organic(
     slots, so collisions occur at the rate crowding produces rather than by construction; the
     deliberate collisions are Phase 2's job. Organic ``slot_unavailable`` refusals are counted and
     reported as their own number precisely so the two are never conflated.
+
+    ==Every planned item ends in exactly one category of :class:`OrganicResult`, and nothing falls
+    off the end of this function.== See that class for what used to fall, and what it cost.
     """
     result = OrganicResult()
     lock = threading.Lock()
     clients = {b.slug: Client(stack.api_url, b.config.api_key) for b in world.businesses}
+
+    def _tick(bucket: dict[str, int], code: str | None, status: int) -> None:
+        key = code or f"http_{status}"
+        bucket[key] = bucket.get(key, 0) + 1
 
     def one(item: PlannedBooking) -> None:
         business = world.by_slug(item.business_slug)
         client = clients[item.business_slug]
         event_type = business.event_types[item.event_key]
 
-        slots_response = record(
-            result.slots_latency,
-            result.tally,
-            fetch_slots(
-                client, event_type_id=event_type.id, day=item.day, timezone=item.guest_timezone
-            ),
+        offer = read_offer(
+            record(
+                result.slots_latency,
+                result.tally,
+                fetch_slots(
+                    client, event_type_id=event_type.id, day=item.day, timezone=item.guest_timezone
+                ),
+            )
         )
-        starts = slot_starts(slots_response)
-        if not starts:
+        if not offer.complete:
+            # ==NOT `no_slots_offered`.== The instrument broke; the day is not full, it is unknown.
+            with lock:
+                result.slots_read_failed.append(f"{item.business_slug} {item.day}: {offer.problem}")
+            return
+        if not offer.starts:
             with lock:
                 result.no_slots_offered += 1
             return
@@ -179,7 +331,12 @@ def run_organic(
         # Seeded per booking, not per thread: which slot a guest picks stays deterministic no matter
         # which worker happens to run them or in what order.
         rng = random.Random(seed * 1_000_003 + item.seq)
-        start = rng.choice(starts)
+        start = rng.choice(offer.starts)
+        # ==Stamped BEFORE the request leaves.== See BookedRef.sent_at_wall: taken after the 201
+        # arrived, this reference instant could postdate the confirmation it is meant to precede,
+        # and the resulting negative deltas were dropped — trimming the fastest confirmations out
+        # of the published distribution.
+        sent_at = time.time()
         response = record(
             result.booking_latency,
             result.tally,
@@ -193,14 +350,21 @@ def run_organic(
                 locale=item.locale,
             ),
         )
-        created_at = time.time()
         if response.error_code == "slot_unavailable":
             with lock:
                 result.collisions += 1
             return
         if not response.ok:
+            with lock:
+                _tick(result.booking_refused, response.error_code, response.status)
             return
         body: Any = response.body
+        if not isinstance(body, dict) or "id" not in body or "start" not in body:
+            # A 201 without the booking contract used to raise KeyError inside the pool and take the
+            # whole run down; now it is one legible, gating outcome among the others.
+            with lock:
+                result.booking_unreadable.append(f"{item.guest_email}: {response.text[:120]!r}")
+            return
         with lock:
             result.booked.append(
                 BookedRef(
@@ -208,7 +372,7 @@ def run_organic(
                     business_slug=item.business_slug,
                     guest_email=item.guest_email,
                     start=str(body["start"]),
-                    created_at_wall=created_at,
+                    sent_at_wall=sent_at,
                 )
             )
 
@@ -220,6 +384,7 @@ def run_organic(
     follow_ups = [
         item for item in plan if item.follow_up != "none" and item.guest_email in by_email
     ]
+    result.follow_ups_attempted = len(follow_ups)
 
     def follow_up(item: PlannedBooking) -> None:
         ref = by_email[item.guest_email]
@@ -231,26 +396,44 @@ def run_organic(
                 result.tally,
                 client.post(f"/api/v1/bookings/{ref.booking_id}/cancel"),
             )
-            if response.ok:
-                with lock:
+            with lock:
+                if response.ok:
                     result.cancelled += 1
+                else:
+                    _tick(result.cancel_refused, response.error_code, response.status)
             return
 
         event_type = business.event_types[item.event_key]
-        offer = fetch_slots(
-            client, event_type_id=event_type.id, day=item.day, timezone=item.guest_timezone, days=3
+        offer = read_offer(
+            fetch_slots(
+                client,
+                event_type_id=event_type.id,
+                day=item.day,
+                timezone=item.guest_timezone,
+                days=3,
+            )
         )
-        starts = [start for start in slot_starts(offer) if start != ref.start]
+        if not offer.complete:
+            with lock:
+                result.reschedule_slots_read_failed.append(
+                    f"{item.business_slug} {item.day}: {offer.problem}"
+                )
+            return
+        starts = [start for start in offer.starts if start != ref.start]
         if not starts:
+            with lock:
+                result.reschedule_no_target += 1
             return
         response = record(
             result.reschedule_latency,
             result.tally,
             client.post(f"/api/v1/bookings/{ref.booking_id}/reschedule", {"new_start": starts[0]}),
         )
-        if response.ok:
-            with lock:
+        with lock:
+            if response.ok:
                 result.rescheduled += 1
+            else:
+                _tick(result.reschedule_refused, response.error_code, response.status)
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="followup") as pool:
         list(pool.map(follow_up, follow_ups))
@@ -476,6 +659,57 @@ def sink_events_for_booking(sink_url: str, booking_id: str) -> dict[str, int]:
     return counts
 
 
+def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of them share a meaning
+    sink_url: str,
+    booking_id: str,
+    *,
+    sampler: OutboxSampler,
+    drain_timeout: float = 240.0,
+    appear_timeout_seconds: float = 60.0,
+    settle_seconds: float = 10.0,
+    poll_seconds: float = 0.5,
+) -> CancelWebhookObservation:
+    """Observe what the cancel race really delivered, instead of sleeping and hoping.
+
+    ==Drain first, then poll, then settle.== Each phase removes a different way the old
+    ``time.sleep(12)`` could lie:
+
+    * **drain** — the outbox is the durable queue every webhook leaves through, so waiting for
+      ``due == 0`` means every delivery the race queued has been ATTEMPTED before the sink is asked
+      anything. That is what makes the observation deterministic rather than a guess about how fast
+      the drain happens to be today;
+    * **poll** — the read then waits for the event to appear, up to an explicit deadline, so
+      "arrived at 13 s" stops being reported as "never arrived";
+    * **settle** — and it keeps watching afterwards, because the defect this control exists to
+      catch is a SECOND delivery, which by definition arrives after the first.
+
+    A duplicate that lands during the settling window is counted. One that lands after it is not —
+    no finite observation can promise otherwise, and the window is stated in the report rather than
+    left for a reader to assume away.
+    """
+    drained, drain_wait = wait_for_drain(sampler, timeout_seconds=drain_timeout)
+    started = time.monotonic()
+    appeared_after: float | None = None
+    counts = sink_events_for_booking(sink_url, booking_id)
+    while counts.get("booking.cancelled", 0) == 0 and time.monotonic() - started < (
+        appear_timeout_seconds
+    ):
+        time.sleep(poll_seconds)
+        counts = sink_events_for_booking(sink_url, booking_id)
+    if counts.get("booking.cancelled", 0) > 0:
+        appeared_after = time.monotonic() - started
+        time.sleep(settle_seconds)
+        counts = sink_events_for_booking(sink_url, booking_id)
+    return CancelWebhookObservation(
+        counts=counts,
+        drained=drained,
+        drain_wait_seconds=drain_wait,
+        appeared_after_seconds=appeared_after,
+        appear_timeout_seconds=appear_timeout_seconds,
+        settle_seconds=settle_seconds,
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Phase 3 — the controls
 # --------------------------------------------------------------------------------------
@@ -542,35 +776,31 @@ def judge_closed_day(response: Response) -> Control:
     So the emptiness is judged only after the response has proved it is a real, well-formed answer:
     2xx, a JSON object, and a ``slots`` list actually present. Anything else is an executed,
     FAILED control that names what came back.
+
+    ==That judgement now lives in :func:`read_offer`, and this reads it.== It used to be inlined
+    here, which is why the organic phase — the other place that turns a slots response into a
+    decision — went on counting a failed query as "the day was full" long after C3 had stopped.
+    A rule enforced at one of its call sites is a rule with a hole in it.
     """
-    if not response.ok:
+    offer = read_offer(response)
+    if not offer.complete:
         return Control(
             ident="C3",
             guards="the schedule is enforced: a closed weekend offers no slots",
             expected="a 2xx slots response with 0 slots",
             observed=(
-                f"the slots query FAILED: {response.status} {response.error_code} "
-                f"{response.text[:120]!r} — an empty offer could not be distinguished from a "
-                "broken one"
+                f"{offer.problem} — an empty offer could not be distinguished from a broken one"
             ),
             passed=False,
         )
     body: Any = response.body
-    if not isinstance(body, dict) or not isinstance(body.get("slots"), list):
-        return Control(
-            ident="C3",
-            guards="the schedule is enforced: a closed weekend offers no slots",
-            expected="a 2xx slots response with 0 slots",
-            observed=f"200 but the body is not the slots contract: {response.text[:140]!r}",
-            passed=False,
-        )
-    starts = slot_starts(response)
+    availability = body.get("availability") if isinstance(body, dict) else None
     return Control(
         ident="C3",
         guards="the schedule is enforced: a closed weekend offers no slots",
         expected="0 slots offered on a Saturday, from a well-formed 2xx",
-        observed=f"{len(starts)} slots offered (availability={body.get('availability')!r})",
-        passed=len(starts) == 0,
+        observed=f"{len(offer.starts)} slots offered (availability={availability!r})",
+        passed=len(offer.starts) == 0,
     )
 
 
@@ -648,49 +878,167 @@ def control_no_show_before_end(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class DeadmanObservation:
+    """Everything the dead-man sequence saw, separated into what is DURABLE and what is a snapshot.
+
+    The distinction is the whole fix. See :func:`judge_drain_deadman`.
+    """
+
+    work_created: int
+    surface_unreachable: bool
+    baseline_due: int
+    baseline_rows: int
+    final_rows: int
+    delivered_after_restart: int | None
+    """``drain.delivered`` of the RESTARTED worker process — zero at boot, monotonic after."""
+    drain_recovery_seconds: float | None
+    first_reading_due: int | None
+    """Corroboration only. ``None`` = the boot window closed before any scrape succeeded."""
+    first_reading_oldest_age_seconds: float = 0.0
+
+    @property
+    def rows_delta(self) -> int:
+        return self.final_rows - self.baseline_rows
+
+    @property
+    def caught_in_flight(self) -> bool:
+        """Whether the backlog GAUGE was still elevated when the first scrape landed.
+
+        ==Reported, never required.== It is a coin toss against the drain — see the judge.
+        """
+        return self.first_reading_due is not None and self.first_reading_due > self.baseline_due
+
+
+def judge_drain_deadman(observation: DeadmanObservation) -> Control:
+    """==C5 — and why "the first reading beats the baseline" was a control racing its subject.==
+
+    The claim is that the backlog metric is LIVE: an instrument wired to a constant zero draws the
+    same flat, healthy line as a queue that is genuinely keeping up, so every number in §3 rests on
+    this. The sequence that produces it is sound — strand real work behind a stopped worker, prove
+    the outage was real, restart, watch it clear.
+
+    ==What was wrong was the ORACLE.== It required ``first_reading > baseline``, where
+    ``first_reading`` is the first successful scrape after the restart and ``due`` is an
+    INSTANTANEOUS gauge. The restarted worker serves that metric and drains the queue, and it may
+    finish draining before the first scrape gets an answer — on a fast tick with a small backlog,
+    routinely. The control then reads ``due == 0`` and fails a system that behaved perfectly.
+    ==A control that can fail by luck is not a control== — worse, its failure mode here is to
+    accuse the product of the harness's own timing.
+
+    So the pass conditions are now the DURABLE ones, which cannot be missed by arriving late:
+
+    * **the outage was real** — the operator surface went unreachable with the worker;
+    * **the snapshot SAW the stranded work** — the DB-derived row count grew by at least the work
+      created, and it stays grown for ever, unlike ``due``. A constant-zero instrument fails here;
+    * **the restarted worker really processed it** — ``drain.delivered``, a counter that resets to
+      zero at boot and only climbs, is at least the work created. Readable at any later instant;
+    * **and it cleared** — ``due`` returned to zero.
+
+    ``caught_in_flight`` (the old condition) is still recorded and reported, because catching the
+    gauge mid-climb is genuine extra evidence when it happens. It is simply no longer the thing the
+    verdict hangs on, since whether it happens is decided by a race with the system under test.
+
+    .. rubric:: What this still cannot prove
+
+    That a **dead** worker is visible in the metric. It is not: ``/metrics/summary`` is served BY
+    the worker, so while the drain is down the metric is not late, it is absent (``Connection
+    refused``). That needs external liveness monitoring, and the report says so rather than leaving
+    a reader to assume the backlog alarm covers it.
+    """
+    reasons: list[str] = []
+    if observation.work_created <= 0:
+        reasons.append("no work was created during the outage, so nothing was ever stranded")
+    if not observation.surface_unreachable:
+        reasons.append(
+            "the operator surface still ANSWERED during the outage — the worker never stopped"
+        )
+    if observation.rows_delta < observation.work_created:
+        reasons.append(
+            f"the DB-derived snapshot grew by only {observation.rows_delta} row(s) for "
+            f"{observation.work_created} stranded booking(s) — it is not reading the real table"
+        )
+    if observation.delivered_after_restart is None:
+        reasons.append("the payload carried no `drain.delivered` counter — the contract changed")
+    elif observation.delivered_after_restart < observation.work_created:
+        reasons.append(
+            f"the restarted worker reports {observation.delivered_after_restart} delivered for "
+            f"{observation.work_created} stranded booking(s)"
+        )
+    if observation.drain_recovery_seconds is None:
+        reasons.append("the backlog NEVER returned to 0")
+    delivered_text = (
+        "ABSENT"
+        if observation.delivered_after_restart is None
+        else str(observation.delivered_after_restart)
+    )
+    first_due_text = (
+        "none" if observation.first_reading_due is None else str(observation.first_reading_due)
+    )
+    return Control(
+        ident="C5",
+        guards="the backlog metric is LIVE (stranded work is seen, and then cleared)",
+        expected=(
+            "the operator surface goes unreachable with the worker; the DB-derived snapshot and "
+            "the restarted worker's delivered counter both account for the stranded work; the "
+            "backlog then returns to 0"
+        ),
+        observed=(
+            f"stranded {observation.work_created} booking(s); surface unreachable during the "
+            f"outage: {'yes' if observation.surface_unreachable else 'NO'}; outbox rows "
+            f"{observation.baseline_rows}→{observation.final_rows} (+{observation.rows_delta}); "
+            f"restarted worker delivered="
+            f"{delivered_text}"
+            f"; backlog caught in flight: "
+            f"{'yes' if observation.caught_in_flight else 'no (drained before the first scrape)'}"
+            f" (first reading due="
+            f"{first_due_text}"
+            f", oldest {observation.first_reading_oldest_age_seconds:.1f}s); "
+            + (
+                f"drained in {observation.drain_recovery_seconds:.1f}s"
+                if observation.drain_recovery_seconds is not None
+                else "NEVER drained"
+            )
+            + (f" — FAILED: {'; '.join(reasons)}" if reasons else "")
+        ),
+        passed=not reasons,
+    )
+
+
 def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two timing knobs
     sampler: OutboxSampler,
     stop_worker: Callable[[], None],
     start_worker: Callable[[], None],
-    make_work: Callable[[], None],
+    make_work: Callable[[], int],
     *,
     grow_seconds: float = 25.0,
     drain_timeout: float = 240.0,
 ) -> tuple[Control, dict[str, float]]:
-    """==The instrument's own control.== Strand real work; watch the metric see it, then clear it.
+    """==The instrument's own control.== Strand real work; prove the metric accounts for it.
 
     Without this, every backlog number in the report is unfalsifiable: a scraper wired to a constant
     zero draws the same flat, healthy line as a queue that is genuinely keeping up.
 
-    .. rubric:: Why this does NOT read the backlog during the outage
+    The sequence:
 
-    The obvious version of this control — stop the worker, scrape, watch ``due`` climb — cannot
-    work, and finding that out is itself a result worth keeping. ==``/metrics/summary`` is served BY
-    THE WORKER== (``api/operator.py`` moved it there deliberately, so the numbers come from the
-    process holding the BYPASSRLS pool and are therefore true). One process serves the metric and
-    drains the queue, so while the drain is down the metric is not late — it is **absent**:
-    ``Connection refused``, not a climbing number.
-
-    So the observable sequence is the one this runs instead:
-
-    1. read the baseline;
-    2. stop the worker and create real bookings, whose intents nobody can drain;
+    1. read the baseline — the backlog gauge AND the durable row count;
+    2. stop the worker and create real bookings, whose intents nobody can drain. ``make_work``
+       returns HOW MANY it created, because the pass conditions are stated against that number
+       rather than against a constant written twice;
     3. confirm the operator surface is genuinely UNREACHABLE (which also proves the stop worked,
        rather than assuming ``docker compose stop`` did what it was asked);
-    4. restart, and read the FIRST reading that comes back — it must show the stranded work;
-    5. wait for it to return to zero.
+    4. restart, and take the earliest scrape that answers — kept as corroboration;
+    5. wait for the backlog to clear, then read the durable signals.
 
-    A scraper wired to a constant zero fails step 4. A queue that never recovers fails step 5. What
-    this cannot prove — and no scrape of this endpoint ever could — is that a **dead** worker is
-    visible in the metric. It is not. That needs external liveness monitoring, and the report says
-    so rather than leaving a reader to assume the backlog alarm covers it.
+    :func:`judge_drain_deadman` owns what those readings mean, and why step 4 is no longer allowed
+    to decide the verdict on its own.
     """
-    baseline = sampler.scrape().due
+    baseline = sampler.scrape()
     # The background sampler would otherwise log the deliberate outage as scrape failures, and the
     # report would warn about an instrument that was working exactly as intended.
     sampler.pause()
     stop_worker()
-    make_work()
+    work_created = make_work()
     time.sleep(grow_seconds)
 
     # Step 3: the outage must be REAL. If the surface still answers, the worker never stopped and
@@ -703,8 +1051,8 @@ def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two ti
 
     start_worker()
 
-    # Step 4: the first reading the restarted worker gives us. Poll through the boot window, taking
-    # the earliest successful scrape — the stranded work must still be visible in it.
+    # Step 4: the earliest reading the restarted worker gives us. It MAY still show the backlog and
+    # it may not — the drain is racing us, and that race is exactly why it no longer gates.
     started_waiting = time.monotonic()
     boot_deadline = started_waiting + 90.0
     first_reading: int | None = None
@@ -719,45 +1067,48 @@ def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two ti
         first_age = sample.oldest_due_age_seconds
         break
 
-    # Step 5: and it must clear.
+    # Step 5: it must clear, and then the durable signals are read.
     deadline = time.monotonic() + drain_timeout
     drained_after: float | None = None
+    final: OutboxSample | None = None
     while time.monotonic() < deadline:
         try:
-            if sampler.scrape().due == 0:
-                drained_after = time.monotonic() - started_waiting
-                break
+            sample = sampler.scrape()
         except OutboxScrapeError:
-            pass
+            time.sleep(1.0)
+            continue
+        final = sample
+        if sample.due == 0:
+            drained_after = time.monotonic() - started_waiting
+            break
         time.sleep(1.0)
     sampler.resume()
 
-    passed = surface_down and first_reading is not None and first_reading > baseline
-    passed = passed and drained_after is not None
+    observation = DeadmanObservation(
+        work_created=work_created,
+        surface_unreachable=surface_down,
+        baseline_due=baseline.due,
+        baseline_rows=baseline.rows,
+        final_rows=final.rows if final is not None else baseline.rows,
+        delivered_after_restart=final.delivered if final is not None else None,
+        drain_recovery_seconds=drained_after,
+        first_reading_due=first_reading,
+        first_reading_oldest_age_seconds=first_age,
+    )
     return (
-        Control(
-            ident="C5",
-            guards="the backlog metric is LIVE (stranded work is seen, and then cleared)",
-            expected=(
-                "the operator surface goes unreachable with the worker; on restart the first "
-                "reading exceeds the baseline, then returns to 0"
-            ),
-            observed=(
-                f"baseline due={baseline}; surface unreachable during the outage: "
-                f"{'yes' if surface_down else 'NO'}; first reading after restart="
-                f"{first_reading if first_reading is not None else 'none'} "
-                f"(oldest {first_age:.1f}s); "
-                + (
-                    f"drained in {drained_after:.1f}s"
-                    if drained_after is not None
-                    else "NEVER drained"
-                )
-            ),
-            passed=passed,
-        ),
+        judge_drain_deadman(observation),
         {
-            "baseline_due": float(baseline),
+            "work_created": float(work_created),
+            "baseline_due": float(baseline.due),
             "surface_unreachable_during_outage": 1.0 if surface_down else 0.0,
+            "outbox_rows_baseline": float(baseline.rows),
+            "outbox_rows_final": float(observation.final_rows),
+            "delivered_after_restart": float(
+                observation.delivered_after_restart
+                if observation.delivered_after_restart is not None
+                else -1
+            ),
+            "backlog_caught_in_flight": 1.0 if observation.caught_in_flight else 0.0,
             "first_reading_after_restart": float(
                 first_reading if first_reading is not None else -1
             ),
@@ -830,6 +1181,200 @@ def control_outbox_drained(
             f"unexplained scrape failures={scrape_failures}"
         ),
         passed=passed,
+    )
+
+
+def judge_organic_accounting(result: OrganicResult, *, planned: int) -> Control:
+    """==C13 — every planned intent ended somewhere KNOWN, and nothing broke on the way.==
+
+    The organic phase is the source of §1's volume and §2's latency, and until this existed it was
+    the only phase whose failures could not reach the verdict. Two silent ``return`` statements did
+    it: a slots query that failed was filed as ``no_slots_offered`` — read by the report as *the day
+    was full* — and any non-2xx booking that was not a collision simply vanished. ==A run in which
+    the API 500'd on half its requests would have reported a slightly quieter fortnight and stamped
+    itself MEASURED.==
+
+    So this asks two questions that a taxonomy alone cannot answer:
+
+    * **does it add up?** The create categories must sum to the number of items PLANNED, and the
+      follow-up categories to the number of follow-ups attempted. A count reconciled against a
+      number computed elsewhere is the only kind that can notice its own omissions — the same
+      lesson ``REQUIRED_CONTROL_IDS`` learned one level up.
+    * **is anything in it a finding?** A collision, a full day and a reschedule with nowhere to go
+      are the product working. A broken read, a 5xx, an unreadable body and a refused mutation are
+      not, and any of them voids the run rather than shrinking a number quietly.
+    """
+    creates = result.create_outcomes()
+    follow_ups = result.follow_up_outcomes()
+    create_total = sum(creates.values())
+    follow_up_total = sum(follow_ups.values())
+    unexpected = result.unexpected_organic_failures()
+    reconciled = create_total == planned and follow_up_total == result.follow_ups_attempted
+    detail = ""
+    if result.slots_read_failed:
+        detail += f" · first slots failure: {result.slots_read_failed[0]}"
+    if result.booking_unreadable:
+        detail += f" · first unreadable body: {result.booking_unreadable[0]}"
+    return Control(
+        ident="C13",
+        guards=(
+            "the organic phase is fully explained: every planned intent lands in a known outcome, "
+            "and no request failed unexpectedly"
+        ),
+        expected=(
+            f"{planned} planned = the sum of the create outcomes, "
+            f"{result.follow_ups_attempted} follow-ups = the sum of the follow-up outcomes, "
+            "and 0 unexpected failures"
+        ),
+        observed=(
+            f"creates {create_total}/{planned} `{creates}`; "
+            f"follow-ups {follow_up_total}/{result.follow_ups_attempted} `{follow_ups}`; "
+            f"unexpected failures: {unexpected or 'none'}{detail}"
+        ),
+        passed=planned > 0 and reconciled and not unexpected,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CancelWebhookObservation:
+    """What the sink was actually seen to hold for the cancel race, and how it was seen.
+
+    ==Carries the timing, not just the count, because "none yet" and "never" are the same number.==
+    """
+
+    counts: dict[str, int]
+    drained: bool
+    drain_wait_seconds: float
+    appeared_after_seconds: float | None
+    """``None`` means nothing arrived inside the window — a DELIVERY fact, not a duplication one."""
+    appear_timeout_seconds: float
+    settle_seconds: float
+
+
+def judge_cancel_idempotency(
+    observation: CancelWebhookObservation, *, ident: str = "C7", guards: str = ""
+) -> Control:
+    """==C7 — and the three different things a count of ``booking.cancelled`` can mean.==
+
+    This control used to be ``time.sleep(12)`` followed by one read. That sleep was doing two jobs
+    it could not do: standing in for an observation, and standing in for a deadline. If a webhook
+    arrived at 13 seconds the sink read 0 and C7 failed — ==indistinguishable from the duplication
+    it exists to detect, and pointing at the product for a fault of the harness.== A control that
+    reports a timeout as a defect lies in both directions at once: it manufactures failures it did
+    not see, and it would report a genuine 0-of-2 the same way.
+
+    The observation is now made rather than waited for. The outbox is drained FIRST, so every
+    delivery the race queued has been attempted before the sink is asked anything; then the sink is
+    polled until the event appears or an explicit timeout elapses; then a settling window runs so a
+    duplicate arriving late is still counted. Three distinguishable verdicts come out:
+
+    * ``the outbox never drained`` — the observation was never valid; say so, do not judge on it;
+    * ``nothing arrived within N s`` — a delivery/timeout fact, named as one;
+    * ``k delivered`` — the real oracle: exactly one passes, two or more is the idempotency defect.
+    """
+    delivered = observation.counts.get("booking.cancelled", 0)
+    window = (
+        f"drained in {observation.drain_wait_seconds:.1f}s, then polled up to "
+        f"{observation.appear_timeout_seconds:.0f}s + {observation.settle_seconds:.0f}s settling"
+    )
+    if not observation.drained:
+        verdict = (
+            f"the outbox did NOT drain within {observation.drain_wait_seconds:.1f}s, so the sink "
+            "was read before every queued delivery had been attempted — this run did not observe "
+            "idempotency either way"
+        )
+        passed = False
+    elif delivered == 0:
+        verdict = (
+            f"NOTHING arrived: 0 booking.cancelled within "
+            f"{observation.appear_timeout_seconds:.0f}s "
+            "of a drained outbox. ==This is a DELIVERY failure, not a duplication one== — the "
+            "distinction this control exists to keep"
+        )
+        passed = False
+    else:
+        verdict = (
+            f"{delivered} booking.cancelled delivered"
+            if delivered != 1
+            else "exactly 1 booking.cancelled delivered"
+        )
+        passed = delivered == 1
+    return Control(
+        ident=ident,
+        guards=guards or "an idempotent cancel emits exactly ONE booking.cancelled webhook",
+        expected="exactly 1 booking.cancelled at the sink for this booking",
+        observed=f"{verdict} · all events {observation.counts} · {window}",
+        passed=passed,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationCoverage:
+    """Whether the drain-latency distribution describes the whole run or an unstated subset."""
+
+    created: int
+    matched: int
+    negative_deltas: int
+    worst_negative_ms: float
+    read_complete: bool
+    read_problem: str
+    reported_total: int
+    page_size: int
+    attempts: int
+    waited_seconds: float
+
+
+def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
+    """==C14 — the booking→confirmation figures are COMPLETE, and nothing was quietly dropped.==
+
+    Two silent subtractions used to sit between the mailbox and §2, and both moved the published
+    numbers in the flattering direction:
+
+    * the mailbox was read with a hardcoded ``limit=20000``, equal to the ``MP_MAX_MESSAGES`` the
+      overlay sets and compared against nothing. Past it the list simply stopped, and a latency
+      sample that loses members reports a faster product;
+    * confirmations whose timestamp preceded the booking's reference instant were discarded by a
+      bare ``if delta_ms >= 0``. Only the FASTEST can do that, so the discard trimmed the left tail
+      and every percentile moved up.
+
+    Neither reached the verdict. The report even warned, in §7, that drain latency had *n* samples
+    for *m* bookings — a warning is not a control, and a run that shipped with it still said
+    MEASURED. So the reconciliation is now a control: the read must be provably whole (paged to
+    Mailpit's own total), every created booking must be matched to a message, and a negative delta
+    — which cannot happen legitimately once the reference is the SEND instant — is real clock skew,
+    counted and gating rather than silently filtered.
+    """
+    unmatched = coverage.created - coverage.matched
+    reasons: list[str] = []
+    if not coverage.read_complete:
+        reasons.append(f"the mailbox read was INCOMPLETE ({coverage.read_problem})")
+    if coverage.created <= 0:
+        reasons.append("no organic booking was created, so the distribution describes nothing")
+    if unmatched:
+        reasons.append(f"{unmatched} created booking(s) never matched a confirmation")
+    if coverage.negative_deltas:
+        reasons.append(
+            f"{coverage.negative_deltas} confirmation(s) preceded the POST that caused them "
+            f"(worst {coverage.worst_negative_ms:.1f}ms) — the two clocks disagree"
+        )
+    return Control(
+        ident="C14",
+        guards=(
+            "the booking→confirmation sample is complete: the mailbox was read whole and every "
+            "created booking is in it"
+        ),
+        expected=(
+            f"a complete mailbox read and {coverage.created} of {coverage.created} bookings "
+            "matched, with 0 negative deltas"
+        ),
+        observed=(
+            f"matched {coverage.matched}/{coverage.created} after {coverage.attempts} read(s) in "
+            f"{coverage.waited_seconds:.1f}s; mailbox read complete={coverage.read_complete} "
+            f"(reported total {coverage.reported_total}, page size {coverage.page_size}); "
+            f"negative deltas={coverage.negative_deltas}"
+            + (f" — {'; '.join(reasons)}" if reasons else "")
+        ),
+        passed=not reasons,
     )
 
 
