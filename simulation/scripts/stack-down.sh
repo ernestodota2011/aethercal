@@ -44,6 +44,13 @@ STACK_FILE="${SIM_DIR}/.stack.json"
 # So: restore the environment ALWAYS (safe, and it must happen either way), announce success
 # ONLY on a clean teardown, and exit non-zero so no wrapper mistakes the failure for a stop.
 echo "==> tearing down the throwaway stack (project: aethercal-sim)"
+# ==The token has to be in the environment or compose refuses to interpolate the overlay at all.==
+# The same hole run.sh had, for the same reason, which is why the fix is one sourced function
+# rather than two paragraphs: see scripts/compose-env.sh. This is `--keep`'s only way out, so it
+# failing meant a stack left up with nothing left to take it down.
+# shellcheck source=compose-env.sh
+source "${SIM_DIR}/scripts/compose-env.sh"
+aethercal_export_compose_token "${STACK_FILE}"
 teardown_status=0
 docker compose \
   -f "${REPO_ROOT}/deploy/docker-compose.yml" \

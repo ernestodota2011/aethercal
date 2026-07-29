@@ -14,8 +14,11 @@ import ast
 import base64
 import inspect
 import json
+import os
 import pathlib
 import random
+import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -2737,3 +2740,135 @@ def test_reported_total_sigue_leyendo_un_total_valido() -> None:
     assert Mailbox.reported_total({"messages_count": 0}) == 0
     assert Mailbox.reported_total({"messages_count": 279}) == 279
     assert Mailbox.reported_total({"total": 42}) == 42
+
+
+# --------------------------------------------------------------------------------------
+# El token de operador en el entorno de `docker compose` — los dos call-sites de SHELL
+# --------------------------------------------------------------------------------------
+
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+
+
+def _arbol_de_teardown(raiz: pathlib.Path, *, con_stack_file: str | None) -> pathlib.Path:
+    """Copia los guiones a un arbol desechable y planta un `docker` de mentira.
+
+    ==Se copian en vez de correr los del repo porque `stack-down.sh` BORRA
+    `.stack.json`==, y ese archivo es el unico rastro de un stack vivo: una prueba
+    que se lo lleve por delante le destruye el stack a quien la corra.
+    """
+    sim = raiz / "simulation"
+    (sim / "scripts").mkdir(parents=True)
+    for nombre in ("stack-down.sh", "restore-env.sh", "compose-env.sh"):
+        destino = sim / "scripts" / nombre
+        destino.write_bytes((SCRIPTS_DIR / nombre).read_bytes())
+        destino.chmod(0o755)
+    if con_stack_file is not None:
+        (sim / ".stack.json").write_text(
+            json.dumps({"metricsToken": con_stack_file}), encoding="utf-8"
+        )
+
+    # El doble de `docker`: NO necesita demonio, solo contesta si la variable llego.
+    # Es el oraculo de la prueba — compose falla exactamente asi cuando falta.
+    binarios = raiz / "bin"
+    binarios.mkdir()
+    doble = binarios / "docker"
+    doble.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ -z "${AETHERCAL_SIM_METRICS_TOKEN:-}" ]]; then\n'
+        "  echo 'error while interpolating services.worker.environment."
+        "AETHERCAL_METRICS_TOKEN: required variable AETHERCAL_SIM_METRICS_TOKEN"
+        " is missing a value' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        'echo "${AETHERCAL_SIM_METRICS_TOKEN}" > "${TOKEN_VISTO}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    doble.chmod(0o755)
+    return sim / "scripts" / "stack-down.sh"
+
+
+def _correr_teardown(raiz: pathlib.Path, guion: pathlib.Path) -> tuple[int, str, str]:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - solo en un host sin bash
+        pytest.skip("no hay bash en este host")
+    visto = raiz / "token-visto.txt"
+    entorno = {k: v for k, v in os.environ.items() if k != "AETHERCAL_SIM_METRICS_TOKEN"}
+    entorno["PATH"] = f"{raiz / 'bin'}{os.pathsep}{entorno.get('PATH', '')}"
+    entorno["TOKEN_VISTO"] = str(visto)
+    hecho = subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona en la prueba
+        [bash, str(guion)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=entorno,
+    )
+    leido = visto.read_text(encoding="utf-8").strip() if visto.exists() else ""
+    return hecho.returncode, hecho.stderr, leido
+
+
+def test_stack_down_lleva_el_token_del_stack_file_al_entorno_de_compose(
+    tmp_path: pathlib.Path,
+) -> None:
+    """REGRESION, y la encontro una corrida real: el teardown NUNCA funciono.
+
+    `compose.sim.yml` declara `AETHERCAL_SIM_METRICS_TOKEN` con `:?` — requerida y
+    sin default — y compose interpola el archivo ENTERO en cada subcomando, asi que
+    `down` hereda una exigencia pensada para `up`. `_compose` (Python) ya inyectaba
+    la variable y lo documenta; los dos call-sites de shell no, de modo que
+    ==`docker compose down -v` fallaba siempre y el stack desechable quedaba vivo==.
+    Hasta que `run.sh` aprendio a propagar el codigo de salida, ademas lo hacia en
+    silencio.
+    """
+    guion = _arbol_de_teardown(tmp_path, con_stack_file="token-de-esta-corrida")
+    codigo, err, token_visto = _correr_teardown(tmp_path, guion)
+
+    assert codigo == 0, f"el teardown no cerro limpio: {err}"
+    assert token_visto == "token-de-esta-corrida", (
+        "el token debe VIAJAR desde .stack.json, no volver a derivarse"
+    )
+    assert not (tmp_path / "simulation" / ".stack.json").exists(), (
+        "un teardown limpio retira el rastro del stack"
+    )
+
+
+def test_stack_down_sigue_pudiendo_bajar_un_stack_sin_stack_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`stack-down.sh` se anuncia como seguro de correr cuando no hay nada arriba.
+
+    Sin `.stack.json` no hay token que cargar, y `down` no lo lee jamas — no arranca
+    ningun contenedor. Negarse a limpiar por una variable que nadie va a consumir
+    dejaria contenedores vivos por pulcritud, que es peor. Se exporta un valor
+    NOMBRADO como lo que es, para que nunca se confunda con un secreto.
+    """
+    guion = _arbol_de_teardown(tmp_path, con_stack_file=None)
+    codigo, err, token_visto = _correr_teardown(tmp_path, guion)
+
+    assert codigo == 0, f"el teardown se nego a correr sin stack file: {err}"
+    assert token_visto, "la variable debe llegar puesta igual"
+    assert "unused" in token_visto, (
+        f"el marcador debe decir que no se usa, no parecer un token: {token_visto!r}"
+    )
+
+
+def test_run_sh_pone_el_token_antes_de_su_propio_down() -> None:
+    """El otro call-site de shell, afirmado sobre el guion.
+
+    Correr `cleanup` de verdad exigiria un `stack-up.sh` completo; lo que hay que
+    fijar es que el teardown de `run.sh` pase por la MISMA funcion compartida, y
+    despues de capturar el estado de la simulacion (llamarla antes pisaria `$?`).
+    """
+    guion = (SCRIPTS_DIR / "run.sh").read_text(encoding="utf-8")
+    assert "scripts/compose-env.sh" in guion, "no carga la funcion compartida"
+
+    cuerpo = guion[guion.index("cleanup()") : guion.index("trap cleanup EXIT")]
+    assert "aethercal_export_compose_token" in cuerpo, (
+        "el teardown de run.sh no pone el token en el entorno"
+    )
+    assert cuerpo.index("local run_status=$?") < cuerpo.index("aethercal_export_compose_token"), (
+        "poner el token antes de capturar $? pisaria el estado de la simulacion"
+    )
+    assert cuerpo.index("aethercal_export_compose_token") < cuerpo.index("${COMPOSE_CMD} down"), (
+        "el token tiene que estar puesto ANTES del down"
+    )

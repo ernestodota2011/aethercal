@@ -193,6 +193,37 @@ configuration replaced by test-only values.
 > names the way out, and `scripts/stack-down.sh` is that way out — it tears the throwaway stack down
 > **and** restores `deploy/.env`, which a bare `docker compose down -v` never did.
 
+> [!danger] ==And then a live run proved that neither teardown had ever run at all.==
+> `compose.sim.yml` declares `AETHERCAL_METRICS_TOKEN: ${AETHERCAL_SIM_METRICS_TOKEN:?…}` —
+> required, no default — so the worker and the harness can never hold different strings. But
+> compose interpolates the **whole file on every subcommand**, so `down` inherits an exigency
+> written for `up`, and both shell teardowns ran it out of a shell that had never heard of the
+> variable. Every one of them failed with `required variable … is missing a value`, and the
+> throwaway stack stayed up.
+>
+> ==`aethercal_sim.__main__._compose` had already met this, fixed it for itself, and written the
+> trap down in its own docstring== — "the harness inherits its shell from whoever launched it and
+> that variable is normally NOT set there". The fix went into the one Python call site and not into
+> the two shell ones. **A rule enforced at some of its call sites is a rule with a hole in it**, and
+> this file already said exactly that about `read_offer` one section above. It now lives in
+> `scripts/compose-env.sh`, sourced by both, carrying the value from `.stack.json` instead of
+> re-deriving it.
+>
+> It went unseen because the containers were destroyed with their host and nobody looked, and
+> because until `run.sh` learned to propagate its exit code the failure printed and returned **0**.
+> ==The fix that made a failed teardown visible caught this on its first live run== — which is the
+> argument for that fix, made by the thing it found.
+
+> [!warning] ==The documented command could not be executed from a fresh clone.==
+> Every `.sh` in the repository was committed `100644`. The quickstart at the top of this file says
+> `simulation/scripts/run.sh`, and `run.sh` in turn invokes `"${SIM_DIR}/scripts/stack-up.sh"`
+> directly — both of which answer `Permission denied` on any clone made on a machine that did not
+> already have the bit. It survived because the repository is authored on Windows, where
+> `core.filemode=false` means git never records the bit and the local filesystem always grants it,
+> and because CI invokes the `e2e` pair as `bash e2e/scripts/stack-up.sh` — a prefix that works and
+> hides the cause. The five documented entry points are now `100755` in the index; the two files
+> that are only ever *sourced* stay `100644`, because that is what they are.
+
 ## What a run does
 
 1. **Provision** — three businesses across two timezones, each with four event types (see
@@ -237,6 +268,7 @@ about running more than one worker.
 | Path | What |
 |---|---|
 | `compose.sim.yml` | Third overlay on the shipping stack: the renamed project, the operator token, a bigger mailbox |
+| `scripts/compose-env.sh` | The one place the operator token reaches a `docker compose` environment — sourced by the two teardowns |
 | `scripts/stack-up.sh` | Boots the throwaway stack, creates the businesses, writes `.stack.json` |
 | `scripts/stack-down.sh` | Tears it down **and gives `deploy/.env` back** — the exit a `--keep` run otherwise has none of |
 | `scripts/run.sh` | The one command: up → simulate → report → down |

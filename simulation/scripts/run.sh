@@ -43,6 +43,8 @@ ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
 # dies halfway no longer leaves shared repo configuration replaced by test-only values.
 # shellcheck source=restore-env.sh
 source "${SIM_DIR}/scripts/restore-env.sh"
+# shellcheck source=compose-env.sh
+source "${SIM_DIR}/scripts/compose-env.sh"
 
 restore_env() {
   aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}"
@@ -64,6 +66,11 @@ cleanup() {
     return
   fi
   echo "==> tearing down the throwaway stack"
+  # ==`docker compose` cannot even PARSE the overlay without the operator token in its
+  # environment.== compose.sim.yml declares it `:?` — required, no default — and interpolates the
+  # whole file on every subcommand, so `down` fails on a variable that only `up` has any use for.
+  # This teardown had therefore never once run; see scripts/compose-env.sh.
+  aethercal_export_compose_token "${SIM_DIR}/.stack.json"
   # ==Same rule as stack-down.sh, and it lives in both because the defect did.== Restore the
   # environment either way; never announce a teardown that did not happen.
   local teardown_status=0
