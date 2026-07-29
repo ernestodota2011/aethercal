@@ -77,7 +77,7 @@ import pytest
 
 from aethercal.server.integrations.money import implementation_fingerprint
 from aethercal.server.integrations.stripe import StripeGateway
-from aethercal.server.services.outbox import refund_dedupe_key
+from aethercal.server.services.outbox import refund_idempotency_key
 from aethercal.server.services.tenant_credentials import CredentialProvider, GatewayOperation
 
 REFUND = GatewayOperation.REFUND
@@ -174,6 +174,8 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
     stripe_api: httpx.Client,
     expire_session: Callable[[str], str | None],
     harness_return_url: Callable[[str], str],
+    phase_a_mark: Callable[[str], str],
+    record_phase_a_session: Callable[[str, str], None],
 ) -> None:
     """==Phase A: open a real, payable $1 invitation and stop.== No money moves in this test.
 
@@ -188,9 +190,11 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
     session = await open_one_dollar_session(
         idempotency_key=_phase_a_idempotency_key(),
         expires_at=expires_at,
-        # ==The provenance mark, applied AT CREATION through the production path.== Phase B refunds
-        # only what carries it: this account holds real customer payments and $1 identifies nothing.
-        return_url=harness_return_url(f"{PHASE_A_PURPOSE}/{_run_id()}"),
+        # ==The provenance mark, applied AT CREATION through the production path.== Phase B
+        # refunds only what carries it: this account holds real customer payments and $1 identifies
+        # nothing. It is an HMAC (`phase_a_mark`), not the published path it used to be — a public
+        # prefix proves somebody read this repository, not that this harness made the session.
+        return_url=harness_return_url(f"{PHASE_A_PURPOSE}/{_run_id()}/{phase_a_mark(_run_id())}"),
     )
 
     # ==The invitation exists from the line above onwards, so from here the default is CLOSE IT.==
@@ -251,6 +255,11 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
             "the gateway returned a different checkout URL from the one Stripe holds for this "
             "session; refusing to publish either"
         )
+
+        # ==Write down WHICH session this run opened, before publishing its URL.== The mark says
+        # "this harness made one"; only this says "it was THIS one" — and a mark travels in a URL a
+        # guest can read, so without the id a copy of it on another session would verify.
+        record_phase_a_session(_run_id(), str(opened["id"]))
 
         must_expire = False  # ==validated: leaving it open is now the POINT of this phase==
         mode = "LIVE" if opened["livemode"] else "TEST"
@@ -318,7 +327,7 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
        and nothing can send it back without this id;
     3. everything else inside a ``try``/``finally`` that guarantees :func:`ensure_refunded`: the
        currency, the ``paid`` status, the amount against the hard cap, and the gateway's refund on
-       ==production's own idempotency key== (:func:`refund_dedupe_key`, imported rather than
+       ==production's own idempotency key== (:func:`refund_idempotency_key`, imported rather than
        re-typed), so what is verified is the key the refund runner really sends;
     4. confirm with a SEPARATE request. The gateway returning ``None`` is not evidence; Stripe
        saying ``succeeded`` is;
@@ -394,10 +403,11 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
             "(==No money is at risk==: nothing has been charged on this session.)"
         )
 
-    # ==Production's own key, imported.== `refund_dedupe_key` is what `make_refund_runner` sends, so
-    # a crash between the provider call and our commit re-sends THIS key and Stripe returns the same
+    # ==Production's own key, imported.== `refund_idempotency_key` is what the refund runner
+    # sends, so a crash between the provider call and our commit re-sends THIS key and Stripe
+    # returns the same
     # refund rather than a second one. Re-typing its shape here would verify a lookalike.
-    idempotency_key = refund_dedupe_key(payment_intent_id)
+    idempotency_key = refund_idempotency_key(payment_intent_id, after_failed_refund=None)
 
     failed = False
     try:
@@ -417,10 +427,17 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
             f"{one_dollar_cents}. Refusing to act on a charge this harness did not open."
         )
 
-        await gateway.refund(
+        outcome = await gateway.refund(
             provider_ref=payment_intent_id,
             idempotency_key=idempotency_key,
             secrets={"secret_key": secret_key},
+        )
+        # ==The provider's own verdict, before anything else is read as progress.== A refund that
+        # comes back terminally failed moved no money, and certifying REFUND on the strength of a
+        # 200 is how a dead refund reaches `live_verifications()` as evidence.
+        assert not outcome.terminally_failed, (
+            f"the gateway's refund ended terminally failed at Stripe ({outcome.refund_id!r}), so "
+            "the money did NOT go back and this run verifies nothing"
         )
 
         # ==Settle FIRST, certify second.== `ensure_refunded` is the only thing here that knows

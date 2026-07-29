@@ -257,6 +257,35 @@ differently, so it could only be overruled and never discharged.
     untouched. Every way of getting the injected fingerprints wrong is restrictive on the charging
     side and noisy on the refund side, never silent. An AST guard fails if any gateway call site
     stops consulting the gate.
+- **A terminally failed refund is no longer permanently unretryable.** `refund_dedupe_key` served
+  as both the outbox row's identity and the key sent to the provider — and a provider replays the
+  answer it gave for a repeated idempotency key. So once a refund ended `failed`/`canceled` (the
+  money did not move and never will), every retry got that same dead refund back: the guest was
+  never paid back, and the retry reported success. `PaymentGateway.refund` now returns a
+  `RefundOutcome` (the provider's own verdict, instead of "the HTTP call worked"), and
+  `refund_idempotency_key` carries a **generation** named by the failure it follows.
+  - **The generation is a function of OBSERVED STATE, never of the attempt.** A key derived from a
+    counter, the clock or randomness would satisfy "retryable" while issuing a *second* refund on
+    every ordinary crash-retry — trading a bug that never returns the money for one that returns it
+    twice. While the state is unchanged the key is unchanged, so a retry replays.
+  - **One new generation per drain, not a chain**, and a second terminal failure raises instead of
+    marking the payment refunded: the outbox retries (creating nothing new — the keys are stable)
+    and its ceiling dead-letters it with an alert for a human. A card that rejects refunds needs a
+    person, not a hundred attempts.
+  - An unrecognised provider status reads as **not** terminally failed, in both adapters: the
+    consequence of calling it a failure is another refund, so the safe direction is silence.
+- **The live harness's provenance mark is authenticated, not published.**
+  `require_phase_a_provenance` demanded a fixed, public `success_url` prefix — every character of it
+  in this repository — so any session in the account could carry it and pass the one barrier between
+  the harness's $1 and the real customer invoices beside it. The mark is now an **HMAC** over the
+  purpose, the run id and a per-run nonce, keyed by `AETHERCAL_LIVE_STRIPE_PROVENANCE_SECRET`
+  (environment only), applied at creation through the return URL and compared with
+  `hmac.compare_digest`.
+  - **Two questions, both required**: the HMAC answers *did I create this?*; the session id phase A
+    persisted (outside the repo, `~/.aethercal` by default) answers *is it THE one?* A mark travels
+    in a URL a guest can read, so a copy of it on another session fails the id check.
+  - **Without the signing key the money harness refuses to run** — a hard failure, never a skip and
+    never an unauthenticated fallback.
 - **A failed creation of a payable session is resolved rather than assumed away.** The live harness
   guarded everything *after* the session existed and nothing around the call that creates it: if
   Stripe processed the request and the response never landed, a live $1 invitation stood in a real

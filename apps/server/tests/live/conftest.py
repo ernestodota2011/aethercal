@@ -41,7 +41,13 @@ harness can produce, and a cleanup error that swallows a real one is the second 
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import hmac
+import json
 import os
+import pathlib
+import secrets
 import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from datetime import datetime
@@ -50,7 +56,7 @@ from typing import Any
 import httpx
 import pytest
 
-from aethercal.server.integrations.stripe import StripeGateway
+from aethercal.server.integrations.stripe import TERMINAL_REFUND_FAILURES, StripeGateway
 from aethercal.server.services.payments import CheckoutSession
 
 SECRET_KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
@@ -66,9 +72,20 @@ CURRENCY = "usd"
 """Fixed alongside the cap: 100 minor units is $1.00 in USD and something else elsewhere."""
 
 PROVENANCE_BASE = "https://example.com/aethercal-live-verification"
-"""==The harness's mark on everything it creates.== Stripe requires a well-formed return URL, never
-fetches it, and echoes it back on the session as ``success_url`` — so it is where this harness signs
-its work. See :func:`harness_return_url`."""
+"""==Where the harness signs its work.== Stripe requires a well-formed return URL, never fetches it,
+and echoes it back on the session as ``success_url`` — so it is the one field this harness can write
+at creation and read back later. See :func:`harness_return_url`."""
+
+PROVENANCE_SECRET_ENV = "AETHERCAL_LIVE_STRIPE_PROVENANCE_SECRET"
+"""==The HMAC key that makes the mark unforgeable.== From the ENVIRONMENT, never this repository — a
+signing key committed beside the thing it signs proves nothing at all. Absent, the money harness
+REFUSES TO RUN (:func:`provenance_secret`); it never degrades to an unauthenticated mark."""
+
+STATE_DIR_ENV = "AETHERCAL_LIVE_STRIPE_STATE_DIR"
+"""Where phase A writes what phase B must know. Defaults under ``~/.aethercal``: ==outside the
+repository==, because it holds the run's nonce."""
+
+DEFAULT_STATE_DIR = pathlib.Path.home() / ".aethercal" / "live-stripe"
 
 PHASE_A_PURPOSE = "refund"
 """The segment marking a PAYABLE phase-A session, so a free checkout-harness session (marked
@@ -83,8 +100,13 @@ CHECKOUT_PURPOSE = "checkout"
 REFUND_SUCCEEDED = "succeeded"
 """==The ONLY status that means the money is back.== Terminal, and the money has actually moved."""
 
-REFUND_DEAD_ENDS = frozenset({"failed", "canceled"})
+REFUND_DEAD_ENDS = TERMINAL_REFUND_FAILURES
 """Terminal and the money did NOT move — so these count as zero, never as progress.
+
+==Imported from the adapter, not spelled again.== The gateway decides what Stripe's terminal
+failures are (it is the code that reads them off the API); a second copy here would be free to
+drift from the one production acts on, and the drift would be invisible — both spellings look
+right.
 
 Everything that is neither this nor :data:`REFUND_SUCCEEDED` (``pending``, ``requires_action``) is
 **in flight**: real money that has not come back yet. Counting it as done is the exact bug this
@@ -295,6 +317,119 @@ def stripe_reachable(secret_key: str, unauthenticated_stripe_api: httpx.Client) 
     return response.status_code
 
 
+def _state_path(run_id: str) -> pathlib.Path:
+    """The file holding one phase-A run's nonce and the session it opened."""
+    directory = pathlib.Path(os.environ.get(STATE_DIR_ENV, "").strip() or DEFAULT_STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"phase-a-{run_id}.json"
+
+
+def _read_state(run_id: str) -> dict[str, Any]:
+    """What phase A wrote for this run, or ``{}``. ==Never raises==: a missing file is an answer."""
+    try:
+        loaded = json.loads(_state_path(run_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_state(run_id: str, **fields: str) -> None:
+    """Merge ``fields`` into this run's record, owner-readable only."""
+    path = _state_path(run_id)
+    state = _read_state(run_id) | fields
+    path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    # Best effort: Windows and exotic filesystems have no POSIX mode to set, and a state file
+    # nobody could tighten is still better than no state file at all.
+    with contextlib.suppress(OSError):  # pragma: no cover - platform dependent
+        path.chmod(0o600)
+
+
+def _mark_for(run_id: str, *, nonce: str, secret: str) -> str:
+    """The authenticated mark for one phase-A run. ==An HMAC, not a public constant.==
+
+    Covers the purpose and the run id, so a checkout-harness session or another run's session cannot
+    present a mark that verifies here; and the NONCE, so the digest cannot be recomputed by anybody
+    lacking both the key and this run's local state.
+    """
+    payload = f"{PHASE_A_PURPOSE}/{run_id}/{nonce}".encode()
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+@pytest.fixture
+def provenance_secret(secret_key: str) -> str:
+    """The HMAC key, from the environment. ==Absent, the harness REFUSES TO RUN.==
+
+    ``fail``, not ``skip``, and the difference is the whole point: a skip would let somebody run the
+    money harness with the provenance check quietly disabled — the silent no-op, aimed at the one
+    barrier standing between our $1 and the real customer invoices in the same account. There is no
+    unauthenticated mode to degrade to.
+
+    It depends on :func:`secret_key` so the ORDER is right: a machine with no API key skips the
+    whole suite quietly (nothing was being attempted), and only somebody actually running the
+    harness is stopped by a missing signing key.
+    """
+    del secret_key  # ordering only: with no API key the suite has already declined
+
+    return provenance_secret_from_env()
+
+
+def provenance_secret_from_env() -> str:
+    """The signing key, or a hard failure. ==Module level so the guardrails can PROVE it fails.==
+
+    A fail-closed nobody exercises is a claim, and this one guards the barrier separating our $1
+    from the real customer invoices beside it. Kept out of the fixture body so
+    ``test_live_harness_guardrails`` can call it with the variable unset and watch it refuse.
+    """
+    value = os.environ.get(PROVENANCE_SECRET_ENV, "").strip()
+    if not value:
+        pytest.fail(
+            f"{PROVENANCE_SECRET_ENV} is not set, so phase B could not tell this harness's own "
+            "session from any other in the account — and this account holds REAL CUSTOMER "
+            "PAYMENTS.\n"
+            "\n"
+            "==Refusing to run rather than running unprotected.== Export a random secret and keep "
+            "it: the SAME value must be present for phase A and phase B of a run.\n"
+            "\n"
+            "(It is a signing key. It never goes in the repository, and nothing here prints it.)"
+        )
+    return value
+
+
+@pytest.fixture
+def phase_a_mark(provenance_secret: str) -> Callable[[str], str]:
+    """The mark phase A stamps, for a run id. ==Stable across re-runs of the same run.==
+
+    The nonce is minted once per run id and kept in the local state file, NOT regenerated per
+    invocation — because phase A's idempotency key is fixed on purpose and Stripe refuses a repeated
+    key whose parameters have changed. A fresh nonce would change the return URL, turning the
+    deliberate "a re-run replays the same session" behaviour into a 400.
+    """
+
+    def _mark(run_id: str) -> str:
+        nonce = str(_read_state(run_id).get("nonce") or "")
+        if not nonce:
+            nonce = secrets.token_urlsafe(32)
+            _write_state(run_id, nonce=nonce)
+        return _mark_for(run_id, nonce=nonce, secret=provenance_secret)
+
+    return _mark
+
+
+@pytest.fixture
+def record_phase_a_session() -> Callable[[str, str], None]:
+    """Persist WHICH session phase A opened. ==The other half of the provenance question.==
+
+    The mark answers *did I create this?*; this answers *is it THE one I created?* Both are needed:
+    a mark travels in a URL a guest can read, so it can be copied onto another session — and the
+    copy fails, because the id it must also match was written down when phase A opened it.
+    """
+
+    def _record(run_id: str, session_id: str) -> None:
+        _write_state(run_id, session_id=session_id)
+
+    return _record
+
+
 @pytest.fixture
 def harness_return_url() -> Callable[[str], str]:
     """The return URL this harness stamps on a session, by purpose. ==Its signature on its work.==
@@ -328,7 +463,7 @@ def harness_return_url() -> Callable[[str], str]:
 
 @pytest.fixture
 def require_phase_a_provenance(
-    harness_return_url: Callable[[str], str],
+    harness_return_url: Callable[[str], str], provenance_secret: str
 ) -> Callable[[Mapping[str, Any], str], None]:
     """Refuse to act on a session this harness did not open. ==Checked BEFORE any refund.==
 
@@ -336,29 +471,78 @@ def require_phase_a_provenance(
     boolean here is one hurried ``if`` away from being ignored, and what it guards is somebody
     else's money.
 
-    ==The amount proves nothing.== $1 is one figure among thousands in a real account, so the check
-    is on the mark this harness applied at creation and on the run id inside it — not on how much
-    the transaction was for.
+    .. rubric:: ==The finding: a PUBLIC prefix is not proof of authorship==
+
+    The first cut required ``success_url`` to start with a fixed, published path
+    (``…/aethercal-live-verification/refund/v1``). Every character of it is in this repository, so
+    ==any session in the account could carry it== and pass the one barrier between our $1 and the
+    real customer invoices beside it. It proved that somebody had read the source, not that this
+    harness had created the session.
+
+    The mark is now an **HMAC** over the purpose, the run id and a per-run nonce, keyed by a secret
+    that lives in the environment (:data:`PROVENANCE_SECRET_ENV`) and nowhere in this tree. It is
+    applied AT CREATION through the return URL — the one field the production call already carries
+    — so no payable session ever exists unmarked. Compared with :func:`hmac.compare_digest`.
+
+    .. rubric:: Two questions, and it needs both answers
+
+    * **did I create this?** — the HMAC. Unforgeable without the key;
+    * **is it THE one I created?** — the session id phase A wrote down. ==The mark travels in a URL
+      a guest can read==, so a copy of it can be pasted onto another session; that copy fails here,
+      because the id will not match. Neither check alone is enough, and the digest is deliberately
+      NOT treated as a secret: it is public by construction.
+
+    ==The amount proves nothing== and never did: $1 is one figure among thousands in a real account.
+
+    A refusal names the ``session_id`` — an identifier, not a secret — and never the mark, the nonce
+    or the key.
     """
 
     def _require(session: Mapping[str, Any], run_id: str) -> None:
-        expected = harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}")
-        success_url = session.get("success_url")
-        # The trailing `?` is load-bearing: the gateway appends its query string right after the
-        # return URL, so requiring the boundary stops run id `v1` matching a session marked `v11`.
-        if not isinstance(success_url, str) or not success_url.startswith(f"{expected}?"):
+        state = _read_state(run_id)
+        nonce = str(state.get("nonce") or "")
+        opened = str(state.get("session_id") or "")
+        session_id = session.get("id")
+
+        if not nonce or not opened:
             raise AssertionError(
-                f"session {session.get('id')!r} does not carry this harness's mark for run id "
-                f"{run_id!r}, so there is nothing to show it was opened by phase A.\n"
+                f"there is no phase-A record for run id {run_id!r}, so nothing can say which "
+                "session this harness opened — and without that, a session id is just a string "
+                "somebody typed.\n"
                 "\n"
-                "==Refusing to touch it.== This account holds real customer payments, and the "
-                "amount distinguishes nothing — a $1 charge here could be anybody's. Phase B only "
-                "refunds what phase A opened.\n"
+                "==Refusing to touch it.== Run phase A for this run id first. Its state lives "
+                f"outside the repository (override the location with {STATE_DIR_ENV}); if phase A "
+                "ran on another machine, run phase B there, because the nonce is local to it."
+            )
+
+        if session_id != opened:
+            raise AssertionError(
+                f"session {session_id!r} is not the session phase A opened for run id {run_id!r} "
+                f"(that was {opened!r}).\n"
                 "\n"
-                f"expected a return URL of {expected!r}; the session carries {success_url!r}.\n"
+                "==Refusing to touch it.== This account holds real customer payments, and a mark "
+                "travels in a URL anybody can read — so matching the mark is not enough on its "
+                "own. Phase B refunds the exact session phase A opened, and no other."
+            )
+
+        expected_prefix = harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}") + "/"
+        success_url = session.get("success_url")
+        presented = ""
+        if isinstance(success_url, str) and success_url.startswith(expected_prefix):
+            presented = success_url[len(expected_prefix) :].split("?", 1)[0]
+
+        expected = _mark_for(run_id, nonce=nonce, secret=provenance_secret)
+        if not hmac.compare_digest(presented, expected):
+            raise AssertionError(
+                f"session {session_id!r} does not carry this harness's AUTHENTICATED mark for run "
+                f"id {run_id!r}, so there is nothing to show it was opened by phase A.\n"
                 "\n"
-                "If phase A was run with a different run id, pass the same one: "
-                f"{RUN_ID_ENV}=<id>."
+                "==Refusing to touch it.== The mark is an HMAC applied at creation, not a public "
+                "path anybody could reproduce: a session that merely LOOKS like ours does not "
+                "pass. If phase A ran with a different signing key, or on another machine, phase B "
+                "cannot verify what it opened.\n"
+                "\n"
+                "(Neither the expected mark nor the key is shown.)"
             )
 
     return _require

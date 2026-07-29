@@ -49,13 +49,21 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession
+from aethercal.server.services.payments import CheckoutSession, RefundOutcome
 
 _logger = logging.getLogger(__name__)
 
 _STRIPE_SIGNATURE_HEADER = "Stripe-Signature"
 _STRIPE_API_BASE = "https://api.stripe.com/v1"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
+
+TERMINAL_REFUND_FAILURES = frozenset({"failed", "canceled"})
+"""Stripe refund statuses that are TERMINAL and moved NO money. ==The vocabulary lives here.==
+
+Anything else is either ``succeeded`` (done) or still in flight (``pending``, ``requires_action``)
+— and treating in-flight as failed is how a guest gets refunded twice. The live harness imports
+this rather than spelling it again, so the two cannot drift.
+"""
 
 _CHECKOUT_SESSION_FLOOR = timedelta(minutes=30)
 """Stripe rejects a Checkout Session whose ``expires_at`` is under 30 minutes in the future."""
@@ -252,12 +260,18 @@ class StripeGateway:
 
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         """Refund the PaymentIntent ``provider_ref`` in full, on the business's own key.
 
         ==No ``provider`` and no ``amount_cents``.== Both used to be taken and immediately
         ``del``'d; see :meth:`PaymentGateway.refund` for why an ignored parameter was not harmless
         here. A full refund keys on the PaymentIntent alone.
+
+        ==It reads the refund back out of the response, and that is not decoration.== Stripe answers
+        ``200`` for a refund it has merely ACCEPTED; the status may be ``pending``, and it may end
+        ``failed``. Returning ``None``, as this did, told the runner only that the HTTP call worked
+        — so a terminally failed refund was recorded as a success, and its idempotency key replayed
+        that same dead refund on every retry for ever.
         """
         secret_key = secrets["secret_key"]
         async with self._client(secret_key) as client:
@@ -269,6 +283,16 @@ class StripeGateway:
                 headers={"Idempotency-Key": idempotency_key},
             )
             response.raise_for_status()
+            body = response.json()
+        # ==An unknown shape reads as NOT terminally failed.== The consequence of "failed" is that
+        # the runner opens a new generation and issues ANOTHER refund, so guessing that way round
+        # pays a guest twice. Silence means "no new refund", which is the recoverable error.
+        refund_id = body.get("id") if isinstance(body, dict) else None
+        status = body.get("status") if isinstance(body, dict) else None
+        return RefundOutcome(
+            refund_id=str(refund_id) if isinstance(refund_id, str) else None,
+            terminally_failed=status in TERMINAL_REFUND_FAILURES,
+        )
 
 
-__all__ = ["StripeGateway", "StripeWebhookAdapter"]
+__all__ = ["TERMINAL_REFUND_FAILURES", "StripeGateway", "StripeWebhookAdapter"]

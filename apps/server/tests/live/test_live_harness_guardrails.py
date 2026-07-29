@@ -25,6 +25,12 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import (
+    PHASE_A_PURPOSE,
+    PROVENANCE_SECRET_ENV,
+    STATE_DIR_ENV,
+    provenance_secret_from_env,
+)
 from live_harness_modules import provider_touching_modules
 
 from aethercal.server.integrations.stripe import StripeGateway
@@ -33,7 +39,9 @@ SECRET_KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
 
 
 @pytest.fixture(autouse=True)
-def _a_dummy_key_so_the_client_fixtures_build(monkeypatch: pytest.MonkeyPatch) -> None:
+def _a_dummy_key_so_the_client_fixtures_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
     """Let ``stripe_api`` construct without a real credential. ==Nothing here reaches the network.==
 
     Building an :class:`httpx.Client` opens no connection, and the tests below replace its request
@@ -44,6 +52,11 @@ def _a_dummy_key_so_the_client_fixtures_build(monkeypatch: pytest.MonkeyPatch) -
     this fixture is scoped to this file. The network guard is fully armed for everything here.
     """
     monkeypatch.setenv(SECRET_KEY_ENV, "sk_test_NOT_A_REAL_KEY_guardrails")
+    # The provenance machinery needs a signing key and somewhere to keep a run's state. Both are
+    # synthetic and scoped to this test: the key is a literal (there is no real one in this
+    # repository) and the state goes to a temp directory, never the operator's real one.
+    monkeypatch.setenv(PROVENANCE_SECRET_ENV, "offline-guardrails-signing-key-NOT-A-REAL-ONE")
+    monkeypatch.setenv(STATE_DIR_ENV, str(tmp_path / "live-state"))
 
 
 async def test_the_refund_is_unplugged_for_this_whole_directory(gateway: StripeGateway) -> None:
@@ -307,67 +320,179 @@ def _foreign_paid_session() -> dict[str, Any]:
     }
 
 
-def test_a_paid_session_of_the_same_amount_is_refused_without_provenance(
+PHASE_A_SESSION = "cs_live_THE_SESSION_PHASE_A_OPENED"
+QUERY = "?checkout=success&session_id={CHECKOUT_SESSION_ID}"
+
+
+def _phase_a_opened(
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
+    harness_return_url: Callable[[str], str],
+    run_id: str,
+    session_id: str = PHASE_A_SESSION,
+) -> dict[str, Any]:
+    """Arrange a genuine phase-A run and return the session Stripe would echo back for it."""
+    record_phase_a_session(run_id, session_id)
+    marked = harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}/{phase_a_mark(run_id)}")
+    return _foreign_paid_session() | {"id": session_id, "success_url": marked + QUERY}
+
+
+def test_a_session_imitating_the_public_marker_is_refused(
     require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
-) -> None:
-    """==The finding: phase B would refund any session id it was handed.==
-
-    Nothing proved the id came from phase A, and the account this runs against carries **real
-    customer invoices**. A mistyped, stale or hostile value pointed the refund at somebody else's
-    transaction — and ==the $1 cap defends nothing==, because $1 is one figure among thousands. The
-    harness ASSUMED provenance instead of ESTABLISHING it.
-
-    The session below is paid, in USD, for exactly the harness's amount. It is refused anyway,
-    because it does not carry the mark phase A applies at creation.
-    """
-    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
-        require_phase_a_provenance(_foreign_paid_session(), "v1")
-
-
-def test_a_session_from_a_different_run_is_refused(
-    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
     harness_return_url: Callable[[str], str],
 ) -> None:
-    """The mark carries the RUN ID, so phase B refunds the run it was asked about and no other.
+    """==THE finding, reproduced: the old mark was a PUBLIC prefix anybody could reproduce.==
 
-    Two payable sessions can exist at once (a lapsed ``v1``, a fresh ``v2``). Refunding whichever
-    one happened to be pasted would be the same class of mistake in miniature.
+    Phase B used to accept any session whose ``success_url`` began with
+    ``…/aethercal-live-verification/refund/<run id>`` — every character of which is published in
+    this repository. So a session that merely IMITATES it passed the one barrier standing between
+    our $1 and the real customer invoices in the same account.
+
+    The imitator below is built to be maximally convincing: it carries the exact public path the
+    old guard demanded, AND the very session id phase A recorded — so the id check cannot be what
+    rejects it. ==Only the HMAC can==, and it must.
     """
-    session = _foreign_paid_session() | {"success_url": f"{harness_return_url('refund/v2')}?x=1"}
+    run_id = "v1"
+    _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, run_id)
 
-    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
-        require_phase_a_provenance(session, "v1")
+    imitator = _foreign_paid_session() | {
+        "id": PHASE_A_SESSION,  # the id matches: the mark is the only thing left to judge it
+        "success_url": harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}") + QUERY,
+    }
+
+    with pytest.raises(AssertionError, match="AUTHENTICATED mark"):
+        require_phase_a_provenance(imitator, run_id)
 
 
-def test_a_prefix_of_the_run_id_is_not_a_match(
+def test_a_guessed_mark_is_refused(
     require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
     harness_return_url: Callable[[str], str],
 ) -> None:
-    """==Run id ``v1`` must not match a session marked ``v11``.==
+    """The same attack one step further: a mark-SHAPED value in the right place.
 
-    The check requires the query-string boundary right after the run id, so one id cannot pass as
-    the prefix of another. Without that boundary this would be a silent, plausible-looking match.
+    Sixty-four hex characters where the digest goes, on the right session id, under the right run.
+    Without the key it is a guess, and a guess does not verify.
     """
-    session = _foreign_paid_session() | {"success_url": f"{harness_return_url('refund/v11')}?x=1"}
+    run_id = "v1"
+    _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, run_id)
 
-    with pytest.raises(AssertionError, match="does not carry this harness's mark"):
-        require_phase_a_provenance(session, "v1")
+    guessed = _foreign_paid_session() | {
+        "id": PHASE_A_SESSION,
+        "success_url": harness_return_url(f"{PHASE_A_PURPOSE}/{run_id}/{'0' * 64}") + QUERY,
+    }
+
+    with pytest.raises(AssertionError, match="AUTHENTICATED mark"):
+        require_phase_a_provenance(guessed, run_id)
 
 
 def test_a_session_this_harness_opened_is_accepted(
     require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
     harness_return_url: Callable[[str], str],
 ) -> None:
-    """==Anti-vacuity.== A check that refused everything would pass all three tests above and make
-    phase B impossible to run at all.
+    """==Anti-vacuity, and the half that makes every refusal above mean something.==
 
-    The URL is built exactly as the gateway builds it: the harness's return URL, then the query
-    string ``create_checkout_session`` appends.
+    A guard that refused everything would pass all of them while making phase B impossible to run.
+    This is the genuine article: the mark phase A stamps, on the session phase A recorded.
     """
-    query = "?checkout=success&session_id={CHECKOUT_SESSION_ID}"
-    session = _foreign_paid_session() | {"success_url": harness_return_url("refund/v1") + query}
+    run_id = "v1"
+    session = _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, run_id)
 
-    require_phase_a_provenance(session, "v1")  # must not raise
+    require_phase_a_provenance(session, run_id)  # must not raise
+
+
+def test_a_paid_session_of_the_same_amount_is_refused_without_provenance(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """==The original finding: phase B would refund any session id it was handed.==
+
+    A real customer's invoice — paid, in USD, for exactly the harness's amount — is refused, and
+    ==the $1 cap defends nothing== on its own: $1 is one figure among thousands.
+    """
+    run_id = "v1"
+    _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, run_id)
+
+    with pytest.raises(AssertionError, match="not the session phase A opened"):
+        require_phase_a_provenance(_foreign_paid_session(), run_id)
+
+
+def test_a_session_from_a_different_run_is_refused(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """The mark and the record are per RUN, so phase B refunds the run it was asked about.
+
+    Two payable sessions can exist at once (a lapsed ``v1``, a fresh ``v2``). Refunding whichever
+    one happened to be pasted would be the same class of mistake in miniature — and a mark minted
+    for ``v2`` does not verify under ``v1``, because the run id is inside the HMAC.
+    """
+    other = _phase_a_opened(
+        record_phase_a_session, phase_a_mark, harness_return_url, "v2", "cs_live_RUN_TWO"
+    )
+    _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, "v1")
+
+    with pytest.raises(AssertionError, match="not the session phase A opened"):
+        require_phase_a_provenance(other, "v1")
+
+
+def test_a_prefix_of_the_run_id_is_not_a_match(
+    require_phase_a_provenance: Callable[[Mapping[str, Any], str], None],
+    record_phase_a_session: Callable[[str, str], None],
+    phase_a_mark: Callable[[str], str],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """==Run id ``v1`` must not match a session marked ``v11``.==
+
+    The boundary is the separator after the run id, so one id cannot pass as the prefix of another.
+    Without it this would be a silent, plausible-looking match.
+    """
+    _phase_a_opened(record_phase_a_session, phase_a_mark, harness_return_url, "v1")
+    marked_v11 = harness_return_url(f"{PHASE_A_PURPOSE}/v11/{phase_a_mark('v11')}")
+    session = _foreign_paid_session() | {"id": PHASE_A_SESSION, "success_url": marked_v11 + QUERY}
+
+    with pytest.raises(AssertionError, match="AUTHENTICATED mark"):
+        require_phase_a_provenance(session, "v1")
+
+
+def test_without_a_signing_key_the_money_harness_refuses_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==Fail closed: no key, no run.== Never "carry on without checking provenance".
+
+    A skip here would be the silent no-op aimed at the one barrier that keeps this harness off other
+    people's payments. The refusal must be a FAILURE, and it never prints the key it is missing.
+    """
+    monkeypatch.delenv(PROVENANCE_SECRET_ENV, raising=False)
+
+    with pytest.raises(pytest.fail.Exception, match="Refusing to run"):
+        provenance_secret_from_env()
+
+
+def test_the_mark_is_not_derivable_from_the_repository(
+    phase_a_mark: Callable[[str], str],
+    harness_return_url: Callable[[str], str],
+) -> None:
+    """==The property the old marker lacked: the mark is not a function of public data.==
+
+    Two runs that differ only in their run id produce unrelated marks, and neither is contained in
+    the published path. If this failed, the mark would be reconstructible by anybody holding a
+    checkout of this repository — which is exactly what the finding was about.
+    """
+    first, second = phase_a_mark("v1"), phase_a_mark("v2")
+
+    assert first != second
+    assert len(first) == 64, "an HMAC-SHA256 digest, not a path"
+    assert first not in harness_return_url(f"{PHASE_A_PURPOSE}/v1")
 
 
 def test_provenance_is_demanded_before_the_refund_is_sent() -> None:
@@ -533,7 +658,7 @@ def test_the_payment_intent_is_resolved_before_the_guarantee_but_after_provenanc
     )
     demand = "require_phase_a_provenance(session, _run_id())"
     resolve = 'payment_intent_id = session.get("payment_intent")'
-    keyed = "idempotency_key = refund_dedupe_key(payment_intent_id)"
+    keyed = "idempotency_key = refund_idempotency_key(payment_intent_id, after_failed_refund=None)"
 
     for needle in (demand, resolve, keyed):
         assert needle in source, f"phase B no longer contains `{needle}`"

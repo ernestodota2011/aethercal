@@ -85,6 +85,7 @@ from aethercal.server.services.outbox import (
     enqueue_effect,
     expire_hold_dedupe_key,
     refund_dedupe_key,
+    refund_idempotency_key,
 )
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
@@ -880,6 +881,33 @@ class CheckoutSession:
     checkout_session_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class RefundOutcome:
+    """What the provider said about the refund a :meth:`PaymentGateway.refund` call produced.
+
+    ==``refund`` used to return ``None``==, so "the API accepted the request" was the only thing the
+    runner could know — and a refund that later reached a TERMINAL FAILURE was indistinguishable
+    from one on its way to succeeding. That is what made a failed refund unretryable: the runner had
+    nothing to derive a new idempotency generation from, and nothing to stop it recording the
+    payment as refunded.
+    """
+
+    refund_id: str | None
+    """The provider's id for the refund this call created — or REPLAYED, on a repeated key.
+
+    ``None`` when the provider named none, which is the one case a new generation cannot be derived
+    from: see :func:`~aethercal.server.services.outbox.refund_idempotency_key`.
+    """
+
+    terminally_failed: bool
+    """==The money did NOT move, and this refund will never move it.==
+
+    Terminal, so retrying the same key replays this answer for ever. Anything still in flight
+    (``pending``, ``requires_action``) is NOT this: it may yet succeed, and issuing another refund
+    beside it is how a guest gets paid twice.
+    """
+
+
 class PaymentGateway(Protocol):
     """The provider side of the money — ==injected==, so every provider call is a seam, not a
     hard-wired Stripe import. A test passes a spy; production passes the real BYOK adapter."""
@@ -916,8 +944,13 @@ class PaymentGateway(Protocol):
 
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         """Refund the charge ``provider_ref`` IN FULL, on the business's OWN account (``secrets``).
+
+        Returns what the provider said (:class:`RefundOutcome`), because "the call did not raise"
+        is not "the money went back": a refund can be accepted and later fail terminally, and the
+        runner must be able to tell — so it can open a new idempotency generation instead of
+        replaying a dead one for ever.
 
         ==``idempotency_key`` is deterministic (one per charge), so a retry after a crash gets the
         SAME refund, not a second one.== The provider dedupes on it — that is the real guarantee the
@@ -1085,11 +1118,48 @@ def make_refund_runner(
             # the provider returns the SAME refund for a repeated key rather than a second one (both
             # Stripe and Mercado Pago document this). The money moves once even if this code runs
             # twice.
-            await gateway.refund(
+            outcome = await gateway.refund(
                 provider_ref=provider_ref,
-                idempotency_key=refund_dedupe_key(provider_ref),
+                idempotency_key=refund_idempotency_key(provider_ref, after_failed_refund=None),
                 secrets=credential.secrets,
             )
+
+            # ==A terminal failure opens a NEW generation of the key (H9).== The provider replays
+            # its answer for a repeated idempotency key, so once a refund ends `failed`/`canceled`
+            # every retry on that key gets the same dead refund back: the guest's money never
+            # returns and the retry reports success. The generation is named by the FAILURE's id,
+            # so it is a function of observed state — stable while the state is, which is what
+            # keeps a crash-retry from issuing a second refund.
+            if outcome.terminally_failed and outcome.refund_id is not None:
+                _logger.error(
+                    "ALERT: the refund of payment %s (%s) failed TERMINALLY at the provider "
+                    "(refund %s); issuing a fresh one on a new idempotency generation",
+                    payment.id,
+                    provider_ref,
+                    outcome.refund_id,
+                )
+                outcome = await gateway.refund(
+                    provider_ref=provider_ref,
+                    idempotency_key=refund_idempotency_key(
+                        provider_ref, after_failed_refund=outcome.refund_id
+                    ),
+                    secrets=credential.secrets,
+                )
+
+            # ==ONE new generation per drain, not a chain.== A card that rejects refunds keeps
+            # rejecting them; issuing them in a loop until one sticks is a machine arguing with a
+            # bank. So a second terminal failure RAISES: the outbox retries this whole runner
+            # (replaying both calls and creating nothing new — the keys are stable), and its
+            # attempt ceiling dead-letters it with an alert for a human. The payment is NOT marked
+            # refunded, because it was not.
+            if outcome.terminally_failed:
+                raise RuntimeError(
+                    f"the refund of {provider_ref} failed terminally at the provider "
+                    f"(refund {outcome.refund_id!r}), and so did the fresh one issued after it. "
+                    "The guest's money has NOT come back and no further refund will be issued "
+                    "automatically — this needs a human at the provider's dashboard."
+                )
+
             payment.status = PaymentStatus.REFUNDED
             _logger.info("refund runner: refunded payment %s (%s)", payment.id, provider_ref)
 
@@ -1342,6 +1412,7 @@ __all__ = [
     "ConfirmEffects",
     "ParkedPaymentReport",
     "PaymentGateway",
+    "RefundOutcome",
     "apply_dispute_event",
     "apply_paid_event",
     "apply_refunded_event",

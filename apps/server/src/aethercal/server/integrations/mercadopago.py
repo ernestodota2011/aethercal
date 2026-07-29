@@ -76,9 +76,19 @@ from aethercal.server.services.payment_webhooks import (
     ParsedWebhookEvent,
     WebhookEventKind,
 )
-from aethercal.server.services.payments import CheckoutSession
+from aethercal.server.services.payments import CheckoutSession, RefundOutcome
 
 _logger = logging.getLogger(__name__)
+
+TERMINAL_REFUND_FAILURES = frozenset({"rejected", "cancelled", "canceled"})
+"""Mercado Pago refund statuses that are TERMINAL and moved NO money.
+
+==Deliberately NARROW.== Everything not listed here — including a status this adapter has never
+seen — reads as "not terminally failed", so the runner does NOT open a new generation and does NOT
+issue a second refund. Guessing the other way pays a guest twice; guessing this way delays a refund
+the outbox will retry. Like the rest of this adapter it is written to the documented vocabulary and
+has never been exercised against a real account.
+"""
 
 _MP_API_BASE = "https://api.mercadopago.com"
 _HTTP_TIMEOUT = httpx.Timeout(20.0)
@@ -740,7 +750,7 @@ class MercadoPagoGateway:
 
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         """Refund the payment ``provider_ref`` IN FULL, on the business's own token.
 
         ==There is no ``amount`` in the body, and no ``amount_cents`` in the signature== — Mercado
@@ -762,6 +772,15 @@ class MercadoPagoGateway:
                 headers={"X-Idempotency-Key": idempotency_key},
             )
             response.raise_for_status()
+            body = response.json()
+        # Same reading as Stripe's, and the same asymmetry: an unrecognised status is NOT a terminal
+        # failure, because the consequence of calling it one is a second refund.
+        refund_id = body.get("id") if isinstance(body, dict) else None
+        status = body.get("status") if isinstance(body, dict) else None
+        return RefundOutcome(
+            refund_id=str(refund_id) if refund_id is not None else None,
+            terminally_failed=status in TERMINAL_REFUND_FAILURES,
+        )
 
 
 def _iso8601(moment: datetime) -> str:
@@ -775,6 +794,7 @@ def _iso8601(moment: datetime) -> str:
 
 
 __all__ = [
+    "TERMINAL_REFUND_FAILURES",
     "MercadoPagoError",
     "MercadoPagoGateway",
     "MercadoPagoPaymentStatus",

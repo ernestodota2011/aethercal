@@ -24,6 +24,7 @@ from aethercal.server.db.pools import WorkerPools
 from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.scheduler import build_drain_executor
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork, refund_dedupe_key
+from aethercal.server.services.payments import RefundOutcome
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
@@ -42,9 +43,14 @@ class _GatewaySpy:
 
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         assert secrets.get("secret_key", "").startswith("sk_test_")
+        del provider_ref
         self.refunds.append(idempotency_key)
+        # A provider that accepted the refund and named none: the runner reads this, so a double
+        # that returned nothing would be asserting that the drain works against a shape no gateway
+        # produces.
+        return RefundOutcome(refund_id=None, terminally_failed=False)
 
     async def create_checkout_session(
         self, **_: object

@@ -766,6 +766,39 @@ def refund_dedupe_key(provider_ref: str) -> str:
     return f"{OutboxEffect.REFUND.value}:{provider_ref}"
 
 
+def refund_idempotency_key(provider_ref: str, *, after_failed_refund: str | None) -> str:
+    """The key sent to the PROVIDER for a refund. ==Distinct from the outbox row's key.==
+
+    :func:`refund_dedupe_key` identifies the ROW (a database UNIQUE constraint, which must never
+    move). This identifies the ATTEMPT at the provider, and it carries a GENERATION.
+
+    .. rubric:: ==The finding: a terminally failed refund was permanently unretryable==
+
+    Both keys used to be the same string. A provider replays the response it gave for a repeated
+    idempotency key — so once a refund reached a TERMINAL FAILURE (``failed``/``canceled``: the
+    money did not move and never will), every retry got that same dead refund back. ==The guest's
+    money never came back, and the retry looked like it had worked.==
+
+    So a new failure opens a new generation, named by ``after_failed_refund`` — the id of the
+    terminal failure it follows.
+
+    .. rubric:: ==Why the generation is the FAILURE's id and not a counter or a clock==
+
+    Because the whole purpose of the key is that a retry cannot pay twice. A key derived from the
+    attempt number, the time, or randomness changes on every retry — so a crash between the
+    provider call and our commit would issue a SECOND refund, and we would have traded a bug that
+    never returns the money for one that returns it twice. ==The generation must be a function of
+    OBSERVED STATE==: while the state does not change the key does not change, so a retry replays
+    rather than duplicates.
+
+    ``after_failed_refund`` has no default. The safe value is not obvious enough to be assumed:
+    ``None`` is right for the first attempt and wrong for every retry after a failure, and a caller
+    that never thinks about it is the caller whose guest never gets paid back.
+    """
+    key = refund_dedupe_key(provider_ref)
+    return key if after_failed_refund is None else f"{key}:after:{after_failed_refund}"
+
+
 def expire_hold_dedupe_key(booking_id: uuid.UUID) -> str:
     """The idempotency key for a hold-expiry intent (one per booking: a hold IS one booking)."""
     return f"{OutboxEffect.EXPIRE_HOLD.value}:{booking_id}"
@@ -3060,6 +3093,7 @@ __all__ = [
     "reconcile_workflow_steps",
     "recover_expired_leases",
     "refund_dedupe_key",
+    "refund_idempotency_key",
     "run_email_effect",
     "run_google_effect",
     "run_notify_effect",
