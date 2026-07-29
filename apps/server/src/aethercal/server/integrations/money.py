@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from collections.abc import Mapping
 from typing import assert_never
 
 from aethercal.server.integrations.mercadopago import MercadoPagoGateway, MercadoPagoWebhookAdapter
@@ -39,6 +40,7 @@ from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     GatewayOperation,
     credential_class,
+    gateway_operations,
 )
 
 
@@ -117,8 +119,9 @@ def implementation_fingerprint(provider: CredentialProvider, operation: GatewayO
     did not exist when the evidence was gathered. That is ``feedback_justificacion_caduca`` exactly:
     a justification about a moving target, written once.
 
-    So each record carries this fingerprint, and ``tests/test_credential_mode_guard.py`` re-computes
-    it and refuses any record whose implementation has changed underneath it. Editing the method
+    So each record carries this fingerprint, and ==the credential door re-computes it on every
+    write== (:func:`current_gateway_implementations`, handed to
+    :func:`~aethercal.server.services.tenant_credentials.verified_operations`). Editing the method
     ==invalidates its verification== and demands a fresh run, which is the only honest outcome.
 
     .. rubric:: What it hashes, and why the bluntness is deliberate
@@ -131,6 +134,38 @@ def implementation_fingerprint(provider: CredentialProvider, operation: GatewayO
     gateway = gateway_for(provider)  # raises NotAMoneyProviderError for an INFRA provider
     method = getattr(type(gateway), gateway_method_for(operation))
     return hashlib.sha256(inspect.getsource(method).encode("utf-8")).hexdigest()[:16]
+
+
+def current_gateway_implementations(
+    provider: CredentialProvider,
+) -> Mapping[GatewayOperation, str]:
+    """The fingerprint of the code that would run RIGHT NOW, per operation. ==The door's input.==
+
+    .. rubric:: ==This function exists because the check could not live where the decision does==
+
+    ``services.tenant_credentials`` owns the decision *may a live credential be stored?*, and it
+    cannot compute a fingerprint: this module imports it, so the reverse edge is a cycle. The first
+    cut resolved that by moving the comparison OUT of the decision and into
+    ``tests/test_credential_mode_guard.py`` — which meant a rewritten ``StripeGateway.refund``
+    invalidated its verification **in CI only**, while the production door went on authorising a
+    live key against an implementation nobody had ever exercised. ==The evidence expired in the
+    suite and stayed valid in production.==
+
+    So the dependency is INVERTED rather than dropped: the layer that can see both sides computes
+    the fact and hands it to the decision
+    (:func:`~aethercal.server.services.tenant_credentials.verified_operations`, whose parameter has
+    no default). ``cli.run_credentials_set`` — the operator's actual path to storing a credential —
+    calls this.
+
+    Derived from :func:`~aethercal.server.services.tenant_credentials.gateway_operations`, so a
+    THIRD operation is fingerprinted the day it is added rather than the day somebody remembers.
+    An INFRA provider has no gateway operations, so the answer is ``{}`` and
+    :func:`implementation_fingerprint` (which refuses one) is never reached.
+    """
+    return {
+        operation: implementation_fingerprint(provider, operation)
+        for operation in gateway_operations(provider)
+    }
 
 
 def _not_money(provider: CredentialProvider) -> str:
@@ -181,6 +216,7 @@ __all__ = [
     "NotAMoneyProviderError",
     "build_payment_gateways",
     "build_webhook_adapters",
+    "current_gateway_implementations",
     "gateway_for",
     "gateway_method_for",
     "implementation_fingerprint",

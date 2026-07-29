@@ -198,9 +198,22 @@ test-mode credential (`sk_test_…`, `TEST-…`) and names the operations that a
 **What verification does *not* relax:** the value must be a recognisable key of that provider —
 `sk_test_…`/`sk_live_…` for Stripe, `TEST-…`/`APP_USR-…` for Mercado Pago — **always**, verified or
 not. That check used to ride on the test-mode prefix, so it vanished the moment a provider became
-fully verified, leaving a truncated paste or a key from another account to be stored unexamined at
-exactly the point real money starts moving. The two questions are now separate: *is this a key of
-this provider?* (permanent) and *is this the right mode for what we have proved?* (relaxes).
+fully verified, leaving rubbish to be stored unexamined at exactly the point real money starts
+moving. The two questions are now separate: *is this a key of this provider?* (permanent) and *is
+this the right mode for what we have proved?* (relaxes).
+
+> [!NOTE]
+> **A prefix is not a key, and the check now says exactly how far it reaches.** The value must carry
+> the prefix, at least 12 more characters, and nothing but letters, digits, `-` or `_` — so
+> `sk_live_` typed on its own, a paste truncated to a stub, and a value that picked up a line break
+> or its surrounding quotes are all refused. (`startswith` alone accepted the bare prefix while the
+> error message promised it caught "a truncated paste".)
+>
+> **What it cannot decide:** whether a well-formed key is genuine, current, or *yours*. A key from
+> another account has exactly the right shape. Only an authenticated call to the provider settles
+> that, and this door makes none — configuring a credential must not depend on the provider being
+> reachable. So a wrong-account key is stored and fails when somebody tries to pay, and the refusal
+> text says that rather than implying otherwise.
 
 #### Why per operation, and not one flag per provider
 
@@ -263,6 +276,7 @@ The barriers on the money phase are structural, not procedural:
 | **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one. To open a new one on purpose, set `AETHERCAL_LIVE_STRIPE_RUN_ID=v2` — phase A names that command itself if the replayed session has lapsed |
 | **the refund is idempotent** | phase B uses production's own `refund_dedupe_key`, so a retry gets the same refund and never a second |
 | **the money always comes back — *all* of it** | the `finally` reads what was actually **captured**, sums only refunds that are `succeeded` (`pending` is *in flight*, not done), issues the remainder on its own derived key, and polls to a terminal state. ==A partial or pending refund is a failure, not a pass== |
+| **the guarantee opens before any validation can abort** | phase B resolves the PaymentIntent immediately after the provenance check and puts **everything else** — currency, `paid`, amount, the gateway call — inside the `try` whose `finally` refunds. Those checks used to run *before* it, so a mismatch on a genuinely paid session ended the run with the dollar still on the card. If the PaymentIntent cannot be resolved at all on a `paid` session, the run **shouts the session id** for a manual refund |
 | **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
 | **held money is never quiet** | if the refund cannot be completed, the run prints the **charge id** and the dashboard link for a manual refund, and fails |
 | **nothing payable is left unvalidated** | phase A validates amount, currency, mode and status **after** creating the session and **expires it on any failure** — a session is left open only once it has passed. The pay-URL it prints is Stripe's own, checked against the gateway's |
@@ -277,11 +291,19 @@ requires having done the run.
 
 > [!NOTE]
 > **A verification is about an implementation, not about a provider's name.** Each record names the
-> fingerprint of the exact gateway method it exercised, and the test suite re-computes it — so
-> editing `StripeGateway.refund` **invalidates that operation's verification** and demands a fresh
-> run. Without it, the register would go on saying "verified" about code nobody has ever run. The
-> hash covers the method's source, so even a cosmetic edit forces a re-run: a needless free run
-> costs minutes, a false "still verified" costs somebody's money.
+> fingerprint of the exact gateway method it exercised, and **the door re-computes it on every
+> credential write** — so editing `StripeGateway.refund` **invalidates that operation's
+> verification** and the next live credential is refused, in the operator's own command. Without it,
+> the register would go on saying "verified" about code nobody has ever run. The hash covers the
+> method's source, so even a cosmetic edit forces a re-run: a needless free run costs minutes, a
+> false "still verified" costs somebody's money.
+>
+> That comparison used to live in the test suite alone — `services` cannot import `integrations`, so
+> the door could not compute a fingerprint. The evidence therefore expired in CI and **stayed valid
+> in production**. The dependency is now inverted rather than dropped: `cli.run_credentials_set`
+> (the layer that can see both) passes `current_gateway_implementations(provider)` into the door,
+> and the parameter has no default — a caller cannot omit it, and any partial answer makes the door
+> *stricter*, never laxer.
 
 > [!WARNING]
 > **A verification performed in TEST mode does not authorise a LIVE credential.** Each record states

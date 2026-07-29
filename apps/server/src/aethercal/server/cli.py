@@ -32,6 +32,7 @@ from aethercal.server.db.migrate import head_revision, run_migrations
 from aethercal.server.db.models import ApiKey, Booking, Outbox, OutboxStatus, Tenant
 from aethercal.server.db.roles import DbRole, assert_engine_role, assert_sync_engine_role
 from aethercal.server.integrations.google.oauth import get_credentials
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.api_keys import (
     RevokeKeyOutcome,
     issue_api_key,
@@ -421,11 +422,24 @@ async def run_credentials_set(
     secrets: Mapping[str, str],
     key: bytes,
 ) -> None:
-    """Store (or replace) one business's credential for ``provider``, encrypted at rest."""
+    """Store (or replace) one business's credential for ``provider``, encrypted at rest.
+
+    ==This is the composition layer for the live-credential door.== ``services`` cannot import
+    ``integrations`` (that edge is a cycle), so it cannot see which gateway code a verification was
+    about; the CLI can see both, and hands the door the fingerprints of what would actually run
+    today (:func:`~aethercal.server.integrations.money.current_gateway_implementations`). A stale
+    verification therefore stops authorising a live key HERE — in the operator's own command —
+    rather than only in the test suite, which is where that comparison used to live.
+    """
     async with sessionmaker() as session, session.begin():
         tenant_id = await _tenant_id_for(session, tenant_slug)
         await store_credential(
-            session, tenant_id=tenant_id, provider=provider, secrets=secrets, fernet_key=key
+            session,
+            tenant_id=tenant_id,
+            provider=provider,
+            secrets=secrets,
+            fernet_key=key,
+            current_implementations=current_gateway_implementations(provider),
         )
 
 

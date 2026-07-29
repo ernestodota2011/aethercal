@@ -21,6 +21,7 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import Booking, Payment, PaymentStatus, Schedule, Tenant, User
 from aethercal.server.db.pools import WorkerPools
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.scheduler import build_drain_executor
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork, refund_dedupe_key
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
@@ -107,6 +108,7 @@ async def test_the_worker_drain_arms_a_functional_invocable_refund_runner(
             provider=CredentialProvider.STRIPE,
             secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": "whsec_x"},
             fernet_key=_KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         tenant_id, booking_id = tenant.id, booking.id
 

@@ -17,6 +17,7 @@ describes and the test goes red.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 from collections.abc import Callable, Mapping
@@ -386,6 +387,140 @@ def test_provenance_is_demanded_before_the_refund_is_sent() -> None:
     assert refund_call in source, "phase B no longer calls the gateway's refund"
     assert source.index(demand) < source.index(refund_call), (
         "phase B sends the refund before it has established that the session came from phase A"
+    )
+
+
+PHASE_B = "test_phase_b_refunds_the_real_charge_through_the_gateway"
+REFUND_GUARANTEE = "ensure_refunded"
+
+
+def _phase_b() -> ast.AsyncFunctionDef:
+    """Phase B's own syntax tree. ==Parsed, not grepped== — this is a claim about STRUCTURE."""
+    source = (pathlib.Path(__file__).parent / "test_stripe_live_refund.py").read_text(
+        encoding="utf-8"
+    )
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == PHASE_B:
+            return node
+    raise AssertionError(f"{PHASE_B} is gone, so this guard is watching nothing")
+
+
+def _guarantees_the_refund(node: ast.stmt) -> bool:
+    """A ``try`` whose ``finally`` calls :func:`ensure_refunded` — the money's safety net."""
+    if not isinstance(node, ast.Try):
+        return False
+    return any(
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == REFUND_GUARANTEE
+        for statement in node.finalbody
+        for inner in ast.walk(statement)
+    )
+
+
+def test_every_validation_after_the_payment_intent_is_inside_the_refund_guarantee() -> None:
+    """==The finding: the money's safety net started AFTER four assertions that could abort.==
+
+    Phase B validated the currency, the ``paid`` status, the amount and the PaymentIntent's shape
+    and only THEN opened the ``try``/``finally`` that guarantees the refund. Every one of those can
+    fail on a session a human has genuinely paid — and when one did, the run ended with ==a real
+    dollar on a real card and nothing left to send it back==. The validations were guarding the run;
+    nothing was guarding the money.
+
+    So the structure is pinned: once there is a PaymentIntent to aim a refund at, ==nothing that can
+    abort may run outside the guarantee==.
+
+    .. note::
+
+       This proves STRUCTURE, not correctness — like
+       :func:`test_no_harness_certifies_a_fact_before_establishing_it` above. It cannot tell whether
+       the right things are validated; what it catches is the regression that already happened once:
+       somebody adds "just one quick check" above the ``try``, and a failure of that check strands
+       somebody's dollar.
+    """
+    phase_b = _phase_b()
+    guarantees = [node for node in phase_b.body if _guarantees_the_refund(node)]
+
+    assert len(guarantees) == 1, (
+        f"{PHASE_B} has {len(guarantees)} top-level `try` blocks whose `finally` calls "
+        f"`{REFUND_GUARANTEE}`; there must be exactly one, or 'is the money guaranteed?' has no "
+        "single answer"
+    )
+    guarantee = guarantees[0]
+
+    assert phase_b.body[-1] is guarantee, (
+        "the refund guarantee is not the last thing phase B does, so something runs after the "
+        "`finally` that returns the money — outside the only thing protecting it"
+    )
+
+    unprotected = [
+        node.lineno
+        for statement in phase_b.body[: phase_b.body.index(guarantee)]
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Assert)
+    ]
+    assert not unprotected, (
+        f"{PHASE_B} asserts at line(s) {unprotected}, BEFORE the `try` whose `finally` guarantees "
+        "the refund. A real card may already have been charged by then: if one of those assertions "
+        "fails, the run stops and the money stays on it. Move the check inside the guarantee."
+    )
+
+
+def test_the_payment_intent_is_resolved_before_the_guarantee_but_after_provenance() -> None:
+    """==The two barriers are in tension, and the order between them is the whole design.==
+
+    The refund guarantee cannot open before there is a PaymentIntent to aim at — so the id is
+    resolved early. But resolving it early must NOT come before provenance: pointing the refund
+    machinery at a stranger's payment would be worse than stranding our own dollar, and this account
+    carries real customer invoices.
+
+    So: provenance, then the id, then the guarantee. All three, in that order, checked here rather
+    than remembered.
+    """
+    source = (pathlib.Path(__file__).parent / "test_stripe_live_refund.py").read_text(
+        encoding="utf-8"
+    )
+    demand = "require_phase_a_provenance(session, _run_id())"
+    resolve = 'payment_intent_id = session.get("payment_intent")'
+    keyed = "idempotency_key = refund_dedupe_key(payment_intent_id)"
+
+    for needle in (demand, resolve, keyed):
+        assert needle in source, f"phase B no longer contains `{needle}`"
+
+    assert source.index(demand) < source.index(resolve), (
+        "phase B resolves the PaymentIntent before it has established that the session came from "
+        "phase A — so a foreign payment becomes a target before anything refuses it"
+    )
+    assert source.index(resolve) < source.index(keyed), (
+        "phase B derives the refund key before resolving the PaymentIntent it is derived from"
+    )
+
+
+def test_an_unresolvable_payment_intent_on_a_paid_session_raises_the_alarm() -> None:
+    """==The one path that cannot be guaranteed must SHOUT, and must name the session.==
+
+    If the PaymentIntent cannot be read off a session that says ``paid``, there is real money and no
+    way to aim a refund at it — ``ensure_refunded`` takes the very id that is missing. That is the
+    worst state this harness can reach, so the branch that handles it is checked here: it must be
+    reachable, it must name the session id, and it must be unmistakable.
+
+    Read from the source rather than executed, because executing it needs a live credential and a
+    paid session — the two things this offline file deliberately does not have.
+    """
+    source = (pathlib.Path(__file__).parent / "test_stripe_live_refund.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "MONEY MAY BE HELD" in source, (
+        "phase B no longer shouts when a PAID session's PaymentIntent cannot be resolved. That is "
+        "real money nothing can return automatically, and silence is how nobody goes looking."
+    )
+    assert "{paid_session_id}" in source, (
+        "the alarm must name the session id — with no PaymentIntent it is the only handle a human "
+        "has left"
+    )
+    assert "DASHBOARD_SEARCH_URL" in source, (
+        "the alarm must say WHERE to refund by hand; an alarm without the next action is a shrug"
     )
 
 

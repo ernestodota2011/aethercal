@@ -51,11 +51,16 @@ from collections.abc import Awaitable, Callable
 from datetime import date
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.server.cli import run_create_tenant, run_credentials_list, run_credentials_set
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant
-from aethercal.server.integrations.money import gateway_method_for, implementation_fingerprint
+from aethercal.server.integrations.money import (
+    current_gateway_implementations,
+    gateway_method_for,
+    implementation_fingerprint,
+)
 from aethercal.server.services import tenant_credentials as credentials
 from aethercal.server.services.payments import PaymentGateway
 from aethercal.server.services.tenant_credentials import (
@@ -74,6 +79,7 @@ from aethercal.server.services.tenant_credentials import (
     live_verifications,
     required_fields,
     required_test_mode_prefixes,
+    stale_verifications,
     store_credential,
     unverified_operations,
     verified_operations,
@@ -112,14 +118,24 @@ async def _store(
     """Through the real funnel: ``store_credential`` is the only writer of this table."""
     tenant = await tenant_factory(session)
     await store_credential(
-        session, tenant_id=tenant.id, provider=provider, secrets=secrets, fernet_key=KEY
+        session,
+        tenant_id=tenant.id,
+        provider=provider,
+        secrets=secrets,
+        fernet_key=KEY,
+        current_implementations=current_gateway_implementations(provider),
     )
+
+
+CODE_THAT_NO_LONGER_EXISTS = "0000000000000000"
+"""A fingerprint no adapter in this tree hashes to — a record about code that has been rewritten."""
 
 
 def _exercised(
     monkeypatch: pytest.MonkeyPatch,
     *operations: GatewayOperation,
     mode: ProviderMode = ProviderMode.LIVE,
+    implementation: str | None = None,
 ) -> None:
     """Rewrite the verification register so every provider has exactly ``operations`` exercised.
 
@@ -132,20 +148,33 @@ def _exercised(
 
     ``mode`` defaults to LIVE because that is the interesting case for most of these; the tests that
     turn on the distinction pass it explicitly and loudly.
+
+    ``implementation`` defaults to the CURRENT fingerprint, so a test about mode or coverage is not
+    accidentally also a test about staleness. Passing :data:`CODE_THAT_NO_LONGER_EXISTS` arranges
+    the opposite state — real evidence, in the right mode, about a method that has been rewritten.
+
+    ==The fingerprint is computed PER PROVIDER, and that matters now that the door compares it.==
+    One provider's fingerprints are stale evidence for another's gateway, so a register that handed
+    every provider Stripe's would arrange "fully verified" for Stripe and "entirely stale" for
+    Mercado Pago while claiming to arrange the same state for both. An INFRA provider gets ``()``,
+    exactly as the real register does: it has no gateway to have exercised.
     """
-    records = tuple(
-        LiveVerification(
-            operation=operation,
-            mode=mode,
-            # The CURRENT fingerprint: these tests are about mode and coverage, so their records
-            # must not also look stale. Staleness has its own tests below.
-            implementation=implementation_fingerprint(CredentialProvider.STRIPE, operation),
-            verified_on=date(2026, 7, 25),
-            evidence="synthetic: arranged by a test, nothing was run against any provider",
+
+    def _records(provider: CredentialProvider) -> tuple[LiveVerification, ...]:
+        if credential_class(provider) is not CredentialClass.MONEY:
+            return ()
+        return tuple(
+            LiveVerification(
+                operation=operation,
+                mode=mode,
+                implementation=implementation or implementation_fingerprint(provider, operation),
+                verified_on=date(2026, 7, 25),
+                evidence="synthetic: arranged by a test, nothing was run against any provider",
+            )
+            for operation in operations
         )
-        for operation in operations
-    )
-    monkeypatch.setattr(credentials, "live_verifications", lambda provider: records)
+
+    monkeypatch.setattr(credentials, "live_verifications", _records)
 
 
 class TestTheDoorFollowsTheRegister:
@@ -228,6 +257,79 @@ class TestTheDoorFollowsTheRegister:
         assert "TEST mode" in message, message
         assert GatewayOperation.CHECKOUT.value in message
         assert GatewayOperation.REFUND.value in message
+
+    async def test_a_live_key_is_refused_when_the_evidence_names_code_that_has_changed(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==The finding: an obsolete verification went on authorising live credentials.==
+
+        Every operation exercised, in LIVE mode, with real evidence — and every record naming a
+        gateway method that has since been rewritten. The register says "verified"; what it is
+        verified ABOUT no longer exists. ==A live credential must still be refused.==
+
+        This is the state a repository reaches by ordinary work: somebody edits
+        ``StripeGateway.refund`` weeks after the harness ran. Until this, the comparison that
+        catches it lived in :class:`TestTheRuleIsDerived` and NOWHERE ELSE — so the evidence expired
+        in CI while ``verified_operations()``, the function the door consults, went on opening for
+        an implementation nobody had ever run. ==Revert the fingerprint check in
+        ``verified_operations`` and this test stores the key instead of raising.==
+        """
+        _exercised(monkeypatch, *GatewayOperation, implementation=CODE_THAT_NO_LONGER_EXISTS)
+        with pytest.raises(LiveCredentialRefusedError):
+            await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+    async def test_the_refusal_explains_that_the_evidence_names_code_that_has_changed(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==Being refused right after a green LIVE run reads as a broken guard, so say WHY.==
+
+        "refund has never been run in LIVE mode" is false and unhelpful to somebody who ran it last
+        month: what changed is the code, not the evidence. The message must distinguish *nobody ran
+        this* from *somebody ran something else*, or the operator re-runs a harness that costs a
+        real charge and is refused again for the same reason.
+        """
+        _exercised(monkeypatch, *GatewayOperation, implementation=CODE_THAT_NO_LONGER_EXISTS)
+        with pytest.raises(LiveCredentialRefusedError) as raised:
+            await _store(sqlite_session, tenant_factory, CredentialProvider.STRIPE, STRIPE_LIVE)
+
+        message = str(raised.value)
+        assert "CHANGED" in message, message
+        assert GatewayOperation.REFUND.value in message
+        assert GatewayOperation.CHECKOUT.value in message
+
+    async def test_an_operation_with_no_fingerprint_supplied_counts_as_unverified(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==Every way of getting the injected argument wrong must be RESTRICTIVE.==
+
+        The fingerprints are supplied by the caller, so the question "what if a caller supplies a
+        partial or empty map?" has to have an answer, and only one answer is safe: an operation the
+        map does not mention is not verified. A missing key that read as "no objection" would make
+        the guard opt-out by omission — which is the shape of every defect this module has had.
+
+        Here the register is fully verified and current, and the door is handed nothing. It refuses.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        tenant = await tenant_factory(sqlite_session)
+
+        with pytest.raises(LiveCredentialRefusedError):
+            await store_credential(
+                sqlite_session,
+                tenant_id=tenant.id,
+                provider=CredentialProvider.STRIPE,
+                secrets=STRIPE_LIVE,
+                fernet_key=KEY,
+                current_implementations={},
+            )
 
     async def test_a_live_key_is_accepted_once_every_operation_has_been_exercised(
         self,
@@ -388,7 +490,9 @@ class TestTheRegisterAsItStandsToday:
         changes for one provider and not the other.
         """
         secrets = dict(LIVE_SECRETS[provider])
-        if unverified_operations(provider):
+        if unverified_operations(
+            provider, current_implementations=current_gateway_implementations(provider)
+        ):
             with pytest.raises(LiveCredentialRefusedError):
                 await _store(sqlite_session, tenant_factory, provider, secrets)
         else:
@@ -421,17 +525,21 @@ class TestTheRegisterAsItStandsToday:
 def _records_whose_code_has_changed(provider: CredentialProvider) -> list[str]:
     """Verifications whose implementation no longer matches the code in the tree.
 
-    ==The check production cannot make itself.== ``services`` may not import ``integrations``, so
-    the register stores the fingerprint as an opaque string and the tie is made here — exactly as
-    it is for :class:`GatewayOperation` and the ``PaymentGateway`` protocol.
+    ==It calls the PRODUCTION rule; it does not restate it.== This helper used to re-implement the
+    comparison, and that was the defect: the only place the fingerprint was ever checked was a test,
+    so the register expired in CI and stayed valid in the door. Now
+    :func:`~aethercal.server.services.tenant_credentials.stale_verifications` is the rule, the door
+    consults it on every write, and this reads the same answer the operator's command reads.
+
+    Through the MODULE, not this file's own imported name: that is how the door resolves the
+    register, so it is how a test arranging the register must read it back. A direct import here
+    would quietly bypass every ``monkeypatch`` and the arranged states would never be seen.
     """
-    # Through the MODULE, not this file's own imported name: that is how the door resolves the
-    # register, so it is how a test arranging the register must read it back. A direct import here
-    # would quietly bypass every `monkeypatch` and the arranged states would never be seen.
     return [
         f"{provider.value}/{record.operation.value}"
-        for record in credentials.live_verifications(provider)
-        if record.implementation != implementation_fingerprint(provider, record.operation)
+        for record in credentials.stale_verifications(
+            provider, current_implementations=current_gateway_implementations(provider)
+        )
     ]
 
 
@@ -494,9 +602,9 @@ class TestTheRuleIsDerived:
                     f"{provider.value} guards the mode of {field!r} but declares no key family for "
                     "it, so the permanent type check does not cover the field the mode check does"
                 )
-                assert test_prefix.startswith(families[field]), (
+                assert test_prefix.startswith(families[field].prefixes), (
                     f"{provider.value}'s test-mode prefix {test_prefix!r} is not one of its "
-                    f"recognised families {families[field]}: while unverified, the type "
+                    f"recognised families {families[field].prefixes}: while unverified, the type "
                     "guard would reject exactly what the mode guard demands"
                 )
 
@@ -527,11 +635,13 @@ class TestTheRuleIsDerived:
     def test_every_provider_has_an_answer_from_every_function(self) -> None:
         """Exhaustive, like ``credential_class`` and ``required_fields``. No provider may raise."""
         for provider in CredentialProvider:
+            current = current_gateway_implementations(provider)
             declared_test_mode_prefixes(provider)
-            required_test_mode_prefixes(provider)
+            required_test_mode_prefixes(provider, current_implementations=current)
             credential_key_families(provider)
             gateway_operations(provider)
             live_verifications(provider)
+            stale_verifications(provider, current_implementations=current)
 
     def test_only_a_money_provider_has_gateway_operations(self) -> None:
         """==Derived from ``credential_class``, so the two cannot drift.==
@@ -552,7 +662,9 @@ class TestTheRuleIsDerived:
         """==Evidence for an act the provider does not perform is evidence for nothing==, and it
         would count towards opening the door while covering none of the real calls."""
         for provider in CredentialProvider:
-            stray = verified_operations(provider) - gateway_operations(provider)
+            stray = verified_operations(
+                provider, current_implementations=current_gateway_implementations(provider)
+            ) - gateway_operations(provider)
             assert not stray, (
                 f"{provider.value} claims to have exercised {sorted(op.value for op in stray)}, "
                 "which its gateway does not perform"
@@ -620,7 +732,7 @@ class TestTheRuleIsDerived:
                 LiveVerification(
                     operation=GatewayOperation.CHECKOUT,
                     mode=ProviderMode.LIVE,
-                    implementation="0000000000000000",  # not what any adapter hashes to
+                    implementation=CODE_THAT_NO_LONGER_EXISTS,
                     verified_on=date(2026, 7, 25),
                     evidence="synthetic: a verification of code that no longer exists",
                 ),
@@ -678,3 +790,206 @@ class TestTheOrderOfTheDoor:
                 CredentialProvider.STRIPE,
                 {"secret_key": "sk_test_NOT_A_REAL_KEY"},  # no webhook_secret
             )
+
+
+class TestAPrefixIsNotAKey:
+    """==The finding: the shape check promised more than ``startswith`` could deliver.==
+
+    Its refusal said a "truncated paste" was caught, and the code behind that sentence was
+    ``value.startswith(prefixes)`` — so ``"sk_live_"``, typed on its own, was stored as a payment
+    credential. ==What it certified was not what it measured.==
+
+    What the check can now decide is stated in
+    :func:`~aethercal.server.services.tenant_credentials.credential_key_families`: prefix, a floor
+    on what follows it, and that what follows is one unbroken token. What it still cannot decide —
+    whether a well-formed key is genuine or yours — is said in the refusal itself rather than
+    implied away. The tests below are one per promise, so a promise cannot be re-added without one.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "secret_key", "must_not_echo"),
+        [
+            # Nothing to withhold here: the whole value IS a prefix the refusal publishes on
+            # purpose, so the echo assertion would be asserting against the help text.
+            ("the prefix on its own", "sk_live_", None),
+            ("truncated to a stub", "sk_test_NOTREAL", "NOTREAL"),
+            (
+                "a wrapped paste that gained a space",
+                "sk_test_NOTAREALKEY 0000000000",
+                "NOTAREALKEY",
+            ),
+            ("a here-doc that kept its newline", "sk_test_NOTAREALKEY0000000000\n", "NOTAREALKEY"),
+            ("the surrounding quotes came too", '"sk_test_NOTAREALKEY0000000000"', "NOTAREALKEY"),
+        ],
+    )
+    async def test_a_value_that_is_not_a_key_is_refused(  # noqa: PLR0913
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+        label: str,
+        secret_key: str,
+        must_not_echo: str | None,
+    ) -> None:
+        """Every shape a bad paste actually takes, refused BEFORE it is stored.
+
+        ==Run with the register fully verified==, which is the state where this is the only check
+        left standing: once the mode guard has been discharged by evidence, nothing else looks at
+        ``secret_key`` at all. That is the moment real money moves, and it is exactly when the
+        original ``startswith`` was at its weakest.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        with pytest.raises(UnrecognisedCredentialError) as raised:
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.STRIPE,
+                {"secret_key": secret_key, "webhook_secret": "whsec_FAKE"},
+            )
+
+        if must_not_echo is not None:
+            assert must_not_echo not in str(raised.value), (
+                f"{label}: the refusal echoed the value, which may be a real key that was mangled"
+            )
+
+    async def test_a_key_shaped_value_is_still_accepted(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==The anti-vacuity half, and the one that decides the floor.==
+
+        A shape check tightened until it refuses everything would pass every case above while
+        locking every business out of taking money. The floor is deliberately far below the shortest
+        key any of these providers issues, because ==refusing a genuine key stops a business
+        charging, while admitting a well-formed impostor costs a 401 and no money moves==.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        await _store(
+            sqlite_session,
+            tenant_factory,
+            CredentialProvider.STRIPE,
+            {"secret_key": "sk_live_NOTAREALKEY0000000000", "webhook_secret": "whsec_FAKE"},
+        )
+
+    async def test_a_mercado_pago_token_is_held_to_its_own_shape(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The rule is per provider, not a Stripe rule other providers inherit by accident.
+
+        ``APP_USR-`` alone is as much of a non-key as ``sk_live_`` is, and a token whose body is
+        hyphen-separated digits must still pass — the alphabet is the loose reading on purpose.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        with pytest.raises(UnrecognisedCredentialError):
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.MERCADO_PAGO,
+                {"access_token": "APP_USR-", "webhook_secret": "mp_FAKE"},
+            )
+
+        await _store(
+            sqlite_session,
+            tenant_factory,
+            CredentialProvider.MERCADO_PAGO,
+            {
+                "access_token": "APP_USR-0000000000000000-072500-NOTAREAL-000000000",
+                "webhook_secret": "mp_FAKE",
+            },
+        )
+
+    async def test_the_refusal_says_what_it_cannot_decide(
+        self,
+        sqlite_session: AsyncSession,
+        tenant_factory: TenantFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """==The message may not promise a check the code does not make.==
+
+        The old one claimed to refuse "a key from another account". Nothing local can tell one
+        account's well-formed key from another's — only an authenticated call to the provider can,
+        and this door makes none. A refusal that overstates its reach is how somebody concludes a
+        stored credential has been *validated*.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        with pytest.raises(UnrecognisedCredentialError) as raised:
+            await _store(
+                sqlite_session,
+                tenant_factory,
+                CredentialProvider.STRIPE,
+                {"secret_key": "sk_live_", "webhook_secret": "whsec_FAKE"},
+            )
+
+        message = str(raised.value)
+        assert "WRONG account" in message, message
+        assert "authenticated call" in message, message
+
+
+class TestTheDoorTheOperatorActuallyUses:
+    """==The productive path, driven end to end: ``aethercal-admin credentials set``.==
+
+    Everything above drives ``store_credential`` directly. That proves the DOOR behaves — and it
+    would go on proving it while the one production caller quietly handed the door a mapping that
+    said whatever it liked, which is the only remaining way to open it wrongly.
+
+    So these two run the operator's own coroutine
+    (:func:`~aethercal.server.cli.run_credentials_set`) and assert on what it does with the REAL
+    fingerprints it fetches for itself. ==This is the test
+    that would have caught the original finding==: the register is fully verified, in LIVE mode,
+    with evidence about code that no longer exists, and the command must refuse.
+    """
+
+    async def test_the_command_refuses_a_live_key_when_the_evidence_is_stale(
+        self, sqlite_maker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """==Revert the fingerprint check and this stores a live payment credential.==
+
+        Nothing here patches the fingerprints: ``run_credentials_set`` computes them from the tree
+        it is running against, so what is under test is the wiring as shipped — not an argument a
+        test chose.
+        """
+        await run_create_tenant(
+            sqlite_maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC"
+        )
+        _exercised(monkeypatch, *GatewayOperation, implementation=CODE_THAT_NO_LONGER_EXISTS)
+
+        with pytest.raises(LiveCredentialRefusedError):
+            await run_credentials_set(
+                sqlite_maker,
+                tenant_slug="acme",
+                provider=CredentialProvider.STRIPE,
+                secrets=STRIPE_LIVE,
+                key=KEY,
+            )
+
+    async def test_the_command_accepts_a_live_key_when_the_evidence_is_current(
+        self, sqlite_maker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """==The anti-vacuity half, and it is what makes the test above mean something.==
+
+        If the command refused every live key regardless — because it passed ``{}``, say, or because
+        the wiring was broken — the refusal above would pass for entirely the wrong reason. The only
+        difference between these two tests is whether the register's fingerprints match the tree, so
+        the command must be reading the real ones.
+        """
+        await run_create_tenant(
+            sqlite_maker, slug="acme", name="Acme", email="host@acme.test", timezone="UTC"
+        )
+        _exercised(monkeypatch, *GatewayOperation)
+
+        await run_credentials_set(
+            sqlite_maker,
+            tenant_slug="acme",
+            provider=CredentialProvider.STRIPE,
+            secrets=STRIPE_LIVE,
+            key=KEY,
+        )
+
+        assert await run_credentials_list(sqlite_maker, tenant_slug="acme") == (
+            CredentialProvider.STRIPE,
+        )

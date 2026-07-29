@@ -83,6 +83,14 @@ pytestmark = pytest.mark.live_provider
 ALLOW_REAL_CHARGE_ENV = "AETHERCAL_LIVE_STRIPE_ALLOW_REAL_CHARGE"
 PAID_SESSION_ENV = "AETHERCAL_LIVE_STRIPE_CHECKOUT_SESSION"
 
+DASHBOARD_SEARCH_URL = "https://dashboard.stripe.com/search?query="
+"""Where a human goes when only a SESSION id is left to go on.
+
+``shout_that_money_is_held`` links a PaymentIntent directly, which is better — but the one case
+this constant serves is precisely the one where the PaymentIntent could not be resolved, so the
+session id is the only handle there is. Stripe's dashboard search takes it.
+"""
+
 RUN_ID_ENV = "AETHERCAL_LIVE_STRIPE_RUN_ID"
 DEFAULT_RUN_ID = "v1"
 PHASE_A_PURPOSE = "refund"
@@ -297,20 +305,46 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
 
     .. rubric:: The order of the barriers
 
-    1. resolve the session and require ``payment_status == "paid"`` — refunding an unpaid session is
-       a no-op that would look like success;
-    2. re-check the amount against the hard cap **before** touching anything: this is money coming
-       back, so a mismatch means we are looking at the wrong charge entirely;
-    3. run the gateway's refund on ==production's own idempotency key== (:func:`refund_dedupe_key`,
-       imported rather than re-typed), so what is verified is the key the refund runner really
-       sends — a retry gets the same refund and never a second one;
+    1. **provenance first**, before anything at all is read as a target. It is a safety barrier, not
+       a validation: a session this harness did not open must never become something we refund;
+    2. resolve the PaymentIntent **defensively, and immediately after** — because from the moment a
+       real card has been charged, ==the only thing that matters is that the money can get back==,
+       and nothing can send it back without this id;
+    3. everything else inside a ``try``/``finally`` that guarantees :func:`ensure_refunded`: the
+       currency, the ``paid`` status, the amount against the hard cap, and the gateway's refund on
+       ==production's own idempotency key== (:func:`refund_dedupe_key`, imported rather than
+       re-typed), so what is verified is the key the refund runner really sends;
     4. confirm with a SEPARATE request. The gateway returning ``None`` is not evidence; Stripe
        saying ``succeeded`` is;
-    5. and in the ``finally``, guarantee the money is back **through the independent client** —
-       because the thing on trial here is precisely the code that might have failed to send it.
+    5. and in that ``finally``, the money goes back **through the independent client** — because the
+       thing on trial here is precisely the code that might have failed to send it.
+
+    .. rubric:: ==Why steps 2 and 3 are in that order, and what getting it wrong cost==
+
+    The guarantee used to start AFTER the currency, status, amount and PaymentIntent-shape
+    assertions. Every one of those can fail on a session a human has genuinely PAID — a mismatched
+    amount, a currency surprise, a payload shape this code did not expect — and when one did, the
+    test aborted ==with a real dollar still on somebody's card and no ``finally`` to send it back==.
+    The validations were guarding the RUN; nothing was guarding the MONEY. So the guarantee now
+    opens as early as it possibly can: the instant there is an id a refund can be aimed at.
+
+    ==Provenance still comes first, and that ordering is not negotiable==: aiming the refund
+    machinery at a stranger's payment would be a worse failure than leaving our own dollar stuck.
     """
-    session_response = stripe_api.get(f"/checkout/sessions/{paid_session_id}")
-    session_response.raise_for_status()
+    try:
+        session_response = stripe_api.get(f"/checkout/sessions/{paid_session_id}")
+        session_response.raise_for_status()
+    except Exception as exc:
+        # Nothing can be established, so nothing may be assumed — including whether this is ours or
+        # whether it was paid. ==Say what is unknown and name the session==, rather than dying with
+        # a bare HTTP error that mentions no id anybody could act on.
+        pytest.fail(
+            f"could not read checkout session {paid_session_id!r} from Stripe: "
+            f"{type(exc).__name__}: {exc}\n"
+            "\n"
+            "If that session HAS been paid, the money is still held and nothing here can return "
+            f"it. Check it by hand: {DASHBOARD_SEARCH_URL}{paid_session_id}"
+        )
     session: dict[str, Any] = session_response.json()
 
     # ==PROVENANCE FIRST, before anything is read as a target.== Nothing about a session id proves
@@ -320,22 +354,39 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
     # resolved, so a foreign session is refused before it can become a target at all.
     require_phase_a_provenance(session, _run_id())
 
-    assert session["currency"] == one_dollar_currency, (
-        f"session {paid_session_id} is in {session['currency']!r}, not {one_dollar_currency!r}"
-    )
-    assert session["payment_status"] == "paid", (
-        f"session {paid_session_id} is {session['payment_status']!r}, not 'paid'. Phase B refunds "
-        "a charge that exists; in live mode nothing here can create one, so pay the phase-A "
-        "session first."
-    )
-    assert session["amount_total"] == one_dollar_cents, (
-        f"this session is for {session['amount_total']} cents and the hard cap is "
-        f"{one_dollar_cents}. Refusing to act on a charge this harness did not open."
-    )
-    payment_intent_id = session["payment_intent"]
-    assert isinstance(payment_intent_id, str) and payment_intent_id.startswith("pi_"), (
-        f"expected a PaymentIntent id on the paid session, got {payment_intent_id!r}"
-    )
+    # ==Then the PaymentIntent, before ANY other validation.== Everything after this line runs
+    # inside a `finally` that returns the money, and this id is what makes that possible — so it is
+    # resolved as the very first thing after the safety barrier. Read defensively: a payload shape
+    # this code did not expect used to raise `KeyError` here, which is a crash BEFORE the guarantee
+    # exists rather than inside it.
+    payment_intent_id = session.get("payment_intent")
+    if not (isinstance(payment_intent_id, str) and payment_intent_id.startswith("pi_")):
+        if session.get("payment_status") == "paid":
+            # ==A real charge exists and nothing here can point a refund at it.== So this is an
+            # ALARM, not an assertion: it names the session, because that is the only handle a
+            # human has left. Same shape as `shout_that_money_is_held`, which cannot be used —
+            # it takes the very id we could not resolve.
+            pytest.fail(
+                "\n"
+                "################################################################\n"
+                "###  MONEY MAY BE HELD. REFUND IT BY HAND, NOW.              ###\n"
+                "################################################################\n"
+                f"  session        : {paid_session_id}\n"
+                "  payment_status : paid\n"
+                f"  payment_intent : {payment_intent_id!r}  <- not a usable id\n"
+                f"  dashboard      : {DASHBOARD_SEARCH_URL}{paid_session_id}\n"
+                "  This session was PAID with a real card and its PaymentIntent could not be\n"
+                "  resolved, so the automatic refund cannot even be aimed. Nothing else in\n"
+                "  this harness will retry it.\n"
+                "################################################################\n"
+            )
+        pytest.fail(
+            f"session {paid_session_id} is {session.get('payment_status')!r}, not 'paid', and "
+            "carries no PaymentIntent. Phase B refunds a charge that exists; in live mode nothing "
+            "here can create one, so pay the phase-A session first.\n"
+            "\n"
+            "(==No money is at risk==: nothing has been charged on this session.)"
+        )
 
     # ==Production's own key, imported.== `refund_dedupe_key` is what `make_refund_runner` sends, so
     # a crash between the provider call and our commit re-sends THIS key and Stripe returns the same
@@ -344,6 +395,22 @@ async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR
 
     failed = False
     try:
+        # ==Inside the guarantee from here on.== These three used to run BEFORE it. Each can fail on
+        # a session that has genuinely been paid, and each failure ended the run with the dollar
+        # still on the card.
+        assert session["currency"] == one_dollar_currency, (
+            f"session {paid_session_id} is in {session['currency']!r}, not {one_dollar_currency!r}"
+        )
+        assert session["payment_status"] == "paid", (
+            f"session {paid_session_id} is {session['payment_status']!r}, not 'paid'. Phase B "
+            "refunds a charge that exists; in live mode nothing here can create one, so pay the "
+            "phase-A session first."
+        )
+        assert session["amount_total"] == one_dollar_cents, (
+            f"this session is for {session['amount_total']} cents and the hard cap is "
+            f"{one_dollar_cents}. Refusing to act on a charge this harness did not open."
+        )
+
         await gateway.refund(
             provider_ref=payment_intent_id,
             idempotency_key=idempotency_key,

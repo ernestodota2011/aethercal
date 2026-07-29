@@ -216,6 +216,40 @@ differently, so it could only be overruled and never discharged.
   of the gateway method's source). Editing `StripeGateway.refund` invalidates that operation's
   verification and demands a fresh run — otherwise the register would go on saying "verified" about
   code nobody has ever run.
+  - **That comparison runs in the DOOR, not only in the suite.** It used to live in
+    `tests/test_credential_mode_guard.py` alone, because `services` cannot import `integrations` —
+    so a rewritten gateway method expired its verification in CI while `verified_operations()`, the
+    function the credential door consults, went on authorising a live key against an implementation
+    nobody had ever exercised. The evidence expired in the tests and stayed valid in production. The
+    dependency is now inverted rather than dropped: `verified_operations()`,
+    `unverified_operations()`, `required_test_mode_prefixes()` and `store_credential()` take
+    `current_implementations`, **with no default**, and `cli.run_credentials_set` — the operator's
+    own command — supplies `integrations.money.current_gateway_implementations(provider)`. Every way
+    of getting that argument wrong (empty, partial) makes the door *stricter*, never laxer. The
+    refusal now distinguishes *nobody ran this*, *somebody ran it in TEST mode* and *somebody ran it
+    against code that has since changed*, so an operator is not sent to re-run what they just ran —
+    which, for `refund`, would mean another real charge.
+- **A prefix on its own is no longer accepted as a key.** The permanent type check was
+  `value.startswith(prefixes)` while its own refusal promised to catch "a truncated paste" — so
+  `sk_live_`, typed alone, was stored as a payment credential. `credential_key_families()` now
+  returns a `KeyFamily` (prefixes + a floor on what follows + one unbroken token), which refuses the
+  bare prefix, a paste truncated to a stub, and a value carrying a space, a line break or its
+  surrounding quotes. The floor is deliberately far below the shortest key any of these providers
+  issues: refusing a genuine key stops a business charging, while admitting a well-formed impostor
+  costs a `401` and moves no money.
+  - **And the refusal no longer claims what it cannot check.** It used to say it caught "a key from
+    another account"; nothing local can. The message now states that limit — only an authenticated
+    call to the provider decides whether a well-formed key is genuine, current or yours, and this
+    door deliberately makes none.
+- **The live refund harness guarantees the refund from the moment it can aim one.** Phase B's
+  `try`/`finally` used to start *after* the currency, `paid`, amount and PaymentIntent-shape
+  assertions; any of those can fail on a session a human has genuinely paid, and then the run ended
+  with a real dollar on a real card and no `finally` left to send it back. The PaymentIntent is now
+  resolved defensively immediately after the provenance check (which still runs first — a stranger's
+  payment must never become a target), and every remaining validation moved inside the guarantee. If
+  the PaymentIntent cannot be resolved on a `paid` session, the run raises a loud alarm naming the
+  **session id** for a manual refund. Pinned structurally by an AST guard in
+  `tests/live/test_live_harness_guardrails.py`: no assertion may sit outside that `try`.
 - The live suite is the one exception to the repo-wide network guard, and the exception is an
   **allowlist**: `api.stripe.com:443` and nothing else, with SMTP and the Google API still shut. A
   marked test reaching anywhere else is refused exactly as an ordinary test would be.

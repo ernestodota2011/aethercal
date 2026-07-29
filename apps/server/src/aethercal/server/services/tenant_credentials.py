@@ -74,6 +74,7 @@ what it has.==
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -312,9 +313,13 @@ class GatewayOperation(StrEnum):
 
     ==This enum is the domain's, not the gateway module's, and that is deliberate.== The
     verification registry is read on the credential WRITE path, and ``services`` cannot import
-    ``integrations`` (that is the direction the import contracts forbid, and reversing it would make
-    a cycle). ``tests/test_credential_mode_guard.py`` therefore ties the two together from outside:
-    it walks :class:`~aethercal.server.services.payments.PaymentGateway` and asserts every operation
+    ``integrations`` — ``integrations.money`` imports THIS module, so the reverse edge would be a
+    cycle. What the door needs from ``integrations`` therefore arrives as an ARGUMENT
+    (``current_implementations``, see :func:`verified_operations`) rather than as an import: the
+    dependency is inverted, not dropped.
+
+    ``tests/test_credential_mode_guard.py`` still ties the enum to the protocol from outside: it
+    walks :class:`~aethercal.server.services.payments.PaymentGateway` and asserts every operation
     the protocol declares has a member here — so a THIRD operation (F5's partial refund, a capture)
     cannot be added to the gateway without arriving as unverified and re-closing the door.
     """
@@ -399,12 +404,26 @@ class LiveVerification:
     """==WHICH CODE was exercised== — ``integrations.money.implementation_fingerprint``.
 
     Without it a verification outlives the thing it verified: rewrite ``StripeGateway.refund``
-    tomorrow and the register still says "verified", about code nobody has ever run. The fingerprint
-    is re-computed by ``tests/test_credential_mode_guard.py``, so an edit to the method
-    ==invalidates its verification== and demands a fresh run.
+    tomorrow and the register still says "verified", about code nobody has ever run.
 
-    It is a plain string here rather than a computed call because ``services`` may not import
-    ``integrations`` — the tie is made from the test, as it is for :class:`GatewayOperation`.
+    ==The comparison happens IN THE DOOR, at write time.== :func:`verified_operations` is handed the
+    fingerprints of the code that would run right now and counts a record only while the two agree,
+    so an edit to the method ==invalidates its verification== and the next live credential is
+    refused — in production, not merely in the suite.
+
+    .. rubric:: ==It used to be checked only by a test, and that was the whole defect==
+
+    The re-computation lived in ``tests/test_credential_mode_guard.py`` and nowhere else, because
+    ``services`` may not import ``integrations``. So the register went stale in the one place it
+    mattered: the suite would turn red on the next run, while ``verified_operations()`` — the
+    function the door actually consults — went on authorising a live credential against an
+    implementation nobody had ever exercised. ==A guard enforced only by its own test is a guard the
+    product does not have.== The import direction was a real constraint and it was never a reason to
+    leave the check out of the decision: the fingerprints are INJECTED instead
+    (``current_implementations``), and the layer that can see both sides supplies them.
+
+    It stays a plain string here for the same layering reason it always was — this module cannot
+    compute it, so it stores what it was told and compares it against what it is handed.
     """
 
     verified_on: date
@@ -471,31 +490,100 @@ def live_verifications(provider: CredentialProvider) -> tuple[LiveVerification, 
             assert_never(unreachable)
 
 
-def verified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
+def _names_current_code(
+    record: LiveVerification, current_implementations: Mapping[GatewayOperation, str]
+) -> bool:
+    """Does this record describe the code that would run TODAY?
+
+    ``.get`` rather than ``[]`` deliberately: an operation absent from the mapping compares unequal,
+    so it reads as "not verified". ==Every way of getting this argument wrong is restrictive==, and
+    that is the direction a money guard must fail in.
+    """
+    return current_implementations.get(record.operation) == record.implementation
+
+
+def stale_verifications(
+    provider: CredentialProvider,
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> tuple[LiveVerification, ...]:
+    """Records that name an implementation the tree no longer contains. ==Evidence about ghosts.==
+
+    A verification is a claim about CODE, not about a provider's name: rewrite
+    ``StripeGateway.refund`` and its record describes a method that no longer exists. This names
+    those records — for the refusal message, which owes the operator the difference between *nobody
+    ran this* and *somebody ran something else*, and for the suite, which asserts the real register
+    holds none.
+
+    Mode-agnostic on purpose: a stale TEST record is just as stale, and calling it anything else
+    would make the suite's staleness check depend on which mode somebody happened to record.
+    """
+    return tuple(
+        record
+        for record in live_verifications(provider)
+        if not _names_current_code(record, current_implementations)
+    )
+
+
+def verified_operations(
+    provider: CredentialProvider,
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> frozenset[GatewayOperation]:
     """The operations whose evidence ==authorises a LIVE credential.== Derived from the register.
 
-    ==Not simply "operations with a record".== A record made in TEST mode is real evidence about the
-    transport and the request shape, and it is worth nothing here: this function answers the money
-    guard's question — *may a live key be stored?* — so it counts only what
-    :func:`authorises_live_credentials` says may pay for that.
+    ==Not simply "operations with a record".== A record earns its place here only if BOTH are true:
 
-    Which is why the filter lives HERE and not at each call site: there is exactly one place that
-    decides what evidence is worth, and no caller can forget to apply it.
+    * it was gathered in a mode that can pay for a live key (:func:`authorises_live_credentials`) —
+      a TEST-mode round-trip is real evidence about the transport and buys nothing here;
+    * it names the code that would ACTUALLY RUN (:func:`stale_verifications`) — an edit to the
+      gateway method retires its own verification.
+
+    Both filters live HERE, in the function the door consults, and not at the call sites: there is
+    exactly one place that decides what evidence is worth, so no caller can forget to apply it.
+
+    .. rubric:: ==Why ``current_implementations`` is a required argument with NO DEFAULT==
+
+    This module may not import ``integrations`` (``integrations.money`` imports it, so the reverse
+    edge is a cycle), and the fingerprint of a gateway method can only be computed there. The
+    constraint is real; ==leaving the comparison out of the decision because of it was not.== That
+    is what happened: the staleness check lived in ``tests/test_credential_mode_guard.py`` alone, so
+    the evidence expired in the suite and went on authorising live credentials in production.
+
+    So the fact is INJECTED by the layer that can see both sides
+    (``integrations.money.current_gateway_implementations``), and the parameter has **no default**
+    on purpose — a default is exactly how a caller forgets:
+
+    * ``{}`` as a default would mark every record stale, so the door could never open at all and the
+      register would be decorative — the "permanent by construction" guard this design replaced;
+    * a default that skipped the check would restore the defect verbatim.
+
+    ==There is nothing to pass by accident and nothing to omit.== A caller that supplies a partial
+    or empty mapping gets a STRICTER door, never a laxer one; the only way to widen it is to supply
+    fingerprints that match the register, which is a deliberate forgery rather than an oversight.
     """
     return frozenset(
         record.operation
         for record in live_verifications(provider)
         if authorises_live_credentials(record.mode)
+        and _names_current_code(record, current_implementations)
     )
 
 
-def unverified_operations(provider: CredentialProvider) -> frozenset[GatewayOperation]:
+def unverified_operations(
+    provider: CredentialProvider,
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> frozenset[GatewayOperation]:
     """What this gateway DOES, minus what has been seen working. ==The gap the guard defends.==
 
     Non-empty means: there is an act this product would perform with a live credential that has
-    never once been performed for real. Empty means every act the gateway can take has a receipt.
+    never once been performed for real — or was, against code that has since changed. Empty means
+    every act the gateway can take has a receipt, and the receipt describes what would run.
     """
-    return gateway_operations(provider) - verified_operations(provider)
+    return gateway_operations(provider) - verified_operations(
+        provider, current_implementations=current_implementations
+    )
 
 
 def declared_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
@@ -547,17 +635,87 @@ def declared_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, st
             assert_never(unreachable)
 
 
-def credential_key_families(provider: CredentialProvider) -> Mapping[str, tuple[str, ...]]:
-    """field → every prefix that is a RECOGNISABLE key for it. ==Always enforced, forever.==
+KEY_BODY_CHARACTERS = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+"""What may follow a key's prefix. ==One unbroken token: no space, no quote, no brace, no newline.==
+
+.. rubric:: Why one shared alphabet and not a per-provider one
+
+The tempting spelling is each provider's exact alphabet — Stripe's keys are base62, Mercado Pago's
+tokens are digits and hyphens. ==That would be a specification we do not own.== A third party can
+widen its own format without telling us, and the cost of being wrong is asymmetric: refusing a
+GENUINE key locks a business out of taking money, while admitting a well-formed impostor costs a
+``401`` on the first call and no money moves. So this is deliberately the loose reading — the
+characters a key of ANY of these schemes is made of.
+
+What it does catch is what a bad paste actually looks like: a wrapped terminal that inserted a
+space or a newline, a value carrying its surrounding quotes, a fragment of JSON, a field that is
+plainly prose. Those are the real failure modes, and none of them survives this.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class KeyFamily:
+    """What makes a value a RECOGNISABLE key of its provider: the prefix, and the shape of the rest.
+
+    ==A prefix on its own was never enough, and the error message said so before the code did.== The
+    check was ``value.startswith(prefixes)``, and its refusal promised to catch "a truncated paste"
+    — while ``"sk_live_"``, typed alone, sailed through and was stored as a payment credential.
+    ==What it certified was not what it measured==: the contract was written for a check that did
+    not exist. This is that check.
+    """
+
+    prefixes: tuple[str, ...]
+    """Every prefix that starts a key of this provider. ==An allowlist== — see
+    :func:`credential_key_families` for why it is not a list of forbidden ones."""
+
+    minimum_body: int
+    """How much must follow the prefix before this can be a key at all.
+
+    ==Deliberately far BELOW the shortest key any of these providers issues.== It is a floor to
+    catch a stub, not a fingerprint of a format: set it near the real length and the day a provider
+    shortens its scheme, this door refuses genuine keys and a business cannot charge. Set it here
+    and it still refuses the prefix alone, a paste truncated to a handful of characters, and an
+    empty-ish value — the shapes that are unambiguously not a key.
+    """
+
+    def unrecognised(self, value: str) -> str | None:
+        """Why ``value`` is not a key of this provider, or ``None`` if it might be one.
+
+        ==Returns the RULE that was broken, never anything measured off the value.== "It is 6
+        characters long" would be a fact about a secret, printed into the operator's terminal and
+        their shell history; a value refused here can still be a real key that was truncated, so its
+        length is not ours to publish. Naming the rule is enough to fix the input.
+        """
+        for prefix in self.prefixes:
+            if value.startswith(prefix):
+                body = value[len(prefix) :]
+                if len(body) < self.minimum_body:
+                    return (
+                        "it stops at (or just after) the prefix — there is not enough after it for "
+                        "this to be a key. A prefix on its own is not a credential"
+                    )
+                if not KEY_BODY_CHARACTERS.match(body):
+                    return (
+                        "what follows the prefix is not a single unbroken token — it carries a "
+                        "space, a line break, a quote or some other character no key contains, "
+                        "which is what a copy-paste out of a wrapped terminal or a JSON snippet "
+                        "looks like"
+                    )
+                return None
+        return "it does not begin with any prefix this provider's keys begin with"
+
+
+def credential_key_families(provider: CredentialProvider) -> Mapping[str, KeyFamily]:
+    """field → what a RECOGNISABLE key for it looks like. ==Always enforced, forever.==
 
     .. rubric:: ==The hole this closes: the type check used to evaporate on success==
 
     There was only ever one check on the SHAPE of a payment key, and it was the TEST-mode prefix —
     so the moment a provider became fully verified, :func:`required_test_mode_prefixes` returned
-    ``{}`` and ==nothing looked at ``secret_key`` at all any more==. A truncated paste, a key from
-    somebody else's account, a webhook secret dropped in the wrong field, or plain rubbish would
-    have been stored without a murmur. ==The validation vanished exactly when the system started
-    moving real money==, which is the worst possible moment to relax one.
+    ``{}`` and ==nothing looked at ``secret_key`` at all any more==. A truncated paste, a webhook
+    secret dropped in the wrong field, or plain rubbish would have been stored without a murmur.
+    ==The validation vanished exactly when the system started moving real money==, which is the
+    worst possible moment to relax one.
 
     Two questions were tangled together, and they are now separate:
 
@@ -569,12 +727,30 @@ def credential_key_families(provider: CredentialProvider) -> Mapping[str, tuple[
     Still an ALLOWLIST, for the reason it always was: a restricted key (``rk_live_``), a publishable
     key, a prefix Stripe introduces next year or a fat-fingered paste is refused because it is not
     on the list — never admitted because nobody thought to forbid it.
+
+    .. rubric:: ==What this can decide, and what it CANNOT — stated because the message used to
+       overstate it==
+
+    It decides SHAPE: the prefix, that something of key-like length follows it, and that what
+    follows is one unbroken token (:class:`KeyFamily`). That is enough to refuse the prefix typed on
+    its own, a paste truncated to a stub, and a value contaminated by a line break or a quote.
+
+    ==It cannot decide whether a well-formed key is genuine, current, or yours.== A key from another
+    Stripe account, a rotated one, a key truncated by three characters — all of them are the right
+    shape, and no amount of local inspection separates them from the real thing. Only an
+    authenticated call to the provider can, and this door deliberately makes none: a credential
+    write would then depend on the provider being reachable, and an outage would stop a business
+    configuring itself. So the limit is REAL, and the refusal now says so rather than claiming to
+    catch "a key from another account" — a promise the code never kept.
     """
     match provider:
         case CredentialProvider.STRIPE:
-            return {"secret_key": ("sk_test_", "sk_live_")}
+            # `sk_test_…` / `sk_live_…`, then base62. The floor is well under the shortest secret
+            # key Stripe has ever issued (its legacy format already carried 24 characters).
+            return {"secret_key": KeyFamily(prefixes=("sk_test_", "sk_live_"), minimum_body=12)}
         case CredentialProvider.MERCADO_PAGO:
-            return {"access_token": ("TEST-", "APP_USR-")}
+            # `TEST-…` / `APP_USR-…`, then hyphen-separated digits and letters, far longer than 12.
+            return {"access_token": KeyFamily(prefixes=("TEST-", "APP_USR-"), minimum_body=12)}
         case CredentialProvider.SMTP | CredentialProvider.WHATSAPP | CredentialProvider.SMS:
             # No test/live distinction in the value and no house format either: an SMTP host is
             # whatever the business's mail provider calls it.
@@ -583,7 +759,11 @@ def credential_key_families(provider: CredentialProvider) -> Mapping[str, tuple[
             assert_never(unreachable)
 
 
-def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
+def required_test_mode_prefixes(
+    provider: CredentialProvider,
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> Mapping[str, str]:
     """What the door ENFORCES right now. ==DERIVED from what has been verified, not declared.==
 
     ==This relaxes; :func:`credential_key_families` never does.== What evidence lifts is the
@@ -615,8 +795,12 @@ def required_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, st
       is not required any more;
     * **INFRA provider** → ``{}`` by both routes at once (no gateway operations, no declared
       prefixes). It was never subject to a mode and still is not.
+
+    ``current_implementations`` travels through to :func:`verified_operations`, which is where it is
+    explained and where the "no default" rule is enforced. It is threaded rather than fetched
+    because this module cannot fetch it — see that function.
     """
-    if unverified_operations(provider):
+    if unverified_operations(provider, current_implementations=current_implementations):
         return declared_test_mode_prefixes(provider)
     return {}
 
@@ -644,7 +828,12 @@ class ResolvedCredential:
         )
 
 
-def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[str, str]:
+def _validate(
+    provider: CredentialProvider,
+    secrets: Mapping[str, str],
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> dict[str, str]:
     """Refuse a half-configured credential — or a LIVE one — AT THE DOOR.
 
     ==The door, and not the callers.== Every write of this table goes through
@@ -652,7 +841,13 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
     importer, a fixture) inherits both refusals rather than having to remember them. Gating the
     caller instead of the funnel is how the CLI ends up with a check the admin UI does not have.
 
-    The two refusals run in this order deliberately, and each keeps answering its OWN question: a
+    ==And the live check is the DOOR's, not the suite's.== The staleness half of it used to live
+    only in ``tests/test_credential_mode_guard.py``, so a rewritten gateway method expired its
+    verification in CI while this function went on storing live credentials against it.
+    ``current_implementations`` is what closes that: the fact the comparison needs arrives as an
+    argument, and :func:`verified_operations` explains why it has no default.
+
+    The three refusals run in this order deliberately, and each keeps answering its OWN question: a
     credential missing a field is INCOMPLETE whatever mode its other fields are in, and reporting
     that as a live-key refusal would send the operator off to rotate a key that was never the
     problem.
@@ -673,29 +868,42 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
     # ==FIRST, and permanently: is this a key of this provider at all?== This check does NOT relax
     # when the register fills up. It used to be welded to the mode guard below, so it evaporated the
     # day a provider became fully verified — the one moment it mattered most.
-    for field, families in credential_key_families(provider).items():
-        if not str(present[field]).startswith(families):
+    for field, family in credential_key_families(provider).items():
+        problem = family.unrecognised(str(present[field]))
+        if problem is not None:
             raise UnrecognisedCredentialError(
-                f"the {provider.value} `{field}` is not a recognisable {provider.value} key.\n"
+                f"the {provider.value} `{field}` is not a recognisable {provider.value} key: "
+                f"{problem}.\n"
                 "\n"
-                f"It must begin with one of: {', '.join(families)}. A value that is merely close — "
-                "a truncated paste, a publishable or restricted key, a webhook secret in the wrong "
-                "field, a key from another account — is refused here rather than stored and "
-                "discovered at the moment somebody tries to pay.\n"
+                f"It must begin with one of: {', '.join(family.prefixes)}, followed by at least "
+                f"{family.minimum_body} more characters, all of them letters, digits, `-` or `_`. "
+                "That refuses a publishable or restricted key, a webhook secret dropped in the "
+                "wrong field, the prefix typed on its own, a paste truncated to a stub, and a "
+                "value carrying a line break or a quote.\n"
+                "\n"
+                "==What it cannot tell you, said plainly==: whether a well-formed key is genuine, "
+                "current, or belongs to your account. Only an authenticated call to the provider "
+                "decides that, and this door makes none — so a key of the right shape from the "
+                "WRONG account is stored here and fails when somebody tries to pay.\n"
                 "\n"
                 "==This check never relaxes.== Verifying the gateway against the real API lifts "
                 "the restriction to TEST-mode keys; it does not make a non-key acceptable.\n"
                 "\n"
-                "(The value is not shown — it is a secret, wrong shape or not.)"
+                "(The value is not shown — it is a secret, wrong shape or not. Neither is anything "
+                "measured off it: a refused value can still be a real key that was truncated.)"
             )
 
-    for field, prefix in required_test_mode_prefixes(provider).items():
+    for field, prefix in required_test_mode_prefixes(
+        provider, current_implementations=current_implementations
+    ).items():
         if not str(present[field]).startswith(prefix):
             # ==Names the FIELD and the PROVIDER — both fixed literals we control — and NEVER the
             # value.== A live key is the most sensitive thing this system is ever handed, and
             # refusing it does not make it less secret; echoing it (or even the prefix it failed on)
             # would put it in the operator's terminal, their shell history and the CLI's stderr.
-            outstanding = unverified_operations(provider)
+            outstanding = unverified_operations(
+                provider, current_implementations=current_implementations
+            )
             unverified = ", ".join(sorted(op.value for op in outstanding))
             # ==Name the operations whose ONLY evidence is test-mode, separately.== Being told
             # "refund is unverified" right after watching a green test-mode run of refund reads as a
@@ -705,6 +913,17 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
                 record.operation.value
                 for record in live_verifications(provider)
                 if record.operation in outstanding and not authorises_live_credentials(record.mode)
+            )
+            # ==And the same courtesy for evidence that has gone STALE==, which reads even more like
+            # a broken guard: the operator ran the harness in LIVE mode, wrote the record, and is
+            # refused anyway — because the gateway method was edited afterwards, so the evidence
+            # describes code that no longer exists. Only naming it sends them to the re-run.
+            stale = sorted(
+                record.operation.value
+                for record in stale_verifications(
+                    provider, current_implementations=current_implementations
+                )
+                if record.operation in outstanding and authorises_live_credentials(record.mode)
             )
             raise LiveCredentialRefusedError(
                 f"the {provider.value} `{field}` is not a test-mode credential, and the "
@@ -716,6 +935,15 @@ def _validate(provider: CredentialProvider, secrets: Mapping[str, str]) -> dict[
                     "backend, with no card networks and no money. That evidence is real, and it "
                     "does not pay for this: only a LIVE run can.)\n\n"
                     if test_only
+                    else ""
+                )
+                + (
+                    f"({', '.join(stale)} HAS been exercised in LIVE mode — but against code that "
+                    "has CHANGED since. The gateway method was edited after the run, so the "
+                    "evidence no longer describes what would execute, and a verification of code "
+                    "nobody has run is not a verification. Re-run the harness for those "
+                    "operations and record the new fingerprint.)\n\n"
+                    if stale
                     else ""
                 )
                 + f"It must start with `{prefix}`. ==This is refused rather than warned about==: a "
@@ -754,20 +982,34 @@ async def _row_for(
     ).one_or_none()
 
 
-async def store_credential(
+# PLR0913: six, and every one of them is a fact this write cannot proceed without — the session, the
+# business, the provider, the values, the key that encrypts them, and the evidence the live door
+# reads. Collapsing a pair into a bag would hide the one argument that must not be forgettable.
+async def store_credential(  # noqa: PLR0913
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     provider: CredentialProvider,
     secrets: Mapping[str, str],
     fernet_key: bytes,
+    current_implementations: Mapping[GatewayOperation, str],
 ) -> TenantCredential:
     """Store (or REPLACE) a business's credential for ``provider``, encrypted. Flushes; no commit.
 
     Replacing rather than adding: one credential per provider per business, so "which of these two
     accounts do we charge into?" is a question this system never has to answer.
+
+    ``current_implementations`` is the fingerprint of the gateway code that would run right now, one
+    per operation — ``integrations.money.current_gateway_implementations(provider)``. ==It has no
+    default, so this door cannot be opened without stating what the evidence would be about==; see
+    :func:`verified_operations`. For an INFRA provider it is legitimately ``{}`` (there is no
+    gateway), and it is still passed rather than assumed, because the caller that would have to
+    "know" that is exactly the caller that gets it wrong for a money provider one day.
     """
-    payload = json.dumps(_validate(provider, secrets), sort_keys=True).encode("utf-8")
+    payload = json.dumps(
+        _validate(provider, secrets, current_implementations=current_implementations),
+        sort_keys=True,
+    ).encode("utf-8")
     ciphertext = encrypt_secret(payload, fernet_key)
 
     existing = await _row_for(session, tenant_id=tenant_id, provider=provider)
@@ -1011,6 +1253,7 @@ async def resolve_infra_credential(
 
 
 __all__ = [
+    "KEY_BODY_CHARACTERS",
     "AmbiguousMoneyProviderError",
     "CredentialClass",
     "CredentialError",
@@ -1018,6 +1261,7 @@ __all__ = [
     "CredentialSource",
     "GatewayOperation",
     "IncompleteCredentialError",
+    "KeyFamily",
     "LiveCredentialRefusedError",
     "LiveVerification",
     "MalformedCredentialError",
@@ -1039,6 +1283,7 @@ __all__ = [
     "resolve_infra_credential",
     "resolve_money_credential",
     "resolve_tenant_money_provider",
+    "stale_verifications",
     "store_credential",
     "unverified_operations",
     "verified_operations",

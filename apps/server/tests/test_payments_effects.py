@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.core.model import BookingStatus
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Booking, Payment, PaymentStatus, Schedule, Tenant, User
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork, refund_dedupe_key
 from aethercal.server.services.payments import (
     build_money_runners,
@@ -110,6 +111,7 @@ async def _stripe_credential(session: AsyncSession, tenant_id: uuid.UUID) -> Non
         provider=CredentialProvider.STRIPE,
         secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": "whsec_test_x"},
         fernet_key=_KEY,
+        current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
     )
 
 
@@ -409,6 +411,7 @@ async def _mercado_pago_credential(session: AsyncSession, tenant_id: uuid.UUID) 
         provider=CredentialProvider.MERCADO_PAGO,
         secrets={"access_token": "TEST-NOT-A-REAL-TOKEN", "webhook_secret": "mp_whsec_x"},
         fernet_key=_KEY,
+        current_implementations=current_gateway_implementations(CredentialProvider.MERCADO_PAGO),
     )
 
 

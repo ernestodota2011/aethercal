@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.server.channels import Channel
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.guc import reset_tenant_binding, tenant_scope
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 from aethercal.server.services.tenant_senders import (
     LEND_OPERATOR_PHONE_IDENTITY_ENV,
@@ -103,6 +104,7 @@ async def _seed_whatsapp(
             provider=CredentialProvider.WHATSAPP,
             secrets=_whatsapp_secrets(name),
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
 

@@ -35,6 +35,7 @@ from aethercal.server.db.models import (
     User,
 )
 from aethercal.server.db.roles import DbRole
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.outbox import OutboxEffect
 from aethercal.server.services.payments import CheckoutSession
 from aethercal.server.services.slots import compute_slots
@@ -193,6 +194,7 @@ async def _seed(
                 provider=provider,
                 secrets=_CREDENTIAL_SECRETS[provider],
                 fernet_key=_KEY,
+                current_implementations=current_gateway_implementations(provider),
             )
         now = datetime.now(UTC)
         target = (now + timedelta(days=2)).date()

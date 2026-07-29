@@ -31,6 +31,7 @@ from aethercal.server.crypto import decrypt_secret, derive_fernet_key, encrypt_s
 from aethercal.server.db import Base
 from aethercal.server.db.encrypted import encrypted_columns
 from aethercal.server.db.models import ExternalConnection, Tenant, TenantCredential, User, Webhook
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.key_rotation import (
     KeyRotationError,
     RotationReport,
@@ -71,6 +72,7 @@ async def _seed_under_the_old_key(session: AsyncSession, tenant_factory: TenantF
         provider=CredentialProvider.STRIPE,
         secrets=STRIPE,
         fernet_key=OLD,
+        current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
     )
     session.add(
         Webhook(

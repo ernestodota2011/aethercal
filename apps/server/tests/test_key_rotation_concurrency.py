@@ -38,6 +38,7 @@ from aethercal.server.crypto import decrypt_secret, derive_fernet_key
 from aethercal.server.db.engine import build_sessionmaker
 from aethercal.server.db.guc import bind_tenant
 from aethercal.server.db.models import Tenant, TenantCredential
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.key_rotation import rotate_fernet_key
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
@@ -85,6 +86,7 @@ async def test_a_concurrent_credential_update_is_not_lost_to_a_rotation(
             provider=CredentialProvider.STRIPE,
             secrets=STRIPE_ORIGINAL,
             fernet_key=OLD,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
 
     row_is_locked = asyncio.Event()
@@ -103,6 +105,7 @@ async def test_a_concurrent_credential_update_is_not_lost_to_a_rotation(
                 provider=CredentialProvider.STRIPE,
                 secrets=STRIPE_UPDATED,
                 fernet_key=NEW,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
             row_is_locked.set()
             await asyncio.sleep(_HOLD_SECONDS)
