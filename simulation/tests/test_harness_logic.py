@@ -42,6 +42,7 @@ from aethercal_sim.measure import (
 )
 from aethercal_sim.report import REQUIRED_CONTROL_IDS, missing_controls, verdict_for
 from aethercal_sim.scenarios import (
+    ActiveBooking,
     BookedRef,
     CancelWebhookObservation,
     ConfirmationCoverage,
@@ -448,22 +449,35 @@ def test_lineage_controls_fail_on_an_incomplete_read(at_most: bool) -> None:
     against a guest left holding two live appointments.
     """
     broken = DiaryRead([], complete=False, problem="GET /bookings/ answered 500")
-    control = judge_lineage(broken, ident="C9", guards="g", at_most=at_most)
+    control = judge_lineage(
+        broken,
+        ident="C9",
+        guards="g",
+        at_most=at_most,
+        race=_mutation_race(winners=1),
+        original_id=SUBJECT,
+    )
     assert control.ran is True
     assert control.passed is False
     assert "could not be read completely" in control.observed
 
 
 def test_lineage_passes_on_a_complete_read_with_one_survivor() -> None:
-    read = DiaryRead(["abc confirmed"], complete=True)
-    assert judge_lineage(read, ident="C8", guards="g", at_most=False).passed
-    assert judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+    read = _diary(SUCCESSOR)
+    assert judge_lineage(
+        read, ident="C8", guards="g", at_most=False, race=_mutation_race(1), original_id=SUBJECT
+    ).passed
+    assert judge_lineage(
+        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+    ).passed
 
 
 def test_lineage_fails_when_two_live_appointments_survive() -> None:
     """The defect the pair exists to catch, on a read that IS trustworthy."""
-    read = DiaryRead(["a confirmed", "b confirmed"], complete=True)
-    assert not judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+    read = _diary("a-1", "b-2")
+    assert not judge_lineage(
+        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+    ).passed
 
 
 def test_pick_micro_slot_takes_the_first_slot_that_ENDS_within_budget() -> None:
@@ -497,9 +511,13 @@ def test_pick_micro_slot_ignores_slots_already_in_the_past() -> None:
 
 def test_c9_accepts_zero_survivors_but_c8_does_not() -> None:
     """A cancel may legitimately win the mixed race; a reschedule race must leave a successor."""
-    read = DiaryRead([], complete=True)
-    assert judge_lineage(read, ident="C9", guards="g", at_most=True).passed
-    assert not judge_lineage(read, ident="C8", guards="g", at_most=False).passed
+    read = _diary()
+    assert judge_lineage(
+        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+    ).passed
+    assert not judge_lineage(
+        read, ident="C8", guards="g", at_most=False, race=_mutation_race(1), original_id=SUBJECT
+    ).passed
 
 
 # --------------------------------------------------------------------------------------
@@ -1612,3 +1630,167 @@ def test_a_corrupt_delivery_body_RAISES_rather_than_decoding_to_garbage(corrupt:
 def test_a_well_formed_delivery_body_still_decodes() -> None:
     payload = b'{"event": "booking.cancelled"}'
     assert decode_delivery(base64.b64encode(payload).decode()) == payload
+
+
+# --------------------------------------------------------------------------------------
+# ==C8/C9 -- a control that can pass over an IMMOBILE system guards nothing.==
+#
+# If every request in the mutation race failed, the ORIGINAL booking is still sitting there, and a
+# diary holding exactly one live appointment is precisely what "one successor survives" looks like.
+# C8 passed. C9's "at most one" passed even more easily. ==The control measured a final state
+# compatible with two different histories, and only one of them is the history it claims to test==
+# -- the same defect as C2 being read as proof of simultaneity, one control over.
+# --------------------------------------------------------------------------------------
+
+SUBJECT = "subject-0000"
+SUCCESSOR = "successor-9999"
+
+
+def _mutation_race(winners: int, contenders: int = 40) -> RaceOutcome:
+    return RaceOutcome(
+        name="race_reschedule_same_booking",
+        contenders=contenders,
+        winners=winners,
+        refusals_by_code={"not_active": contenders - winners} if contenders > winners else {},
+        unexpected=[],
+        latency=Latency("race"),
+        intervals=[(0.0, 1.0), (0.01, 1.01)],
+    )
+
+
+def _diary(*bookings: str, complete: bool = True, problem: str = "") -> DiaryRead:
+    return DiaryRead(
+        [ActiveBooking(booking, "confirmed") for booking in bookings],
+        complete=complete,
+        problem=problem,
+    )
+
+
+def test_c8_passes_when_a_real_SUCCESSOR_survives() -> None:
+    """==The anti-vacuity half.== A normal race with a real successor must stay green."""
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(winners=1),
+        original_id=SUBJECT,
+    )
+    assert control.passed is True
+    assert control.ran is True
+
+
+def test_c8_FAILS_when_every_mutation_failed_and_the_original_survives() -> None:
+    """==The fail-open, stated as the run that used to read green.==
+
+    Zero winners: not one reschedule took effect. The diary then holds exactly one live
+    appointment -- the subject itself -- which is byte-for-byte what a correct race leaves. The old
+    control saw `len(active) == 1` and passed.
+    """
+    control = judge_lineage(
+        _diary(SUBJECT),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(winners=0),
+        original_id=SUBJECT,
+    )
+    assert control.ran is True
+    assert control.passed is False
+    assert "not exactly" in control.observed
+    assert "survivor IS the original subject" in control.observed
+
+
+def test_c9_FAILS_when_every_mutation_failed_and_the_original_survives() -> None:
+    """C9's "at most one" is even easier to satisfy over a system that never moved."""
+    control = judge_lineage(
+        _diary(SUBJECT),
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(winners=0, contenders=2),
+        original_id=SUBJECT,
+    )
+    assert control.passed is False
+    assert "NOTHING mutated" in control.observed
+    assert "survivor IS the original subject" in control.observed
+
+
+def test_c9_passes_when_the_cancel_won_and_nothing_survives() -> None:
+    """Zero survivors is legitimate for the mixed race -- and it proves motion by itself."""
+    control = judge_lineage(
+        _diary(),
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(winners=2, contenders=2),
+        original_id=SUBJECT,
+    )
+    assert control.passed is True
+
+
+def test_c9_passes_when_the_reschedule_won_and_a_successor_survives() -> None:
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(winners=2, contenders=2),
+        original_id=SUBJECT,
+    )
+    assert control.passed is True
+
+
+def test_c9_still_fails_on_two_live_appointments() -> None:
+    """The invariant the pair exists for, undisturbed by the new conditions."""
+    control = judge_lineage(
+        _diary(SUCCESSOR, "another-1111"),
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(winners=2, contenders=2),
+        original_id=SUBJECT,
+    )
+    assert control.passed is False
+    assert "double-booked" in control.observed
+
+
+def test_c8_still_fails_when_no_successor_survives() -> None:
+    """A pure reschedule race must leave a successor; zero is a lost booking."""
+    control = judge_lineage(
+        _diary(),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(winners=1),
+        original_id=SUBJECT,
+    )
+    assert control.passed is False
+
+
+def test_c8_fails_when_the_reschedule_race_had_more_than_one_winner() -> None:
+    """Exactly one may win by contract; two means the advisory lock did not hold."""
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(winners=2),
+        original_id=SUBJECT,
+    )
+    assert control.passed is False
+
+
+@pytest.mark.parametrize("at_most", [True, False])
+def test_lineage_refuses_to_judge_without_the_race(at_most: bool) -> None:
+    """==Absent evidence is not evidence== -- with no race outcome nothing can be evidenced."""
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C8",
+        guards="g",
+        at_most=at_most,
+        race=None,
+        original_id=SUBJECT,
+    )
+    assert control.passed is False
+    assert "not available" in control.observed

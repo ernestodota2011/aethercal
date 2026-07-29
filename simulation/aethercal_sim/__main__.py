@@ -468,9 +468,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         )
         controls.append(Control.not_run("C8", _C8, "exactly 1 successor survives", why))
     else:
-        races.append(race_reschedule(stack, target, booking_id=reschedule_id, starts=later_starts))
+        reschedule_race = race_reschedule(
+            stack, target, booking_id=reschedule_id, starts=later_starts
+        )
+        races.append(reschedule_race)
         # ==What the race LEFT BEHIND, which is the invariant that matters.== One HTTP winner is
-        # not the contract; one live appointment is.
+        # not the contract; one live appointment is — but the diary alone cannot tell "one successor
+        # survived" from "nothing happened and the original is still there", so the race and the
+        # subject's own id go in as the discriminators.
         controls.append(
             control_lineage_after_race(
                 stack,
@@ -480,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 guest_email=f"reschedule.subject.{run_id}@guests.sim.test",
                 date_from=race_day,
                 date_to=race_day + timedelta(days=28),
+                race=reschedule_race,
+                original_id=reschedule_id,
             )
         )
 
@@ -499,9 +506,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         why = "its subject never booked" if mixed_id is None else "no target slot on offer"
         controls.append(Control.not_run("C9", _C9, "at most 1 active booking survives", why))
     else:
-        races.append(
-            race_cancel_vs_reschedule(stack, target, booking_id=mixed_id, start=spare_starts[0])
+        mixed_race = race_cancel_vs_reschedule(
+            stack, target, booking_id=mixed_id, start=spare_starts[0]
         )
+        races.append(mixed_race)
         # ==Both calls answering 200 here is CORRECT, so the winner count is not the oracle.== The
         # reschedule swaps in a successor; the cancel then finds the predecessor already cancelled
         # and is an idempotent no-op. Either order is legitimate — what must never happen is the
@@ -515,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 guest_email=f"mixed.subject.{run_id}@guests.sim.test",
                 date_from=race_day,
                 date_to=race_day + timedelta(days=28),
+                race=mixed_race,
+                original_id=mixed_id,
                 at_most=True,
             )
         )

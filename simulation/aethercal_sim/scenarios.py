@@ -1677,6 +1677,22 @@ def pick_micro_slot(
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveBooking:
+    """One live appointment in a guest's diary. ==Id and status in ONE object, never two lists.==
+
+    The id used to be embedded in a display string (``f"{id} {status}"``) and the control that needs
+    it would have had to parse it back out. Two representations of the same fact drift; one of them
+    is then the one nobody updates.
+    """
+
+    booking_id: str
+    status: str
+
+    def __str__(self) -> str:
+        return f"{self.booking_id} {self.status}"
+
+
+@dataclass(frozen=True, slots=True)
 class DiaryRead:
     """The result of reading a guest's live appointments — ==and whether the read is TRUSTWORTHY.==
 
@@ -1688,9 +1704,13 @@ class DiaryRead:
     So the read reports its own health and the controls refuse to judge cardinality without it.
     """
 
-    active: list[str]
+    active: list[ActiveBooking]
     complete: bool
     problem: str = ""
+
+    @property
+    def ids(self) -> list[str]:
+        return [booking.booking_id for booking in self.active]
 
 
 def active_bookings_for_guest(  # noqa: PLR0911 - each return names a DISTINCT way the read broke
@@ -1714,7 +1734,7 @@ def active_bookings_for_guest(  # noqa: PLR0911 - each return names a DISTINCT w
     """
     client = Client(stack.api_url, business.config.api_key)
     query = f"from={date_from.isoformat()}&to={date_to.isoformat()}&limit=500"
-    found: list[str] = []
+    found: list[ActiveBooking] = []
     offset = 0
     guard = 0
     while True:
@@ -1745,7 +1765,7 @@ def active_bookings_for_guest(  # noqa: PLR0911 - each return names a DISTINCT w
                 continue
             status = str(item.get("status", ""))
             if status in ("pending", "confirmed"):
-                found.append(f"{item.get('id')} {status}")
+                found.append(ActiveBooking(str(item.get("id")), status))
         if not items:
             # An empty page before reaching `total` means the server and the envelope disagree;
             # trusting it would silently truncate the diary.
@@ -1768,6 +1788,8 @@ def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window 
     guest_email: str,
     date_from: date,
     date_to: date,
+    race: RaceOutcome | None,
+    original_id: str,
     at_most: bool = False,
 ) -> Control:
     """==What a mutation race left BEHIND, which is the invariant that actually matters.==
@@ -1789,17 +1811,53 @@ def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window 
         ident=ident,
         guards=guards,
         at_most=at_most,
+        race=race,
+        original_id=original_id,
     )
 
 
-def judge_lineage(read: DiaryRead, *, ident: str, guards: str, at_most: bool) -> Control:
-    """Turn a diary read into a verdict. ==Pure, so the broken-source case is testable.==
+def judge_lineage(  # noqa: PLR0913 - the verdict needs the read, the race AND the subject
+    read: DiaryRead,
+    *,
+    ident: str,
+    guards: str,
+    at_most: bool,
+    race: RaceOutcome | None,
+    original_id: str,
+) -> Control:
+    """Turn a diary read into a verdict. ==Pure, so both broken-source cases are testable.==
 
-    Cardinality is judged only on a COMPLETE read. An unreadable diary returns an empty list, and
-    "at most one" is trivially true of nothing — so a failing bookings endpoint would have PASSED
-    the very control that guards against a guest holding two live appointments.
+    .. rubric:: Two ways this could pass without proving anything, and both are closed
+
+    **A partial read.** An unreadable diary returns an empty list, and "at most one" is trivially
+    true of nothing — so a failing bookings endpoint would have PASSED the very control guarding
+    against a guest holding two live appointments. Cardinality is judged only on a COMPLETE read.
+
+    **==A system that never moved.==** This is the one that survived longer. If every request in the
+    mutation race failed, the ORIGINAL booking is still sitting there — and a diary holding exactly
+    one live appointment is precisely what "one successor survives" looks like. C8 passed. C9's
+    "at most one" passed even more easily. ==The control measured a final state compatible with two
+    different histories and only one of them is the history it claims to test== — the same defect as
+    C2 being read as proof of simultaneity, one control over.
+
+    So the race itself is now evidence, and the survivor's identity is the discriminator:
+
+    * **the race must have produced a winner.** A pure reschedule race has exactly one by contract;
+      a cancel racing a reschedule has at least one, because both calls may legitimately answer 200.
+      Zero winners means nothing happened, whatever the diary looks like afterwards;
+    * ==**whoever survives must not BE the subject.**== A reschedule swaps in a successor, so the
+      original must be gone. If the survivor is the original, no mutation took effect — and that is
+      exactly the state a fully-failed race leaves behind.
+
+    ``at_most`` still distinguishes the two shapes: a pure reschedule race must leave EXACTLY one
+    successor; a cancel racing a reschedule may leave one (the reschedule got there first) or none
+    (the cancel did) — but never two, and never the original.
     """
-    expected = "at most 1 active booking survives" if at_most else "exactly 1 successor survives"
+    expected = (
+        "at least 1 winner, and at most 1 active booking — never the original"
+        if at_most
+        else "exactly 1 winner, and exactly 1 SUCCESSOR (not the original) survives"
+    )
     if not read.complete:
         return Control(
             ident=ident,
@@ -1811,13 +1869,43 @@ def judge_lineage(read: DiaryRead, *, ident: str, guards: str, at_most: bool) ->
             ),
             passed=False,
         )
+
     active = read.active
+    reasons: list[str] = []
+    if race is None:
+        reasons.append("the race outcome was not available, so no mutation could be evidenced")
+    elif at_most and race.winners < 1:
+        reasons.append(
+            f"NOTHING mutated: {race.winners} of {race.contenders} calls succeeded, so the diary "
+            "below is the state the run started in"
+        )
+    elif not at_most and race.winners != 1:
+        reasons.append(
+            f"the reschedule race left {race.winners} winner(s) of {race.contenders}, not exactly "
+            "1 — with 0 nothing mutated at all"
+        )
+    if at_most and len(active) > 1:
+        # The invariant that matters most: a guest must never end up holding two live appointments.
+        reasons.append(f"{len(active)} live appointments survive — the guest is double-booked")
+    if not at_most and len(active) != 1:
+        reasons.append(f"{len(active)} successors survive, expected exactly 1")
+    survivors = read.ids
+    if original_id in survivors:
+        reasons.append(
+            f"the survivor IS the original subject ({original_id}) — no mutation took effect, "
+            "which is exactly the diary a fully-failed race leaves behind"
+        )
+    winners_text = "unknown" if race is None else f"{race.winners}/{race.contenders}"
     return Control(
         ident=ident,
         guards=guards,
         expected=expected,
-        observed=f"{len(active)} active: {active or 'none'}",
-        passed=len(active) <= 1 if at_most else len(active) == 1,
+        observed=(
+            f"race winners {winners_text}; {len(active)} active: "
+            f"{[str(booking) for booking in active] or 'none'}; subject {original_id}"
+            + (f" — FAILED: {'; '.join(reasons)}" if reasons else "")
+        ),
+        passed=not reasons,
     )
 
 
