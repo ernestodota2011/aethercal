@@ -127,7 +127,18 @@ def allocate_by_weight(*, total: int, weights: list[float], rng: random.Random) 
     """
     if total <= 0 or not weights:
         return [0] * len(weights)
-    exact = [total * weight for weight in weights]
+    # ==El contrato dice "suman total EXACTAMENTE"; eso solo era cierto si los pesos ya
+    # venian normalizados.== Con pesos [1, 1] las partes sumaban el DOBLE, y el `remainder
+    # <= 0` de abajo devolvia esa lista en silencio: una promesa del docstring que nada
+    # hacia cumplir. Se normaliza aqui — idempotente sobre pesos ya normalizados — y una
+    # suma no positiva o un peso negativo son un error explicito, no una respuesta
+    # plausible calculada sobre una entrada que no significa nada.
+    if any(weight < 0 for weight in weights):
+        raise ValueError(f"pesos negativos no admiten reparto: {weights}")
+    escala = sum(weights)
+    if escala <= 0:
+        raise ValueError(f"la suma de pesos debe ser positiva, es {escala}")
+    exact = [total * weight / escala for weight in weights]
     counts = [int(value) for value in exact]
     remainder = total - sum(counts)
     if remainder <= 0:

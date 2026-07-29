@@ -49,6 +49,9 @@ restore_env() {
 }
 
 cleanup() {
+  # ==El estado con el que se entra al trap es el de la SIMULACION.== Se captura
+  # primero y se conserva: un teardown fallido no puede TAPAR una corrida fallida.
+  local run_status=$?
   if ((KEEP == 1)); then
     # ==One teardown command, and it is the one that also restores deploy/.env.== This used to
     # print a bare `down -v`, which drops the containers and leaves shared repo configuration
@@ -71,7 +74,13 @@ cleanup() {
     echo "ERROR: the throwaway stack did NOT tear down cleanly (exit ${teardown_status})." >&2
     echo "       It may still be running. deploy/.env has been restored regardless." >&2
     echo "       Tear it down with: ${SIM_DIR}/scripts/stack-down.sh" >&2
+    # ==Y SALE distinto de cero.== Antes solo lo imprimia: quien invoca esto veia
+    # exit 0 y un contenedor vivo, que es la misma familia de defecto que el propio
+    # arnes persigue — una operacion que fallo reportando exito. Un fallo de la
+    # simulacion manda sobre este, para no ocultar la causa con la consecuencia.
+    exit $((run_status != 0 ? run_status : teardown_status))
   fi
+  exit "${run_status}"
 }
 trap cleanup EXIT
 

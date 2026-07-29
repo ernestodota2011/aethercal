@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import pathlib
 import random
 import threading
 import time
@@ -2573,3 +2574,65 @@ def test_a_business_entry_missing_fields_names_the_path_and_the_problem(tmp_path
     )
     with pytest.raises(StackUnavailableError, match=r"businesses\[0\] is missing"):
         load_stack(stack_file)
+
+
+# ---------------------------------------------------------------------------
+# Gate por rebanadas (2026-07-29) — el reparto conserva el total SIEMPRE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        [1.0, 1.0],  # suma 2: el caso que devolvia el DOBLE
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [0.25, 0.25],  # suma 0.5: devolvia la MITAD
+        [3.0, 1.0],
+        [0.0, 1.0, 0.0],  # ceros: todo a un unico destino
+    ],
+)
+def test_allocate_conserva_el_total_con_pesos_SIN_normalizar(weights: list[float]) -> None:
+    """El docstring promete que las partes suman `total` EXACTAMENTE, y eso solo
+    era cierto si el llamador ya habia normalizado. Nada lo hacia cumplir: con
+    [1, 1] las partes sumaban el doble y se devolvian en silencio."""
+    total = 239
+    counts = allocate_by_weight(total=total, weights=weights, rng=random.Random(20260725))
+    assert sum(counts) == total, f"pesos {weights} -> {counts} suma {sum(counts)}"
+    assert all(c >= 0 for c in counts)
+
+
+def test_allocate_sigue_conservando_el_total_con_pesos_normalizados() -> None:
+    """Anti-vacuidad: normalizar no puede romper el caso que ya funcionaba — es
+    el unico que usa produccion."""
+    weights = [0.2, 0.3, 0.5]
+    counts = allocate_by_weight(total=100, weights=weights, rng=random.Random(1))
+    assert sum(counts) == 100
+    assert counts[2] > counts[0], "el peso mayor debe llevarse mas"
+
+
+@pytest.mark.parametrize("weights", [[-1.0, 2.0], [0.0, 0.0], [-0.5]])
+def test_allocate_rechaza_pesos_sin_significado(weights: list[float]) -> None:
+    """Un peso negativo o una suma no positiva no tienen reparto: el error es
+    explicito, no un resultado plausible calculado sobre una entrada absurda."""
+    with pytest.raises(ValueError):
+        allocate_by_weight(total=10, weights=weights, rng=random.Random(1))
+
+
+def test_run_sh_sale_distinto_de_cero_si_el_teardown_falla() -> None:
+    """REGRESION: `cleanup` imprimia el fallo del teardown y el trap EXIT no
+    propagaba nada — quien invocaba veia exit 0 con un contenedor vivo. Y el
+    estado de la SIMULACION manda sobre el del teardown, para no tapar la causa
+    con la consecuencia.
+
+    Se afirma sobre el guion, no ejecutandolo: correrlo exigiria Docker y un
+    stack real, y lo que hay que fijar es que el codigo de salida viaje.
+    """
+    guion = (pathlib.Path(__file__).resolve().parents[1] / "scripts" / "run.sh").read_text(
+        encoding="utf-8"
+    )
+    cuerpo = guion[guion.index("cleanup()") : guion.index("trap cleanup EXIT")]
+    assert "local run_status=$?" in cuerpo, "no captura el estado de la simulacion"
+    assert 'exit "${run_status}"' in cuerpo, "el camino feliz no propaga el estado"
+    assert "run_status != 0 ? run_status : teardown_status" in cuerpo, (
+        "un teardown fallido debe salir != 0 SIN tapar un fallo previo de la corrida"
+    )
