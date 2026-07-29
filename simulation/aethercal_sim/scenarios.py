@@ -1233,6 +1233,7 @@ def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a 
     *,
     grow_seconds: float = 25.0,
     drain_timeout: float = 240.0,
+    settle_seconds: float = 3.0,
 ) -> tuple[Control, dict[str, float]]:
     """==The instrument's own control.== Strand real work; prove the metric accounts for it.
 
@@ -1264,6 +1265,7 @@ def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a 
     first_age = 0.0
     drained_after: float | None = None
     final: OutboxSample | None = None
+    delivered_seen = 0
     started_waiting = time.monotonic()
     worker_stopped = False
 
@@ -1301,9 +1303,18 @@ def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a 
                 continue
             first_reading = sample.due
             first_age = sample.oldest_due_age_seconds
+            delivered_seen = max(delivered_seen, sample.delivered or 0)
             break
 
         # Step 5: it must clear, and then the durable signals are read.
+        #
+        # ==`delivered` is MONOTONIC, so it is read as a maximum over every scrape, never as the
+        # value that happened to be current when `due` first hit zero.== Reading it at that instant
+        # is a race the harness loses at random: the drain pass commits its rows (so the DB-derived
+        # `due` is already 0) and folds the pass into the process counter a moment later, so a
+        # scrape landing in between sees a drained queue and a counter of zero. A live run failed
+        # C5 exactly that way — 6 stranded, backlog caught in flight, drained in 7.1s, delivered 0.
+        # Taking the max is race-free precisely because the counter never goes down.
         deadline = time.monotonic() + drain_timeout
         while time.monotonic() < deadline:
             try:
@@ -1312,10 +1323,21 @@ def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a 
                 time.sleep(1.0)
                 continue
             final = sample
+            delivered_seen = max(delivered_seen, sample.delivered or 0)
             if sample.due == 0:
                 drained_after = time.monotonic() - started_waiting
                 break
             time.sleep(1.0)
+
+        # One more read after the queue is empty, so the counter for the LAST pass is folded in.
+        time.sleep(settle_seconds)
+        try:
+            tail = sampler.scrape()
+        except OutboxScrapeError:
+            tail = None
+        if tail is not None:
+            final = tail
+            delivered_seen = max(delivered_seen, tail.delivered or 0)
     finally:
         # Put the worker back if we are the reason it is down, and always un-pause the instrument.
         # Both are best-effort: a failure here must not mask whatever brought us into the `finally`.
@@ -1330,7 +1352,9 @@ def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a 
         baseline_due=baseline.due,
         baseline_rows=baseline.rows,
         final_rows=final.rows if final is not None else baseline.rows,
-        delivered_after_restart=final.delivered if final is not None else None,
+        delivered_after_restart=(
+            delivered_seen if final is not None and final.delivered is not None else None
+        ),
         drain_recovery_seconds=drained_after,
         first_reading_due=first_reading,
         first_reading_oldest_age_seconds=first_age,

@@ -2166,3 +2166,18 @@ def test_sink_events_for_booking_does_not_cross_attribute(monkeypatch: pytest.Mo
     counts, unreadable = sink_events_for_booking("http://localhost:9099", "book-1")
     assert unreadable == 0
     assert counts == {"booking.created": 1}, "the successor's delivery is not book-1's"
+
+
+def test_c5_reads_delivered_as_a_maximum_not_as_an_instant() -> None:
+    """==A monotonic counter read at one instant is still a race, and a live run lost it.==
+
+    The drain pass commits its rows -- so the DB-derived `due` is already 0 -- and folds the pass
+    into the process counter a moment later. A scrape landing in between sees a drained queue and a
+    counter of zero, and C5 fails a system that behaved perfectly: 6 stranded, backlog caught in
+    flight, drained in 7.1s, delivered 0. Taking the maximum is race-free because the counter never
+    goes down.
+    """
+    observation = _deadman(delivered_after_restart=6)
+    assert judge_drain_deadman(observation).passed is True
+    # The value that would have been read at the instant `due` hit zero.
+    assert judge_drain_deadman(_deadman(delivered_after_restart=0)).passed is False
