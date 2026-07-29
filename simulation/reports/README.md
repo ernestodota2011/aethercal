@@ -14,10 +14,27 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `bd6232d4` | 2026-07-29 | MEASURED | **240** planned / 212 created, 45 follow-ups, 40-way races, **all fifteen** controls held. ==The plan total is now an identity: 240 = 40/week × 2 weeks × 3 businesses, exactly==, where independent per-day rounding had been quietly producing 239. §6's 550 classified reconciles with §1; 29 `slot_unavailable` split across both legs. Confirmations 188 matched + 24 superseded = 212, 0 unaccounted, 0 duplicates, 0 uid collisions, 0 unparseable envelopes. C5 on a **drained baseline** (due=0), 6 stranded, 6 delivered. Peak 40 of 40 in flight (C15). 391 samples, 0 scrape failures. Same observability limit as its predecessors: a **dead** worker is invisible to the backlog metric (§7). |
+| `1b3a66f9` | 2026-07-29 | MEASURED | **240** planned / 206 created, 44 follow-ups, 40-way races, **all fifteen** controls held, and the id set is the required set exactly. The plan is **byte-identical** to `bd6232d4`'s at the same seed — the `allocate_by_weight` normalisation moved nothing, because production already normalised at the call site. §6's 547 classified reconciles with §1; 36 `slot_unavailable` split across both legs — **34** on the create leg and **2** on the reschedule leg — and `240 − 34 = 206` closes the create leg on its own. Confirmations 180 matched + 26 superseded = 206, 0 unaccounted, 0 duplicates, 0 uid collisions, 0 unparseable envelopes. C5 on a drained baseline (due=0), 6 stranded, 6 delivered. Peak 40 of 40 in flight (C15). 388 samples, 0 scrape failures. ==The first run in this directory whose stack was actually torn down by its own script== — see the withdrawal below. Same observability limit as every predecessor: a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Eleven earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, eleven times over.
+> [!warning] ==Twelve earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, twelve times over.
+>
+> `bd6232d4` — withdrawn with **no wrong number in it**, and the second one withdrawn on that
+> footing. Every total reconciled, its plan is byte-identical to the replacement's at the same seed,
+> and ten defects closed after it left its arithmetic untouched. What it cannot claim is the one
+> thing every report here implies: that the throwaway stack it describes was thrown away.
+> ==`docker compose down -v` had never once succeeded from either shell script.== `compose.sim.yml`
+> requires `AETHERCAL_SIM_METRICS_TOKEN` with `:?`, compose interpolates the whole file on *every*
+> subcommand, and both teardowns ran it out of a shell that never had the variable — so `down`
+> failed on an exigency written for `up`, and the stack stayed up. `bd6232d4` reported exit 0 while
+> doing it, because the trap printed the failure and propagated nothing.
+>
+> ==It was found by the fix that made a failed teardown visible, on that fix's first live run==,
+> which is the argument for that fix made by the thing it found. Two of `bd6232d4`'s instruments are
+> also gone: its confirmation reconciliation stopped at the **first** complete count, so a late
+> arrival — or a late duplicate, half of what C14 is for — was unobservable by construction. The
+> replacement reads to a quiet window instead, and can report that the window never had to restart.
+> `bd6232d4` could not have reported either way.
 >
 > `e4a99ccc` — withdrawn after a gate run **by slices** (one file per review) found seven defects
 > that no full-diff run had seen, three of them high and one a security gap. The two that touch its
