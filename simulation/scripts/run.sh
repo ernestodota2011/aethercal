@@ -98,8 +98,12 @@ cd "${SIM_DIR}"
 # ==The harness runs on the system Python with no dependencies.== That is not a shortcut, it is the
 # point: a throwaway host needs a stack and an interpreter, and nothing else has to be installed
 # before a measurement can happen.
+# ==The compose invocation is NOT passed in any more.== It used to be handed over as a string and
+# used verbatim to `stop`/`start` a container — the one input the isolation check never looked at,
+# in the one code path that manipulates containers. The harness derives the same three overlays
+# itself (`aethercal_sim.__main__.COMPOSE_FILES`) and proves they resolve to the project it just
+# verified, before it touches anything. `COMPOSE_CMD` above stays: it is this script's own teardown.
 python3 -m aethercal_sim \
-  --compose-cmd "${COMPOSE_CMD}" \
   --out "${SIM_DIR}/simulation-report.md" \
   --json-out "${SIM_DIR}/simulation-report.json" \
   "$@"

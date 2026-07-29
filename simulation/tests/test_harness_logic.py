@@ -13,14 +13,17 @@ import argparse
 import ast
 import base64
 import inspect
+import itertools
 import json
 import os
 import pathlib
 import random
 import shutil
 import subprocess
+import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -28,6 +31,9 @@ from typing import Any
 import pytest
 
 from aethercal_sim.__main__ import (
+    COMPOSE_FILES,
+    assert_compose_targets_stack,
+    compose_command,
     confirmations_by_recipient,
     contender_count,
     measure_confirmations,
@@ -71,6 +77,7 @@ from aethercal_sim.scenarios import (
     cap_probe_blocker,
     control_outbox_drained,
     decode_delivery,
+    fetch_slots,
     identifier_values,
     is_reschedule_collision,
     judge_cancel_idempotency,
@@ -1089,8 +1096,25 @@ def test_c14_refuses_a_run_that_created_nothing() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _envelope(address: str, created: str = "2026-07-29T02:00:00.000Z") -> dict[str, Any]:
-    return {"To": [{"Address": address}], "Subject": "Confirmed", "Created": created}
+_siguiente_id = itertools.count(1)
+
+
+def _envelope(
+    address: str, created: str = "2026-07-29T02:00:00.000Z", identifier: str | None = None
+) -> dict[str, Any]:
+    """Un sobre como los que Mailpit devuelve de verdad — ==`ID` incluido.==
+
+    Este ayudante NO lo traia, y esa omision es un hallazgo por si sola: el doble era mas
+    permisivo que el servidor real, de modo que ninguna prueba sobre la paginacion podia
+    distinguir un mensaje de otro. `Mailbox.parse` ya leia `ID` y `hydrate_invites` ya se negaba a
+    trabajar sin el; el unico sitio donde el campo no existia era el fixture que los certificaba.
+    """
+    return {
+        "ID": identifier or f"msg-{next(_siguiente_id)}",
+        "To": [{"Address": address}],
+        "Subject": "Confirmed",
+        "Created": created,
+    }
 
 
 class _FakeMailpit:
@@ -1177,8 +1201,8 @@ def test_a_read_that_LOST_envelopes_is_not_a_complete_read() -> None:
     fake = _FakeMailpit(
         [
             _envelope("good@guests.sim.test"),
-            {"To": [{"Address": "nostamp@guests.sim.test"}], "Created": "not-a-date"},
-            {"To": [], "Created": "2026-07-29T02:00:00Z"},
+            {"ID": "sin-fecha", "To": [{"Address": "x@guests.sim.test"}], "Created": "not-a-date"},
+            {"ID": "sin-destinatario", "To": [], "Created": "2026-07-29T02:00:00Z"},
         ]
     )
     read = _mailbox(fake).read_all()
@@ -1192,7 +1216,10 @@ def test_a_read_that_LOST_envelopes_is_not_a_complete_read() -> None:
 def test_a_lossy_mailbox_read_turns_C14_red() -> None:
     """The sabotage the finding names: the count adds up and the run must still go red."""
     fake = _FakeMailpit(
-        [_envelope("g@guests.sim.test"), {"To": [], "Created": "2026-07-29T02:00:00Z"}]
+        [
+            _envelope("g@guests.sim.test"),
+            {"ID": "sin-destinatario", "To": [], "Created": "2026-07-29T02:00:00Z"},
+        ]
     )
     read = _mailbox(fake).read_all()
     assert read.reported_total == 2
@@ -2871,4 +2898,561 @@ def test_run_sh_pone_el_token_antes_de_su_propio_down() -> None:
     )
     assert cuerpo.index("aethercal_export_compose_token") < cuerpo.index("${COMPOSE_CMD} down"), (
         "el token tiene que estar puesto ANTES del down"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# ==S1 — el comando de compose se DERIVA, y se prueba que apunta a la pila verificada.==
+#
+# `--compose-cmd` aceptaba una invocacion arbitraria y la usaba tal cual para `stop`/`start` del
+# worker. Asi que la pila que el arnes DEMUESTRA estar tocando y la que ese comando podia alcanzar
+# eran dos objetos distintos: `assert_disposable_stack` verificaba un nonce plantado en una base de
+# datos, y C5 paraba el contenedor que nombrara otra cadena. Era la unica entrada sin validacion
+# alguna, en el unico camino que manipula contenedores.
+# --------------------------------------------------------------------------------------
+
+
+def test_el_comando_de_compose_se_deriva_y_ya_no_se_acepta() -> None:
+    """No hay bandera que aceptar: lo que se puede calcular no se configura.
+
+    Es la misma doctrina que `world.SINK_WEBHOOK_URL` ya escribio para la URL que marca el
+    SERVIDOR -- "lo que nunca se acepta no necesita validacion".
+    """
+    argumentos = parse_args([])
+    assert not hasattr(argumentos, "compose_cmd"), (
+        "mientras exista la bandera, existe la via para apuntar `stop` a otra pila"
+    )
+
+    derivado = compose_command()
+    assert derivado[:2] == ["docker", "compose"]
+    banderas = [derivado[i + 1] for i, parte in enumerate(derivado) if parte == "-f"]
+    assert len(banderas) == 3, f"los tres overlays, ni uno menos: {derivado}"
+    assert [pathlib.Path(ruta).name for ruta in banderas] == [
+        "docker-compose.yml",
+        "compose.e2e.yml",
+        "compose.sim.yml",
+    ]
+    for ruta in COMPOSE_FILES:
+        assert ruta.exists(), f"el overlay derivado no existe en el repo: {ruta}"
+
+
+def test_un_proyecto_distinto_al_verificado_no_deja_parar_ningun_contenedor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==El caso que el hallazgo nombra.== `compose.sim.yml` es lo unico que renombra el proyecto;
+    si alguien le toca el `name:`, los mismos tres archivos derivados resuelven a `aethercal`, que
+    es el nombre de una instancia real. Sin este chequeo, C5 le pararia el worker.
+    """
+    monkeypatch.setattr(
+        "aethercal_sim.__main__._compose",
+        lambda *_args, **_kw: json.dumps({"name": "aethercal", "services": {}}),
+    )
+    with pytest.raises(NotADisposableStackError, match="not the verified"):
+        assert_compose_targets_stack(_stack())
+
+
+def test_no_poder_leer_el_proyecto_es_una_NEGATIVA_no_un_permiso(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falla-cerrado: "no se pudo comprobar" y "se comprobo y coincide" jamas son lo mismo."""
+
+    def revienta(*_args: Any, **_kw: Any) -> str:
+        raise RuntimeError("`docker compose config` failed (127): docker: not found")
+
+    monkeypatch.setattr("aethercal_sim.__main__._compose", revienta)
+    with pytest.raises(NotADisposableStackError, match="nothing will be stopped"):
+        assert_compose_targets_stack(_stack())
+
+
+def test_un_config_que_no_es_JSON_tampoco_autoriza(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("aethercal_sim.__main__._compose", lambda *_a, **_k: "name: aethercal-sim")
+    with pytest.raises(NotADisposableStackError, match="did not return JSON"):
+        assert_compose_targets_stack(_stack())
+
+
+def test_el_proyecto_correcto_SI_pasa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anti-vacuidad: el chequeo no niega todo -- la pila de verdad lo atraviesa."""
+    monkeypatch.setattr(
+        "aethercal_sim.__main__._compose",
+        lambda *_a, **_k: json.dumps({"name": EXPECTED_COMPOSE_PROJECT, "services": {}}),
+    )
+    assert assert_compose_targets_stack(_stack()) == EXPECTED_COMPOSE_PROJECT
+
+
+# --------------------------------------------------------------------------------------
+# ==S8 — las dos salidas no pueden ser el mismo archivo.==
+# --------------------------------------------------------------------------------------
+
+
+def test_las_dos_salidas_no_pueden_ser_el_mismo_archivo() -> None:
+    """El reporte se escribe primero y el JSON lo pisaria -- al FINAL, con la carga ya generada."""
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(["--out", "informe.md", "--json-out", "informe.md"])
+    assert excinfo.value.code == 2
+
+
+def test_dos_nombres_del_MISMO_archivo_tambien_se_rechazan(tmp_path: pathlib.Path) -> None:
+    """==Comparadas RESUELTAS, que es la unica comparacion que sirve.==
+
+    `a.md` y `sub/../a.md` son un archivo con dos nombres, y un chequeo sobre las cadenas crudas
+    los deja pasar a los dos.
+    """
+    (tmp_path / "sub").mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(
+            [
+                "--out",
+                str(tmp_path / "a.md"),
+                "--json-out",
+                str(tmp_path / "sub" / ".." / "a.md"),
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
+def test_dos_salidas_distintas_siguen_siendo_validas() -> None:
+    """Anti-vacuidad: los valores por defecto -- y cualquier par distinto -- pasan."""
+    por_defecto = parse_args([])
+    assert por_defecto.out != por_defecto.json_out
+    elegidas = parse_args(["--out", "informe.md", "--json-out", "informe.json"])
+    assert (elegidas.out.name, elegidas.json_out.name) == ("informe.md", "informe.json")
+
+
+# --------------------------------------------------------------------------------------
+# ==S5 — la zona horaria viaja CODIFICADA.==
+# --------------------------------------------------------------------------------------
+
+
+class _ClienteQueAnota:
+    """Anota la ruta pedida. `fetch_slots` solo llama a `get`."""
+
+    def __init__(self) -> None:
+        self.rutas: list[str] = []
+
+    def get(self, path: str) -> Response:
+        self.rutas.append(path)
+        return Response(200, {"slots": []}, "{}", 1.0, None)
+
+
+@pytest.mark.parametrize(
+    ("zona", "esperado"),
+    [
+        ("America/New_York", "tz=America%2FNew_York"),
+        ("Etc/GMT+5", "tz=Etc%2FGMT%2B5"),
+    ],
+)
+def test_la_zona_horaria_viaja_codificada_en_la_query(zona: str, esperado: str) -> None:
+    """==El `+` es el caso caro: sin codificar decodifica a un ESPACIO== y el servidor recibe una
+    zona que no existe. Cae sobre la lectura mas caliente de la corrida, y "no hay nada en oferta"
+    se parece demasiado a un dia lleno.
+    """
+    cliente = _ClienteQueAnota()
+    fetch_slots(
+        cliente,  # type: ignore[arg-type]  # solo se usa `get`
+        event_type_id="et-1",
+        day=date(2026, 8, 3),
+        timezone=zona,
+        days=5,
+    )
+    assert esperado in cliente.rutas[0], cliente.rutas[0]
+    assert urllib.parse.parse_qs(cliente.rutas[0].split("?", 1)[1])["tz"] == [zona], (
+        "el servidor tiene que recibir la zona EXACTA que se pidio"
+    )
+
+
+def test_la_query_de_slots_sigue_llevando_sus_cuatro_parametros() -> None:
+    """Anti-vacuidad: codificar no puede perder ni renombrar nada."""
+    cliente = _ClienteQueAnota()
+    fetch_slots(
+        cliente,  # type: ignore[arg-type]
+        event_type_id="et-9",
+        day=date(2026, 8, 3),
+        timezone="UTC",
+        days=3,
+    )
+    campos = urllib.parse.parse_qs(cliente.rutas[0].split("?", 1)[1])
+    assert campos == {
+        "event_type": ["et-9"],
+        "from": ["2026-08-03"],
+        "to": ["2026-08-05"],
+        "tz": ["UTC"],
+    }
+
+
+# --------------------------------------------------------------------------------------
+# ==S6 — una barrera rota es un HALLAZGO, no un aborto.==
+#
+# La excepcion de la llamada ya tenia su casilla en la taxonomia, precisamente porque escaparse de
+# `pool.map` termina la corrida sin resultado alguno. Y la linea de arriba -- `barrier.wait` -- se
+# quedo fuera de la proteccion: es la que MAS puede reventar (un hermano que muere, o el timeout de
+# 60 s) y llega a todos los hilos que esperan a la vez.
+# --------------------------------------------------------------------------------------
+
+
+class _BarreraQueRompe:
+    """Rompe para los primeros `rotos` hilos que llegan; a los demas los suelta."""
+
+    def __init__(self, rotos: int) -> None:
+        self._restantes = rotos
+        self._lock = threading.Lock()
+
+    def wait(self, timeout: float | None = None) -> int:
+        with self._lock:
+            if self._restantes > 0:
+                self._restantes -= 1
+                raise threading.BrokenBarrierError
+        return 0
+
+
+class _ThreadingConBarreraRota:
+    """Delega todo en `threading` salvo la barrera, que es el sujeto de la prueba."""
+
+    def __init__(self, rotos: int) -> None:
+        self._rotos = rotos
+
+    def __getattr__(self, nombre: str) -> Any:
+        return getattr(threading, nombre)
+
+    def Barrier(self, parties: int, **_kw: Any) -> _BarreraQueRompe:
+        return _BarreraQueRompe(self._rotos)
+
+
+def test_una_barrera_rota_es_un_hallazgo_y_no_borra_la_corrida(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==Antes se propagaba fuera de `pool.map` y no quedaba NADA==: ni reporte, ni veredicto, ni
+    una linea diciendo cual contendiente murio. Y los otros 39 resultados se iban con el.
+    """
+    monkeypatch.setattr("aethercal_sim.scenarios.threading", _ThreadingConBarreraRota(1))
+
+    def bien() -> Response:
+        time.sleep(0.02)
+        return Response(201, {"id": "x"}, "", 20.0, None)
+
+    resultado = _fire_together([bien, bien, bien], "probe_barrera")
+
+    assert resultado.contenders == 3, "el contendiente muerto sigue contando en el denominador"
+    assert resultado.winners == 2, "los que SI pasaron la barrera se midieron igual"
+    assert any("never got past the barrier" in u for u in resultado.unexpected), (
+        f"el fallo de barrera tiene que aparecer en la taxonomia: {resultado.unexpected}"
+    )
+    assert len(resultado.intervals) == 2, (
+        "==el que nunca disparo no aporta intervalo==: inventarle uno inflaria el solape que C15 "
+        "mide, y C15 dejaria de poder distinguir una rafaga de una cola"
+    )
+
+
+def test_una_barrera_rota_hunde_C15_en_vez_de_pasar_desapercibida(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La consecuencia que importa: el hallazgo llega al veredicto, no solo a una lista."""
+    monkeypatch.setattr("aethercal_sim.scenarios.threading", _ThreadingConBarreraRota(3))
+    resultado = _fire_together(
+        [lambda: Response(201, {"id": "x"}, "", 1.0, None) for _ in range(3)],
+        "probe_barrera_total",
+    )
+    assert resultado.winners == 0
+    assert resultado.intervals == []
+    assert judge_race_concurrency([resultado]).passed is False
+
+
+# --------------------------------------------------------------------------------------
+# ==S7 — una pagina repetida no es una lectura completa.==
+# --------------------------------------------------------------------------------------
+
+
+class _MailpitQueRepiteLaPagina:
+    """Un servidor que ignora `start` y contesta SIEMPRE la primera pagina.
+
+    Un proxy, un parametro renombrado, o un Mailpit futuro que pagine por cursor. La aritmetica
+    cuadra igual -- 2 paginas por 2 mensajes es el total de 4 que prometio -- y la lista termina
+    con cada mensaje dos veces.
+    """
+
+    def __init__(self, pagina: list[dict[str, Any]], total: int) -> None:
+        self.pagina = pagina
+        self.total = total
+
+    def __call__(self, path: str) -> Any:
+        return {"messages_count": self.total, "messages": self.pagina}
+
+
+def test_una_pagina_repetida_no_es_una_lectura_completa() -> None:
+    """==El defecto llega disfrazado del hallazgo que C14 busca==: mensajes duplicados."""
+    repetida = [_envelope("a@guests.sim.test"), _envelope("b@guests.sim.test")]
+    buzon = Mailbox("http://localhost:8025", page_size=2)
+    buzon._get = _MailpitQueRepiteLaPagina(repetida, total=4)  # type: ignore[method-assign]
+
+    lectura = buzon.read_all()
+
+    assert lectura.complete is False, (
+        "leyo 2 mensajes distintos de 4 y la aritmetica del cursor cuadraba"
+    )
+    assert "repeats message" in lectura.problem
+    assert "call HALF a mailbox a whole one" in lectura.problem
+
+
+def test_un_sobre_sin_ID_no_se_puede_reconciliar() -> None:
+    """Sin identidad no hay conteo de unicos. Y `hydrate_invites` ya se negaba mas abajo."""
+    buzon = Mailbox("http://localhost:8025")
+    buzon._get = lambda _path: {  # type: ignore[method-assign]
+        "messages_count": 1,
+        "messages": [{"To": [{"Address": "a@guests.sim.test"}], "Created": "2026-07-29T02:00:00Z"}],
+    }
+    lectura = buzon.read_all()
+    assert lectura.complete is False
+    assert "carries no `ID`" in lectura.problem
+
+
+def test_una_lectura_paginada_de_verdad_sigue_siendo_completa() -> None:
+    """Anti-vacuidad: paginar bien no puede volverse sospechoso.
+
+    Tres paginas reales de 500, ids distintos, y la lectura se declara entera -- que es lo que
+    `test_mailbox_pages_past_its_page_size` ya exige y esta mitad conserva.
+    """
+    fake = _FakeMailpit([_envelope(f"g{n}@guests.sim.test") for n in range(1200)])
+    lectura = _mailbox(fake, page_size=500).read_all()
+    assert (lectura.complete, len(lectura.messages), lectura.pages) == (True, 1200, 3)
+
+
+# --------------------------------------------------------------------------------------
+# ==S2 y S3 — el arranque no puede correr sobre la base anterior, ni quedarse `deploy/.env`.==
+#
+# Se corre el guion DE VERDAD contra un `docker` de mentira, en un arbol desechable. Es la unica
+# forma de probar un trap: afirmar sobre el texto diria que el `trap` esta escrito, no que restaura.
+# --------------------------------------------------------------------------------------
+
+ENV_DEL_DESARROLLADOR = "AETHERCAL_API_KEY=la-del-desarrollador\nAETHERCAL_TENANT_SLUG=suyo\n"
+
+
+def _arbol_de_arranque(raiz: pathlib.Path) -> pathlib.Path:
+    """Un repo de mentira con lo justo para llegar al `down`, y un `docker` que obedece a
+    `DOCKER_FALLA_EN`."""
+    sim = raiz / "simulation"
+    (sim / "scripts").mkdir(parents=True)
+    for nombre in ("stack-up.sh", "restore-env.sh"):
+        destino = sim / "scripts" / nombre
+        destino.write_bytes((SCRIPTS_DIR / nombre).read_bytes())
+        destino.chmod(0o755)
+
+    (raiz / "deploy").mkdir()
+    (raiz / "deploy" / ".env").write_text(ENV_DEL_DESARROLLADOR, encoding="utf-8")
+    (raiz / "e2e" / "scripts").mkdir(parents=True)
+    (raiz / "e2e" / "scripts" / "deploy.env.template").write_text(
+        "AETHERCAL_API_KEY=de-prueba\nAETHERCAL_TENANT_SLUG=de-prueba\n", encoding="utf-8"
+    )
+
+    binarios = raiz / "bin"
+    binarios.mkdir()
+    doble = binarios / "docker"
+    doble.write_text(
+        "#!/usr/bin/env bash\n"
+        "for subcomando in ${DOCKER_FALLA_EN:-}; do\n"
+        '  for arg in "$@"; do\n'
+        '    if [[ "${arg}" == "${subcomando}" ]]; then\n'
+        '      echo "fake docker: refusing to ${subcomando}" >&2\n'
+        "      exit 7\n"
+        "    fi\n"
+        "  done\n"
+        "done\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    doble.chmod(0o755)
+    return sim / "scripts" / "stack-up.sh"
+
+
+def _correr_arranque(
+    raiz: pathlib.Path, guion: pathlib.Path, *, falla_en: str
+) -> tuple[int, str, str]:
+    """Corre el guion con un `docker` que se niega a ejecutar los subcomandos nombrados.
+
+    ==`falla_en` acepta varios a proposito.== Un doble que solo rechaza `down` deja al guion
+    saboteado seguir hasta un `wait_for_http` de cuatro minutos, y la prueba se pondria roja por
+    tiempo agotado -- un rojo lento y de motivo equivocado. Negando tambien el `up`, la version
+    saboteada muere de inmediato y por la razon correcta: aborto SIN el mensaje del teardown.
+    """
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - solo en un host sin bash
+        pytest.skip("no hay bash en este host")
+    entorno = dict(os.environ)
+    entorno["PATH"] = f"{raiz / 'bin'}{os.pathsep}{entorno.get('PATH', '')}"
+    entorno["DOCKER_FALLA_EN"] = falla_en
+    hecho = subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona en la prueba
+        [bash, str(guion)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=entorno,
+    )
+    env_final = (raiz / "deploy" / ".env").read_text(encoding="utf-8")
+    return hecho.returncode, hecho.stderr, env_final
+
+
+def test_un_teardown_previo_fallido_ABORTA_el_arranque(tmp_path: pathlib.Path) -> None:
+    """==S2: `|| true` sobre el `down -v` dejaba correr la simulacion sobre la base ANTERIOR.==
+
+    Un contenedor que no para, un volumen en uso, un demonio que se fue: cualquiera de esos y la
+    corrida medira dos semanas de trafico contra datos viejos -- y en la direccion halagadora, que
+    es la que nadie audita: una base con reservas ofrece menos huecos y produce mas colisiones, que
+    la seccion 1 cuenta como trafico ordinario.
+    """
+    guion = _arbol_de_arranque(tmp_path)
+    codigo, err, env_final = _correr_arranque(tmp_path, guion, falla_en="down up")
+
+    assert codigo != 0, "el arranque no puede seguir sobre una pila que no se pudo borrar"
+    assert "could not reset the previous SIMULATION stack" in err, (
+        f"tiene que abortar EN el teardown, no seguir hasta tropezar mas abajo: {err}"
+    )
+    assert "fake docker: refusing to down" in err, "el motivo real de compose tiene que verse"
+    assert env_final == ENV_DEL_DESARROLLADOR, (
+        "S3: y al abortar, el `deploy/.env` del desarrollador vuelve a su sitio"
+    )
+
+
+def test_un_fallo_posterior_tambien_devuelve_deploy_env(tmp_path: pathlib.Path) -> None:
+    """==S3, en un fallo que NO es el de S2==: el trap cubre todo el arranque, no un caso.
+
+    Aqui el `down` va bien y revienta el `up`. Corriendo `stack-up.sh` directo -- que es lo que el
+    README propone -- cualquier fallo dejaba la configuracion compartida del repo sustituida por
+    valores de prueba, con la unica copia en un respaldo cuyo nombre nadie tiene por que conocer.
+    """
+    guion = _arbol_de_arranque(tmp_path)
+    codigo, err, env_final = _correr_arranque(tmp_path, guion, falla_en="up")
+
+    assert codigo != 0
+    assert "restoring" in err.lower(), err
+    assert env_final == ENV_DEL_DESARROLLADOR
+    assert not (tmp_path / "simulation" / ".env.deploy-backup.state").exists(), (
+        "un restore confirmado retira su propio marcador"
+    )
+    assert not (tmp_path / "simulation" / ".env.deploy-backup").exists()
+
+
+def test_el_trap_se_arma_DESPUES_del_guardian_del_respaldo_y_se_desarma_al_final() -> None:
+    """Las dos condiciones que un fallo no puede demostrar, afirmadas sobre el guion.
+
+    ==Armarlo una linea antes seria peor que no tenerlo==: encima del guardian que protege el
+    respaldo de una corrida `--keep`, el trap dispararia en esa misma negativa y restauraria el
+    respaldo AJENO sobre el `deploy/.env` que su pila sigue leyendo. Y desarmarlo al final es lo
+    que deja a la pila sana leyendo sus valores de prueba hasta que alguien la baje.
+    """
+    guion = (SCRIPTS_DIR / "stack-up.sh").read_text(encoding="utf-8")
+    guardian = guion.index("already exists, so a previous run")
+    armado = guion.index("trap stack_up_failed EXIT")
+    desarmado = guion.index("trap - EXIT")
+    escritura = guion.index("json.dump(document, handle")
+
+    assert guardian < armado, "el trap no puede armarse antes del guardian del respaldo"
+    assert armado < escritura < desarmado, (
+        "se desarma DESPUES de escribir el stack file: hasta ahi, cualquier fallo restaura"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# ==S4 — el stack file se GENERA; no se concatena.==
+# --------------------------------------------------------------------------------------
+
+
+def _generador_del_stack_file() -> str:
+    """El cuerpo Python que `stack-up.sh` alimenta por stdin, extraido del guion mismo.
+
+    Se corre EL codigo del guion, no una copia: una copia se arregla sola cuando el original se
+    rompe, que es justo lo contrario de lo que una prueba tiene que hacer.
+    """
+    guion = (SCRIPTS_DIR / "stack-up.sh").read_text(encoding="utf-8")
+    apertura = "python3 - \"${STACK_FILE}\" <<'PY'\n"
+    inicio = guion.index(apertura) + len(apertura)
+    return guion[inicio : guion.index("\nPY\n", inicio)]
+
+
+#: Una clave que el alfabeto de `issue-api-key` no promete no producir. Todo esto es de mentira.
+CLAVE_HOSTIL = 'sk_"sim"\\test/con espacios'
+
+
+def _entorno_del_stack_file(clave: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "SIM_API_URL": "http://localhost:8000",
+        "SIM_WORKER_URL": "http://127.0.0.1:8001",
+        "SIM_BOOKING_URL": "http://localhost:5001",
+        "SIM_MAILPIT_URL": "http://localhost:8025",
+        "SIM_SINK_URL": "http://localhost:9099",
+        "SIM_METRICS_TOKEN": clave,
+        "SIM_NONCE": "a1b2c3d4" * 4,
+        "SIM_BUSINESS_COUNT": "1",
+        "SIM_BUSINESS_0_SLUG": "clinica-sonrisa",
+        "SIM_BUSINESS_0_NAME": 'Clinica "Sonrisa"',
+        "SIM_BUSINESS_0_TIMEZONE": "America/New_York",
+        "SIM_BUSINESS_0_TENANT_ID": "tid-1",
+        "SIM_BUSINESS_0_HOST_USER_ID": "uid-1",
+        "SIM_BUSINESS_0_API_KEY": clave,
+    }
+
+
+def _escribir_stack_file(destino: pathlib.Path, clave: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona en la prueba
+        [sys.executable, "-", str(destino)],
+        input=_generador_del_stack_file(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=_entorno_del_stack_file(clave),
+    )
+
+
+def test_una_clave_con_comillas_y_barras_sobrevive_al_stack_file(tmp_path: pathlib.Path) -> None:
+    """==El heredoc interpolaba los valores tal cual==, asi que la validez del archivo era una
+    propiedad de lo que la clave contuviera: una comilla y el JSON no parsea; una barra y parsea
+    hacia OTRA cadena que la emitida.
+
+    Lo segundo es lo peligroso -- `load_stack` no se queja, y el arnes se queda con una clave (o un
+    nonce) corrompido en silencio, que es la mitad de la prueba de identidad sobre la que
+    `assert_disposable_stack` no puede pedir una segunda opinion.
+    """
+    destino = tmp_path / ".stack.json"
+    hecho = _escribir_stack_file(destino, CLAVE_HOSTIL)
+    assert hecho.returncode == 0, hecho.stderr
+
+    pila = load_stack(destino)
+    assert pila.metrics_token == CLAVE_HOSTIL
+    assert pila.businesses[0].api_key == CLAVE_HOSTIL
+    assert pila.businesses[0].name == 'Clinica "Sonrisa"'
+    assert pila.compose_project == EXPECTED_COMPOSE_PROJECT
+
+
+def test_el_stack_file_normal_sigue_siendo_el_que_el_arnes_lee(tmp_path: pathlib.Path) -> None:
+    """Anti-vacuidad: con una clave corriente el archivo es exactamente lo que `load_stack` espera,
+    y ==no lleva `sinkWebhookUrl`== -- `world.SINK_WEBHOOK_URL` lo deriva a proposito, y dejar una
+    copia rancia aqui es una invitacion a volver a cablearlo.
+    """
+    destino = tmp_path / ".stack.json"
+    hecho = _escribir_stack_file(destino, "token-de-prueba-de-32-caracteres-o-mas")
+    assert hecho.returncode == 0, hecho.stderr
+
+    crudo: dict[str, Any] = json.loads(destino.read_text(encoding="utf-8"))
+    assert set(crudo) == {
+        "apiUrl",
+        "workerUrl",
+        "bookingUrl",
+        "mailpitUrl",
+        "sinkUrl",
+        "metricsToken",
+        "composeProject",
+        "nonce",
+        "businesses",
+    }
+    assert load_stack(destino).api_url == "http://localhost:8000"
+
+
+def test_el_stack_file_ya_no_se_arma_concatenando() -> None:
+    """La forma, porque es la que se puede volver a romper: quien vuelva al heredoc o al `+=` esta
+    reintroduciendo el defecto entero, no bajando la calidad de un detalle.
+    """
+    guion = (SCRIPTS_DIR / "stack-up.sh").read_text(encoding="utf-8")
+    assert "json.dump(document, handle" in guion, "el escapado tiene que ser de la libreria"
+    assert 'cat >"${STACK_FILE}"' not in guion, "volvio el heredoc que interpolaba los valores"
+    assert "business_json" not in guion, "volvio la concatenacion a mano de la lista"
+    assert 'os.environ[f"SIM_BUSINESS_{index}_API_KEY"]' in guion, (
+        "la clave viaja por el entorno; por argv la publicaria en `ps` a todo el host"
     )

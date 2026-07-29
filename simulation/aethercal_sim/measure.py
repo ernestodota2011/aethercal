@@ -849,7 +849,9 @@ class Mailbox:
             )
         return MailboxRead(collected, True, total, page, self.page_size, unparseable)
 
-    def read_all(self) -> MailboxRead:  # noqa: PLR0911 - each return names a DISTINCT broken read
+    def read_all(  # noqa: PLR0911, PLR0912 - each return names a DISTINCT broken read
+        self,
+    ) -> MailboxRead:
         """Page through the WHOLE mailbox, or report why the read is not whole.
 
         ==There is no ``limit`` parameter, on purpose.== How much this read should return is a
@@ -858,8 +860,24 @@ class Mailbox:
         termination condition. A failed request, an envelope that is not the contract, a page that
         does not advance, or a total never reached each return ``complete=False`` with the reason
         attached — because the one thing a truncated mailbox must never look like is a small one.
+
+        .. rubric:: ==The cursor is Mailpit's; the ORACLE is the set of ids seen.==
+
+        ``start`` used to be both, and the two are not the same statement. Advancing it by the
+        length of each page and stopping at the reported total means a server that answers the SAME
+        page twice — a proxy ignoring ``start``, a renamed parameter, a future Mailpit that
+        paginates by cursor — ends the loop having read half the mailbox, with the arithmetic
+        agreeing perfectly: 2 pages of 500 is the 1000 it was promised. The list then holds 500
+        messages twice over, and ==a duplicated confirmation is one of the two things C14 exists to
+        catch==, so the broken read arrives wearing the costume of the finding.
+
+        Every id is recorded now, a page carrying one already seen is a refusal that names itself,
+        and the loop ends when ``total`` DISTINCT messages have been observed. There is deliberately
+        no second "and now reconcile the count" step: with repeats refused, the cursor and the
+        unique count are the same number, and two statements of one fact are two things that drift.
         """
         collected: list[MailMessage] = []
+        seen: set[str] = set()
         unparseable = 0
         start = 0
         total = 0
@@ -906,6 +924,38 @@ class Mailbox:
                     why=f"`messages` is not a list: {raw_messages!r}",
                 )
             for item in raw_messages:
+                # ==The id is read from the RAW envelope, not from the parsed message.== An
+                # envelope this client cannot parse is still a message that exists and still
+                # occupies a slot in the total, so it has to be counted as seen or the read can
+                # never reconcile; and a page of repeated unparseable envelopes is exactly as
+                # broken as a page of repeated good ones.
+                identifier = str(item.get("ID", "")) if isinstance(item, dict) else ""
+                if not identifier:
+                    return self._incomplete(
+                        collected=collected,
+                        total=total,
+                        page=page,
+                        unparseable=unparseable,
+                        why=(
+                            f"an envelope on page {page} carries no `ID`, so this read cannot be "
+                            "reconciled against the total the server reports — and the message's "
+                            "own source could not be fetched either"
+                        ),
+                    )
+                if identifier in seen:
+                    return self._incomplete(
+                        collected=collected,
+                        total=total,
+                        page=page,
+                        unparseable=unparseable,
+                        why=(
+                            f"page {page} (start {start}) repeats message {identifier!r}, which an "
+                            f"earlier page already returned. Paging is not advancing, so reaching "
+                            f"the reported total of {total} would count the same messages twice "
+                            "and call HALF a mailbox a whole one"
+                        ),
+                    )
+                seen.add(identifier)
                 message = self.parse(item)
                 if message is None:
                     unparseable += 1
@@ -915,7 +965,7 @@ class Mailbox:
             if not raw_messages:
                 # An empty page BEFORE the reported total means the server and its own envelope
                 # disagree; trusting it truncates the mailbox, which is the whole defect.
-                if start >= total:
+                if len(seen) >= total:
                     return self._whole(collected, total, page, unparseable)
                 return self._incomplete(
                     collected=collected,
@@ -924,7 +974,7 @@ class Mailbox:
                     unparseable=unparseable,
                     why=f"an empty page at start {start} of a reported total of {total}",
                 )
-            if start >= total:
+            if len(seen) >= total:
                 return self._whole(collected, total, page, unparseable)
         return self._incomplete(
             collected=collected,

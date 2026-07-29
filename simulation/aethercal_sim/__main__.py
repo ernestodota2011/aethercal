@@ -1,6 +1,6 @@
 """Run the two-week simulation end to end and write the report.
 
-    python -m aethercal_sim --compose-cmd "docker compose -f ... -f ... -f ..."
+    python -m aethercal_sim
 
 The phases run in this order, and the order is deliberate:
 
@@ -16,24 +16,25 @@ The dead-man control comes late on purpose: it deliberately stops the worker, an
 middle of the organic phase would fold a self-inflicted stall into the very backlog figures the run
 is trying to report.
 
-==The drain control has to stop and start a container, so it needs the compose command.== Without
-``--compose-cmd`` the run REFUSES to start rather than quietly reporting a backlog nobody proved was
-real. ``--allow-missing-drain-control`` is the explicit, loud escape: C5 is then reported as NOT RUN
-and the whole run is INCOMPLETE.
+==The drain control has to stop and start a container, so it needs a compose command — and that
+command is DERIVED, never accepted.== See :data:`COMPOSE_FILES`.
+``--allow-missing-drain-control`` is the explicit, loud escape: C5 is then reported as NOT RUN and
+the whole run is INCOMPLETE.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
-import shlex
 import subprocess
 import sys
 import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .client import Client
 from .measure import (
@@ -78,7 +79,13 @@ from .scenarios import (
 )
 from .scenarios import book as book_slot
 from .traffic import plan_two_weeks, summarise_plan
-from .world import assert_disposable_stack, load_stack, provision
+from .world import (
+    NotADisposableStackError,
+    StackConfig,
+    assert_disposable_stack,
+    load_stack,
+    provision,
+)
 
 #: How Spanish-leaning each business's guests are. The third is deliberately bilingual.
 LOCALE_MIX = {"clinica-sonrisa": 0.85, "katy-hvac": 0.15, "estudio-legal": 0.5}
@@ -91,13 +98,41 @@ _SPARE_SLOTS = 4
 #: no-show leg. A budget, never a truncation: a slot that does not fit is not chosen at all.
 NO_SHOW_WAIT_BUDGET_SECONDS = 420.0
 
+#: The directory this harness lives in, and the repository that holds it. Everything below is
+#: derived from these two, because every one of them is a fact about the layout rather than a
+#: decision an invocation gets to make.
+SIM_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = SIM_DIR.parent
+
 #: ==Fixed, not a flag.== `--stack-file` used to let any path be passed, which meant nothing
 #: structural stopped this harness — whose first acts are to purge a mailbox, create businesses and
 #: (via run.sh) `down -v` a database — from being aimed at a live instance. The isolation guarantee
 #: lived in the README and in whatever the operator had been told, i.e. in the two places that do
 #: not execute. The path is now the one file `stack-up.sh` writes, and `assert_disposable_stack`
 #: proves the target really is that stack before anything is touched.
-STACK_FILE = Path(__file__).resolve().parent.parent / ".stack.json"
+STACK_FILE = SIM_DIR / ".stack.json"
+
+#: ==The compose files C5 may act on — DERIVED, for exactly the reason `SINK_WEBHOOK_URL` is.==
+#:
+#: `--compose-cmd` used to accept an arbitrary invocation and hand it straight to `stop`/`start`.
+#: So the stack this harness PROVES it is talking to and the stack that command can reach into were
+#: two different objects: `assert_disposable_stack` verified a nonce planted in one database, and
+#: then C5 stopped whatever container some other string named. The whole isolation guarantee has a
+#: hole in it exactly the width of one CLI flag — and the flag was the only input in this harness
+#: with no validation at all, in the one code path that manipulates containers.
+#:
+#: A value the harness can compute has no business being configurable: what is never accepted needs
+#: no validation. These are the same three overlays `scripts/run.sh` builds and the same three the
+#: report names, in the same order, and they are the whole reason `down -v` cannot reach a real
+#: instance (`compose.sim.yml` renames the project). ==Deriving them also closes the hazard both
+#: shell scripts carry a warning about== — "any future edit that drops that `-f` turns a safe
+#: script into a destructive one" — because a list that lives in code cannot be shortened by an
+#: invocation, and :func:`assert_compose_targets_stack` catches it if the FILE is edited instead.
+COMPOSE_FILES = (
+    REPO_ROOT / "deploy" / "docker-compose.yml",
+    REPO_ROOT / "e2e" / "compose.e2e.yml",
+    SIM_DIR / "compose.sim.yml",
+)
 
 
 def positive_int(raw: str) -> int:
@@ -161,15 +196,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--per-week", type=positive_int, default=40, help="bookings per business per week"
     )
-    parser.add_argument("--compose-cmd", default="", help="docker compose invocation (for C5)")
     parser.add_argument("--allow-missing-drain-control", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("simulation-report.md"))
     parser.add_argument("--json-out", type=Path, default=Path("simulation-report.json"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # ==The two outputs are written one after the other, so the same path means the JSON silently
+    # eats the report.== Both defaults differ, so this only bites an invocation that passes them —
+    # and it bites at the END of a run, after the load has been generated and the controls judged,
+    # destroying the one artifact a person reads and leaving a file whose name says `.md` holding
+    # JSON. Nothing downstream can tell that from a run that only ever wrote JSON.
+    #
+    # Compared RESOLVED, because `simulation-report.md` and `./simulation-report.md` and
+    # `reports/../simulation-report.md` are one file wearing three names, and a check on the raw
+    # strings would wave all but the first through.
+    if args.out.resolve() == args.json_out.resolve():
+        parser.error(
+            f"--out and --json-out resolve to the SAME file ({args.out.resolve()}). "
+            "The Markdown report is written first and the JSON would overwrite it, so the run "
+            "would end holding one artifact where it reports two. Give them different paths."
+        )
+    return args
 
 
-def _compose(compose_cmd: str, metrics_token: str, *args: str) -> None:
-    """Run a compose subcommand on the simulation project.
+def _compose(metrics_token: str, *args: str) -> str:
+    """Run a compose subcommand on the simulation project, and return its stdout.
 
     ==The operator token has to be in the ENVIRONMENT of this call.== ``compose.sim.yml`` declares
     ``AETHERCAL_METRICS_TOKEN: ${AETHERCAL_SIM_METRICS_TOKEN:?…}`` — required, with no default, so
@@ -185,7 +236,7 @@ def _compose(compose_cmd: str, metrics_token: str, *args: str) -> None:
     "exit status 1" for what was really a legible message from compose about a missing variable.
     """
     result = subprocess.run(  # noqa: PLW1510 - returncode is inspected below, with stderr attached
-        [*shlex.split(compose_cmd), *args],
+        [*compose_command(), *args],
         capture_output=True,
         timeout=180,
         text=True,
@@ -196,6 +247,59 @@ def _compose(compose_cmd: str, metrics_token: str, *args: str) -> None:
             f"`docker compose {' '.join(args)}` failed ({result.returncode}):\n"
             f"{result.stderr.strip()[:800]}"
         )
+    return result.stdout
+
+
+def compose_command() -> list[str]:
+    """The one compose invocation this harness may make, built from :data:`COMPOSE_FILES`."""
+    argv = ["docker", "compose"]
+    for path in COMPOSE_FILES:
+        argv += ["-f", str(path)]
+    return argv
+
+
+def assert_compose_targets_stack(stack: StackConfig) -> str:
+    """==Prove the derived compose invocation resolves to the project that was VERIFIED.==
+
+    :func:`~aethercal_sim.world.assert_disposable_stack` establishes that the target database
+    carries this run's nonce and that its project is ``aethercal-sim``. That says nothing about
+    what ``docker compose … stop worker`` would reach — a different question, answered by a
+    different set of files. Deriving the files (rather than accepting a command) makes the two
+    agree by construction; this reads the answer back out of compose itself and refuses if it does
+    not, so a hand-edited ``compose.sim.yml`` whose ``name:`` no longer renames the project cannot
+    turn C5 into `stop` against a real instance's worker.
+
+    ==Fail-closed, and BEFORE anything is created or purged.== It is called next to the stack
+    assertion, not next to C5: a refusal that fires an hour into a run has already generated the
+    load it was supposed to prevent. Anything that stops the project name being READ — no docker,
+    a missing overlay, a compose that will not parse — is a refusal too, because "could not check"
+    and "checked and it matched" must never be the same outcome.
+    """
+    try:
+        raw = _compose(stack.metrics_token, "config", "--format", "json")
+    except Exception as exc:
+        raise NotADisposableStackError(
+            f"could not resolve the simulation compose project ({type(exc).__name__}: {exc}).\n"
+            "C5 stops and starts a container, so the invocation that does it has to be shown to "
+            "point at the verified stack. It could not be, so nothing will be stopped."
+        ) from exc
+    try:
+        config: Any = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise NotADisposableStackError(
+            f"`docker compose config` did not return JSON ({exc}); the project name this harness "
+            "would act on cannot be established."
+        ) from exc
+    name = config.get("name") if isinstance(config, dict) else None
+    if name != stack.compose_project:
+        raise NotADisposableStackError(
+            f"the derived compose files resolve to project {name!r}, not the verified "
+            f"{stack.compose_project!r}.\n"
+            "==That means `stop`/`start` would reach containers this run never proved anything "
+            "about.== The most likely cause is an edit to simulation/compose.sim.yml that dropped "
+            "or changed its `name:` — the one line that keeps `down -v` away from a real instance."
+        )
+    return str(name)
 
 
 def _host_description() -> str:
@@ -203,20 +307,6 @@ def _host_description() -> str:
         f"{platform.node()} · {platform.system()} {platform.release()} · "
         f"python {platform.python_version()}"
     )
-
-
-_MISSING_COMPOSE = """ERROR: --compose-cmd is required.
-
-The drain dead-man control (C5) stops and restarts the worker container, and it is what makes every
-backlog number in this report falsifiable: without it, an instrument wired to a constant zero draws
-exactly the same flat, healthy graph as a queue that is genuinely keeping up.
-
-Pass the compose invocation, e.g.
-  --compose-cmd "docker compose -f deploy/docker-compose.yml -f e2e/compose.e2e.yml \
--f simulation/compose.sim.yml"
-
-or pass --allow-missing-drain-control to run anyway; C5 is then reported as NOT RUN and the
-verdict becomes INCOMPLETE."""
 
 
 #: How long the confirmation reconciliation keeps re-reading the mailbox before giving up.
@@ -437,9 +527,6 @@ def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[Ma
 
 def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a run IS its phases
     args = parse_args(argv)
-    if not args.compose_cmd and not args.allow_missing_drain_control:
-        print(_MISSING_COMPOSE, file=sys.stderr)
-        return 2
 
     run_id = uuid.uuid4().hex[:8]
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
@@ -453,6 +540,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
     # It raises before any write, so a refusal leaves the target untouched.
     nonce = assert_disposable_stack(stack)
     print(f"==> target verified as the throwaway stack (marker {nonce[:8]}...)")
+
+    # ==And the containers C5 will stop are part of the SAME verified thing.== Checked here, next
+    # to its sibling and before the first write, rather than at C5 an hour later.
+    if not args.allow_missing_drain_control:
+        project = assert_compose_targets_stack(stack)
+        print(f"==> compose invocation verified as project `{project}` (derived, not accepted)")
 
     mailbox = Mailbox(stack.mailpit_url)
     mailbox.purge()
@@ -793,7 +886,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
 
         # C5 — the drain dead-man. It stops the worker, so it runs last.
         drain_stats: dict[str, float] = {}
-        if args.compose_cmd:
+        if not args.allow_missing_drain_control:
             print("==> control C5: stopping the worker to prove the backlog metric is live")
 
             def make_work() -> int:
@@ -826,14 +919,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     created += 1 if probe.ok else 0
                 return created
 
+            def stop_worker() -> None:
+                _compose(stack.metrics_token, "stop", "worker")
+
+            def start_worker() -> None:
+                _compose(stack.metrics_token, "start", "worker")
+
             control, drain_stats = control_drain_deadman(
                 sampler,
-                stop_worker=lambda: _compose(
-                    args.compose_cmd, stack.metrics_token, "stop", "worker"
-                ),
-                start_worker=lambda: _compose(
-                    args.compose_cmd, stack.metrics_token, "start", "worker"
-                ),
+                stop_worker=stop_worker,
+                start_worker=start_worker,
                 make_work=make_work,
             )
             controls.append(control)
@@ -843,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     "C5",
                     "the backlog metric is LIVE (a dead drain is visible, and recovers)",
                     "due climbs while the worker is stopped, then returns to 0",
-                    "no --compose-cmd was given, so the worker could not be stopped",
+                    "--allow-missing-drain-control was passed, so the worker was never stopped",
                 )
             )
 

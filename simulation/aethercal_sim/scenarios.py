@@ -38,6 +38,7 @@ import json
 import random
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -76,8 +77,30 @@ _BARRIER_TIMEOUT_SECONDS = 60.0
 def fetch_slots(
     client: Client, *, event_type_id: str, day: date, timezone: str, days: int = 1
 ) -> Response:
+    """The day's offer. ==The query is BUILT, not spliced together.==
+
+    Every IANA zone this harness uses carries a ``/`` — ``America/New_York``, ``America/Chicago`` —
+    and the fixed-offset ones carry a ``+`` (``Etc/GMT+5``). Interpolated by hand, the first
+    happens to survive because ``/`` is a legal query character, and the second does NOT: ``+``
+    decodes to a SPACE, so the server is asked for a zone that does not exist. The failure lands on
+    the hottest read in the run, and its shape is the one this directory keeps finding — a slots
+    query that answers "nothing on offer" reads, to a hasty caller, exactly like a fully-booked
+    day. (:class:`OfferRead` is what stops it being read that way, but the query should not have
+    been broken in the first place.)
+
+    ==The zones this run happens to use are not the check.== A harness whose correctness depends on
+    nobody adding a business in ``Etc/GMT+5`` is a harness with a trap in it, and the fix costs one
+    call: ``urlencode`` escapes every parameter, including ones nobody has needed yet.
+    """
     end = day + timedelta(days=days - 1)
-    query = f"event_type={event_type_id}&from={day.isoformat()}&to={end.isoformat()}&tz={timezone}"
+    query = urllib.parse.urlencode(
+        {
+            "event_type": event_type_id,
+            "from": day.isoformat(),
+            "to": end.isoformat(),
+            "tz": timezone,
+        }
+    )
     return client.get(f"/api/v1/slots/?{query}")
 
 
@@ -574,6 +597,14 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
     The ``(started, finished)`` pair per call is what lets a later control assert the burst really
     overlapped. Without it the barrier is a mechanism nobody observes, and every claim in §4 about
     simultaneity rests on the code being read rather than on the run being measured.
+
+    ==Both ways a contender can die are classified, and the barrier was the one that was not.== The
+    call raising was given a taxonomy entry precisely because an exception escaping ``pool.map``
+    ends the run with no result at all — and then the very next line up, ``barrier.wait``, was left
+    outside the protection. It is the line MOST able to raise: a `BrokenBarrierError` is what a
+    sibling thread dying, or the 60-second timeout, produces, and it arrives in *every* waiting
+    thread at once. So the one failure that takes the whole burst down was the one that could still
+    delete the report instead of appearing in it.
     """
     barrier = threading.Barrier(len(calls))
     responses: list[Response] = []
@@ -583,8 +614,17 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
     latency = Latency(name)
 
     def run(call: Callable[[], Response]) -> None:
-        # Every thread blocks here until the last one arrives; then all are released together.
-        barrier.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
+        try:
+            # Every thread blocks here until the last one arrives; then all are released together.
+            barrier.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
+        except Exception as exc:
+            with lock:
+                crashed.append(f"a contender never got past the barrier: {type(exc).__name__}")
+            return
+        # ==The clock starts AFTER the barrier, and that is load-bearing.== Folding the wait into
+        # the interval would make every contender overlap every other by construction, and C15 —
+        # the control that exists to prove the burst was not a queue — would be measuring the
+        # barrier instead of the requests.
         started = time.perf_counter()
         response: Response | None = None
         try:
@@ -595,7 +635,7 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
             # race that produces an exception has produced a FINDING; it belongs in the taxonomy,
             # failing the control, not in a traceback that deletes the other 39 results with it.
             with lock:
-                crashed.append(f"{type(exc).__name__}: {exc}")
+                crashed.append(f"the call raised {type(exc).__name__}: {exc}")
         finally:
             # ==The interval is recorded on BOTH paths.== C15 measures simultaneity from these, so
             # dropping a crashed contender's interval would under-report the peak overlap and make
@@ -623,8 +663,10 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
         # transport error under load is a finding, not a tidy row in a table of expected codes.
         if response.status not in (400, 409, 422):
             unexpected.append(f"{response.status} {response.text[:120]}")
-    # A contender that raised never produced a response, so it can only be counted here.
-    unexpected.extend(f"the call raised {failure}" for failure in crashed)
+    # A contender that died — at the barrier or in the call — never produced a response, so it can
+    # only be counted here. The messages say WHICH of the two it was, because a burst that never
+    # started and a burst whose requests failed are different findings.
+    unexpected.extend(crashed)
     return RaceOutcome(
         name=name,
         contenders=len(calls),

@@ -32,14 +32,20 @@ ENV_FILE="${REPO_ROOT}/deploy/.env"
 STACK_FILE="${SIM_DIR}/.stack.json"
 ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
 
+# ==The one place `deploy/.env` is put back== — sourced here for the failure trap installed below,
+# and by run.sh and stack-down.sh for theirs. See scripts/restore-env.sh.
+# shellcheck source=restore-env.sh
+source "${SIM_DIR}/scripts/restore-env.sh"
+
 API_URL="http://localhost:8000"
 WORKER_URL="http://127.0.0.1:${SIM_WORKER_HOST_PORT:-8001}"
 BOOKING_URL="http://localhost:5001"
 MAILPIT_URL="http://localhost:8025"
 SINK_URL="http://localhost:9099"
-# What the SERVER dials: the sink's name on the compose network. See e2e/compose.e2e.yml for why
-# that address must be globally routable — the delivery worker's SSRF guard rejects private ones.
-SINK_WEBHOOK_URL="http://hooks:9099/hook"
+# What the SERVER dials is NOT declared here any more: `aethercal_sim.world.SINK_WEBHOOK_URL`
+# derives it, because it is the one endpoint no amount of loopback checking on the client side can
+# constrain. See that constant for the reasoning, and e2e/compose.e2e.yml for why the address must
+# stay globally routable — the delivery worker's SSRF guard rejects private ones.
 
 # ==The one place the operator token is decided.== compose.sim.yml REQUIRES this variable and
 # declares no default of its own, so the worker and the harness cannot end up holding different
@@ -131,10 +137,63 @@ if [[ -f "${ENV_FILE}" ]]; then
 else
   echo "absent" >"${ENV_BACKUP}.state"
 fi
+
+# ==A boot that dies from HERE on gives the file back; one that SUCCEEDS must not.==
+#
+# `run.sh` restores `deploy/.env` from its own trap, so a failure inside a `run.sh` invocation was
+# always covered. But this script is one of the five documented entry points and the README tells a
+# reader to run it — and run DIRECTLY, every failure below (a migration that exits non-zero, an API
+# that never comes up, an admin CLI that returns no key) left the developer's shared repo
+# configuration replaced by test-only values, with the only copy sitting in a backup whose name
+# nobody has any reason to know. `set -e` made that the NORMAL outcome of anything going wrong.
+#
+# ==Installed here, and not one line earlier, on purpose.== Above this point sits the hard stop for
+# a leftover `${ENV_BACKUP}.state` — the guard that protects a `--keep` run's backup. A trap armed
+# before that check would fire on the refusal itself and restore the OTHER run's backup over the
+# `deploy/.env` its stack is still reading, destroying the very file the guard exists to save.
+#
+# It is disarmed at the end: a stack that came up healthy must go on reading these values until
+# `run.sh` or `stack-down.sh` tears it down.
+stack_up_failed() {
+  local status=$?
+  if ((status == 0)); then
+    return 0
+  fi
+  echo "" >&2
+  echo "ERROR: stack-up.sh failed (exit ${status}). Restoring ${ENV_FILE}." >&2
+  aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}" || true
+  echo "       Containers may still be up; tear them down with:" >&2
+  echo "         ${SIM_DIR}/scripts/stack-down.sh" >&2
+  exit "${status}"
+}
+trap stack_up_failed EXIT
+
 cp "${E2E_DIR}/scripts/deploy.env.template" "${ENV_FILE}"
 
 echo "==> resetting any previous SIMULATION stack (project: aethercal-sim)"
-compose down -v --remove-orphans >/dev/null 2>&1 || true
+# ==No `|| true`, and no `/dev/null`.== This is the command that guarantees the run starts from an
+# empty database — "the slot was released" is otherwise a claim about history nobody can see. It was
+# written to swallow every failure it could produce: a container that would not stop, a volume still
+# in use, a daemon that had gone away. ==Any of those and the simulation proceeds to measure two
+# weeks of traffic against the PREVIOUS run's data==, which invalidates every number it then
+# reports — silently, and in the flattering direction, since a database that already holds bookings
+# offers fewer slots and produces more of the collisions §1 counts as ordinary traffic.
+#
+# Nothing is being tolerated in its place, because there is nothing to tolerate: `docker compose
+# down` on a project that does not exist is a SUCCESS. The absent-stack case was never the reason
+# for the `|| true`; it only ever hid the cases that matter.
+down_log="$(mktemp)"
+down_status=0
+compose down -v --remove-orphans >"${down_log}" 2>&1 || down_status=$?
+if ((down_status != 0)); then
+  echo "ERROR: could not reset the previous SIMULATION stack (exit ${down_status})." >&2
+  echo "       Refusing to boot on top of it: the run would measure two weeks of traffic against" >&2
+  echo "       whatever database survived, and report the result as a clean instance." >&2
+  cat "${down_log}" >&2
+  rm -f "${down_log}"
+  exit 1
+fi
+rm -f "${down_log}"
 
 echo "==> starting postgres + migrate + app + worker + mailpit + webhook sink"
 compose up -d --build postgres migrate app worker mailpit hooks
@@ -182,7 +241,7 @@ if ((metrics_ok == 0)); then
 fi
 
 echo "==> creating ${#BUSINESSES[@]} businesses and issuing an API key for each"
-business_json=""
+business_count=0
 first_key=""
 first_slug="${BUSINESSES[0]%%:*}"
 for entry in "${BUSINESSES[@]}"; do
@@ -205,9 +264,17 @@ for entry in "${BUSINESSES[@]}"; do
   fi
   [[ -z "${first_key}" ]] && first_key="${api_key}"
 
-  [[ -n "${business_json}" ]] && business_json+=","
-  business_json+="$(printf '\n    {"slug": "%s", "name": "%s", "timezone": "%s", "tenantId": "%s", "hostUserId": "%s", "apiKey": "%s"}' \
-    "${slug}" "${name}" "${timezone}" "${tenant_id}" "${host_user_id}" "${api_key}")"
+  # ==Each field goes into the ENVIRONMENT, never onto a command line.== The JSON is assembled by
+  # `python3` below, and the obvious way to hand it these values would be `python3 -c ... "${slug}"
+  # "${api_key}"` — which publishes a live API key in `ps` output to every user on the host for as
+  # long as the process runs. The environment of a process is readable only by its owner and root.
+  export "SIM_BUSINESS_${business_count}_SLUG=${slug}"
+  export "SIM_BUSINESS_${business_count}_NAME=${name}"
+  export "SIM_BUSINESS_${business_count}_TIMEZONE=${timezone}"
+  export "SIM_BUSINESS_${business_count}_TENANT_ID=${tenant_id}"
+  export "SIM_BUSINESS_${business_count}_HOST_USER_ID=${host_user_id}"
+  export "SIM_BUSINESS_${business_count}_API_KEY=${api_key}"
+  business_count=$((business_count + 1))
 done
 
 # ==Plant this run's nonce INSIDE the database, as a schedule the harness reads back.==
@@ -252,20 +319,61 @@ done
 compose up -d booking
 wait_for_http "the booking page" "${BOOKING_URL}/healthz" 120
 
-cat >"${STACK_FILE}" <<JSON
-{
-  "apiUrl": "${API_URL}",
-  "workerUrl": "${WORKER_URL}",
-  "bookingUrl": "${BOOKING_URL}",
-  "mailpitUrl": "${MAILPIT_URL}",
-  "sinkUrl": "${SINK_URL}",
-  "sinkWebhookUrl": "${SINK_WEBHOOK_URL}",
-  "metricsToken": "${METRICS_TOKEN}",
-  "composeProject": "aethercal-sim",
-  "nonce": "${RUN_NONCE}",
-  "businesses": [${business_json}
-  ]
+# ==The stack file is GENERATED, not concatenated.== It used to be a heredoc with the values
+# interpolated straight in, which makes the file's validity a property of what the API key happens
+# to contain: one `"` and the JSON is malformed, one `\` and it parses into a different string than
+# was issued. `aethercal-admin issue-api-key` decides that alphabet, not this script, and a token
+# format that grew a `+/` today would be an isolation failure tomorrow — `load_stack` would raise
+# `JSONDecodeError` at best, and at worst hand the harness a silently corrupted key or nonce, which
+# is the half of the identity proof `assert_disposable_stack` cannot get a second opinion on.
+#
+# `json.dump` owns the escaping. Every value arrives through the environment (see the loop above),
+# so nothing sensitive is visible in `ps`, and the only argument is the destination path.
+#
+# ==`sinkWebhookUrl` is deliberately NOT written.== `world.SINK_WEBHOOK_URL` derives it precisely so
+# that the one address the SERVER dials cannot come out of a file; leaving a stale copy here is an
+# invitation to wire the harness back up to it.
+SIM_BUSINESS_COUNT="${business_count}" \
+  SIM_API_URL="${API_URL}" \
+  SIM_WORKER_URL="${WORKER_URL}" \
+  SIM_BOOKING_URL="${BOOKING_URL}" \
+  SIM_MAILPIT_URL="${MAILPIT_URL}" \
+  SIM_SINK_URL="${SINK_URL}" \
+  SIM_METRICS_TOKEN="${METRICS_TOKEN}" \
+  SIM_NONCE="${RUN_NONCE}" \
+  python3 - "${STACK_FILE}" <<'PY'
+import json
+import os
+import sys
+
+document = {
+    "apiUrl": os.environ["SIM_API_URL"],
+    "workerUrl": os.environ["SIM_WORKER_URL"],
+    "bookingUrl": os.environ["SIM_BOOKING_URL"],
+    "mailpitUrl": os.environ["SIM_MAILPIT_URL"],
+    "sinkUrl": os.environ["SIM_SINK_URL"],
+    "metricsToken": os.environ["SIM_METRICS_TOKEN"],
+    "composeProject": "aethercal-sim",
+    "nonce": os.environ["SIM_NONCE"],
+    "businesses": [
+        {
+            "slug": os.environ[f"SIM_BUSINESS_{index}_SLUG"],
+            "name": os.environ[f"SIM_BUSINESS_{index}_NAME"],
+            "timezone": os.environ[f"SIM_BUSINESS_{index}_TIMEZONE"],
+            "tenantId": os.environ[f"SIM_BUSINESS_{index}_TENANT_ID"],
+            "hostUserId": os.environ[f"SIM_BUSINESS_{index}_HOST_USER_ID"],
+            "apiKey": os.environ[f"SIM_BUSINESS_{index}_API_KEY"],
+        }
+        for index in range(int(os.environ["SIM_BUSINESS_COUNT"]))
+    ],
 }
-JSON
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(document, handle, indent=2)
+    handle.write("\n")
+PY
+
+# The boot finished, so the stack must go on reading the test-only deploy/.env until run.sh or
+# stack-down.sh tears it down. Disarm the restore trap; see where it is installed for why.
+trap - EXIT
 
 echo "==> stack is up; wrote ${STACK_FILE}"

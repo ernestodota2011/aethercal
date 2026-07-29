@@ -175,6 +175,25 @@ Every guest address is `@guests.sim.test`, and every business is created fresh p
 The intended host is a disposable container that is destroyed afterwards — but the checks above hold
 wherever it is pointed.
 
+> [!danger] ==And then C5 stopped a container the four checks above had never looked at.==
+> All four establish facts about a **database**. `--compose-cmd` took an arbitrary invocation and
+> handed it straight to `stop worker` / `start worker` — so the stack this harness *proves* it is
+> talking to and the stack that command could reach into were **two different objects**, and the
+> second one had no validation at all. It was the only unvalidated input in the harness, in the one
+> code path that manipulates containers.
+>
+> The flag is gone. `__main__.COMPOSE_FILES` derives the same three overlays `run.sh` builds, and a
+> fifth check now runs beside the other four, **before the first write**: `docker compose … config`
+> must report the project `aethercal-sim`. It is **fail-closed** — no docker, a missing overlay, a
+> compose that will not parse, and the run refuses, because *"could not check"* and *"checked and it
+> matched"* must never be the same outcome. This also closes the hazard both shell scripts carry a
+> warning about (*"any future edit that drops that `-f` turns a safe script into a destructive
+> one"*): a list that lives in code cannot be shortened by an invocation, and an edit to
+> `compose.sim.yml`'s `name:` is exactly what the fifth check catches.
+>
+> `--allow-missing-drain-control` stays as the loud escape: C5 is then `NOT RUN` and the verdict is
+> `INCOMPLETE`.
+
 ### `deploy/.env` is borrowed, not taken
 
 The shipping stack reads `deploy/.env` (`env_file:` on each service), so `stack-up.sh` has to write
@@ -213,6 +232,30 @@ configuration replaced by test-only values.
 > because until `run.sh` learned to propagate its exit code the failure printed and returned **0**.
 > ==The fix that made a failed teardown visible caught this on its first live run== — which is the
 > argument for that fix, made by the thing it found.
+
+> [!warning] ==The `deploy/.env` guarantee only ever covered `run.sh`'s failures, not `stack-up.sh`'s.==
+> `run.sh` restores the file from its own trap, so a failure *inside a `run.sh` invocation* was
+> always handled. But `stack-up.sh` is one of the five documented entry points and this file tells
+> you to run it — and run **directly**, every failure below the backup (a migration that exits
+> non-zero, an API that never comes up, an admin CLI that returns no key) left shared repo
+> configuration replaced by test-only values, with the only copy in a backup whose name nobody has
+> any reason to know. `set -e` made that the *normal* outcome of anything going wrong.
+>
+> `stack-up.sh` now installs its own failure trap — **armed after the leftover-backup hard stop**
+> (arming it one line earlier would fire on that very refusal and restore a `--keep` run's backup
+> over the `deploy/.env` its stack is still reading) and **disarmed once the boot succeeds**,
+> because a healthy stack must go on reading those values until something tears it down.
+
+> [!danger] ==And the `down -v` that guarantees an empty database was written to swallow failure.==
+> `compose down -v --remove-orphans || true`: a container that would not stop, a volume still in
+> use, a daemon that had gone away — and the simulation proceeded to measure two weeks of traffic
+> **against the previous run's database**, which invalidates every number it then reports. Silently,
+> and in the flattering direction: a database that already holds bookings offers fewer slots and
+> produces more of the collisions §1 counts as ordinary traffic.
+>
+> The `|| true` is gone and nothing replaced it, because there was nothing to tolerate: `docker
+> compose down` on a project that does not exist is a **success**. The absent-stack case was never
+> the reason for it; it only ever hid the cases that matter.
 
 > [!warning] ==The documented command could not be executed from a fresh clone.==
 > Every `.sh` in the repository was committed `100644`. The quickstart at the top of this file says
