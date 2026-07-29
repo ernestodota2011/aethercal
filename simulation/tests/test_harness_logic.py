@@ -44,9 +44,14 @@ from aethercal_sim.measure import (
 )
 from aethercal_sim.report import REQUIRED_CONTROL_IDS, missing_controls, verdict_for
 from aethercal_sim.scenarios import (
+    CAP_CREATED,
+    CAP_DAY_FULL,
+    CAP_NO_SLOTS,
+    CAP_READ_FAILED,
     ActiveBooking,
     BookedRef,
     CancelWebhookObservation,
+    CapProbeOutcome,
     ConfirmationCoverage,
     Control,
     DeadmanObservation,
@@ -760,14 +765,36 @@ def test_cap_probe_lets_a_real_offer_through() -> None:
     assert cap_probe_blocker(OfferRead(["2026-08-03T09:00:00Z"], True)) is None
 
 
+def _cap(kind: str, detail: str = "") -> CapProbeOutcome:
+    return CapProbeOutcome(kind, detail)
+
+
 def test_c4_passes_when_the_third_probe_is_stopped() -> None:
-    assert judge_day_cap(["201/ok", "201/ok", "no_slots_offered"]).passed
-    assert judge_day_cap(["201/ok", "201/ok", "409/day_full"]).passed
+    assert judge_day_cap([_cap(CAP_CREATED), _cap(CAP_CREATED), _cap(CAP_NO_SLOTS)]).passed
+    assert judge_day_cap([_cap(CAP_CREATED), _cap(CAP_CREATED), _cap(CAP_DAY_FULL)]).passed
 
 
 def test_c4_fails_when_the_third_probe_SUCCEEDS() -> None:
     """The cap did not bite: three bookings landed on a day capped at two."""
-    assert not judge_day_cap(["201/ok", "201/ok", "201/ok"]).passed
+    assert not judge_day_cap([_cap(CAP_CREATED)] * 3).passed
+
+
+def test_c4_is_not_fooled_by_day_full_appearing_inside_an_error_body() -> None:
+    """==Found by sweeping scenarios.py, not reported by the gate.==
+
+    The third probe used to be judged with `"day_full" in outcomes[2]`, and the broken-read outcome
+    embeds the response BODY. A failed slots query whose body merely mentioned `day_full` therefore
+    satisfied the cap's pass condition -- on the one control whose hoped-for answer is already an
+    absence. The kind is now compared, and the prose is never matched against.
+    """
+    poisoned = _cap(
+        CAP_READ_FAILED,
+        'the slots query FAILED: 500 None \'{"detail": "internal error near day_full"}\'',
+    )
+    control = judge_day_cap([_cap(CAP_CREATED), _cap(CAP_CREATED), poisoned])
+    assert control.ran is True
+    assert control.passed is False
+    assert "day_full" in control.observed, "the prose is still REPORTED, just not matched"
 
 
 def test_c4_fails_when_a_probe_read_a_BROKEN_offer() -> None:
@@ -779,7 +806,11 @@ def test_c4_fails_when_a_probe_read_a_BROKEN_offer() -> None:
     third outcome.
     """
     control = judge_day_cap(
-        ["201/ok", "201/ok", "slots_query_failed(200 but the body is not the slots contract)"]
+        [
+            _cap(CAP_CREATED),
+            _cap(CAP_CREATED),
+            _cap(CAP_READ_FAILED, "200 but the body is not the slots contract"),
+        ]
     )
     assert control.ran is True
     assert control.passed is False
@@ -1087,7 +1118,15 @@ def test_mailbox_read_survives_a_failed_request_as_a_fact() -> None:
     assert read.messages == []
 
 
-def test_mailbox_counts_unreadable_envelopes_instead_of_dropping_them() -> None:
+def test_a_read_that_LOST_envelopes_is_not_a_complete_read() -> None:
+    """==The total is reached and the read is still SHORT.== Third time in this shape.
+
+    `complete` used to mean only "the paging arrived at Mailpit's count", so a read that reached
+    3 of 3 while failing to parse two of those envelopes declared itself whole. An envelope with no
+    recipient or an unreadable `Created` stamp is a message that EXISTS and did not make it into
+    the list: the reconciliation that follows is over a smaller set than it believes, and the
+    shortfall presents as a booking that simply has no confirmation.
+    """
     fake = _FakeMailpit(
         [
             _envelope("good@guests.sim.test"),
@@ -1096,9 +1135,32 @@ def test_mailbox_counts_unreadable_envelopes_instead_of_dropping_them() -> None:
         ]
     )
     read = _mailbox(fake).read_all()
-    assert read.complete is True
+    assert read.reported_total == 3, "the total WAS reached -- that is the point"
     assert len(read.messages) == 1
     assert read.unparseable == 2
+    assert read.complete is False
+    assert "SHORTER than the mailbox it reports" in read.problem
+
+
+def test_a_lossy_mailbox_read_turns_C14_red() -> None:
+    """The sabotage the finding names: the count adds up and the run must still go red."""
+    fake = _FakeMailpit(
+        [_envelope("g@guests.sim.test"), {"To": [], "Created": "2026-07-29T02:00:00Z"}]
+    )
+    read = _mailbox(fake).read_all()
+    assert read.reported_total == 2
+    coverage = _coverage(read_complete=read.complete, read_problem=read.problem)
+    control = judge_confirmation_coverage(coverage)
+    assert control.passed is False
+    assert "INCOMPLETE" in control.observed
+
+
+def test_a_clean_mailbox_read_is_still_complete() -> None:
+    """The anti-vacuity half: nothing lost, nothing to report."""
+    read = _mailbox(_FakeMailpit([_envelope("g@guests.sim.test")])).read_all()
+    assert read.complete is True
+    assert read.unparseable == 0
+    assert read.problem == ""
 
 
 # --------------------------------------------------------------------------------------
@@ -2181,3 +2243,45 @@ def test_c5_reads_delivered_as_a_maximum_not_as_an_instant() -> None:
     assert judge_drain_deadman(observation).passed is True
     # The value that would have been read at the instant `due` hit zero.
     assert judge_drain_deadman(_deadman(delivered_after_restart=0)).passed is False
+
+
+def test_stop_records_a_sampler_that_would_not_stop() -> None:
+    """==A stop() that cannot guarantee the stop must not carry on in silence.==
+
+    It used to `join(timeout=10.0)` and return regardless. A thread outliving that kept appending
+    to `_samples` and `_failures` while `main()` built C12 and rendered §3 -- the report assembled
+    over a state still being written. The failure now reaches C12, which gates on it.
+    """
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+
+    class _Stuck:
+        def join(self, timeout: float | None = None) -> None:
+            return
+
+        def is_alive(self) -> bool:
+            return True
+
+    sampler._thread = _Stuck()  # type: ignore[assignment]
+    sampler.stop()
+    assert len(sampler.failures) == 1
+    assert "STILL RUNNING" in sampler.failures[0]
+    control = control_outbox_drained(
+        drained=True, waited_seconds=0.0, scrape_failures=len(sampler.failures)
+    )
+    assert control.passed is False
+
+
+def test_stop_is_silent_when_the_thread_really_finished() -> None:
+    """The anti-vacuity half: a clean stop records nothing."""
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+
+    class _Finished:
+        def join(self, timeout: float | None = None) -> None:
+            return
+
+        def is_alive(self) -> bool:
+            return False
+
+    sampler._thread = _Finished()  # type: ignore[assignment]
+    sampler.stop()
+    assert sampler.failures == []

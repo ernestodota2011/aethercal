@@ -442,9 +442,30 @@ class OutboxSampler:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop sampling and ==prove the thread is finished before anyone reads the results.==
+
+        This used to ``join(timeout=10.0)`` and return regardless. If the thread outlived the
+        timeout it kept appending to ``_samples`` and ``_failures`` while ``main()`` built C12 and
+        rendered §3 — a report constructed over a state that was still changing, with the peak
+        backlog and the scrape-failure count read mid-write. ==A ``stop()`` that cannot guarantee
+        the stop and carries on in silence is the same no-op this branch has been closing all
+        along==, and it is the sibling of C5 reading a durable counter at one instant.
+
+        The join now gets the time an in-flight scrape actually needs (the client's own socket
+        timeout plus an interval), and a thread still alive after that is recorded as a failure —
+        which C12 gates on, so it reaches the verdict instead of being swallowed.
+        """
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10.0)
+        if self._thread is None:
+            return
+        self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+        if self._thread.is_alive():
+            with self._lock:
+                self._failures.append(
+                    "the sampler thread was STILL RUNNING "
+                    f"{_STOP_JOIN_TIMEOUT_SECONDS:.0f}s after stop() was asked for, so every "
+                    "backlog number below was read while it was still being written"
+                )
 
     @property
     def samples(self) -> list[OutboxSample]:
@@ -528,6 +549,10 @@ class MailMessage:
 #: How many messages ONE Mailpit request asks for. ==A page size, never a ceiling.== The difference
 #: is the whole of :class:`MailboxRead` — see its docstring.
 MAILBOX_PAGE_SIZE = 500
+
+#: How long ``stop()`` waits for the sampler thread. One in-flight scrape can hold the socket for
+#: the client's full timeout, so the wait has to exceed it or a healthy stop looks like a stuck one.
+_STOP_JOIN_TIMEOUT_SECONDS = 20.0
 
 #: A read needing more pages than this is not a big mailbox, it is a loop that will not terminate.
 _MAX_MAILBOX_PAGES = 400
@@ -752,6 +777,35 @@ class Mailbox:
             )
         return hydrated, ""
 
+    def _whole(
+        self, collected: list[MailMessage], total: int, page: int, unparseable: int
+    ) -> MailboxRead:
+        """The read reached the reported total — ==but "reached the total" is not "read it all".==
+
+        ``complete`` used to mean only that the paging arrived at Mailpit's count, so a read that
+        had reached 279 of 279 while silently failing to parse three of those envelopes still
+        declared itself whole. An envelope with no recipient or an unreadable ``Created`` stamp is a
+        message that exists and did not make it into the list: the list is short, the reconciliation
+        that follows is over a smaller set than it believes, and ==the shortfall presents as a
+        booking that simply has no confirmation.==
+
+        This is the third time on this branch that a reader has counted its own losses and then
+        declared success anyway, so the decision lives in ONE place: a read is whole when it paged
+        to the total AND lost nothing on the way.
+        """
+        if unparseable:
+            return MailboxRead(
+                collected,
+                False,
+                total,
+                page,
+                self.page_size,
+                unparseable,
+                f"{unparseable} envelope(s) of {total} could not be parsed (no recipient, or an "
+                "unreadable Created stamp), so this list is SHORTER than the mailbox it reports",
+            )
+        return MailboxRead(collected, True, total, page, self.page_size, unparseable)
+
     def read_all(self) -> MailboxRead:  # noqa: PLR0911 - each return names a DISTINCT broken read
         """Page through the WHOLE mailbox, or report why the read is not whole.
 
@@ -819,7 +873,7 @@ class Mailbox:
                 # An empty page BEFORE the reported total means the server and its own envelope
                 # disagree; trusting it truncates the mailbox, which is the whole defect.
                 if start >= total:
-                    return MailboxRead(collected, True, total, page, self.page_size, unparseable)
+                    return self._whole(collected, total, page, unparseable)
                 return self._incomplete(
                     collected=collected,
                     total=total,
@@ -828,7 +882,7 @@ class Mailbox:
                     why=f"an empty page at start {start} of a reported total of {total}",
                 )
             if start >= total:
-                return MailboxRead(collected, True, total, page, self.page_size, unparseable)
+                return self._whole(collected, total, page, unparseable)
         return self._incomplete(
             collected=collected,
             total=total,

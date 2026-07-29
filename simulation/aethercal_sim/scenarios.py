@@ -994,6 +994,36 @@ def control_closed_day(stack: StackConfig, business: Business, *, saturday: date
     )
 
 
+@dataclass(frozen=True, slots=True)
+class CapProbeOutcome:
+    """What ONE cap probe did — ==a kind, plus prose that is never matched against.==
+
+    C4 used to record each probe as a free-form string and judge the third with
+    ``"day_full" in outcomes[2]``. The broken-read outcome embeds the response body
+    (``slots_query_failed(the slots query FAILED: 500 ... 'body')``), so a failed query whose body
+    merely MENTIONED ``day_full`` satisfied the cap's pass condition. ==A substring test over a
+    string that carries someone else's text is not a test of anything==, and this is the control
+    whose hoped-for answer is already an absence, which makes it the worst place for one.
+
+    ``kind`` is the identity the verdict reads; ``detail`` is for the report and nothing else.
+    """
+
+    kind: str
+    detail: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.kind}({self.detail})" if self.detail else self.kind
+
+
+#: The probe kinds. ``created`` and ``day_full`` are the product answering; the other two are the
+#: day having nothing left, and the read having broken.
+CAP_CREATED = "created"
+CAP_DAY_FULL = "day_full"
+CAP_NO_SLOTS = "no_slots_offered"
+CAP_REFUSED = "refused"
+CAP_READ_FAILED = "slots_query_failed"
+
+
 def cap_probe_blocker(offer: OfferRead) -> str | None:
     """Why a cap probe cannot book — or ``None`` when it can. ==Pure, so the rule is testable.==
 
@@ -1030,7 +1060,7 @@ def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Con
     """
     client = Client(stack.api_url, business.config.api_key)
     event_type = business.event_types["capped"]
-    outcomes: list[str] = []
+    outcomes: list[CapProbeOutcome] = []
     for index in range(3):
         offer = read_offer(
             fetch_slots(
@@ -1039,7 +1069,11 @@ def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Con
         )
         blocker = cap_probe_blocker(offer)
         if blocker is not None:
-            outcomes.append(blocker)
+            outcomes.append(
+                CapProbeOutcome(CAP_NO_SLOTS)
+                if blocker == "no_slots_offered"
+                else CapProbeOutcome(CAP_READ_FAILED, offer.problem)
+            )
             continue
         starts = offer.starts
         response = book(
@@ -1051,11 +1085,19 @@ def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Con
             guest_timezone="UTC",
             locale="en",
         )
-        outcomes.append(f"{response.status}/{response.error_code or 'ok'}")
+        # ==The kind comes from the machine code, not from a formatted line.==
+        if response.ok:
+            outcomes.append(CapProbeOutcome(CAP_CREATED, str(response.status)))
+        elif response.error_code == CAP_DAY_FULL:
+            outcomes.append(CapProbeOutcome(CAP_DAY_FULL, str(response.status)))
+        else:
+            outcomes.append(
+                CapProbeOutcome(CAP_REFUSED, f"{response.status}/{response.error_code}")
+            )
     return judge_day_cap(outcomes)
 
 
-def judge_day_cap(outcomes: list[str]) -> Control:
+def judge_day_cap(outcomes: list[CapProbeOutcome]) -> Control:
     """Turn C4's three probes into a verdict. ==Pure, so the broken-read case is testable.==
 
     The first two must be created; the third must be stopped — either by the cap at create time or
@@ -1069,15 +1111,15 @@ def judge_day_cap(outcomes: list[str]) -> Control:
     """
     passed = (
         len(outcomes) == 3
-        and outcomes[0].startswith("201")
-        and outcomes[1].startswith("201")
-        and (outcomes[2] == "no_slots_offered" or "day_full" in outcomes[2])
+        and outcomes[0].kind == CAP_CREATED
+        and outcomes[1].kind == CAP_CREATED
+        and outcomes[2].kind in (CAP_NO_SLOTS, CAP_DAY_FULL)
     )
     return Control(
         ident="C4",
         guards="the daily cap bites (max_per_day=2)",
         expected="two created, the third refused (day_full) or no longer offered",
-        observed=" → ".join(outcomes),
+        observed=" → ".join(str(outcome) for outcome in outcomes),
         passed=passed,
     )
 
