@@ -424,9 +424,10 @@ async def run_credentials_set(
 ) -> None:
     """Store (or replace) one business's credential for ``provider``, encrypted at rest.
 
-    ==This is the composition layer for the live-credential door.== ``services`` cannot import
-    ``integrations`` (that edge is a cycle), so it cannot see which gateway code a verification was
-    about; the CLI can see both, and hands the door the fingerprints of what would actually run
+    ==This is the composition layer for the live-credential door.==
+    ``services.tenant_credentials`` cannot import ``integrations.money`` — that module imports IT,
+    so the edge is a cycle — and therefore cannot see which gateway code a verification was about.
+    The CLI can see both, and hands the door the fingerprints of what would actually run
     today (:func:`~aethercal.server.integrations.money.current_gateway_implementations`). A stale
     verification therefore stops authorising a live key HERE — in the operator's own command —
     rather than only in the test suite, which is where that comparison used to live.

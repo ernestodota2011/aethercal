@@ -312,9 +312,9 @@ class GatewayOperation(StrEnum):
     extend it to cover the expensive question.
 
     ==This enum is the domain's, not the gateway module's, and that is deliberate.== The
-    verification registry is read on the credential WRITE path, and ``services`` cannot import
-    ``integrations`` — ``integrations.money`` imports THIS module, so the reverse edge would be a
-    cycle. What the door needs from ``integrations`` therefore arrives as an ARGUMENT
+    verification registry is read on the credential WRITE path, and this module cannot import
+    ``integrations.money`` — that module imports THIS one, so the reverse edge would be a cycle.
+    What the door needs from ``integrations`` therefore arrives as an ARGUMENT
     (``current_implementations``, see :func:`verified_operations`) rather than as an import: the
     dependency is inverted, not dropped.
 
@@ -414,8 +414,8 @@ class LiveVerification:
     .. rubric:: ==It used to be checked only by a test, and that was the whole defect==
 
     The re-computation lived in ``tests/test_credential_mode_guard.py`` and nowhere else, because
-    ``services`` may not import ``integrations``. So the register went stale in the one place it
-    mattered: the suite would turn red on the next run, while ``verified_operations()`` — the
+    this module may not import ``integrations.money``. So the register went stale in the one place
+    it mattered: the suite would turn red on the next run, while ``verified_operations()`` — the
     function the door actually consults — went on authorising a live credential against an
     implementation nobody had ever exercised. ==A guard enforced only by its own test is a guard the
     product does not have.== The import direction was a real constraint and it was never a reason to
@@ -544,8 +544,8 @@ def verified_operations(
 
     .. rubric:: ==Why ``current_implementations`` is a required argument with NO DEFAULT==
 
-    This module may not import ``integrations`` (``integrations.money`` imports it, so the reverse
-    edge is a cycle), and the fingerprint of a gateway method can only be computed there. The
+    This module may not import ``integrations.money`` (that module imports it, so the reverse edge
+    is a cycle), and the fingerprint of a gateway method can only be computed there. The
     constraint is real; ==leaving the comparison out of the decision because of it was not.== That
     is what happened: the staleness check lived in ``tests/test_credential_mode_guard.py`` alone, so
     the evidence expired in the suite and went on authorising live credentials in production.

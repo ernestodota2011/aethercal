@@ -753,10 +753,11 @@ class TestTheRuleIsDerived:
     def test_every_gateway_operation_has_an_enum_member(self) -> None:
         """==The anti-omission lock for a THIRD operation, read off the protocol itself.==
 
-        ``GatewayOperation`` lives in ``services`` and the gateways live in ``integrations``, which
-        ``services`` may not import — so nothing in production ties the two together and they could
-        drift silently. They are tied here instead: F5's partial refund, or a capture step, added to
-        ``PaymentGateway`` without a member here fails THIS test.
+        ``GatewayOperation`` lives in ``services`` and the gateways live in ``integrations.money``,
+        which imports this module and therefore cannot be imported back — so nothing in production
+        ties the enum to the protocol and they could drift silently. They are tied here instead:
+        F5's partial refund, or a capture step, added to ``PaymentGateway`` without a member here
+        fails THIS test.
 
         That matters because of which way the drift fails. A new operation with no member is an
         operation ``gateway_operations`` does not list, so it is never counted as unverified — it
