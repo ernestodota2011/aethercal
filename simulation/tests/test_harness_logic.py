@@ -10,7 +10,7 @@ passed.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
@@ -24,6 +24,7 @@ from aethercal_sim.scenarios import (
     judge_closed_day,
     judge_lineage,
     next_saturday,
+    pick_micro_slot,
 )
 from aethercal_sim.traffic import WEEKDAY_WEIGHTS, PlannedBooking, plan_two_weeks, summarise_plan
 from aethercal_sim.world import (
@@ -420,6 +421,35 @@ def test_lineage_fails_when_two_live_appointments_survive() -> None:
     """The defect the pair exists to catch, on a read that IS trustworthy."""
     read = DiaryRead(["a confirmed", "b confirmed"], complete=True)
     assert not judge_lineage(read, ident="C9", guards="g", at_most=True).passed
+
+
+def test_pick_micro_slot_takes_the_first_slot_that_ENDS_within_budget() -> None:
+    """The budget is about when the appointment is over, not when it starts."""
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    starts = [
+        "2026-07-29T12:01:00Z",  # ends 12:03 -> 180s away, fits
+        "2026-07-29T12:03:00Z",
+    ]
+    assert pick_micro_slot(starts, duration_seconds=120, budget_seconds=420, now=now) == starts[0]
+
+
+def test_pick_micro_slot_refuses_a_slot_that_ends_too_late() -> None:
+    """==The timezone trap, as a regression test.==
+
+    A business in `America/New_York` puts every UTC instant between 00:00 and 04:00 on the previous
+    LOCAL day, so a window opened at the harness's UTC `today` returned a first slot two hours out.
+    The lax version took it anyway, truncated its wait, and marked the no-show early. Refusing is
+    the correct answer; the caller widens the window instead.
+    """
+    now = datetime(2026, 7, 29, 1, 53, tzinfo=UTC)
+    two_hours_out = ["2026-07-29T04:00:00Z", "2026-07-29T04:02:00Z"]
+    assert pick_micro_slot(two_hours_out, duration_seconds=120, budget_seconds=420, now=now) is None
+
+
+def test_pick_micro_slot_ignores_slots_already_in_the_past() -> None:
+    now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    past = ["2026-07-29T11:00:00Z"]
+    assert pick_micro_slot(past, duration_seconds=120, budget_seconds=420, now=now) is None
 
 
 def test_c9_accepts_zero_survivors_but_c8_does_not() -> None:

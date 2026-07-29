@@ -386,9 +386,27 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
     _C11 = "the no-show transition itself, against a real end time"
     no_show_outcome = "not attempted"
     micro = target.event_types["micro"]
+    # ==The window opens YESTERDAY, and that is not padding — it is a timezone bug this control
+    # caught.== The slots window is a range of DATES resolved against the event type's schedule
+    # timezone, while `date.today()` here is the harness's UTC date. For a business in
+    # America/New_York every UTC instant between 00:00 and 04:00 belongs to the PREVIOUS local day,
+    # so "today (UTC) onwards" returned a first slot two hours out and the leg correctly reported
+    # that nothing ended within budget. One day back and three wide covers every offset on earth
+    # (±14 h), so "now" is always inside the window.
+    #
+    # ==The lax version hid this entirely:== it took `starts[0]`, truncated its wait with
+    # `min(...)`,
+    # marked the no-show two hours early, and would have filed the resulting `409 not_ended` — the
+    # guard correctly refusing — as the observed outcome of the POSITIVE test.
     micro_start = pick_micro_slot(
         slot_starts(
-            fetch_slots(client, event_type_id=micro.id, day=date.today(), timezone="UTC", days=2)
+            fetch_slots(
+                client,
+                event_type_id=micro.id,
+                day=date.today() - timedelta(days=1),
+                timezone="UTC",
+                days=3,
+            )
         ),
         duration_seconds=micro.duration_seconds,
         budget_seconds=NO_SHOW_WAIT_BUDGET_SECONDS,

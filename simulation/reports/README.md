@@ -14,15 +14,23 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `dc6cfd8a` | 2026-07-25 | MEASURED | 239 planned / 204 created, 35 organic collisions, 40-way races, **all twelve** controls held. Recorded a real observability limit: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
+| `b72197a2` | 2026-07-29 | MEASURED | 239 planned / 207 created, 32 organic collisions, 40-way races, **all twelve** controls held — on a target that had to *prove* it was the throwaway stack before anything was touched. Records a real observability limit: `/metrics/summary` is served by the worker, so a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==A previous run, `696a49f6`, was published here as `MEASURED` and has been withdrawn.==
-> Its numbers were plausible; its **certificate** was not. The verdict was not bound to the
-> assertions the report presented as proven: the double-booking race took no part in it (a run with
-> five winners on one slot would still have read green), a control whose prerequisite failed
-> vanished instead of failing, a failed drain invalidated nothing, and the latency clock stopped
-> before the response body was read.
+> [!warning] ==Two earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, twice over.
 >
-> Re-judged under the current rules that run returns **VOID**, missing `C10`, `C11` and `C12`. It
-> was replaced rather than annotated, because a withdrawn measurement left in the table is one
+> `696a49f6` — the verdict was not bound to the assertions the report presented as proven: the
+> double-booking race took no part in it (five winners on one slot would still have read green), a
+> control whose prerequisite failed vanished instead of failing, a failed drain invalidated nothing,
+> and the latency clock stopped before the response body was read. Re-judged under the current rules
+> it returns **VOID**, missing `C10`/`C11`/`C12`.
+>
+> `dc6cfd8a` — the verdict logic was sound, but two controls still passed **on a broken source**: C3
+> read "0 slots" without checking the query had succeeded (a closed Saturday and a dead API are
+> indistinguishable that way), and C9's "at most one live appointment" was trivially satisfied by an
+> unreadable diary. Its latency also predates the fix that measures reading the body. And it reached
+> a throwaway container because the operator aimed it there — not because the code refused anything
+> else.
+>
+> Both were replaced rather than annotated: a withdrawn measurement left in the table is one
 > somebody eventually quotes.

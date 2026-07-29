@@ -3,7 +3,7 @@
     "booking.cancelled": 1,
     "booking.created": 1
   },
-  "cancelled": 21,
+  "cancelled": 22,
   "controls": [
     {
       "id": "C10",
@@ -31,19 +31,19 @@
     },
     {
       "id": "C8",
-      "observed": "1 active: ['0ceb5461-bbad-4d14-aa14-4a243b46b66d confirmed']",
+      "observed": "1 active: ['d21e85b0-2cae-4783-bac4-195ce901fb70 confirmed']",
       "passed": true,
       "ran": true
     },
     {
       "id": "C9",
-      "observed": "1 active: ['d2b5fe84-b988-4c79-baf2-d45b197fe166 confirmed']",
+      "observed": "0 active: none",
       "passed": true,
       "ran": true
     },
     {
       "id": "C3",
-      "observed": "0 slots offered",
+      "observed": "0 slots offered (availability='ok')",
       "passed": true,
       "ran": true
     },
@@ -67,7 +67,7 @@
     },
     {
       "id": "C5",
-      "observed": "baseline due=0; surface unreachable during the outage: yes; first reading after restart=6 (oldest 29.8s); drained in 7.9s",
+      "observed": "baseline due=0; surface unreachable during the outage: yes; first reading after restart=6 (oldest 30.9s); drained in 7.3s",
       "passed": true,
       "ran": true
     },
@@ -78,7 +78,7 @@
       "ran": true
     }
   ],
-  "created": 204,
+  "created": 207,
   "errors": [
     {
       "code": "ok",
@@ -87,70 +87,70 @@
     },
     {
       "code": "ok",
-      "count": 204,
+      "count": 207,
       "status": 201
     },
     {
       "code": "slot_unavailable",
-      "count": 38,
+      "count": 35,
       "status": 409
     }
   ],
   "latency": {
     "booking_cancel": {
-      "count": 21,
-      "max": 358.2318500011752,
-      "min": 32.56477800096036,
-      "p50": 86.29471200038097,
-      "p95": 298.409418999654,
-      "p99": 358.2318500011752
+      "count": 22,
+      "max": 265.53460297873244,
+      "min": 29.96310603339225,
+      "p50": 81.48359402548522,
+      "p95": 244.83451998094097,
+      "p99": 265.53460297873244
     },
     "booking_create": {
       "count": 239,
-      "max": 356.57254599937005,
-      "min": 24.175660997570958,
-      "p50": 80.68415299931075,
-      "p95": 202.98920400091447,
-      "p99": 333.5077529991395
+      "max": 574.859157030005,
+      "min": 17.695339978672564,
+      "p50": 85.24187601869926,
+      "p95": 270.73740400373936,
+      "p99": 444.1165970056318
     },
     "booking_reschedule": {
-      "count": 21,
-      "max": 230.51694599780603,
-      "min": 50.52454399992712,
-      "p50": 94.20021799815004,
-      "p95": 175.28139500063844,
-      "p99": 230.51694599780603
+      "count": 20,
+      "max": 318.8152670045383,
+      "min": 45.89608497917652,
+      "p50": 89.78405600646511,
+      "p95": 285.0077240145765,
+      "p99": 318.8152670045383
     },
     "booking_to_confirmation_email": {
-      "count": 204,
-      "max": 11362.132549285889,
-      "min": 2862.0755672454834,
-      "p50": 5377.302885055542,
-      "p95": 9887.723207473755,
-      "p99": 11241.583824157715
+      "count": 207,
+      "max": 11486.11068725586,
+      "min": 3168.660879135132,
+      "p50": 5493.807315826416,
+      "p95": 10205.88755607605,
+      "p99": 11325.012683868408
     },
     "slots_read": {
       "count": 239,
-      "max": 751.2834370027122,
-      "min": 11.8218630013871,
-      "p50": 68.64500099982251,
-      "p95": 201.99584200236131,
-      "p99": 322.73418799741194
+      "max": 402.07163302693516,
+      "min": 7.147633004933596,
+      "p50": 67.9930750047788,
+      "p95": 231.55843396671116,
+      "p99": 328.47915298771113
     }
   },
-  "organic_collisions": 35,
+  "organic_collisions": 32,
   "outbox": {
     "deadman": {
       "baseline_due": 0.0,
-      "drain_recovery_seconds": 7.86003030700158,
+      "drain_recovery_seconds": 7.343914688972291,
       "first_reading_after_restart": 6.0,
-      "first_reading_oldest_age_seconds": 29.76368,
+      "first_reading_oldest_age_seconds": 30.891183,
       "surface_unreachable_during_outage": 1.0
     },
     "drained": true,
-    "peak_due": 185,
-    "peak_oldest_age_seconds": 7.675956,
-    "samples": 451,
+    "peak_due": 182,
+    "peak_oldest_age_seconds": 7.793497,
+    "samples": 316,
     "scrape_failures": 0
   },
   "plan": {
@@ -218,18 +218,20 @@
     {
       "contenders": 2,
       "name": "race_cancel_vs_reschedule",
-      "refusals": {},
+      "refusals": {
+        "not_active": 1
+      },
       "unexpected": [],
-      "winners": 2
+      "winners": 1
     }
   ],
-  "rescheduled": 18,
-  "run_id": "dc6cfd8a",
+  "rescheduled": 17,
+  "run_id": "b72197a2",
   "seed": 20260725,
   "sink": {
-    "booking.cancelled": 22,
-    "booking.created": 257,
-    "booking.rescheduled": 20
+    "booking.cancelled": 24,
+    "booking.created": 260,
+    "booking.rescheduled": 18
   },
   "verdict": "MEASURED"
 }
