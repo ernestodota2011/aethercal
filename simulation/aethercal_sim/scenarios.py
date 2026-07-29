@@ -33,6 +33,7 @@ the last is sent. That is not a race; it is a queue, and it would pass while pro
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import random
 import threading
@@ -696,24 +697,47 @@ def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
     return counts, unreadable
 
 
-def sink_events_for_booking(sink_url: str, booking_id: str) -> dict[str, int]:
-    """Deliveries mentioning ``booking_id``, by event name — the per-booking duplicate check."""
+def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, int], int]:
+    """Deliveries by event name for one booking, plus ==how many could not be READ at all.==
+
+    The per-booking duplicate check is C7's entire oracle, and it used to ``continue`` past any
+    delivery whose base64 or JSON it could not decode. ==That silently subtracts from the count C7
+    then calls "exactly one".== A second `booking.cancelled` arriving with a body this parser
+    chokes on is invisible, and the control certifies idempotency it never observed — a broken read
+    producing the reassuring answer, which is the defect this whole directory exists to hunt.
+
+    :func:`count_sink_events` had already learned it ("a payload shape this cannot parse would
+    otherwise present as zero duplicate cancellations — the answer we were hoping for, and the one
+    a broken reader always gives") and surfaced ``unreadable``. This reader, one function below it,
+    went on swallowing them. So it returns the same pair, and C7 refuses to certify while any
+    delivery in the sink is unreadable.
+
+    An entry that decodes but mentions a different booking is NOT unreadable — it is simply not
+    ours, and skipping it is the function's job.
+    """
     counts: dict[str, int] = {}
+    unreadable = 0
     for entry in _captured(sink_url):
         try:
             raw = base64.b64decode(str(entry.get("body_b64", "")))
         except (ValueError, TypeError):
+            # The body could not even be un-base64'd, so whether it mentions this booking is
+            # unknowable. Counted, never skipped.
+            unreadable += 1
             continue
         if booking_id.encode() not in raw:
             continue
         try:
             payload: Any = json.loads(raw)
         except ValueError:
+            unreadable += 1
             continue
         event: Any = payload.get("event") if isinstance(payload, dict) else None
         if isinstance(event, str):
             counts[event] = counts.get(event, 0) + 1
-    return counts
+        else:
+            unreadable += 1
+    return counts, unreadable
 
 
 def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of them share a meaning
@@ -747,16 +771,16 @@ def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of th
     drained, drain_wait = wait_for_drain(sampler, timeout_seconds=drain_timeout)
     started = time.monotonic()
     appeared_after: float | None = None
-    counts = sink_events_for_booking(sink_url, booking_id)
+    counts, unreadable = sink_events_for_booking(sink_url, booking_id)
     while counts.get("booking.cancelled", 0) == 0 and time.monotonic() - started < (
         appear_timeout_seconds
     ):
         time.sleep(poll_seconds)
-        counts = sink_events_for_booking(sink_url, booking_id)
+        counts, unreadable = sink_events_for_booking(sink_url, booking_id)
     if counts.get("booking.cancelled", 0) > 0:
         appeared_after = time.monotonic() - started
         time.sleep(settle_seconds)
-        counts = sink_events_for_booking(sink_url, booking_id)
+        counts, unreadable = sink_events_for_booking(sink_url, booking_id)
     return CancelWebhookObservation(
         counts=counts,
         drained=drained,
@@ -764,6 +788,7 @@ def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of th
         appeared_after_seconds=appeared_after,
         appear_timeout_seconds=appear_timeout_seconds,
         settle_seconds=settle_seconds,
+        unreadable=unreadable,
     )
 
 
@@ -873,24 +898,54 @@ def control_closed_day(stack: StackConfig, business: Business, *, saturday: date
     )
 
 
+def cap_probe_blocker(offer: OfferRead) -> str | None:
+    """Why a cap probe cannot book — or ``None`` when it can. ==Pure, so the rule is testable.==
+
+    C4's third probe passes when the day has left the offer, so "no slots" is the answer this
+    control HOPES for. That makes it the one place where a read that merely *looks* empty is most
+    dangerous, and the two cases must never collapse into one string:
+
+    * ``slots_query_failed(...)`` — the read broke, and C4 fails naming what broke;
+    * ``no_slots_offered`` — a well-formed 2xx really offered nothing, which is the cap biting.
+
+    Extracted because the judgement that distinguishes them was inline, where the only tests that
+    could reach it were the pure ones over the OUTCOME STRINGS — so deleting the distinction left
+    them green. Same shape as ``is_reschedule_collision``: the classifier needs its own seam, or
+    the mutation that removes it changes nothing anybody is watching.
+    """
+    if not offer.complete:
+        return f"slots_query_failed({offer.problem})"
+    if not offer.starts:
+        return "no_slots_offered"
+    return None
+
+
 def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Control:
-    """``max_per_day=2`` must stop the third booking of the day (RF-14)."""
+    """``max_per_day=2`` must stop the third booking of the day (RF-14).
+
+    ==The third probe's pass condition is "the day left the offer", so an empty offer is the
+    ANSWER this control is hoping for== — which makes it the one control where a broken read is
+    most dangerous. It checked ``offer.ok`` and then called :func:`slot_starts` directly, so a 2xx
+    whose body was not the slots contract yielded no starts and read as the cap biting.
+
+    ``.ok`` is only half the question. :func:`read_offer` asks both halves, and this is now its
+    third call site — after C3 and the organic phase. ==Extracting a rule does not enforce it; the
+    call sites do==, and this one was left behind by the extraction that fixed the other two.
+    """
     client = Client(stack.api_url, business.config.api_key)
     event_type = business.event_types["capped"]
     outcomes: list[str] = []
     for index in range(3):
-        offer = fetch_slots(
-            client, event_type_id=event_type.id, day=day, timezone=business.config.timezone
+        offer = read_offer(
+            fetch_slots(
+                client, event_type_id=event_type.id, day=day, timezone=business.config.timezone
+            )
         )
-        # ==Same trap as C3: a failed query also returns no slots.== "The day left the offer" is a
-        # PASS condition here, so a 500 on the third fetch would have read as the cap biting.
-        if not offer.ok:
-            outcomes.append(f"slots_query_failed({offer.status}/{offer.error_code})")
+        blocker = cap_probe_blocker(offer)
+        if blocker is not None:
+            outcomes.append(blocker)
             continue
-        starts = slot_starts(offer)
-        if not starts:
-            outcomes.append("no_slots_offered")
-            continue
+        starts = offer.starts
         response = book(
             client,
             event_type_id=event_type.id,
@@ -901,9 +956,21 @@ def control_day_cap(stack: StackConfig, business: Business, *, day: date) -> Con
             locale="en",
         )
         outcomes.append(f"{response.status}/{response.error_code or 'ok'}")
-    # The first two must be created; the third must be stopped — either by the cap at create time or
-    # by the day leaving the offer, which is the same guarantee enforced one step earlier (the
-    # service applies the cap in compute_slots precisely so a capped day stops being offered).
+    return judge_day_cap(outcomes)
+
+
+def judge_day_cap(outcomes: list[str]) -> Control:
+    """Turn C4's three probes into a verdict. ==Pure, so the broken-read case is testable.==
+
+    The first two must be created; the third must be stopped — either by the cap at create time or
+    by the day leaving the offer, which is the same guarantee enforced one step earlier (the
+    service applies the cap in ``compute_slots`` precisely so a capped day stops being offered).
+
+    ==Note what that makes "no slots" here: a PASS condition.== It is the only control in the set
+    whose hoped-for answer is an empty offer, which is exactly why a read that merely *looked*
+    empty had to stop counting. ``slots_query_failed(...)`` matches neither accepted third outcome,
+    so it fails and names what broke.
+    """
     passed = (
         len(outcomes) == 3
         and outcomes[0].startswith("201")
@@ -1062,7 +1129,7 @@ def judge_drain_deadman(observation: DeadmanObservation) -> Control:
     )
 
 
-def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two timing knobs
+def control_drain_deadman(  # noqa: PLR0913, PLR0915 - injected effects, plus a way back from each
     sampler: OutboxSampler,
     stop_worker: Callable[[], None],
     start_worker: Callable[[], None],
@@ -1094,52 +1161,72 @@ def control_drain_deadman(  # noqa: PLR0913 - three injected effects plus two ti
     # The background sampler would otherwise log the deliberate outage as scrape failures, and the
     # report would warn about an instrument that was working exactly as intended.
     sampler.pause()
-    stop_worker()
-    work_created = make_work()
-    time.sleep(grow_seconds)
 
-    # Step 3: the outage must be REAL. If the surface still answers, the worker never stopped and
-    # everything below would be measuring a drain that never paused.
+    work_created = 0
     surface_down = False
-    try:
-        sampler.scrape()
-    except OutboxScrapeError:
-        surface_down = True
-
-    start_worker()
-
-    # Step 4: the earliest reading the restarted worker gives us. It MAY still show the backlog and
-    # it may not — the drain is racing us, and that race is exactly why it no longer gates.
-    started_waiting = time.monotonic()
-    boot_deadline = started_waiting + 90.0
     first_reading: int | None = None
     first_age = 0.0
-    while time.monotonic() < boot_deadline:
-        try:
-            sample = sampler.scrape()
-        except OutboxScrapeError:
-            time.sleep(0.25)
-            continue
-        first_reading = sample.due
-        first_age = sample.oldest_due_age_seconds
-        break
-
-    # Step 5: it must clear, and then the durable signals are read.
-    deadline = time.monotonic() + drain_timeout
     drained_after: float | None = None
     final: OutboxSample | None = None
-    while time.monotonic() < deadline:
+    started_waiting = time.monotonic()
+    worker_stopped = False
+
+    # ==This block STOPS A CONTAINER and PAUSES the instrument, so it needs a way back that does
+    # not depend on it finishing.== Without the `finally`, anything raising in between — a compose
+    # timeout, a booking call blowing up in `make_work`, an unexpected error in a scrape — left the
+    # run dead with the worker still down and the sampler still paused. Every later phase would
+    # then be measuring a stack the harness itself had broken, and the report would blame the
+    # product. A control allowed to damage the run it belongs to is worse than no control.
+    try:
+        stop_worker()
+        worker_stopped = True
+        work_created = make_work()
+        time.sleep(grow_seconds)
+
+        # Step 3: the outage must be REAL. If the surface still answers, the worker never stopped
+        # and everything below would be measuring a drain that never paused.
         try:
-            sample = sampler.scrape()
+            sampler.scrape()
         except OutboxScrapeError:
-            time.sleep(1.0)
-            continue
-        final = sample
-        if sample.due == 0:
-            drained_after = time.monotonic() - started_waiting
+            surface_down = True
+
+        start_worker()
+        worker_stopped = False
+
+        # Step 4: the earliest reading the restarted worker gives us. It MAY still show the backlog
+        # and it may not — the drain is racing us, and that race is why it no longer gates.
+        started_waiting = time.monotonic()
+        boot_deadline = started_waiting + 90.0
+        while time.monotonic() < boot_deadline:
+            try:
+                sample = sampler.scrape()
+            except OutboxScrapeError:
+                time.sleep(0.25)
+                continue
+            first_reading = sample.due
+            first_age = sample.oldest_due_age_seconds
             break
-        time.sleep(1.0)
-    sampler.resume()
+
+        # Step 5: it must clear, and then the durable signals are read.
+        deadline = time.monotonic() + drain_timeout
+        while time.monotonic() < deadline:
+            try:
+                sample = sampler.scrape()
+            except OutboxScrapeError:
+                time.sleep(1.0)
+                continue
+            final = sample
+            if sample.due == 0:
+                drained_after = time.monotonic() - started_waiting
+                break
+            time.sleep(1.0)
+    finally:
+        # Put the worker back if we are the reason it is down, and always un-pause the instrument.
+        # Both are best-effort: a failure here must not mask whatever brought us into the `finally`.
+        if worker_stopped:
+            with contextlib.suppress(Exception):
+                start_worker()
+        sampler.resume()
 
     observation = DeadmanObservation(
         work_created=work_created,
@@ -1306,6 +1393,9 @@ class CancelWebhookObservation:
     """``None`` means nothing arrived inside the window — a DELIVERY fact, not a duplication one."""
     appear_timeout_seconds: float
     settle_seconds: float
+    unreadable: int = 0
+    """Deliveries in the sink this harness could not decode. ==A duplicate hiding in one of these
+    is invisible to ``counts``==, so a non-zero value means C7 did not observe what it certifies."""
 
 
 def judge_cancel_idempotency(
@@ -1334,7 +1424,16 @@ def judge_cancel_idempotency(
         f"drained in {observation.drain_wait_seconds:.1f}s, then polled up to "
         f"{observation.appear_timeout_seconds:.0f}s + {observation.settle_seconds:.0f}s settling"
     )
-    if not observation.drained:
+    if observation.unreadable:
+        # ==An unreadable delivery could BE the duplicate.== Certifying "exactly one" over a set
+        # this harness could not fully read is the reassuring answer a broken reader always gives.
+        verdict = (
+            f"{observation.unreadable} delivery(ies) in the sink could NOT be decoded, so the "
+            f"count of {delivered} is a lower bound — a duplicate hiding in one of them would be "
+            "invisible. Refusing to certify idempotency over a set that could not be read"
+        )
+        passed = False
+    elif not observation.drained:
         verdict = (
             f"the outbox did NOT drain within {observation.drain_wait_seconds:.1f}s, so the sink "
             "was read before every queued delivery had been attempted — this run did not observe "
@@ -1360,7 +1459,10 @@ def judge_cancel_idempotency(
         ident=ident,
         guards=guards or "an idempotent cancel emits exactly ONE booking.cancelled webhook",
         expected="exactly 1 booking.cancelled at the sink for this booking",
-        observed=f"{verdict} · all events {observation.counts} · {window}",
+        observed=(
+            f"{verdict} · all events {observation.counts} · unreadable deliveries "
+            f"{observation.unreadable} · {window}"
+        ),
         passed=passed,
     )
 

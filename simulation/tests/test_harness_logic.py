@@ -33,11 +33,14 @@ from aethercal_sim.scenarios import (
     Control,
     DeadmanObservation,
     DiaryRead,
+    OfferRead,
     OrganicResult,
+    cap_probe_blocker,
     is_reschedule_collision,
     judge_cancel_idempotency,
     judge_closed_day,
     judge_confirmation_coverage,
+    judge_day_cap,
     judge_drain_deadman,
     judge_lineage,
     judge_organic_accounting,
@@ -675,7 +678,9 @@ def test_read_offer_accepts_a_well_formed_empty_offer() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _cancel(counts: dict[str, int], *, drained: bool = True) -> CancelWebhookObservation:
+def _cancel(
+    counts: dict[str, int], *, drained: bool = True, unreadable: int = 0
+) -> CancelWebhookObservation:
     return CancelWebhookObservation(
         counts=counts,
         drained=drained,
@@ -683,7 +688,59 @@ def _cancel(counts: dict[str, int], *, drained: bool = True) -> CancelWebhookObs
         appeared_after_seconds=1.0 if counts.get("booking.cancelled") else None,
         appear_timeout_seconds=60.0,
         settle_seconds=10.0,
+        unreadable=unreadable,
     )
+
+
+@pytest.mark.parametrize(
+    ("offer", "expected"),
+    [
+        (OfferRead([], False, "the slots query FAILED: 500 None"), "slots_query_failed"),
+        (OfferRead([], False, "200 but the body is not the slots contract"), "slots_query_failed"),
+        (OfferRead([], True), "no_slots_offered"),
+    ],
+)
+def test_cap_probe_tells_a_broken_read_from_a_day_that_left_the_offer(
+    offer: OfferRead, expected: str
+) -> None:
+    """==The distinction C4 depends on, at the site that makes it.==
+
+    Both produce "no slots". Only one of them is the cap biting; the other is an instrument that
+    stopped answering, and C4's pass condition would have absorbed it.
+    """
+    blocker = cap_probe_blocker(offer)
+    assert blocker is not None
+    assert blocker.startswith(expected)
+
+
+def test_cap_probe_lets_a_real_offer_through() -> None:
+    assert cap_probe_blocker(OfferRead(["2026-08-03T09:00:00Z"], True)) is None
+
+
+def test_c4_passes_when_the_third_probe_is_stopped() -> None:
+    assert judge_day_cap(["201/ok", "201/ok", "no_slots_offered"]).passed
+    assert judge_day_cap(["201/ok", "201/ok", "409/day_full"]).passed
+
+
+def test_c4_fails_when_the_third_probe_SUCCEEDS() -> None:
+    """The cap did not bite: three bookings landed on a day capped at two."""
+    assert not judge_day_cap(["201/ok", "201/ok", "201/ok"]).passed
+
+
+def test_c4_fails_when_a_probe_read_a_BROKEN_offer() -> None:
+    """==C4 hopes for an empty offer, which is why a broken read is most dangerous here.==
+
+    It checked `offer.ok` and then called `slot_starts` directly, so a 2xx whose body was not the
+    slots contract yielded no starts and read as the cap biting. `read_offer` asks both halves of
+    the question now, and this is the verdict side of that: a failed query matches neither accepted
+    third outcome.
+    """
+    control = judge_day_cap(
+        ["201/ok", "201/ok", "slots_query_failed(200 but the body is not the slots contract)"]
+    )
+    assert control.ran is True
+    assert control.passed is False
+    assert "slots_query_failed" in control.observed
 
 
 def test_c7_passes_on_exactly_one_delivery() -> None:
@@ -711,6 +768,27 @@ def test_c7_tells_a_timeout_apart_from_a_duplication() -> None:
     assert never.observed != duplicated.observed
     assert "NOTHING arrived" in never.observed
     assert "NOTHING arrived" not in duplicated.observed
+
+
+def test_c7_refuses_to_certify_over_deliveries_it_could_not_READ() -> None:
+    """==A duplicate hiding in an undecodable body is invisible to the count.==
+
+    The per-booking reader used to `continue` past any delivery whose base64 or JSON it could not
+    decode, which silently subtracts from the very number C7 then calls "exactly one". A broken
+    reader always returns the reassuring answer -- `count_sink_events` had already learned that one
+    function higher up and surfaced `unreadable`; this reader went on swallowing them.
+    """
+    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}, unreadable=1))
+    assert control.passed is False
+    assert "could NOT be decoded" in control.observed
+    assert "lower bound" in control.observed
+
+
+def test_c7_reports_unreadable_deliveries_even_when_it_passes() -> None:
+    """Zero is a measurement here, so it is printed rather than left to be assumed."""
+    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}))
+    assert control.passed is True
+    assert "unreadable deliveries 0" in control.observed
 
 
 def test_c7_refuses_to_judge_when_the_outbox_never_drained() -> None:
