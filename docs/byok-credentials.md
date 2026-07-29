@@ -275,6 +275,7 @@ The barriers on the money phase are structural, not procedural:
 | **$1 hard cap** | the session opener takes **no `amount_cents`** — there is no figure to mistype. A units bug is what turns $1 into $100 |
 | **a retry cannot charge twice** | phase A's idempotency key is *fixed*, so a re-run inside Stripe's 24-hour window returns the **same** session instead of minting a second payable one. To open a new one on purpose, set `AETHERCAL_LIVE_STRIPE_RUN_ID=v2` — phase A names that command itself if the replayed session has lapsed |
 | **the refund is idempotent** | phase B uses production's own `refund_dedupe_key`, so a retry gets the same refund and never a second |
+| **a failed creation is resolved, not assumed away** | if the create call fails *after* Stripe processed it, a payable $1 session is standing with no id to name it. The shared creation seam replays the identical request on the **same idempotency key** — Stripe returns the session it made, which is then expired — and if the replay also fails the run shouts the idempotency key for a manual check. Both harnesses create through that one seam |
 | **the money always comes back — *all* of it** | the `finally` reads what was actually **captured**, sums only refunds that are `succeeded` (`pending` is *in flight*, not done), issues the remainder on its own derived key, and polls to a terminal state. ==A partial or pending refund is a failure, not a pass== |
 | **the guarantee opens before any validation can abort** | phase B resolves the PaymentIntent immediately after the provenance check and puts **everything else** — currency, `paid`, amount, the gateway call — inside the `try` whose `finally` refunds. Those checks used to run *before* it, so a mismatch on a genuinely paid session ended the run with the dollar still on the card. If the PaymentIntent cannot be resolved at all on a `paid` session, the run **shouts the session id** for a manual refund |
 | **the cleanup does not share the gateway's fault** | it runs through the **independent** client — the gateway's refund is the thing on trial |
@@ -315,6 +316,22 @@ requires having done the run.
 > (the layer that can see both) passes `current_gateway_implementations(provider)` into the door,
 > and the parameter has no default — a caller cannot omit it, and any partial answer makes the door
 > *stricter*, never laxer.
+
+> [!IMPORTANT]
+> **The evidence is checked again when the credential is USED, not only when it is stored.** The
+> door runs once, on the day somebody types the key; a gateway edited a month later would keep
+> charging real cards on a verification that no longer describes it. So every charge and every
+> refund re-asks the question against the code in *that* process — and the answer is deliberately
+> **asymmetric**:
+>
+> | Direction | Stale evidence | Why |
+> |---|---|---|
+> | **taking** payment (`checkout`) | **refused** (402) | charging through unexercised code fails *silently* — every status code says success. The refusal costs new bookings, is visible immediately, and clears at **zero cost** by re-running the free checkout harness |
+> | **returning** payment (`refund`) | **allowed, and alarmed** | blocking does not prevent the harm, it *is* the harm: "the guest's money does not come back", produced with certainty on a card already charged. An unexercised refund's realistic failure is loud (the gateway raises, the outbox retries, the intent dead-letters with an alert) |
+>
+> Only a **live** credential is gated: a test-mode key is untouched, so a self-hoster on `sk_test_`
+> never sees this. What stays exposed is stated rather than implied — an edited-but-unexercised
+> `refund` does run against real money, accepted because refusing guarantees the worse outcome.
 
 > [!WARNING]
 > **A verification performed in TEST mode does not authorise a LIVE credential.** Each record states

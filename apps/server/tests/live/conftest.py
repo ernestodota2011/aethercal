@@ -56,6 +56,7 @@ from aethercal.server.services.payments import CheckoutSession
 SECRET_KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
 STRIPE_API_BASE = "https://api.stripe.com/v1"
 DASHBOARD_PAYMENT_URL = "https://dashboard.stripe.com/payments"
+DASHBOARD_SESSIONS_URL = "https://dashboard.stripe.com/payments?type=checkout_session"
 HTTP_TIMEOUT = httpx.Timeout(30.0)
 
 ONE_DOLLAR_CENTS = 100
@@ -364,7 +365,9 @@ def require_phase_a_provenance(
 
 
 @pytest.fixture
-def open_one_dollar_session(secret_key: str, gateway: StripeGateway) -> OpenSession:
+def open_one_dollar_session(
+    secret_key: str, gateway: StripeGateway, expire_session: Callable[[str], str | None]
+) -> OpenSession:
     """Open a Checkout Session through the real gateway. ==There is no ``amount_cents`` to pass.==
 
     The hard cap is enforced by the SHAPE of this seam and not by a rule a test has to follow: a
@@ -374,12 +377,21 @@ def open_one_dollar_session(secret_key: str, gateway: StripeGateway) -> OpenSess
     ``return_url`` IS a parameter, and deliberately so: it is what marks the session as this
     harness's (:func:`harness_return_url`), and each caller marks its own purpose. It is not a lever
     over money — the two things that are, the amount and the currency, remain unpassable.
+
+    .. rubric:: ==A FAILED creation is not a creation that did not happen==
+
+    Both harnesses guarded everything AFTER this call and nothing around the call itself. If Stripe
+    processes the request and the response never lands — a dropped connection, a timeout, a read
+    error — this raises, and ==a live, payable $1 session is standing in a real account outside
+    every cleanup path this directory has==. The session exists; the object that would name it does
+    not, so nothing downstream can expire it. That is the creation-side twin of the defect phase B
+    had on the refund side, and it is why the recovery lives HERE, in the one seam both harnesses
+    create through, rather than in each of them separately.
     """
 
-    async def _open(
+    async def _create(
         *, idempotency_key: str, expires_at: datetime, return_url: str
     ) -> CheckoutSession:
-        _assert_the_hard_cap()
         return await gateway.create_checkout_session(
             idempotency_key=idempotency_key,
             amount_cents=ONE_DOLLAR_CENTS,
@@ -388,6 +400,78 @@ def open_one_dollar_session(secret_key: str, gateway: StripeGateway) -> OpenSess
             return_url=return_url,
             secrets={"secret_key": secret_key},
         )
+
+    async def _recover_an_ambiguous_creation(
+        *, idempotency_key: str, expires_at: datetime, return_url: str
+    ) -> None:
+        """Find out whether a session was created after all, and expire it. ==Never raises.==
+
+        ==The idempotency key IS the persistent reference of the attempt==, so the recovery is a
+        REPLAY of the identical request rather than a search: Stripe returns the same session for a
+        repeated key within 24 hours. That resolves the ambiguity exactly, in both directions —
+
+        * Stripe DID create one, and the replay hands back that same session, which is expired;
+        * Stripe never received it, and the replay creates one now, which is expired immediately.
+
+        Nothing payable is left standing either way, and no money can move in between.
+
+        Replayed through the gateway, with the same arguments, because rebuilding the request by
+        hand would be a second definition of the checkout's shape — free to drift from the one under
+        test, and a mismatched replay is a 400 for reusing a key with different parameters. The
+        EXPIRY goes through the independent client, which is the part that must not share a fault.
+
+        If the replay itself fails there is nothing left to resolve it with, so the run SHOUTS the
+        idempotency key: it is the one handle on the attempt, and Stripe offers no lookup by it.
+        """
+        try:
+            replayed = await _create(
+                idempotency_key=idempotency_key, expires_at=expires_at, return_url=return_url
+            )
+        except Exception as exc:
+            print(
+                "\n"
+                "################################################################\n"
+                "###  A PAYABLE SESSION MAY BE OPEN. CHECK BY HAND, NOW.      ###\n"
+                "################################################################\n"
+                f"  idempotency key : {idempotency_key}\n"
+                f"  amount          : {ONE_DOLLAR_CENTS} cents {CURRENCY.upper()}\n"
+                f"  why             : {_problem('replaying the creation', exc)}\n"
+                f"  dashboard       : {DASHBOARD_SESSIONS_URL}\n"
+                "  The creation failed AMBIGUOUSLY and the replay that would have resolved it\n"
+                "  failed too, so it is unknown whether a live, payable session exists. Stripe\n"
+                "  offers no lookup by idempotency key: find the most recent session for this\n"
+                "  amount in the dashboard and expire it if it is open.\n"
+                "################################################################\n"
+            )
+            return
+        problem = expire_session(replayed.checkout_session_id)
+        print(
+            "\n!!! the creation failed ambiguously; the replay resolved it to "
+            f"{replayed.checkout_session_id}.\n"
+            + (
+                f"    THE EXPIRY ALSO FAILED: {problem}\n"
+                "    A live, payable session may still be OPEN — expire it by hand NOW.\n"
+                if problem is not None
+                else "    It is expired; nobody can pay it.\n"
+            )
+        )
+
+    async def _open(
+        *, idempotency_key: str, expires_at: datetime, return_url: str
+    ) -> CheckoutSession:
+        _assert_the_hard_cap()
+        try:
+            return await _create(
+                idempotency_key=idempotency_key, expires_at=expires_at, return_url=return_url
+            )
+        except BaseException:
+            # ==The creation is ambiguous the moment it fails==, so from here the default is
+            # RESOLVE IT. The original exception is what the run reports; the recovery never
+            # replaces it, exactly as the refund cleanup never replaces the failure explaining it.
+            await _recover_an_ambiguous_creation(
+                idempotency_key=idempotency_key, expires_at=expires_at, return_url=return_url
+            )
+            raise
 
     return _open
 

@@ -88,6 +88,8 @@ from aethercal.server.services.outbox import (
 )
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
+    GatewayOperation,
+    authorise_live_use,
     resolve_money_credential,
 )
 
@@ -987,6 +989,7 @@ def make_refund_runner(
     sessionmaker: _Sessionmaker,
     gateways: Mapping[str, PaymentGateway],
     fernet_keys: Sequence[bytes],
+    implementations: Mapping[str, Mapping[GatewayOperation, str]],
 ) -> OutboxExecutor:
     """Build the REFUND handler the drain dispatches (via ``make_booking_effect_executor``).
 
@@ -1003,6 +1006,16 @@ def make_refund_runner(
     ``KeyError``, and retried until the attempts ran out: a refund that was queued, drained, and
     never sent. The provider now SELECTS the gateway, and a provider with no gateway is a loud
     failure rather than a wrong one.
+
+    .. rubric:: ==Stale evidence ALARMS here; it does not block (H6)==
+
+    ``implementations`` carries the fingerprints of the gateway code in this process, and the refund
+    is checked against them — but the check is not allowed to refuse. ==Blocking a refund does not
+    prevent the harm it guards against; it IS the harm==: "the guest's money does not come back",
+    produced deliberately, indefinitely, on a card that has already been charged. The decision is
+    :func:`~aethercal.server.services.tenant_credentials.blocks_on_stale_evidence`, exhaustive over
+    the money's DIRECTION, so this runner cannot choose to be lenient and the checkout path cannot
+    choose to be brutal.
     """
 
     async def _run(work: OutboxWork, now: datetime) -> None:
@@ -1042,6 +1055,29 @@ def make_refund_runner(
                 provider=CredentialProvider(provider),
                 fernet_key=fernet_keys,
             )
+            # ==The USE gate, in its NON-BLOCKING direction (H6).== The credential was stored under
+            # evidence that was current; if the gateway has been edited since, this refund runs
+            # through code nobody has exercised. It runs anyway — refusing would strand a paid
+            # guest's money with certainty, which is the very outcome the check exists to avoid —
+            # and the reason is ALERTED with the payment named, because an unread alarm is not a
+            # control and a nameless one cannot be acted on.
+            unexercised = authorise_live_use(
+                CredentialProvider(provider),
+                GatewayOperation.REFUND,
+                credential.secrets,
+                current_implementations=implementations.get(provider, {}),
+            )
+            if unexercised is not None:
+                _logger.error(
+                    "ALERT: refunding payment %s (%s, tenant %s) through UNEXERCISED gateway code "
+                    "— proceeding, because blocking a refund strands a paid guest's money, but "
+                    "this run is not covered by any current verification: %s",
+                    payment.id,
+                    provider_ref,
+                    work.tenant_id,
+                    unexercised,
+                )
+
             # ==The provider-level idempotency (finding 1).== The status re-check above is only the
             # FIRST line: it does not survive a crash BETWEEN the provider refund and the
             # ``status = refunded`` commit — the next drain re-runs this with the row still paid.
@@ -1102,6 +1138,7 @@ def build_money_runners(
     exec_maker: _Sessionmaker,
     gateways: Mapping[str, PaymentGateway] | None,
     fernet_keys: Sequence[bytes] | None,
+    implementations: Mapping[str, Mapping[GatewayOperation, str]] | None,
 ) -> tuple[OutboxExecutor | None, OutboxExecutor]:
     """The drain's two money runners, ==FAIL-CLOSED (finding 2)==.
 
@@ -1115,6 +1152,13 @@ def build_money_runners(
     This exists so the wiring the worker's drain tick does — reading ``fernet_keys`` and
     ``payment_gateways`` off app state — is a TESTED, defensive function instead of a bare
     attribute read inside a ``# pragma: no cover`` closure.
+
+    ``implementations`` is read off app state the same defensive way, and a missing one degrades to
+    ``{}`` rather than refusing to build the runner. ==That direction is deliberate and it is the
+    opposite of the gateways'==: without a gateway a refund CANNOT be sent, so not building is the
+    honest answer; without the fingerprints a refund can still be sent, and refusing to build would
+    strand a paid guest's money over a wiring detail. What ``{}`` costs is the alarm's precision —
+    every refund reads as unexercised and says so — which is noisy, never silent.
     """
     expire_hold_runner = make_expire_hold_runner(sessionmaker=exec_maker)
     if not gateways or not fernet_keys:
@@ -1126,7 +1170,10 @@ def build_money_runners(
         )
         return None, expire_hold_runner
     refund_runner = make_refund_runner(
-        sessionmaker=exec_maker, gateways=gateways, fernet_keys=fernet_keys
+        sessionmaker=exec_maker,
+        gateways=gateways,
+        fernet_keys=fernet_keys,
+        implementations=implementations or {},
     )
     return refund_runner, expire_hold_runner
 

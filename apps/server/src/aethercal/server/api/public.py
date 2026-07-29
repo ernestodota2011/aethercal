@@ -89,7 +89,10 @@ from aethercal.server.services.slots import compute_slots
 from aethercal.server.services.tenant_credentials import (
     AmbiguousMoneyProviderError,
     CredentialProvider,
+    GatewayOperation,
     MissingCredentialError,
+    StaleVerificationError,
+    authorise_live_use,
     resolve_money_credential,
     resolve_tenant_money_provider,
 )
@@ -661,6 +664,47 @@ async def _resolve_business_secrets(
     return credential.secrets
 
 
+def _refuse_a_live_charge_through_unexercised_code(
+    request: Request, *, provider: CredentialProvider, secrets: Mapping[str, str]
+) -> None:
+    """==The USE gate on the CHARGING side (H6).== A 402 rather than a real card charged blind.
+
+    The credential door refuses to STORE a live key while the gateway has an unexercised operation.
+    That check happens once. A gateway edited afterwards keeps charging real cards on the strength
+    of evidence that no longer describes it — the evidence expires, the stored credential does not.
+    So the question is asked again HERE, on every checkout, against the code in THIS process.
+
+    ==It can only bite a LIVE credential.== A test-mode key is not gated (there is no real money to
+    protect), so a self-hoster on ``sk_test_`` and every test in this suite are untouched.
+
+    The implementations are read DEFENSIVELY off app state and a missing map reads as ``{}`` — which
+    makes every operation unverified, so a wiring failure REFUSES a live charge instead of waving it
+    through. That is the same fail-closed shape as :func:`_resolve_gateway`'s 503.
+
+    The guest is told nothing about why: the existing 402 is the one public answer for every way a
+    business cannot take money right now. The reason is ALERTED, because unlike a missing credential
+    this is not somebody's pending setup step — it is unexercised code on the money path, and it
+    needs an operator.
+    """
+    implementations: Mapping[str, Mapping[GatewayOperation, str]] | None = getattr(
+        request.app.state, "payment_implementations", None
+    )
+    current = (implementations or {}).get(provider.value, {})
+    try:
+        authorise_live_use(
+            provider, GatewayOperation.CHECKOUT, secrets, current_implementations=current
+        )
+    except StaleVerificationError as exc:
+        _logger.error(
+            "ALERT: refusing to open a LIVE %s checkout — the gateway has been edited since the "
+            "evidence that authorised this credential was recorded, so a real card would be "
+            "charged through code nobody has exercised: %s",
+            provider.value,
+            exc,
+        )
+        raise _payment_unavailable() from exc
+
+
 async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs ARE the contract
     session: AsyncSession,
     *,
@@ -684,6 +728,7 @@ async def _open_checkout_and_record(  # noqa: PLR0913 - the checkout's inputs AR
     delegated to :func:`record_checkout_intent`, which is TOCTOU-safe (r4 finding 1): two concurrent
     resumes of one hold both open the SAME session and both try to record it, and the loser absorbs
     the UNIQUE conflict instead of handing the caller an ``IntegrityError``."""
+    _refuse_a_live_charge_through_unexercised_code(request, provider=provider, secrets=secrets)
     expires_at = _checkout_expires_at(booking, now=now, gateway=gateway)
     try:
         checkout: CheckoutSession = await gateway.create_checkout_session(

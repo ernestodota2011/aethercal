@@ -70,13 +70,18 @@ from aethercal.server.services.tenant_credentials import (
     IncompleteCredentialError,
     LiveCredentialRefusedError,
     LiveVerification,
+    MoneyDirection,
     ProviderMode,
+    StaleVerificationError,
     UnrecognisedCredentialError,
+    authorise_live_use,
+    blocks_on_stale_evidence,
     credential_class,
     credential_key_families,
     declared_test_mode_prefixes,
     gateway_operations,
     live_verifications,
+    money_direction,
     required_fields,
     required_test_mode_prefixes,
     stale_verifications,
@@ -994,3 +999,130 @@ class TestTheDoorTheOperatorActuallyUses:
         assert await run_credentials_list(sqlite_maker, tenant_slug="acme") == (
             CredentialProvider.STRIPE,
         )
+
+
+class TestTheGateOnUseAndNotOnlyOnStorage:
+    """==The finding: the door runs ONCE, and the credential outlives its evidence.==
+
+    ``store_credential`` answers on the day somebody types the key. A gateway edited a month later
+    keeps charging real cards on the strength of a verification that no longer describes it —
+    nothing re-asks the question, and the row is read by a refund six weeks later on a Sunday.
+
+    So the question is asked again at USE, and the answer is deliberately ASYMMETRIC. The
+    measurement behind that asymmetry, because it IS the design decision:
+
+    * **charging** through unexercised code is refused. The failure it prevents is SILENT (every
+      status code says success), and the refusal costs new bookings — visible immediately, and
+      cleared at ZERO cost by re-running the free checkout harness;
+    * **refunding** is never refused. The harm being guarded against is "the guest's money does not
+      come back", and blocking PRODUCES exactly that, with certainty, on a card already charged.
+      ==A guard whose failure mode is identical to the harm, but guaranteed, is not a guard.== It
+      alarms instead — and its realistic failure (the gateway raising, the outbox retrying, the
+      intent dead-lettering with an alert) is loud rather than silent.
+    """
+
+    def test_a_stored_live_credential_is_blocked_from_charging_when_the_code_changed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """==The state the finding names: stored under good evidence, used after an edit.==
+
+        The register is fully verified in LIVE mode, so this credential was legitimately storable.
+        The fingerprints handed to the gate are what a process running EDITED code computes — which
+        is exactly what a deploy produces. The charge must be refused.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        edited_deployment = {op: CODE_THAT_NO_LONGER_EXISTS for op in GatewayOperation}
+
+        with pytest.raises(StaleVerificationError) as raised:
+            authorise_live_use(
+                CredentialProvider.STRIPE,
+                GatewayOperation.CHECKOUT,
+                STRIPE_LIVE,
+                current_implementations=edited_deployment,
+            )
+
+        assert "CHANGED" in str(raised.value)
+        assert STRIPE_LIVE["secret_key"] not in str(raised.value), "the refusal must not echo a key"
+
+    def test_the_same_credential_is_not_blocked_from_refunding_but_reports_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """==The other half of the decision, and the one that must never become a block.==
+
+        Identical state, opposite direction. It returns the reason instead of raising, so the caller
+        alarms and the money still goes back. If this ever starts raising, a guest who has already
+        paid stops being refunded — by us, on purpose.
+        """
+        _exercised(monkeypatch, *GatewayOperation)
+        edited_deployment = {op: CODE_THAT_NO_LONGER_EXISTS for op in GatewayOperation}
+
+        reason = authorise_live_use(
+            CredentialProvider.STRIPE,
+            GatewayOperation.REFUND,
+            STRIPE_LIVE,
+            current_implementations=edited_deployment,
+        )
+
+        assert reason is not None, (
+            "the refund path must still REPORT that it is running unexercised code — silence here "
+            "is the write gate's blind spot with extra steps"
+        )
+        assert "CHANGED" in reason
+        assert STRIPE_LIVE["secret_key"] not in reason
+
+    @pytest.mark.parametrize("operation", list(GatewayOperation), ids=lambda op: op.value)
+    def test_current_evidence_authorises_both_directions(
+        self, monkeypatch: pytest.MonkeyPatch, operation: GatewayOperation
+    ) -> None:
+        """==Anti-vacuity.== A gate that refused every live use would pass both tests above while
+        making the product unable to take or return money at all."""
+        _exercised(monkeypatch, *GatewayOperation)
+
+        assert (
+            authorise_live_use(
+                CredentialProvider.STRIPE,
+                operation,
+                STRIPE_LIVE,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("operation", list(GatewayOperation), ids=lambda op: op.value)
+    def test_a_test_mode_credential_is_never_gated_at_use(
+        self, monkeypatch: pytest.MonkeyPatch, operation: GatewayOperation
+    ) -> None:
+        """==The blast radius, pinned.== No real money is at stake on a test key, so the use gate
+        must not touch it: a self-hoster on a test-mode credential, and every other test in this
+        suite, are unaffected by any amount of staleness.
+
+        Nothing is verified here AND the fingerprints are wrong — the most hostile state there is.
+        """
+        _exercised(monkeypatch)
+
+        assert (
+            authorise_live_use(
+                CredentialProvider.STRIPE,
+                operation,
+                STRIPE_TEST,
+                current_implementations={op: CODE_THAT_NO_LONGER_EXISTS for op in GatewayOperation},
+            )
+            is None
+        )
+
+    def test_the_direction_of_every_operation_is_decided_exhaustively(self) -> None:
+        """==The lock on the asymmetry.== A THIRD operation cannot inherit a policy by omission.
+
+        ``money_direction`` and ``blocks_on_stale_evidence`` are ``assert_never`` matches, so F5's
+        partial refund or a capture step does not type-check until somebody has said which way it
+        moves money. This walks the enum so the PAIRING is asserted too: taking money blocks,
+        returning it never does.
+        """
+        for operation in GatewayOperation:
+            direction = money_direction(operation)
+            blocks = blocks_on_stale_evidence(operation)
+            assert blocks is (direction is MoneyDirection.TAKES_PAYMENT), (
+                f"{operation.value} moves money {direction.value} but "
+                f"{'blocks' if blocks else 'does not block'} on stale evidence — refusing to "
+                "return a paid guest's money is the harm, not a guard against it"
+            )

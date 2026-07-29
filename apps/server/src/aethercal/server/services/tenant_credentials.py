@@ -237,6 +237,18 @@ class LiveCredentialRefusedError(CredentialError):
     """
 
 
+class StaleVerificationError(CredentialError):
+    """A LIVE credential was about to run an operation whose evidence no longer describes the code.
+
+    ==Distinct from :class:`LiveCredentialRefusedError`, and the difference is WHEN.== That one is
+    the door: it refuses to STORE a live credential. This one is the road: the credential was stored
+    legitimately, under evidence that was current at the time, and the gateway has been edited
+    since — so what would run NOW is code nobody has exercised, against somebody's real card.
+
+    ==The write-time door could never have caught this.== It ran once, correctly, months ago.
+    """
+
+
 class MalformedCredentialError(CredentialError):
     """A stored credential decrypted to valid JSON that is NOT an object of field → value.
 
@@ -584,6 +596,151 @@ def unverified_operations(
     return gateway_operations(provider) - verified_operations(
         provider, current_implementations=current_implementations
     )
+
+
+class MoneyDirection(StrEnum):
+    """Which WAY the money moves in an operation. ==The two are not equally safe to refuse.=="""
+
+    TAKES_PAYMENT = "takes_payment"
+    """Out of a guest's account and into the business's. Refusing costs a booking."""
+
+    RETURNS_PAYMENT = "returns_payment"
+    """Back to a guest who has ALREADY PAID. ==Refusing strands somebody else's money.=="""
+
+
+def money_direction(operation: GatewayOperation) -> MoneyDirection:
+    """Which way ``operation`` moves money. ==Exhaustive, and it decides a refusal policy.==
+
+    ``assert_never``, like :func:`credential_class`: a third operation (F5's partial refund, a
+    capture) does not type-check until somebody has said which way it moves money — and therefore
+    whether refusing it protects a guest or robs one.
+    """
+    match operation:
+        case GatewayOperation.CHECKOUT:
+            return MoneyDirection.TAKES_PAYMENT
+        case GatewayOperation.REFUND:
+            return MoneyDirection.RETURNS_PAYMENT
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
+def blocks_on_stale_evidence(operation: GatewayOperation) -> bool:
+    """May a live credential be REFUSED at use time when its evidence has gone stale?
+
+    .. rubric:: ==The asymmetry, and the measurement behind it==
+
+    The write-time door refuses everything equally, and it can afford to: nothing is at stake but a
+    configuration step. At USE time the two directions have different worst cases, so one policy
+    would have to be wrong about one of them.
+
+    * ==**TAKES_PAYMENT → refuse.**== Charging a guest through an adapter nobody has exercised is
+      the exact act this whole design exists to prevent, and the failure is silent: every status
+      code says success while the money may have gone nowhere useful. Refusing costs the business
+      new bookings — visible immediately, and recoverable at ZERO COST by re-running the free
+      checkout harness (or reverting the deploy). Nobody's money is stranded by the refusal.
+
+    * ==**RETURNS_PAYMENT → never refuse.**== Blocking a refund does not prevent the harm; it
+      CAUSES it. The harm being guarded against is "the guest's money does not come back", and a
+      block produces exactly that outcome, with certainty, indefinitely — the refund intent stays
+      queued and retries for ever. Letting an unexercised refund run risks the same outcome and may
+      well avoid it. ==A guard whose failure mode is identical to the harm, but guaranteed, is not a
+      guard.== So the refund proceeds and the caller is handed a reason to ALARM.
+
+    ==The honest limit of that second branch, stated rather than implied==: an unexercised refund
+    does run against real money, and this accepts that. What makes it acceptable is that its
+    realistic failure is LOUD — the gateway raises, the outbox retries, the intent goes dead-letter
+    with an alert — and not a silent loss. The quiet, expensive failure lives on the CHARGING side,
+    which is the side that is refused.
+
+    ``assert_never`` over the direction rather than over the operation, so a new operation inherits
+    the reasoning through its direction instead of getting an answer somebody typed in a hurry.
+    """
+    match money_direction(operation):
+        case MoneyDirection.TAKES_PAYMENT:
+            return True
+        case MoneyDirection.RETURNS_PAYMENT:
+            return False
+        case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
+            assert_never(unreachable)
+
+
+def is_live_credential(provider: CredentialProvider, secrets: Mapping[str, str]) -> bool:
+    """Does this credential address the provider's REAL, money-moving backend?
+
+    ==Read off the DECLARED test prefixes, never off the enforced map.== The enforced one relaxes as
+    evidence accumulates, so a verified provider would answer "nothing is live", which is the
+    opposite of the truth and would switch the use gate off at precisely the moment it starts to
+    matter. This is the same reading :func:`_validate` does at the door, asked from the other side.
+
+    An INFRA provider declares no prefixes, so the answer is ``False``: an SMTP relay has no live
+    mode to be in.
+    """
+    return any(
+        not str(secrets.get(field, "")).startswith(prefix)
+        for field, prefix in declared_test_mode_prefixes(provider).items()
+    )
+
+
+def authorise_live_use(
+    provider: CredentialProvider,
+    operation: GatewayOperation,
+    secrets: Mapping[str, str],
+    *,
+    current_implementations: Mapping[GatewayOperation, str],
+) -> str | None:
+    """==The gate on USE.== May this stored credential perform ``operation`` right now?
+
+    .. rubric:: ==Why a second gate exists at all==
+
+    :func:`store_credential` is a gate on WRITING. It answers once, on the day somebody types the
+    key, and it is then over — so a gateway edited afterwards keeps moving real money on the
+    strength of a verification that no longer describes it. ==The evidence expires; the credential
+    does not.== Nothing re-asked the question, and the row is read by a refund six weeks later on a
+    Sunday.
+
+    .. rubric:: What it returns, and why it is two-faced on purpose
+
+    * ``None`` — go ahead. Either the credential is test-mode (no live money, never gated), or the
+      operation's evidence is current;
+    * **raises** :class:`StaleVerificationError` — when :func:`blocks_on_stale_evidence` says this
+      operation may be refused. Raising rather than returning a verdict, for the reason
+      :func:`resolve_money_credential` raises: a boolean is one hurried ``if`` away from being
+      ignored, and what it guards is a stranger's card;
+    * **returns a reason string** — when the evidence is missing but refusing would be worse than
+      proceeding (the refund direction). ==The caller MUST alarm it.== It is handed back rather than
+      logged here so the alarm carries the caller's context — which payment, which business.
+
+    ==The decision of WHICH of those two happens is not the caller's.== It lives in
+    :func:`blocks_on_stale_evidence`, exhaustively, so no call site can quietly choose to be lenient
+    with the charging path or brutal with the refund one.
+
+    ==Every way of getting ``current_implementations`` wrong is restrictive on the charging side and
+    noisy on the refund side==, never silent — the same property :func:`verified_operations`
+    guarantees, and the reason it has no default here either.
+    """
+    if not is_live_credential(provider, secrets):
+        return None  # test mode: no real money, and the guard was never about the key's shape
+    if operation in verified_operations(provider, current_implementations=current_implementations):
+        return None
+
+    stale = stale_verifications(provider, current_implementations=current_implementations)
+    named = sorted(record.operation.value for record in stale if record.operation is operation)
+    reason = (
+        f"the {provider.value} gateway's `{operation.value}` has no CURRENT evidence of having "
+        "been run against the real provider in LIVE mode"
+        + (
+            ", and the record it had names code that has since CHANGED"
+            if named
+            else " — no record authorises it"
+        )
+        + ". A live credential was stored while the evidence was good; the gateway has been edited "
+        "since, so what would run now is code nobody has exercised, against a real card. Re-run "
+        "the harness in `apps/server/tests/live/` for that operation and record the new "
+        "fingerprint. (No key or value is shown — it is a secret, stale evidence or not.)"
+    )
+    if blocks_on_stale_evidence(operation):
+        raise StaleVerificationError(reason)
+    return reason
 
 
 def declared_test_mode_prefixes(provider: CredentialProvider) -> Mapping[str, str]:
@@ -1266,18 +1423,24 @@ __all__ = [
     "LiveVerification",
     "MalformedCredentialError",
     "MissingCredentialError",
+    "MoneyDirection",
     "ProviderMode",
     "ResolvedCredential",
+    "StaleVerificationError",
     "UnrecognisedCredentialError",
     "WrongCredentialClassError",
+    "authorise_live_use",
     "authorises_live_credentials",
+    "blocks_on_stale_evidence",
     "credential_class",
     "credential_key_families",
     "declared_test_mode_prefixes",
     "delete_credential",
     "gateway_operations",
+    "is_live_credential",
     "list_credential_providers",
     "live_verifications",
+    "money_direction",
     "required_fields",
     "required_test_mode_prefixes",
     "resolve_infra_credential",

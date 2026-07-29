@@ -275,8 +275,26 @@ def build_payment_gateways() -> dict[str, PaymentGateway]:
     return {provider.value: gateway_for(provider) for provider in money_providers()}
 
 
+def build_gateway_implementations() -> dict[str, Mapping[GatewayOperation, str]]:
+    """The provider→fingerprints map the USE gate reads. ==The twin of the gateway map.==
+
+    Built and stored beside :func:`build_payment_gateways`, keyed by the same stored provider
+    string, because the two answer halves of one question: *which object performs this act*, and
+    *has THAT code been exercised*. Keeping them apart on the shelf is how one gets wired and the
+    other forgotten.
+
+    Computed once at boot rather than per request: it is a pure function of the source text of this
+    process, so it cannot change while the process lives — and re-hashing a module on every checkout
+    would put file I/O on the money path for an answer that is constant.
+    """
+    return {
+        provider.value: current_gateway_implementations(provider) for provider in money_providers()
+    }
+
+
 __all__ = [
     "NotAMoneyProviderError",
+    "build_gateway_implementations",
     "build_payment_gateways",
     "build_webhook_adapters",
     "current_gateway_implementations",

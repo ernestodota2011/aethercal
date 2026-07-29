@@ -240,6 +240,31 @@ differently, so it could only be overruled and never discharged.
     file. The cost is that an edit to either half of a gateway module invalidates both of its
     operations. What the hash still does not cover — other modules, `httpx`, an injected transport,
     the runtime environment — is written down in the function itself.
+- **The evidence is re-checked when a credential is USED, not only when it is stored.** The door
+  answers once, on the day the key is typed; a gateway edited afterwards kept moving real money on a
+  verification that no longer described it, and nothing re-asked. Every charge and every refund now
+  re-asks against the fingerprints of the code in that process — and the answer is **asymmetric by
+  the money's direction**, decided by an exhaustive `blocks_on_stale_evidence` so a third operation
+  cannot inherit a policy by omission:
+  - **taking** payment through unexercised code is **refused** (the public 402, alerted). That
+    failure is the silent one — every status code says success — and the refusal costs new bookings,
+    is visible at once, and clears at zero cost by re-running the free checkout harness;
+  - **returning** payment is **never refused**, only alarmed. Blocking a refund does not prevent the
+    harm it guards against; it *is* that harm — "the guest's money does not come back" — produced
+    with certainty on a card already charged. An unexercised refund fails loudly (gateway raises,
+    outbox retries, intent dead-letters with an alert) rather than silently.
+  - Only **live** credentials are gated, so test-mode self-hosters and the whole suite are
+    untouched. Every way of getting the injected fingerprints wrong is restrictive on the charging
+    side and noisy on the refund side, never silent. An AST guard fails if any gateway call site
+    stops consulting the gate.
+- **A failed creation of a payable session is resolved rather than assumed away.** The live harness
+  guarded everything *after* the session existed and nothing around the call that creates it: if
+  Stripe processed the request and the response never landed, a live $1 invitation stood in a real
+  account with no id to name it, invisible to every cleanup path. The shared creation seam now
+  replays the identical request on the **same idempotency key** — Stripe returns the session it
+  already made, which is expired — and if the replay fails too, the run shouts the idempotency key
+  with manual-search instructions. Both harnesses create through that seam, and an AST guard pins
+  the creation inside its recovery.
 - **A prefix on its own is no longer accepted as a key.** The permanent type check was
   `value.startswith(prefixes)` while its own refusal promised to catch "a truncated paste" — so
   `sk_live_`, typed alone, was stored as a payment credential. `credential_key_families()` now

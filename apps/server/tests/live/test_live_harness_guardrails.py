@@ -617,3 +617,81 @@ def test_a_failed_refund_counts_as_nothing_and_is_retried(
     assert [r["amount"] for r in refunds if r["id"].startswith("re_ISSUED")] == [100], (
         "a failed refund moved no money, so the full amount must be issued again"
     )
+
+
+CREATION_CALL = "create_checkout_session"
+CREATION_RECOVERY = "_recover_an_ambiguous_creation"
+CREATION_PRIMITIVE = "_create"
+
+
+def _called_names_in(node: ast.AST) -> set[str]:
+    """Every name called anywhere inside ``node`` — ``a.b()`` and ``b()`` both give "b"."""
+    names: set[str] = set()
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Call):
+            continue
+        called = inner.func
+        if isinstance(called, ast.Attribute):
+            names.add(called.attr)
+        elif isinstance(called, ast.Name):
+            names.add(called.id)
+    return names
+
+
+def test_the_creation_of_a_payable_session_is_inside_its_own_recovery() -> None:
+    """==The H3 defect on the CREATION side: a failed create is not a create that did not happen.==
+
+    Both harnesses guarded everything after the session existed and nothing around the call that
+    brings it into existence. If Stripe processes the request and the response never lands — a
+    dropped connection, a timeout, a read error — the call raises with a live, payable $1 session
+    standing in a real account and no object naming it, so every cleanup path in this directory is
+    blind to it.
+
+    The fix lives in the ONE seam both harnesses create through
+    (``conftest.open_one_dollar_session``), and this pins it there: the function that calls the
+    gateway's creation must also call the recovery. Written structurally, because "remember to wrap
+    the create" is exactly the kind of rule that holds until somebody adds a third harness.
+
+    .. note::
+
+       ==Structure, not correctness.== That the replay actually resolves the ambiguity is a property
+       of Stripe's idempotency, argued in the recovery's own docstring; what this catches is the
+       omission — a creation with nothing at all around it.
+    """
+    conftest = pathlib.Path(__file__).parent / "conftest.py"
+    tree = ast.parse(conftest.read_text(encoding="utf-8"))
+    functions = {
+        node: _called_names_in(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+    # Transitively: `_open` reaches the creation through `_create`, so asking only about DIRECT
+    # callers would watch one line and miss every wrapper anybody adds around it.
+    creators = {node for node, calls in functions.items() if CREATION_CALL in calls}
+    while True:
+        named = {node.name for node in creators}
+        grown = {node for node, calls in functions.items() if calls & named}
+        if grown <= creators:
+            break
+        creators |= grown
+
+    assert creators, (
+        f"nothing in the live conftest reaches `{CREATION_CALL}` any more, so this guard is "
+        "watching nothing. If the creation seam moved, move this with it."
+    )
+
+    # Two functions are the mechanism rather than users of it: the primitive that IS the call (it
+    # has no error handling by design — its callers own the recovery), and the recovery itself,
+    # which replays through the primitive and would otherwise be required to recover itself.
+    unrecovered = sorted(
+        node.name
+        for node in creators
+        if node.name not in {CREATION_PRIMITIVE, CREATION_RECOVERY}
+        and CREATION_RECOVERY not in functions[node]
+    )
+    assert not unrecovered, (
+        f"these reach a payable session's creation without `{CREATION_RECOVERY}` around it: "
+        f"{unrecovered}. A create that fails AFTER Stripe processed it leaves a live $1 invitation "
+        "nothing can expire, because the id that names it never came back."
+    )
