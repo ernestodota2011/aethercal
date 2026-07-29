@@ -42,9 +42,9 @@ import httpx
 import pytest
 import test_stripe_live_checkout as checkout_module
 import test_stripe_live_refund as phase_b_module
-from conftest import PHASE_A_PURPOSE, PROVENANCE_BASE
 
 from aethercal.server.services.payments import CheckoutSession, RefundOutcome
+from conftest import PHASE_A_PURPOSE, PROVENANCE_BASE
 
 EVIDENCE = "evidence-block-printed"
 PAID_SESSION = "cs_live_THE_ONE_PHASE_A_OPENED"
