@@ -61,9 +61,17 @@ cleanup() {
     return
   fi
   echo "==> tearing down the throwaway stack"
+  # ==Same rule as stack-down.sh, and it lives in both because the defect did.== Restore the
+  # environment either way; never announce a teardown that did not happen.
+  local teardown_status=0
   # shellcheck disable=SC2086 - COMPOSE_CMD is a command line, and must word-split here.
-  ${COMPOSE_CMD} down -v --remove-orphans >/dev/null 2>&1 || true
+  ${COMPOSE_CMD} down -v --remove-orphans || teardown_status=$?
   restore_env
+  if ((teardown_status != 0)); then
+    echo "ERROR: the throwaway stack did NOT tear down cleanly (exit ${teardown_status})." >&2
+    echo "       It may still be running. deploy/.env has been restored regardless." >&2
+    echo "       Tear it down with: ${SIM_DIR}/scripts/stack-down.sh" >&2
+  fi
 }
 trap cleanup EXIT
 

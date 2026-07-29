@@ -443,10 +443,24 @@ class OutboxSampler:
                     )
 
     def start(self) -> None:
-        # Prove the endpoint answers BEFORE the run, rather than discovering at the end that every
-        # sample failed. A sampler that cannot read is a fatal configuration error, not a degraded
-        # mode: the whole drain-health half of the report would be missing.
-        self.scrape()
+        """Prove the endpoint answers, ==and KEEP that first reading.==
+
+        The probe was thrown away: ``self.scrape()`` ran only for its exception. On a short run the
+        thread could then be stopped before its first tick, leaving ``samples`` empty — and every
+        derived number is a ``max(..., default=0)``, so §3 printed a peak backlog of 0 and a peak
+        age of 0.0s. ==The ABSENCE of measurement read as a perfectly healthy queue==, which is the
+        one failure this module's docstring exists to forbid.
+
+        A sampler that cannot read is a fatal configuration error, not a degraded mode: the whole
+        drain-health half of the report would be missing. So the probe is recorded, and a start
+        that somehow leaves no sample raises rather than proceeding.
+        """
+        sample = self.scrape()
+        with self._lock:
+            self._samples.append(sample)
+            recorded = len(self._samples)
+        if recorded < 1:  # pragma: no cover - defensive; the append above cannot leave it empty
+            raise OutboxScrapeError("the sampler started without recording its first reading")
         self._thread = threading.Thread(target=self._loop, name="outbox-sampler", daemon=True)
         self._thread.start()
 

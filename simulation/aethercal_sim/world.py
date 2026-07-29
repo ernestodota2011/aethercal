@@ -216,18 +216,39 @@ def load_stack(path: Path) -> StackConfig:
     businesses_raw: Any = raw.get("businesses", [])
     if not isinstance(businesses_raw, list) or not businesses_raw:
         raise StackUnavailableError(f"{path} lists no businesses; stack-up.sh did not finish")
-    businesses = [
-        BusinessConfig(
-            slug=str(item["slug"]),
-            name=str(item["name"]),
-            timezone=str(item["timezone"]),
-            tenant_id=str(item["tenantId"]),
-            host_user_id=str(item["hostUserId"]),
-            api_key=str(item["apiKey"]),
+    # ==A filter that can empty a non-empty list must say so HERE.== `if isinstance(item, dict)`
+    # silently dropped anything malformed, so a file with three broken entries produced zero
+    # businesses and the failure surfaced 200 lines later as `stack.businesses[0]` raising
+    # IndexError — an error naming neither the file nor the reason. Every drop is now a refusal
+    # that carries the path and the problem.
+    businesses: list[BusinessConfig] = []
+    for index, item in enumerate(businesses_raw):
+        if not isinstance(item, dict):
+            raise StackUnavailableError(
+                f"{path}: businesses[{index}] is {type(item).__name__}, not an object"
+            )
+        missing = [
+            field
+            for field in ("slug", "name", "timezone", "tenantId", "hostUserId", "apiKey")
+            if field not in item
+        ]
+        if missing:
+            raise StackUnavailableError(
+                f"{path}: businesses[{index}] is missing {missing}. It is written by "
+                "scripts/stack-up.sh; a file this incomplete means the bootstrap did not finish."
+            )
+        businesses.append(
+            BusinessConfig(
+                slug=str(item["slug"]),
+                name=str(item["name"]),
+                timezone=str(item["timezone"]),
+                tenant_id=str(item["tenantId"]),
+                host_user_id=str(item["hostUserId"]),
+                api_key=str(item["apiKey"]),
+            )
         )
-        for item in businesses_raw
-        if isinstance(item, dict)
-    ]
+    if not businesses:
+        raise StackUnavailableError(f"{path}: businesses is empty after parsing")
     return StackConfig(
         api_url=str(raw["apiUrl"]),
         worker_url=str(raw["workerUrl"]),

@@ -57,6 +57,12 @@ from .measure import (
 from .traffic import PlannedBooking
 from .world import Business, StackConfig, World
 
+#: ==The refusal codes each mutation race is CONTRACTUALLY allowed to produce.== Anything else is a
+#: finding: the diary cannot see a contender that fell over, so the lineage looks correct while the
+#: failures went uncounted. Named here rather than inferred, so adding a code is a decision.
+RESCHEDULE_RACE_REFUSALS = frozenset({"not_active"})
+MIXED_RACE_REFUSALS = frozenset({"not_active"})
+
 #: A contender that never reaches the barrier would hang every other thread for ever. A run that
 #: fails is recoverable; a run that hangs at 3am is not.
 _BARRIER_TIMEOUT_SECONDS = 60.0
@@ -572,6 +578,7 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
     barrier = threading.Barrier(len(calls))
     responses: list[Response] = []
     intervals: list[tuple[float, float]] = []
+    crashed: list[str] = []
     lock = threading.Lock()
     latency = Latency(name)
 
@@ -579,12 +586,27 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
         # Every thread blocks here until the last one arrives; then all are released together.
         barrier.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
         started = time.perf_counter()
-        response = call()
-        finished = time.perf_counter()
-        latency.record(response.elapsed_ms)
-        with lock:
-            responses.append(response)
-            intervals.append((started, finished))
+        response: Response | None = None
+        try:
+            response = call()
+        except Exception as exc:
+            # ==This used to propagate out of `pool.map` and end the run with NO classifiable
+            # result== — no report, no verdict, and nothing saying which contender died or why. A
+            # race that produces an exception has produced a FINDING; it belongs in the taxonomy,
+            # failing the control, not in a traceback that deletes the other 39 results with it.
+            with lock:
+                crashed.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            # ==The interval is recorded on BOTH paths.== C15 measures simultaneity from these, so
+            # dropping a crashed contender's interval would under-report the peak overlap and make
+            # the harness look less concurrent than it actually was.
+            finished = time.perf_counter()
+            with lock:
+                intervals.append((started, finished))
+        if response is not None:
+            latency.record(response.elapsed_ms)
+            with lock:
+                responses.append(response)
 
     with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix="race") as pool:
         list(pool.map(run, calls))
@@ -601,6 +623,8 @@ def _fire_together(calls: list[Callable[[], Response]], name: str) -> RaceOutcom
         # transport error under load is a finding, not a tidy row in a table of expected codes.
         if response.status not in (400, 409, 422):
             unexpected.append(f"{response.status} {response.text[:120]}")
+    # A contender that raised never produced a response, so it can only be counted here.
+    unexpected.extend(f"the call raised {failure}" for failure in crashed)
     return RaceOutcome(
         name=name,
         contenders=len(calls),
@@ -1936,6 +1960,7 @@ def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window 
     date_to: date,
     race: RaceOutcome | None,
     original_id: str,
+    allowed_refusals: frozenset[str],
     at_most: bool = False,
 ) -> Control:
     """==What a mutation race left BEHIND, which is the invariant that actually matters.==
@@ -1959,6 +1984,7 @@ def control_lineage_after_race(  # noqa: PLR0913 - identity, subject and window 
         at_most=at_most,
         race=race,
         original_id=original_id,
+        allowed_refusals=allowed_refusals,
     )
 
 
@@ -1970,6 +1996,7 @@ def judge_lineage(  # noqa: PLR0913 - the verdict needs the read, the race AND t
     at_most: bool,
     race: RaceOutcome | None,
     original_id: str,
+    allowed_refusals: frozenset[str],
 ) -> Control:
     """Turn a diary read into a verdict. ==Pure, so both broken-source cases are testable.==
 
@@ -2018,6 +2045,22 @@ def judge_lineage(  # noqa: PLR0913 - the verdict needs the read, the race AND t
 
     active = read.active
     reasons: list[str] = []
+    if race is not None:
+        # ==A winner is not enough: the losers must have lost for the RIGHT reason.== S15 made this
+        # control require that something mutated; a contender refused with a code nobody listed, or
+        # one that fell over with a 5xx or a transport error, is a finding the diary CANNOT see —
+        # the lineage reads correct precisely because those failures never reached it.
+        if race.unexpected:
+            reasons.append(
+                f"{len(race.unexpected)} contender(s) answered something that was neither a "
+                f"success nor a clean domain conflict: {race.unexpected[:3]}"
+            )
+        rogue = sorted(set(race.refusals_by_code) - allowed_refusals)
+        if rogue:
+            reasons.append(
+                f"refusal code(s) {rogue} are not in this race's contract "
+                f"({sorted(allowed_refusals)}), so the losers did not lose for the expected reason"
+            )
     if race is None:
         reasons.append("the race outcome was not available, so no mutation could be evidenced")
     elif at_most and race.winners < 1:

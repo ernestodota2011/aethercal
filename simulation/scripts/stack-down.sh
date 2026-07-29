@@ -33,12 +33,23 @@ ENV_FILE="${REPO_ROOT}/deploy/.env"
 ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
 STACK_FILE="${SIM_DIR}/.stack.json"
 
+# ==The teardown's exit status is the whole point of running it.== It was `|| true` with its
+# output sent to /dev/null, so a `down` that failed — a container that would not stop, a volume
+# still in use, a daemon that had gone away — printed "stack is down" and removed
+# `.stack.json` anyway. That file is the ONLY trace that a stack exists; deleting it while the
+# stack is alive loses the stack AND the `--keep` guard that protects the developer's
+# `deploy/.env` backup (S6/S26), because that guard keys on the state this script just threw
+# away.
+#
+# So: restore the environment ALWAYS (safe, and it must happen either way), announce success
+# ONLY on a clean teardown, and exit non-zero so no wrapper mistakes the failure for a stop.
 echo "==> tearing down the throwaway stack (project: aethercal-sim)"
+teardown_status=0
 docker compose \
   -f "${REPO_ROOT}/deploy/docker-compose.yml" \
   -f "${E2E_DIR}/compose.e2e.yml" \
   -f "${SIM_DIR}/compose.sim.yml" \
-  down -v --remove-orphans >/dev/null 2>&1 || true
+  down -v --remove-orphans || teardown_status=$?
 
 # The same restore `run.sh` performs from its trap, deliberately identical: two ways to put the
 # file back that drift apart are worse than one, because the path nobody exercises is the one that
@@ -49,6 +60,14 @@ if [[ -f "${ENV_BACKUP}.state" ]]; then
   aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}"
 else
   echo "==> no deploy/.env backup to restore"
+fi
+
+if ((teardown_status != 0)); then
+  echo "ERROR: docker compose down exited ${teardown_status}. The stack may still be UP." >&2
+  echo "       ${STACK_FILE} is being KEPT so the stack is not lost track of, and so that" >&2
+  echo "       stack-up.sh goes on refusing to start on top of it." >&2
+  echo "       deploy/.env has been restored regardless." >&2
+  exit "${teardown_status}"
 fi
 
 rm -f "${STACK_FILE}"

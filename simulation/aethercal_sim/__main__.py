@@ -46,6 +46,8 @@ from .measure import (
 )
 from .report import RunContext, render, render_json, verdict_for
 from .scenarios import (
+    MIXED_RACE_REFUSALS,
+    RESCHEDULE_RACE_REFUSALS,
     BookedRef,
     ConfirmationCoverage,
     Control,
@@ -226,8 +228,12 @@ verdict becomes INCOMPLETE."""
 CONFIRMATION_MATCH_TIMEOUT_SECONDS = 30.0
 CONFIRMATION_MATCH_POLL_SECONDS = 3.0
 
+#: Consecutive reads that must show the SAME set of messages before the mailbox is called settled.
+#: Any new message resets the count — a late duplicate is only observable if the window restarts.
+_QUIET_POLLS = 2
 
-def measure_confirmations(
+
+def measure_confirmations(  # noqa: PLR0912, PLR0915 - the quiet window IS the extra branches
     mailbox: Mailbox,
     booked: list[BookedRef],
     *,
@@ -259,6 +265,8 @@ def measure_confirmations(
     confirmations: dict[str, list[MailMessage]] = {}
     superseded_by: dict[str, int] = {}
     matched = 0
+    last_identities: frozenset[str] = frozenset()
+    quiet_polls = 0
     while True:
         attempts += 1
         confirmations = confirmations_by_recipient(read.messages)
@@ -272,7 +280,22 @@ def measure_confirmations(
             if confirmations.get(ref.guest_email.lower())
             or superseded_by.get(ref.guest_email.lower())
         )
-        if accounted >= len(booked) or not read.complete:
+        # ==Reaching the target is not the end of the observation, it is the START of the quiet
+        # window.== Finishing at the first poll that satisfies `accounted` stops exactly when the
+        # asynchronous case the polling exists to cover is still in flight: Mailpit may not have
+        # persisted everything SMTP already delivered, and a LATE duplicate — half the reason C14
+        # exists — arrives by definition after the first one. So the loop continues until the set of
+        # message ids has stopped changing for `_QUIET_POLLS` consecutive reads, and ==any new
+        # message RESETS that window==, which is what makes a late arrival observable at all.
+        identities = frozenset(message.message_id for message in read.messages)
+        if identities == last_identities:
+            quiet_polls += 1
+        else:
+            quiet_polls = 0
+            last_identities = identities
+        if not read.complete:
+            break
+        if accounted >= len(booked) and quiet_polls >= _QUIET_POLLS:
             break
         if time.monotonic() - started >= timeout_seconds:
             break
@@ -624,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     date_to=race_day + timedelta(days=28),
                     race=reschedule_race,
                     original_id=reschedule_id,
+                    allowed_refusals=RESCHEDULE_RACE_REFUSALS,
                 )
             )
 
@@ -664,6 +688,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     date_to=race_day + timedelta(days=28),
                     race=mixed_race,
                     original_id=mixed_id,
+                    allowed_refusals=MIXED_RACE_REFUSALS,
                     at_most=True,
                 )
             )

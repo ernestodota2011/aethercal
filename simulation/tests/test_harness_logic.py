@@ -49,6 +49,7 @@ from aethercal_sim.scenarios import (
     CAP_DAY_FULL,
     CAP_NO_SLOTS,
     CAP_READ_FAILED,
+    RESCHEDULE_RACE_REFUSALS,
     ActiveBooking,
     BookedRef,
     CancelWebhookObservation,
@@ -93,7 +94,9 @@ from aethercal_sim.world import (
     BusinessConfig,
     NotADisposableStackError,
     StackConfig,
+    StackUnavailableError,
     assert_disposable_stack,
+    load_stack,
 )
 
 BUSINESSES = ["clinica-sonrisa", "katy-hvac", "estudio-legal"]
@@ -472,6 +475,7 @@ def test_lineage_controls_fail_on_an_incomplete_read(at_most: bool) -> None:
         at_most=at_most,
         race=_mutation_race(winners=1),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.ran is True
     assert control.passed is False
@@ -481,10 +485,22 @@ def test_lineage_controls_fail_on_an_incomplete_read(at_most: bool) -> None:
 def test_lineage_passes_on_a_complete_read_with_one_survivor() -> None:
     read = _diary(SUCCESSOR)
     assert judge_lineage(
-        read, ident="C8", guards="g", at_most=False, race=_mutation_race(1), original_id=SUBJECT
+        read,
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(1),
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     ).passed
     assert judge_lineage(
-        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+        read,
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(2, 2),
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     ).passed
 
 
@@ -492,7 +508,13 @@ def test_lineage_fails_when_two_live_appointments_survive() -> None:
     """The defect the pair exists to catch, on a read that IS trustworthy."""
     read = _diary("a-1", "b-2")
     assert not judge_lineage(
-        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+        read,
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(2, 2),
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     ).passed
 
 
@@ -529,10 +551,22 @@ def test_c9_accepts_zero_survivors_but_c8_does_not() -> None:
     """A cancel may legitimately win the mixed race; a reschedule race must leave a successor."""
     read = _diary()
     assert judge_lineage(
-        read, ident="C9", guards="g", at_most=True, race=_mutation_race(2, 2), original_id=SUBJECT
+        read,
+        ident="C9",
+        guards="g",
+        at_most=True,
+        race=_mutation_race(2, 2),
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     ).passed
     assert not judge_lineage(
-        read, ident="C8", guards="g", at_most=False, race=_mutation_race(1), original_id=SUBJECT
+        read,
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=_mutation_race(1),
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     ).passed
 
 
@@ -1813,6 +1847,7 @@ def test_c8_passes_when_a_real_SUCCESSOR_survives() -> None:
         at_most=False,
         race=_mutation_race(winners=1),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is True
     assert control.ran is True
@@ -1832,6 +1867,7 @@ def test_c8_FAILS_when_every_mutation_failed_and_the_original_survives() -> None
         at_most=False,
         race=_mutation_race(winners=0),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.ran is True
     assert control.passed is False
@@ -1848,6 +1884,7 @@ def test_c9_FAILS_when_every_mutation_failed_and_the_original_survives() -> None
         at_most=True,
         race=_mutation_race(winners=0, contenders=2),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is False
     assert "NOTHING mutated" in control.observed
@@ -1863,6 +1900,7 @@ def test_c9_passes_when_the_cancel_won_and_nothing_survives() -> None:
         at_most=True,
         race=_mutation_race(winners=2, contenders=2),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is True
 
@@ -1875,6 +1913,7 @@ def test_c9_passes_when_the_reschedule_won_and_a_successor_survives() -> None:
         at_most=True,
         race=_mutation_race(winners=2, contenders=2),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is True
 
@@ -1888,6 +1927,7 @@ def test_c9_still_fails_on_two_live_appointments() -> None:
         at_most=True,
         race=_mutation_race(winners=2, contenders=2),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is False
     assert "double-booked" in control.observed
@@ -1902,6 +1942,7 @@ def test_c8_still_fails_when_no_successor_survives() -> None:
         at_most=False,
         race=_mutation_race(winners=1),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is False
 
@@ -1915,6 +1956,7 @@ def test_c8_fails_when_the_reschedule_race_had_more_than_one_winner() -> None:
         at_most=False,
         race=_mutation_race(winners=2),
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is False
 
@@ -1929,6 +1971,7 @@ def test_lineage_refuses_to_judge_without_the_race(at_most: bool) -> None:
         at_most=at_most,
         race=None,
         original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
     )
     assert control.passed is False
     assert "not available" in control.observed
@@ -2407,3 +2450,126 @@ def test_the_plan_total_matches_the_request_for_many_seeds() -> None:
     for seed in range(12):
         plan = _plan(seed=seed, per_week=40)
         assert len(plan) == 40 * 2 * len(BUSINESSES)
+
+
+# --------------------------------------------------------------------------------------
+# S28-S33.
+# --------------------------------------------------------------------------------------
+
+
+def test_start_keeps_its_probe_so_a_short_run_is_never_backlog_zero() -> None:
+    """==S28: the ABSENCE of measurement used to read as a healthy queue.==
+
+    The probe ran only for its exception and was discarded. A run stopped before the thread's first
+    tick left `samples` empty, and every derived number is a `max(..., default=0)` -- so §3 printed
+    a peak backlog of 0 and a peak age of 0.0s over nothing at all.
+    """
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+    sampler.scrape = lambda: OutboxSample(  # type: ignore[method-assign]
+        at=0.0, due=17, oldest_due_age_seconds=4.5, by_status={}, delivered=1
+    )
+    sampler.start()
+    sampler.stop()
+    assert len(sampler.samples) >= 1, "a run stopped immediately still has its first reading"
+    assert sampler.peak_due() == 17, "the peak must come from a real reading, not from default=0"
+
+
+def test_the_lineage_control_fails_on_an_UNEXPECTED_response() -> None:
+    """==S29: a winner is not enough -- the losers must have lost for the right reason.==
+
+    A contender that answered a 5xx, or fell over in transport, is a finding the diary cannot see:
+    the lineage reads correct precisely because those failures never reached it.
+    """
+    race = _mutation_race(winners=1)
+    race = RaceOutcome(
+        name=race.name,
+        contenders=40,
+        winners=1,
+        refusals_by_code={"not_active": 38},
+        unexpected=["500 boom"],
+        latency=Latency("r"),
+        intervals=[(0.0, 1.0), (0.1, 1.1)],
+    )
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=race,
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
+    )
+    assert control.passed is False
+    assert "neither a success nor a clean domain conflict" in control.observed
+
+
+def test_the_lineage_control_fails_on_a_refusal_code_outside_the_contract() -> None:
+    """`day_full` is a clean 409 and still not a code this race is allowed to produce."""
+    race = RaceOutcome(
+        name="race_reschedule_same_booking",
+        contenders=40,
+        winners=1,
+        refusals_by_code={"not_active": 30, "day_full": 9},
+        unexpected=[],
+        latency=Latency("r"),
+        intervals=[(0.0, 1.0), (0.1, 1.1)],
+    )
+    control = judge_lineage(
+        _diary(SUCCESSOR),
+        ident="C8",
+        guards="g",
+        at_most=False,
+        race=race,
+        original_id=SUBJECT,
+        allowed_refusals=RESCHEDULE_RACE_REFUSALS,
+    )
+    assert control.passed is False
+    assert "day_full" in control.observed
+    assert "not in this race's contract" in control.observed
+
+
+def test_a_contender_that_RAISES_becomes_a_finding_not_a_crash() -> None:
+    """==S30: one exception used to end the run with no classifiable result at all.==
+
+    And the interval is still recorded, because C15 measures simultaneity from these -- dropping a
+    crashed contender's interval would make the harness look less concurrent than it was.
+    """
+
+    def boom() -> Response:
+        raise OSError("connection reset by peer")
+
+    def fine() -> Response:
+        time.sleep(0.05)
+        return Response(201, {"id": "x"}, "", 50.0, None)
+
+    outcome = _fire_together([boom, fine, fine], "probe_crash")
+    assert outcome.winners == 2
+    assert any("raised" in u for u in outcome.unexpected)
+    assert len(outcome.intervals) == 3, "the crashed contender's interval is still recorded"
+
+
+def test_a_business_entry_missing_fields_names_the_path_and_the_problem(tmp_path: Any) -> None:
+    """==S33: a filter that can empty a non-empty list must say so where it happens.==
+
+    `if isinstance(item, dict)` silently dropped malformed entries, so the failure surfaced 200
+    lines later as `businesses[0]` raising IndexError -- an error naming neither file nor reason.
+    """
+    stack_file = tmp_path / ".stack.json"
+    stack_file.write_text(
+        json.dumps(
+            {
+                "apiUrl": "http://localhost:8000",
+                "workerUrl": "http://127.0.0.1:8001",
+                "bookingUrl": "http://localhost:5001",
+                "mailpitUrl": "http://localhost:8025",
+                "sinkUrl": "http://localhost:9099",
+                "metricsToken": "t" * 40,
+                "composeProject": "aethercal-sim",
+                "nonce": "a1b2c3d4" * 4,
+                "businesses": [{"slug": "b", "name": "B"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(StackUnavailableError, match=r"businesses\[0\] is missing"):
+        load_stack(stack_file)
