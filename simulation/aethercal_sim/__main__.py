@@ -782,6 +782,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                     "peak_oldest_age_seconds": sampler.peak_oldest_age(),
                     "samples": len(sampler.samples),
                     "scrape_failures": len(sampler.failures),
+                    "discarded_at_pause": sampler.discarded_at_pause,
                     "drained": drained,
                     "deadman": drain_stats,
                 },

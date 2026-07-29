@@ -315,6 +315,9 @@ class OutboxSampler:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._paused = threading.Event()
+        # ==Held for the whole scrape-and-record step, so `pause()` can wait it out.== See pause().
+        self._in_flight = threading.Lock()
+        self._discarded_at_pause = 0
         self._thread: threading.Thread | None = None
 
     def scrape(self) -> OutboxSample:
@@ -339,42 +342,94 @@ class OutboxSampler:
         return parse_summary(payload)
 
     def pause(self) -> None:
-        """Stop sampling without ending the run.
+        """Stop sampling without ending the run, and ==do not return until sampling has STOPPED.==
 
-        ==For the deliberate outage in the dead-man control, and nothing else.== The operator
-        surface is served by the worker, so stopping the worker makes every scrape fail - and those
-        failures are the control working, not the instrument breaking. Recorded as failures they
-        would raise a warning about an outage the run caused on purpose, and that is how a real
-        warning later gets ignored.
+        For the deliberate outage in the dead-man control, and nothing else. The operator surface is
+        served by the worker, so stopping the worker makes every scrape fail — and those failures
+        are the control working, not the instrument breaking. Recorded as failures they would raise
+        a warning about an outage the run caused on purpose, and that is how a real warning later
+        gets ignored.
+
+        ==That was the guarantee this method DOCUMENTED and did not provide.== It set the flag and
+        returned instantly, while the sampler thread could be in the middle of a scrape — a window
+        as wide as the 10-second socket timeout. `control_drain_deadman` calls this and then stops
+        the worker on the very next line, so that in-flight scrape fails with a connection refused
+        and lands in ``failures``. C12 gates on ``scrape_failures == 0``. ==A perfectly correct run
+        would then fail its own control, at random, because of an outage it caused on purpose== —
+        the same shape as C5 racing its own drain, one layer down in the instrument.
+
+        So the flag is set FIRST and then the in-flight lock is acquired: when this returns, no
+        scrape is running, and any that was running finished with the flag already set and had its
+        result discarded (counted in :attr:`discarded_at_pause`, never silently). A sample lost at
+        that boundary is a sample taken microseconds before a deliberate outage; the count is
+        reported so the discard is a fact rather than a favour.
         """
         self._paused.set()
+        with self._in_flight:
+            pass
 
     def resume(self) -> None:
         self._paused.clear()
 
+    @property
+    def discarded_at_pause(self) -> int:
+        """Scrapes that completed after a pause began, and were therefore not recorded.
+
+        Surfaced because a filter nobody can see is how a real warning eventually gets dropped.
+        """
+        with self._lock:
+            return self._discarded_at_pause
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             if not self._paused.is_set():
-                try:
-                    sample = self.scrape()
-                    with self._lock:
-                        self._samples.append(sample)
-                except OutboxScrapeError as exc:
-                    with self._lock:
-                        self._failures.append(str(exc))
-                except Exception as exc:
-                    # ==An unexpected exception used to END this thread, in silence.== Only
-                    # OutboxScrapeError was caught, so anything else — and the old permissive reader
-                    # could raise TypeError on `int(None)` — killed the sampler outright. The run
-                    # carried on, `failures` stayed empty, C12 saw zero unexplained scrape failures
-                    # and §3 reported a peak backlog computed over however many samples had been
-                    # taken before the thread died. Sampling that STOPPED must never present as
-                    # sampling that found nothing wrong.
-                    with self._lock:
-                        self._failures.append(
-                            f"the sampler hit an unexpected {type(exc).__name__}: {exc}"
-                        )
+                self._scrape_once()
             self._stop.wait(self._interval)
+
+    def _scrape_once(self) -> None:
+        """One sampled read, recorded or discarded. ==Holds the in-flight lock itself.==
+
+        The lock lives HERE rather than at the call site, and that placement is the point: it spans
+        the scrape AND the decision about what to do with its result, so `pause()` can wait for
+        both by acquiring the same lock. Put it in `_loop` instead and the guarantee holds only for
+        the one caller that remembers it — which is the defect this harness keeps finding in itself,
+        a rule enforced at one of its call sites.
+
+        Re-reading `_paused` after the call is the other half: a pause that began mid-scrape means
+        this result belongs to the outage the run caused on purpose, so it is discarded and counted
+        rather than filed as an unexplained failure C12 would then void the run over.
+        """
+        with self._in_flight:
+            self._record_scrape()
+
+    def _record_scrape(self) -> None:
+        try:
+            sample = self.scrape()
+            with self._lock:
+                if self._paused.is_set():
+                    self._discarded_at_pause += 1
+                else:
+                    self._samples.append(sample)
+        except OutboxScrapeError as exc:
+            with self._lock:
+                if self._paused.is_set():
+                    self._discarded_at_pause += 1
+                else:
+                    self._failures.append(str(exc))
+        except Exception as exc:
+            # ==An unexpected exception used to END this thread, in silence.== Only
+            # OutboxScrapeError was caught, so anything else — and the old permissive reader could
+            # raise TypeError on `int(None)` — killed the sampler outright. The run carried on,
+            # `failures` stayed empty, C12 saw zero unexplained scrape failures, and §3 reported a
+            # peak backlog computed over however many samples had been taken before the thread
+            # died. Sampling that STOPPED must never present as sampling that found nothing wrong.
+            with self._lock:
+                if self._paused.is_set():
+                    self._discarded_at_pause += 1
+                else:
+                    self._failures.append(
+                        f"the sampler hit an unexpected {type(exc).__name__}: {exc}"
+                    )
 
     def start(self) -> None:
         # Prove the endpoint answers BEFORE the run, rather than discovering at the end that every

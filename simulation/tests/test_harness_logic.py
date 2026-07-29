@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -30,6 +32,8 @@ from aethercal_sim.measure import (
     Mailbox,
     MailboxRead,
     MailMessage,
+    OutboxSample,
+    OutboxSampler,
     OutboxScrapeError,
     parse_summary,
     percentile,
@@ -45,6 +49,7 @@ from aethercal_sim.scenarios import (
     OfferRead,
     OrganicResult,
     cap_probe_blocker,
+    control_outbox_drained,
     is_reschedule_collision,
     judge_cancel_idempotency,
     judge_closed_day,
@@ -1334,3 +1339,125 @@ def test_a_mistyped_drain_delivered_is_an_error_not_an_absence() -> None:
 def test_a_body_without_the_outbox_contract_is_a_scrape_error(payload: object) -> None:
     with pytest.raises(OutboxScrapeError):
         parse_summary(payload)
+
+
+# --------------------------------------------------------------------------------------
+# ==`pause()` must not return while a scrape is still in flight.==
+#
+# It set the flag and returned instantly, while the sampler thread could be mid-scrape -- a window
+# as wide as the 10s socket timeout. `control_drain_deadman` calls pause() and stops the worker on
+# the very next line, so that in-flight scrape fails with a connection refused and lands in
+# `failures`. C12 gates on `scrape_failures == 0`. ==A perfectly correct run would then fail its own
+# control, at random, because of an outage it caused on purpose== -- the same shape as C5 racing its
+# own drain, one layer down in the instrument.
+#
+# Driven with explicit handshakes rather than sleeps: the scrape blocks until the test releases it,
+# so the interleaving under test is the one that happens, every time.
+# --------------------------------------------------------------------------------------
+
+
+class _BlockingSampler(OutboxSampler):
+    """A sampler whose scrape blocks until released, so the race can be staged deterministically."""
+
+    def __init__(self) -> None:
+        super().__init__("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.raise_scrape_error = True
+        self.calls = 0
+
+    def scrape(self) -> OutboxSample:
+        self.calls += 1
+        self.entered.set()
+        self.release.wait(timeout=5)
+        if self.raise_scrape_error:
+            raise OutboxScrapeError("connection refused (the deliberate outage)")
+        return OutboxSample(at=0.0, due=0, oldest_due_age_seconds=0.0, by_status={}, delivered=0)
+
+
+def _stage_scrape_in_flight(sampler: _BlockingSampler) -> threading.Thread:
+    """Start one loop iteration and block inside its scrape."""
+    worker = threading.Thread(target=sampler._scrape_once, daemon=True)
+    worker.start()
+    assert sampler.entered.wait(timeout=5), "the staged scrape never started"
+    return worker
+
+
+def test_pause_waits_for_an_in_flight_scrape_before_returning() -> None:
+    """==pause() must be a barrier, not a flag.== When it returns, nothing is still scraping."""
+    sampler = _BlockingSampler()
+    worker = _stage_scrape_in_flight(sampler)
+
+    returned = threading.Event()
+
+    def do_pause() -> None:
+        sampler.pause()
+        returned.set()
+
+    pauser = threading.Thread(target=do_pause, daemon=True)
+    pauser.start()
+    # While the scrape is blocked, pause() must NOT have returned.
+    assert not returned.wait(timeout=0.3), "pause() returned while a scrape was still in flight"
+
+    sampler.release.set()
+    assert returned.wait(timeout=5), "pause() never returned after the scrape finished"
+    worker.join(timeout=5)
+    pauser.join(timeout=5)
+
+
+def test_a_failure_from_the_deliberate_outage_is_NOT_counted_against_c12() -> None:
+    """==The defect, as the number C12 actually reads.==
+
+    The scrape is in flight, the pause begins (as the dead-man control does immediately before
+    stopping the worker), and the scrape then fails. That failure belongs to the outage the run
+    caused on purpose, so it must not appear in `failures` -- which C12 requires to be zero.
+    """
+    sampler = _BlockingSampler()
+    worker = _stage_scrape_in_flight(sampler)
+
+    pauser = threading.Thread(target=sampler.pause, daemon=True)
+    pauser.start()
+    time.sleep(0.05)  # let pause() set the flag and block on the in-flight lock
+    sampler.release.set()
+    worker.join(timeout=5)
+    pauser.join(timeout=5)
+
+    assert sampler.failures == []
+    assert sampler.discarded_at_pause == 1
+    control = control_outbox_drained(
+        drained=True, waited_seconds=0.0, scrape_failures=len(sampler.failures)
+    )
+    assert control.passed is True
+
+
+def test_a_sample_completing_after_a_pause_is_discarded_and_COUNTED() -> None:
+    """A boundary sample is dropped -- but the drop is a reported fact, never a silent favour."""
+    sampler = _BlockingSampler()
+    sampler.raise_scrape_error = False
+    worker = _stage_scrape_in_flight(sampler)
+
+    pauser = threading.Thread(target=sampler.pause, daemon=True)
+    pauser.start()
+    time.sleep(0.05)
+    sampler.release.set()
+    worker.join(timeout=5)
+    pauser.join(timeout=5)
+
+    assert sampler.samples == []
+    assert sampler.discarded_at_pause == 1
+
+
+def test_a_real_failure_while_NOT_paused_still_reaches_c12() -> None:
+    """==The fix must not become a blanket excuse.== Unpaused, a failure still counts and voids."""
+    sampler = _BlockingSampler()
+    worker = _stage_scrape_in_flight(sampler)
+    sampler.release.set()
+    worker.join(timeout=5)
+
+    assert len(sampler.failures) == 1
+    assert sampler.discarded_at_pause == 0
+    control = control_outbox_drained(
+        drained=True, waited_seconds=0.0, scrape_failures=len(sampler.failures)
+    )
+    assert control.passed is False
+    assert "scrape failures=1" in control.observed

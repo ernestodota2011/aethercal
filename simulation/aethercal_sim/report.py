@@ -289,6 +289,13 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
         f"- Backlog samples taken: **{len(sampler.samples)}** "
         f"(scrape failures: **{len(sampler.failures)}**)"
     )
+    # ==Reported because a filter nobody can see is how a real warning gets dropped.== A scrape
+    # that finishes after the dead-man's deliberate pause begins belongs to that outage, so it is
+    # not an unexplained failure — but the discard is stated rather than assumed.
+    add(
+        f"- Reads discarded at the deliberate-outage boundary (C5's pause): "
+        f"**{sampler.discarded_at_pause}**"
+    )
     add(f"- **Peak `due` backlog: {sampler.peak_due()}**")
     add(f"- **Peak oldest-due age: {sampler.peak_oldest_age():.1f}s**")
     add(
