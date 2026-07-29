@@ -38,7 +38,11 @@ The run is therefore cut where the human is:
 * ==**phase B refunds ONLY what phase A opened.**== The session is marked at creation (the return
   URL carries the harness's name and the run id, and Stripe echoes it back), and phase B demands
   that mark before it resolves the PaymentIntent. This account holds **real customer invoices**, and
-  a $1 amount identifies nothing — so a mistyped or hostile session id must not reach a refund.
+  a $1 amount identifies nothing — so a mistyped or hostile session id must not reach a refund;
+* ==**both phases carry the connectivity control**== (``conftest.stripe_reachable``), which demands
+  Stripe's own ``401`` for a key Stripe never issued before either phase acts. It is a FIXTURE, so
+  running a phase by name cannot leave it behind — a $1 charge opened, or an evidence block printed,
+  by a process that never reached Stripe would be the worst thing this file could produce.
 
 .. rubric:: How to run it
 
@@ -162,6 +166,7 @@ def paid_session_id() -> str:
 
 
 async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
+    stripe_reachable: int,
     real_charge_allowed: None,
     open_one_dollar_session: Callable[..., Any],
     one_dollar_cents: int,
@@ -286,6 +291,7 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
 
 
 async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR0913
+    stripe_reachable: int,
     paid_session_id: str,
     refund_reconnected: None,
     secret_key: str,

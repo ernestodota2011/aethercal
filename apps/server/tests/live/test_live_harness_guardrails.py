@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 import pytest
+from live_harness_modules import provider_touching_modules
 
 from aethercal.server.integrations.stripe import StripeGateway
 
@@ -387,6 +388,56 @@ def test_provenance_is_demanded_before_the_refund_is_sent() -> None:
     assert refund_call in source, "phase B no longer calls the gateway's refund"
     assert source.index(demand) < source.index(refund_call), (
         "phase B sends the refund before it has established that the session came from phase A"
+    )
+
+
+CONTROL_FIXTURE = "stripe_reachable"
+
+
+def test_every_provider_touching_test_asks_for_the_connectivity_control() -> None:
+    """==The finding: the control could be selected around.==
+
+    The control that proves this process really reaches Stripe used to be a TEST standing beside the
+    runs it vouched for. ``pytest <file>::<test>`` runs one of them alone, and pytest promises no
+    ordering even when both are collected. So the run that ==prints the record somebody pastes into
+    ``live_verifications()``== could happen with the control never executed — evidence about a
+    round-trip nobody watched, feeding the guard that stands between this product and a real charge
+    on a real card.
+
+    It is a fixture now, and a fixture cannot be selected around — but only for the tests that ASK.
+    This is what makes asking non-optional: every test in every provider-touching module must name
+    :data:`CONTROL_FIXTURE` in its signature. A new harness that forgets fails HERE, offline, on
+    every commit — not on the day somebody writes its evidence into the register.
+
+    ==It reads the whole directory, not a list==, so "which tests must ask?" cannot drift from
+    "which tests reach a provider". THIS file is deliberately not among them: it carries no marker,
+    reaches nothing, and its own mention of the marker is a string rather than an assignment — a
+    distinction ``live_harness_modules`` makes structurally, because the substring version
+    classified this very guard as a provider harness the moment it named what it was looking for.
+    """
+    modules = provider_touching_modules(pathlib.Path(__file__).parent)
+    assert modules, (
+        "no provider-touching module was found in tests/live/, so this guard is watching nothing. "
+        "Either the harness moved or the marker was renamed."
+    )
+
+    missing: list[str] = []
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+            parameters = {argument.arg for argument in node.args.args}
+            if CONTROL_FIXTURE not in parameters:
+                missing.append(f"{path.name}::{node.name}")
+
+    assert not missing, (
+        f"these tests reach a real provider without asking for `{CONTROL_FIXTURE}`: {missing}. Run "
+        "one of them by name and it produces evidence — or opens a payable session — with nothing "
+        "having shown this process reaches Stripe at all. Add the fixture to the signature; it "
+        "costs one zero-cost GET and it is what makes the evidence mean anything."
     )
 
 

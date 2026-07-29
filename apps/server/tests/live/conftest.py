@@ -22,6 +22,14 @@ makes it raise for every test in this directory. Phase B — the test whose *pur
 it — asks for :func:`refund_reconnected`, which restores it for that test alone and hands it back
 unplugged at teardown.
 
+.. rubric:: ==Every probe carries its control, and the control is a FIXTURE==
+
+:func:`stripe_reachable` demands Stripe's own ``401`` for a key Stripe never issued — the one answer
+no stub, proxy or offline cache can fabricate. It lives here rather than as a test beside the runs
+it vouches for, because a sibling test is not a precondition: running the evidence-producing test by
+name would simply leave the control uncollected, and the record it prints goes into the register the
+money guard reads.
+
 .. rubric:: ==Cleanup never masks the failure it was cleaning up after==
 
 :func:`ensure_refunded` and :func:`expire_session` are written to be called from a ``finally`` and
@@ -233,6 +241,57 @@ def unauthenticated_stripe_api() -> Iterator[httpx.Client]:
         timeout=HTTP_TIMEOUT,
     ) as client:
         yield client
+
+
+@pytest.fixture
+def stripe_reachable(secret_key: str, unauthenticated_stripe_api: httpx.Client) -> int:
+    """==The control every probe in this directory carries.== Returns the status Stripe gave.
+
+    .. rubric:: Why it is a FIXTURE and no longer a test standing beside one
+
+    It was ``test_the_control_proves_this_process_really_reaches_stripe``, a sibling of the run it
+    was supposed to vouch for — and a sibling is not a precondition. ``pytest <file>::<test>`` runs
+    the evidence-producing test alone, and pytest promises no ordering even when both are collected.
+    So the run that ==writes a record into the money guard's register== could happen without the one
+    thing proving the process reached Stripe at all. Evidence produced without its control is not
+    weak evidence; it is a claim about a round-trip nobody watched happen.
+
+    A fixture cannot be skipped past. Anything that asks for it gets the control first, by
+    construction — and ``tests/live/test_live_harness_guardrails.py`` asserts that every test in
+    every provider-touching module asks.
+
+    .. rubric:: What it proves, and why only a 401 proves it
+
+    A stub, a proxy, an offline cache or a mis-wired fixture can all return something that looks
+    like success. ==None of them can produce Stripe's own ``401`` for a key Stripe never issued.==
+    So the control asks for a REJECTION and requires it: the one answer nothing local fabricates.
+
+    A ``GET``, with a key Stripe never issued, so the control creates nothing — not even a session
+    to clean up — and costs nothing.
+
+    ==``secret_key`` is taken and deliberately not used: that is the SKIP, not an oversight.== The
+    marker only opens the network door; it skips nothing. Depending on the real key here means every
+    test that asks for this control also inherits the skip on a machine that has none — the lesson
+    ``test_network_guard`` records as "the marker is not a guard", which a control living in its own
+    function had to remember for itself.
+    """
+    del secret_key  # the control must use a key Stripe never issued; see above for why it is here
+
+    response = unauthenticated_stripe_api.get("/checkout/sessions", params={"limit": 1})
+
+    if response.status_code != 401:
+        pytest.fail(
+            "a deliberately invalid key did not get Stripe's 401, so this process is NOT talking "
+            "to the real api.stripe.com and no evidence gathered here would mean anything. Got "
+            f"{response.status_code}."
+        )
+    body: dict[str, Any] = response.json()
+    if body.get("error", {}).get("type") != "invalid_request_error":
+        pytest.fail(
+            "the 401 did not carry Stripe's own error shape, so something between this process and "
+            f"Stripe is answering for it: {body}"
+        )
+    return response.status_code
 
 
 @pytest.fixture

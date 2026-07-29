@@ -36,6 +36,7 @@ import aiosmtplib
 import httplib2
 import httpx
 import pytest
+from live_harness_modules import provider_touching_modules
 from pytest_network_guard import (
     LIVE_PROVIDER_ALLOWED_DESTINATIONS,
     RealNetworkForbiddenError,
@@ -45,7 +46,6 @@ from pytest_network_guard import (
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 LIVE_TESTS = REPO_ROOT / "apps" / "server" / "tests" / "live"
 KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
-LIVE_MARK = "pytestmark = pytest.mark.live_provider"
 
 
 def _modules_that_reach_a_provider() -> list[str]:
@@ -60,11 +60,15 @@ def _modules_that_reach_a_provider() -> list[str]:
     ==Reading the marker keeps the question right without keeping a list.== A provider harness added
     tomorrow is covered the day it is written, because the thing that makes it a provider harness is
     the very thing this looks for.
+
+    ==Parsed, not grepped, and that distinction has already bitten.== The substring version counted
+    any file CONTAINING ``pytestmark = pytest.mark.live_provider`` — including the guardrail file,
+    the moment it named the marker in order to search for it. That file then had to "reach a
+    provider", and this gate demanded it not pass without a credential, which it does by design on
+    every commit. See :mod:`live_harness_modules`.
     """
     return sorted(
-        path.relative_to(REPO_ROOT).as_posix()
-        for path in LIVE_TESTS.glob("test_*.py")
-        if LIVE_MARK in path.read_text(encoding="utf-8")
+        path.relative_to(REPO_ROOT).as_posix() for path in provider_touching_modules(LIVE_TESTS)
     )
 
 

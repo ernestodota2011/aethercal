@@ -283,6 +283,7 @@ The barriers on the money phase are structural, not procedural:
 | **phase B refunds only what phase A opened** | the session is **marked at creation** (its return URL carries the harness name + run id; Stripe echoes it back) and phase B demands that mark **before** resolving the PaymentIntent. ==This account holds real customer invoices and $1 identifies nothing==, so a mistyped or stale session id is refused rather than refunded |
 | **the evidence cannot outrun the fact** | the evidence block is composed **only after** the refund has reached a terminal `succeeded` (and the checkout session has actually been expired). ==A `pending` refund is never certified as money returned== |
 | **refund cannot fire by accident** | `StripeGateway.refund` is unplugged for the whole directory; only phase B re-plugs it, and says so in its own signature |
+| **no evidence without its control** | every provider-touching test takes the `stripe_reachable` fixture, which demands Stripe's own `401` for a key Stripe never issued before the test body runs. It used to be a test standing *beside* the run it vouched for — so `pytest <file>::<test>` produced evidence with the control never executed. ==A fixture cannot be selected around==, and an offline AST guard fails if any live test omits it |
 
 The run prints an evidence block. **That block, not a boolean, is what goes into
 `live_verifications()`** in `services/tenant_credentials.py` — one record per operation, each
@@ -298,8 +299,18 @@ requires having done the run.
 > method's source, so even a cosmetic edit forces a re-run: a needless free run costs minutes, a
 > false "still verified" costs somebody's money.
 >
-> That comparison used to live in the test suite alone — `services` cannot import `integrations`, so
-> the door could not compute a fingerprint. The evidence therefore expired in CI and **stayed valid
+> **The fingerprint covers the gateway's whole MODULE, not just the method.** It hashed the method's
+> own text, and `StripeGateway.refund` is four lines that delegate: the request is built by
+> `self._client` out of `_STRIPE_API_BASE` and `_HTTP_TIMEOUT`. Repointing the API base left the
+> hash identical, so a verification reading "exercised against the real Stripe" would have gone on
+> authorising a live key for code now talking somewhere else. The cost of the blunt unit is that an
+> edit to either half of the module invalidates **both** of that provider's operations — chosen
+> deliberately: an incomplete dependency analysis fails as a false "still verified", and that one
+> costs somebody's money. What it still does not cover is stated in the function's own docstring
+> (other modules, `httpx`, an injected transport, the runtime environment).
+>
+> That comparison used to live in the test suite alone — `services` cannot import
+> `integrations.money`, so the door could not compute a fingerprint. The evidence therefore expired in CI and **stayed valid
 > in production**. The dependency is now inverted rather than dropped: `cli.run_credentials_set`
 > (the layer that can see both) passes `current_gateway_implementations(provider)` into the door,
 > and the parameter has no default — a caller cannot omit it, and any partial answer makes the door

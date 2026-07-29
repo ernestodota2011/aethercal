@@ -229,6 +229,17 @@ differently, so it could only be overruled and never discharged.
     refusal now distinguishes *nobody ran this*, *somebody ran it in TEST mode* and *somebody ran it
     against code that has since changed*, so an operator is not sent to re-run what they just ran —
     which, for `refund`, would mean another real charge.
+  - **The fingerprint is of the gateway's whole MODULE, not of the method.** It hashed
+    `inspect.getsource(method)`, and `StripeGateway.refund` is four lines that delegate: the request
+    is built by `self._client` out of `_STRIPE_API_BASE` (the URL the run supposedly spoke to) and
+    `_HTTP_TIMEOUT`. Repointing the base URL left the method's text — and therefore the fingerprint
+    — byte-identical, so the verification stayed valid for code that now talks somewhere else.
+    Mercado Pago's gateway delegates the same way. The precise alternative (walk the AST for the
+    method's transitive closure) was rejected because an incomplete analysis fails as a false "still
+    verified", which is the expensive direction; a hash of the file cannot be incomplete about the
+    file. The cost is that an edit to either half of a gateway module invalidates both of its
+    operations. What the hash still does not cover — other modules, `httpx`, an injected transport,
+    the runtime environment — is written down in the function itself.
 - **A prefix on its own is no longer accepted as a key.** The permanent type check was
   `value.startswith(prefixes)` while its own refusal promised to catch "a truncated paste" — so
   `sk_live_`, typed alone, was stored as a payment credential. `credential_key_families()` now
@@ -241,6 +252,18 @@ differently, so it could only be overruled and never discharged.
     another account"; nothing local can. The message now states that limit — only an authenticated
     call to the provider decides whether a well-formed key is genuine, current or yours, and this
     door deliberately makes none.
+- **The live harness's connectivity control is a fixture, so it cannot be selected around.** It was
+  a test standing beside the runs it vouched for — and a sibling is not a precondition: running the
+  evidence-producing test by name (`pytest <file>::<test>`) left the control uncollected, so a record
+  could reach `live_verifications()` with nothing having shown the process reaches Stripe at all.
+  `stripe_reachable` now demands Stripe's own `401` for a key Stripe never issued, before the body of
+  any provider-touching test, and the refund harness — which had no control whatsoever — gets one in
+  both phases. An offline AST guard fails if any live test omits it.
+  - **Both gates now identify a "live" module by PARSING it, not by grepping for the marker.** The
+    substring test counted any file *containing* `pytestmark = pytest.mark.live_provider` — including
+    a guard that named the marker in order to search for it, which then classified itself as a
+    provider harness and broke the neighbouring gate. Shared in `tests/live_harness_modules.py`, so
+    the two gates cannot answer it differently.
 - **The live refund harness guarantees the refund from the moment it can aim one.** Phase B's
   `try`/`finally` used to start *after* the currency, `paid`, amount and PaymentIntent-shape
   assertions; any of those can fail on a session a human has genuinely paid, and then the run ended

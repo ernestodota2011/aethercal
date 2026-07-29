@@ -29,12 +29,17 @@ different file so nobody wanders into it.
 proves the code path end to end but says nothing about live mode, so ``livemode`` is REPORTED rather
 than assumed — whoever writes the register decides what that evidence supports.
 
-.. rubric:: ==Every probe carries a control==
+.. rubric:: ==Every probe carries a control, and the control is a FIXTURE==
 
 A "live" test that quietly reached a stub, a proxy, or nothing at all would produce evidence for
 code that never ran — the worst possible failure here, because the evidence is the entire point. So
-:func:`test_the_control_proves_this_process_really_reaches_stripe` runs first with a deliberately
-invalid key and requires Stripe's own ``401``. Nothing local produces that.
+``conftest.stripe_reachable`` runs first with a deliberately invalid key and requires Stripe's own
+``401``. Nothing local produces that.
+
+==It is a fixture, not a neighbouring test, and that is the fix for a real hole==: running the
+evidence-producing test BY NAME left the control uncollected, so a record could be written into
+``live_verifications()`` with nothing having shown the process reaches Stripe at all. A dependency
+cannot be selected around.
 """
 
 from __future__ import annotations
@@ -56,40 +61,26 @@ CHECKOUT = GatewayOperation.CHECKOUT
 pytestmark = pytest.mark.live_provider
 
 
-def test_the_control_proves_this_process_really_reaches_stripe(
-    secret_key: str, unauthenticated_stripe_api: httpx.Client
-) -> None:
-    """==The control, and it runs before anything is created.==
+def test_the_control_proves_this_process_really_reaches_stripe(stripe_reachable: int) -> None:
+    """==The control, REPORTED as a test of its own — but ENFORCED as a fixture.==
 
-    A stub, a proxy, an offline cache or a mis-wired fixture can all return something that looks
-    like success. None of them can produce Stripe's own ``401`` for a key Stripe never issued. So
-    this asks for a rejection and requires it: if THIS passes, the requests below really left the
-    machine and really arrived.
+    The work moved to :func:`~conftest.stripe_reachable`, and that move is the point. This function
+    used to BE the control, standing beside the run it vouched for — and a sibling is not a
+    precondition: ``pytest <file>::test_the_gateway_opens…`` collects the evidence run and leaves
+    the control behind, so a record could reach ``live_verifications()`` without anybody having
+    shown that this process reaches Stripe at all.
 
-    A ``GET``, so the control itself creates nothing at all — not even a session to clean up.
-
-    .. note::
-
-       ==``secret_key`` is taken and deliberately not used: that is the SKIP, not an oversight.==
-       The marker only opens the network door; it skips nothing. Without this dependency the test
-       had no reason to stop, so a plain offline ``pytest`` on a machine with no key at all still
-       opened a TLS connection to api.stripe.com — measured, not theorised. ==The skip rides on the
-       fixture==, exactly as ``test_network_guard`` records: "the marker is not a guard".
+    It stays as a named test because a control visible only as a fixture is a control nobody reads
+    in the report. What it asserts now is what the fixture observed.
     """
-    del secret_key  # the control must use a key Stripe never issued; see the note above
-
-    response = unauthenticated_stripe_api.get("/checkout/sessions", params={"limit": 1})
-
-    assert response.status_code == 401, (
-        "a deliberately invalid key did not get Stripe's 401, so this process is NOT talking to "
-        "the real api.stripe.com and no evidence gathered here would mean anything. Got "
-        f"{response.status_code}."
+    assert stripe_reachable == 401, (
+        "the control did not get Stripe's own 401 for a key Stripe never issued, so this process "
+        f"is not talking to the real api.stripe.com. Got {stripe_reachable}."
     )
-    body: dict[str, Any] = response.json()
-    assert body.get("error", {}).get("type") == "invalid_request_error", body
 
 
 async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(  # noqa: PLR0913
+    stripe_reachable: int,
     gateway: StripeGateway,
     open_one_dollar_session: Callable[..., Any],
     one_dollar_cents: int,
