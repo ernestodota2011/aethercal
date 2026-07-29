@@ -11,6 +11,26 @@ Every package in the repository shares one version number.
 
 ### Changed
 
+**The live harness's ORDER invariants are measured by executing them.** The guards over the money
+path — *provenance is demanded before the refund is sent*, *nothing that can abort runs outside the
+refund guarantee*, *the evidence block is composed only after the fact it certifies* — were checked
+by reading the source, and had been approximated three times: substring (a mention in a comment
+satisfied it), then AST position (a real call, but ==presence is not execution==: one inside a
+nested function, a lambda or an untaken branch counts the same as one that runs), and the next fix
+would have been AST-with-exclusions — another approximation, wrong again at the next syntactic
+construction nobody thought to exclude.
+
+- `tests/live/test_phase_b_execution_order.py` drives phase B and the checkout harness with doubles
+  that RECORD, and asserts the sequence that actually happened. It also asserts what an ordering
+  check never could: a session refused by provenance is **never** refunded, and a validation that
+  fails on a genuinely paid session **still** reaches `ensure_refunded`.
+- Offline and unmarked: no credential, no network, so the money harness's own invariants run on
+  every commit instead of only on the day somebody runs it for real.
+- The AST guards stay for claims about SHAPE ("the guarantee is the last statement", "the creation
+  is wrapped by its recovery", "every provider-touching test declares the control fixture") — those
+  are statements about how the code is written, and reading it is the right way to answer them.
+
+
 **A business's messages now go out on that business's own account** — B-03 stored per-business
 credentials; nothing sent with them.
 
