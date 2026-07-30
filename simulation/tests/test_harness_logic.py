@@ -19,6 +19,7 @@ import os
 import pathlib
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -4065,14 +4066,92 @@ def test_the_stack_file_is_created_with_its_credentials_ALREADY_private() -> Non
     descriptor with the mode in the same call, ==never a `chmod` afterwards==, which would leave a
     window in which the file already exists with the wide permissions.
 
-    ==This is a FORM assertion and that is a compromise, so it is named:== the write lives inside a
-    heredoc in a shell script, and the mode it produces is only observable on POSIX, while this
-    suite also runs on Windows where the concept does not exist. Debt, with its fix: execute the
-    extracted snippet in a POSIX-only test and stat the result.
+    The FORM half lives here; the half that measures the actual mode is the POSIX-only test below.
+    Neither is enough alone: the form assertion cannot see what the filesystem does, and the
+    behavioural one cannot run where the concept does not exist.
     """
-    guion = pathlib.Path("simulation/scripts/stack-up.sh").read_text(encoding="utf-8")
+    guion = (SCRIPTS_DIR / "stack-up.sh").read_text(encoding="utf-8")
     assert "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600" in guion, (
         "the stack file is no longer created private"
     )
     assert "os.chmod" not in guion, "a chmod after the fact leaves the file briefly world-readable"
     assert 'open(destination, "w")' not in guion, "the permissive write came back"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes do not exist on Windows")
+def test_the_stack_file_REALLY_lands_0600_under_a_permissive_umask(tmp_path: pathlib.Path) -> None:
+    """==The half that measures instead of reading.== The generator runs; the mode is stat'ed.
+
+    A form assertion cannot see a filesystem. This extracts the generator out of the heredoc, runs
+    it with ==a deliberately permissive umask (0o000)== -- the condition under which the old
+    ``open(..., "w")`` produced 0666 -- and asserts the mode that actually landed. Under the old
+    code this test fails; that is the whole point of writing it.
+    """
+    guion = (SCRIPTS_DIR / "stack-up.sh").read_text(encoding="utf-8")
+    inicio = guion.index("<<'PY'\n") + len("<<'PY'\n")
+    fin = guion.index("\nPY\n", inicio)
+    generador = guion[inicio:fin]
+    assert "os.open(" in generador, "the extraction missed the generator; the heredoc moved"
+
+    destino = tmp_path / ".stack.json"
+    entorno = {
+        **os.environ,
+        "SIM_API_URL": "http://api.test",
+        "SIM_WORKER_URL": "http://worker.test",
+        "SIM_BOOKING_URL": "http://booking.test",
+        "SIM_MAILPIT_URL": "http://mailpit.test",
+        "SIM_SINK_URL": "http://sink.test",
+        "SIM_METRICS_TOKEN": "m" * 40,
+        "SIM_NONCE": "n" * 32,
+        "SIM_BUSINESS_COUNT": "1",
+        "SIM_BUSINESS_0_SLUG": "clinica-sonrisa",
+        "SIM_BUSINESS_0_NAME": "Clinica Sonrisa",
+        "SIM_BUSINESS_0_TIMEZONE": "America/New_York",
+        "SIM_BUSINESS_0_TENANT_ID": "t-0",
+        "SIM_BUSINESS_0_HOST_USER_ID": "h-0",
+        "SIM_BUSINESS_0_API_KEY": "k" * 40,
+    }
+    # `umask(0)` en un subproceso: el permiso tiene que venir del modo de `os.open`, no de que el
+    # entorno de CI resulte ser restrictivo. Sin esto el test pasaria con el codigo viejo en
+    # cualquier maquina cuyo umask fuese 0o077 -- un verde prestado por la maquina.
+    envoltorio = f"import os\nos.umask(0o000)\n{generador}"
+    completado = subprocess.run(
+        [sys.executable, "-c", envoltorio, str(destino)],
+        env=entorno,
+        capture_output=True,
+        text=True,
+        check=False,  # el fallo se afirma abajo CON su stderr; `check=True` lo escondería
+    )
+    assert completado.returncode == 0, completado.stderr
+
+    modo = stat.S_IMODE(destino.stat().st_mode)
+    assert modo == 0o600, f"las credenciales quedaron en {modo:04o}, no en 0600"
+    assert json.loads(destino.read_text(encoding="utf-8"))["composeProject"] == "aethercal-sim", (
+        "el generador escribio, pero no el documento que el arnes lee"
+    )
+
+
+def test_the_writability_probe_does_not_DESTROY_a_file_that_was_already_there(
+    tmp_path: pathlib.Path,
+) -> None:
+    """==Una comprobacion no puede causar el dano que existe para prevenir.==
+
+    La sonda se llamaba `.{destino}.writable-probe`: un nombre derivado del destino, es decir
+    PREDECIBLE. `write_text` trunca lo que encuentre y el `finally` lo borra, de modo que un
+    archivo con ese nombre --el de otra corrida, o el de alguien-- se perdia al comprobar si el
+    directorio era escribible. Ahora se crea en exclusiva y solo se borra lo que se creo.
+    """
+    destino = tmp_path / "run.md"
+    victima = tmp_path / ".run.md.writable-probe"
+    victima.write_text("un archivo que ya estaba aqui", encoding="utf-8")
+
+    assert _unwritable_reason(destino) == ""
+
+    assert victima.exists(), "la sonda BORRO un archivo preexistente"
+    assert victima.read_text(encoding="utf-8") == "un archivo que ya estaba aqui", (
+        "la sonda trunco un archivo preexistente"
+    )
+    # Anti-vacuidad: la sonda hizo su trabajo y no dejo basura suya detras.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".run.md.writable-probe"], (
+        "la sonda dejo su propio archivo temporal en el directorio"
+    )

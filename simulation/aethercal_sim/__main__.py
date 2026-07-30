@@ -30,6 +30,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -259,13 +260,22 @@ def _unwritable_reason(path: Path) -> str:
         parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return f"its parent directory {parent} could not be created ({type(exc).__name__}: {exc})"
-    probe = parent / f".{resolved.name}.writable-probe"
+    # ==La sonda se crea en EXCLUSIVA y con nombre unico, y solo se borra lo que ella creo.==
+    # Con un nombre derivado del destino (`.run.md.writable-probe`) la comprobacion era
+    # DESTRUCTIVA: `write_text` trunca lo que encuentre y el `finally` lo borra, asi que un
+    # archivo preexistente con ese nombre desaparecia — una verificacion que causa el dano que
+    # existe para prevenir. Y dos corridas concurrentes se pisaban la sonda mutuamente.
+    descriptor: int | None = None
+    sonda: str | None = None
     try:
-        probe.write_text("", encoding="utf-8")
+        descriptor, sonda = tempfile.mkstemp(dir=parent, prefix=".writable-probe-")
     except OSError as exc:
         return f"a test file could not be created in {parent} ({type(exc).__name__}: {exc})"
     finally:
-        probe.unlink(missing_ok=True)
+        if descriptor is not None:
+            os.close(descriptor)
+        if sonda is not None:
+            Path(sonda).unlink(missing_ok=True)
     return ""
 
 
