@@ -39,19 +39,25 @@ from aethercal_sim.__main__ import (
     measure_confirmations,
     parse_args,
     positive_int,
+    superseding_notices_by_recipient,
 )
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
     EXPECTED_OUTBOX_STATUSES,
     CalendarInvite,
     ErrorTally,
+    InviteReading,
+    InviteRole,
     Latency,
     Mailbox,
     MailboxRead,
     MailMessage,
+    NoInvite,
     OutboxSample,
     OutboxSampler,
     OutboxScrapeError,
+    UnreadableInvite,
+    invite_role,
     parse_summary,
     percentile,
 )
@@ -1092,6 +1098,62 @@ def test_c14_refuses_a_run_that_created_nothing() -> None:
 
 
 # --------------------------------------------------------------------------------------
+# ==C14 reconcilia su PROPIA aritmetica.==
+#
+# `expected` prometia "{created} of {created} bookings matched" y `passed` no comparaba nada contra
+# `matched`. El invariante se cumplia — cada reserva cae en exactamente uno de matched / duplicada /
+# superseded / unaccounted, porque la particion {0 confirmaciones, 1, >1} cubre toda la poblacion —
+# pero lo sostenian DOS pasadas que nunca se encontraban: `matched` se suma dentro del bucle de
+# sondeo y las otras tres se cuentan en un bucle posterior. Nadie verificaba que concordaran.
+# --------------------------------------------------------------------------------------
+
+
+def test_c14_falla_si_su_propia_aritmetica_no_reconcilia() -> None:
+    """==El hueco: 180 emparejadas de 207 creadas, y las 27 restantes en NINGUNA columna.==
+
+    Antes de este control eso pasaba en verde: sin `unaccounted`, sin duplicadas y sin deltas
+    negativos no habia ningun motivo que anotar, mientras `observed` imprimia numeros que no suman.
+    """
+    control = judge_confirmation_coverage(_coverage(matched=180))
+    assert control.passed is False
+    assert "does not reconcile" in control.observed
+    assert "= 180, against 207 created" in control.observed
+
+
+def test_c14_publica_el_total_reconciliado_incluso_cuando_pasa() -> None:
+    """==Anti-vacuidad.== La corrida sana sigue en verde Y el total conciliado queda impreso: un
+    gate que fallara siempre pasaria la prueba de arriba sin verificar nada."""
+    control = judge_confirmation_coverage(_coverage(matched=185, superseded=22))
+    assert control.passed is True
+    assert "accounted for 207/207" in control.observed
+
+
+def test_c14_cuenta_las_DUPLICADAS_dentro_de_la_reconciliacion() -> None:
+    """==Por que la identidad incluye `duplicate_confirmations` y no solo las otras tres.==
+
+    Una reserva con DOS confirmaciones no esta ni emparejada ni perdida: sale por su propia rama.
+    Dejarla fuera del total haria que toda corrida con duplicadas levantara ADEMAS un falso
+    "la aritmetica no reconcilia", tapando la causa real con una consecuencia inventada.
+    """
+    control = judge_confirmation_coverage(_coverage(matched=200, duplicate_confirmations=7))
+    assert control.passed is False, "las duplicadas siguen gateando por su propio motivo"
+    assert "not one-to-one" in control.observed
+    assert "does not reconcile" not in control.observed, "la aritmetica SI cuadra: 200 + 7 = 207"
+
+
+@pytest.mark.parametrize(
+    "campo", ["created", "matched", "superseded", "unaccounted", "duplicate_confirmations"]
+)
+def test_c14_rechaza_un_conteo_NEGATIVO(campo: str) -> None:
+    """Un conteo negativo no es una poblacion mas chica, es una rota — y podria hacer que la suma
+    cuadre por compensacion."""
+    control = judge_confirmation_coverage(_coverage(**{campo: -1}))
+    assert control.passed is False
+    assert "NEGATIVE" in control.observed
+    assert campo in control.observed
+
+
+# --------------------------------------------------------------------------------------
 # The mailbox reader itself: paging, and refusing to look SMALL when it was cut short.
 # --------------------------------------------------------------------------------------
 
@@ -2022,7 +2084,7 @@ def test_lineage_refuses_to_judge_without_the_race(at_most: bool) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _msg(address: str, when: datetime, invite: CalendarInvite | None, ident: str) -> MailMessage:
+def _msg(address: str, when: datetime, invite: InviteReading, ident: str) -> MailMessage:
     return MailMessage(address, "subject", when, message_id=ident, invite=invite)
 
 
@@ -2048,7 +2110,10 @@ def test_only_the_CONFIRMATION_is_grouped_not_the_later_notices() -> None:
     ]
     grouped = confirmations_by_recipient(messages)
     assert list(grouped) == ["g@guests.sim.test"]
-    assert [m.message_id for m in grouped["g@guests.sim.test"]] == ["m1"]
+    assert [c.message.message_id for c in grouped["g@guests.sim.test"]] == ["m1"]
+    # ==The identity travels WITH the message, and is not optional.== That is what removes the
+    # `invite.uid if invite is not None else ""` the matching loop used to need.
+    assert [c.invite.uid for c in grouped["g@guests.sim.test"]] == ["u1"]
 
 
 def test_a_RESCHEDULE_notice_is_not_a_confirmation() -> None:
@@ -2063,7 +2128,7 @@ def test_a_RESCHEDULE_notice_is_not_a_confirmation() -> None:
 def test_a_message_with_no_calendar_part_is_not_a_confirmation() -> None:
     """A reminder or a workflow email carries no `.ics` at all."""
     now = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
-    assert confirmations_by_recipient([_msg("g@guests.sim.test", now, None, "m1")]) == {}
+    assert confirmations_by_recipient([_msg("g@guests.sim.test", now, NoInvite(), "m1")]) == {}
 
 
 def test_a_MISSING_confirmation_with_a_cancellation_present_is_NOT_matched() -> None:
@@ -2240,7 +2305,235 @@ def test_the_ics_parser_unfolds_long_lines() -> None:
 
 def test_a_message_without_a_calendar_part_yields_no_invite() -> None:
     source = "MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\njust a reminder"
-    assert Mailbox.parse_invite(source) is None
+    assert Mailbox.parse_invite(source) == NoInvite()
+
+
+# --------------------------------------------------------------------------------------
+# ==El tercer estado: una parte de calendario PRESENTE que no se pudo leer.==
+#
+# `parse_invite` devolvia `None` para tres situaciones distintas — sin parte de calendario, fuente
+# irreconstruible, y parte presente pero ilegible — y eso es una particion BINARIA sobre un eje de
+# tres valores. El del medio caia del lado optimista: una invitacion corrupta dejaba de ser una
+# invitacion, la reserva pasaba a "sin confirmacion", y si a ese invitado ademas le habia llegado
+# una cancelacion el arnes la reconciliaba como `superseded` — una salida CONTABILIZADA que C14
+# aprueba. ==El oraculo roto se publicaba como producto sano.==
+# --------------------------------------------------------------------------------------
+
+
+def _fuente_ics(cuerpo: str) -> str:
+    return "MIME-Version: 1.0\r\nContent-Type: text/calendar; charset=utf-8\r\n\r\n" + cuerpo
+
+
+@pytest.mark.parametrize(
+    ("cuerpo", "aguja"),
+    [
+        (
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n"
+            "STATUS:CONFIRMED\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            "UID",
+        ),
+        (
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1@aethercal\r\n"
+            "STATUS:CONFIRMED\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            "METHOD",
+        ),
+        (
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u1@aethercal\r\n"
+            "SEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            "STATUS",
+        ),
+        (
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u1@aethercal\r\n"
+            "STATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            "SEQUENCE",
+        ),
+        (
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u1@aethercal\r\n"
+            "STATUS:CONFIRMED\r\nSEQUENCE:no-soy-un-numero\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            "SEQUENCE",
+        ),
+    ],
+)
+def test_una_parte_de_calendario_ILEGIBLE_no_se_confunde_con_una_AUSENCIA(
+    cuerpo: str, aguja: str
+) -> None:
+    """Cada una de estas es un FALLO de lectura, no un mensaje sin calendario."""
+    lectura = Mailbox.parse_invite(_fuente_ics(cuerpo))
+    assert isinstance(lectura, UnreadableInvite), f"se leyo como {lectura!r}"
+    assert lectura != NoInvite()
+    assert aguja in lectura.reason, f"el motivo no nombra el problema: {lectura.reason!r}"
+    assert invite_role(lectura) is InviteRole.UNREADABLE
+
+
+def test_una_invitacion_BIEN_FORMADA_sigue_leyendose(  # anti-vacuidad del bloque de arriba
+) -> None:
+    """==La otra mitad.== Sin esto, un `parse_invite` que devolviera `UnreadableInvite` SIEMPRE
+    pasaria las cinco pruebas de arriba sin verificar nada."""
+    lectura = Mailbox.parse_invite(
+        _fuente_ics(
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u1@aethercal\r\n"
+            "STATUS:CONFIRMED\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR"
+        )
+    )
+    assert isinstance(lectura, CalendarInvite)
+    assert lectura.uid == "u1@aethercal"
+    assert invite_role(lectura) is InviteRole.CONFIRMATION
+
+
+def test_invite_role_cierra_los_TRES_estados_y_no_admite_un_cuarto() -> None:
+    """==El candado del eje.== `invite_role` termina en `assert_never`, asi que un cuarto estado
+    en `InviteReading` no compila en vez de caer por omision en la rama tranquilizadora — que es
+    exactamente como el estado ilegible desaparecio la primera vez.
+
+    En tiempo de ejecucion eso se ve como un objeto que no es ninguno de los tres: revienta,
+    en lugar de contestar `ABSENT`.
+    """
+    assert invite_role(NoInvite()) is InviteRole.ABSENT
+    assert invite_role(UnreadableInvite("x")) is InviteRole.UNREADABLE
+    assert invite_role(CANCELLED_INVITE) is InviteRole.SUPERSEDING
+    assert (
+        invite_role(CalendarInvite(uid="u", method="REQUEST", status="TENTATIVE", sequence=0))
+        is InviteRole.UNCLASSIFIED
+    )
+    with pytest.raises(AssertionError):
+        invite_role("un cuarto estado")  # type: ignore[arg-type]
+
+
+def test_una_invitacion_ILEGIBLE_no_excusa_una_confirmacion_perdida() -> None:
+    """==El defecto VIVO, de punta a punta: parser → contabilidad → C14.==
+
+    La confirmacion de este invitado llego con el `.ics` mutilado, y ademas le llego su
+    cancelacion. Con los tres estados colapsados en `None` la corrida contaba `superseded=1`
+    (contabilizada) y ==C14 pasaba sobre un agujero en su propio oraculo==. Ahora la parte ilegible
+    se cuenta y gatea.
+    """
+    ilegible = Mailbox.parse_invite(
+        _fuente_ics(
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n"
+            "STATUS:CONFIRMED\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR"
+        )
+    )
+    assert isinstance(ilegible, UnreadableInvite), "el fixture debe producir el estado del medio"
+
+    enviado = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "g@guests.sim.test", "s", enviado.timestamp())]
+    read = MailboxRead(
+        [
+            _msg("g@guests.sim.test", enviado + timedelta(milliseconds=900), ilegible, "m1"),
+            _msg(
+                "g@guests.sim.test",
+                enviado + timedelta(minutes=7),
+                _invite("u1", "CANCEL", "CANCELLED", 1),
+                "m2",
+            ),
+        ],
+        True,
+        2,
+        1,
+        500,
+    )
+    _latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.unreadable_invites == 1
+    assert coverage.messages_with_invite == 1, "solo la cancelacion tiene identidad legible"
+    control = judge_confirmation_coverage(coverage)
+    assert control.passed is False, "una corrida cuyo oraculo no pudo leer un anuncio NO es limpia"
+    assert "could NOT be read" in control.observed
+
+
+def test_el_camino_limpio_sigue_pasando_con_una_cancelacion_de_verdad() -> None:
+    """==Anti-vacuidad del anterior.== Mismo escenario con el `.ics` INTACTO: la confirmacion se
+    retiro de verdad, el invitado fue avisado, y C14 debe seguir aprobando. Sin esto, un gate que
+    fallara siempre pasaria la prueba de arriba."""
+    enviado = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [BookedRef("b1", "biz", "g@guests.sim.test", "s", enviado.timestamp())]
+    read = MailboxRead(
+        [
+            _msg(
+                "g@guests.sim.test",
+                enviado + timedelta(minutes=7),
+                _invite("u1", "CANCEL", "CANCELLED", 1),
+                "m2",
+            )
+        ],
+        True,
+        1,
+        1,
+        500,
+    )
+    _latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.unreadable_invites == 0
+    assert coverage.superseded == 1
+    assert judge_confirmation_coverage(coverage).passed is True
+
+
+def test_una_invitacion_ILEGIBLE_no_cuenta_como_notificacion_que_supersede() -> None:
+    """El diccionario que convierte "falta la confirmacion" en "contabilizada" es el que MENOS
+    puede admitir una lectura fallida: excusaria justo la perdida de la que es evidencia."""
+    ahora = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    assert (
+        superseding_notices_by_recipient(
+            [_msg("g@guests.sim.test", ahora, UnreadableInvite("sin UID"), "m1")]
+        )
+        == {}
+    )
+    # anti-vacuidad: la cancelacion legible SI cuenta
+    assert superseding_notices_by_recipient(
+        [_msg("g@guests.sim.test", ahora, _invite("u1", "CANCEL", "CANCELLED", 1), "m2")]
+    ) == {"g@guests.sim.test": 1}
+
+
+def test_dos_reservas_emparejadas_al_MISMO_uid_colisionan() -> None:
+    """==La garantia uno-a-uno, ejercitada de verdad.==
+
+    El uid se leia con `message.invite.uid if message.invite is not None else ""`, y la cadena
+    vacia es FALSA: `if uid and uid in seen_uids` se saltaba solo. La identidad viaja ahora en el
+    tipo (`Confirmation`), asi que ese repliegue no se puede escribir.
+    """
+    enviado = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    booked = [
+        BookedRef("b1", "biz", "g1@guests.sim.test", "s", enviado.timestamp()),
+        BookedRef("b2", "biz", "g2@guests.sim.test", "s", enviado.timestamp()),
+    ]
+    read = MailboxRead(
+        [
+            _msg(
+                "g1@guests.sim.test",
+                enviado + timedelta(milliseconds=100),
+                _invite("uid-compartido", "REQUEST", "CONFIRMED", 0),
+                "m1",
+            ),
+            _msg(
+                "g2@guests.sim.test",
+                enviado + timedelta(milliseconds=200),
+                _invite("uid-compartido", "REQUEST", "CONFIRMED", 0),
+                "m2",
+            ),
+        ],
+        True,
+        2,
+        1,
+        500,
+    )
+    _latency, _out, coverage = measure_confirmations(
+        _StubMailbox(read),  # type: ignore[arg-type]
+        booked,
+        timeout_seconds=0.0,
+        poll_seconds=0.0,
+    )
+    assert coverage.colliding_uids == 1, "un anuncio contado para dos reservas"
+    control = judge_confirmation_coverage(coverage)
+    assert control.passed is False
+    assert "already claimed" in control.observed
 
 
 # --------------------------------------------------------------------------------------
@@ -2896,9 +3189,120 @@ def test_run_sh_pone_el_token_antes_de_su_propio_down() -> None:
     assert cuerpo.index("local run_status=$?") < cuerpo.index("aethercal_export_compose_token"), (
         "poner el token antes de capturar $? pisaria el estado de la simulacion"
     )
-    assert cuerpo.index("aethercal_export_compose_token") < cuerpo.index("${COMPOSE_CMD} down"), (
-        "el token tiene que estar puesto ANTES del down"
+    assert cuerpo.index("aethercal_export_compose_token") < cuerpo.index(
+        '"${COMPOSE_CMD[@]}" down'
+    ), "el token tiene que estar puesto ANTES del down"
+
+
+# --------------------------------------------------------------------------------------
+# ==El teardown de run.sh sobrevive a una ruta CON ESPACIOS.==
+#
+# `COMPOSE_CMD` era una cadena que se partia en palabras a proposito, con su `shellcheck disable`.
+# El word splitting no distingue el espacio que separa argumentos del que vive DENTRO de una ruta,
+# asi que un clon bajo `C:\Users\Nombre Apellido\` — el home real de esta maquina — le entregaba a
+# compose tres `-f` despedazados y el teardown moria. Es el MISMO teardown que ya se descubrio que
+# no habia corrido nunca por otro motivo; romperlo dos veces por dos mecanismos distintos es el
+# argumento para quitar el mecanismo.
+#
+# ==Se prueba por EFECTO, no por texto==: se corre `run.sh` de verdad, bajo una ruta con espacios,
+# contra un `docker` de mentira que anota su argv. Un test que solo leyera el guion no distingue
+# una cadena de un array.
+# --------------------------------------------------------------------------------------
+
+
+def _arbol_run_sh_con_espacios(raiz: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """Un repo de mentira cuya ruta LLEVA espacios, listo para correr `run.sh` entero."""
+    repo = raiz / "ruta con espacios" / "aethercal"
+    sim = repo / "simulation"
+    (sim / "scripts").mkdir(parents=True)
+    (repo / "deploy").mkdir()
+    (repo / "e2e").mkdir()
+    (repo / "deploy" / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (repo / "e2e" / "compose.e2e.yml").write_text("services: {}\n", encoding="utf-8")
+    (sim / "compose.sim.yml").write_text("name: aethercal-sim\n", encoding="utf-8")
+
+    for nombre in ("run.sh", "restore-env.sh", "compose-env.sh"):
+        destino = sim / "scripts" / nombre
+        destino.write_bytes((SCRIPTS_DIR / nombre).read_bytes())
+        destino.chmod(0o755)
+
+    # `stack-up.sh` de mentira: no hay Docker que levantar, pero SI deja el `.stack.json` del que
+    # `compose-env.sh` acarrea el token — el mismo contrato que el de verdad.
+    arranque = sim / "scripts" / "stack-up.sh"
+    arranque.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'printf \'{"metricsToken": "token-de-esta-corrida"}\' > "$(dirname "${BASH_SOURCE[0]}")'
+        '/../.stack.json"\n',
+        encoding="utf-8",
     )
+    arranque.chmod(0o755)
+
+    binarios = raiz / "bin"
+    binarios.mkdir()
+    doble_docker = binarios / "docker"
+    # Anota UN argumento por linea: es la unica forma de ver si una ruta llego entera o partida.
+    doble_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'for arg in "$@"; do printf \'%s\\n\' "${arg}" >> "${ARGV_VISTO}"; done\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    doble_docker.chmod(0o755)
+
+    # `python3` de mentira SOLO para el arnes (`-m aethercal_sim`), que aqui no tiene stack contra
+    # el cual correr. Todo lo demas — el `python3 -c` con el que compose-env.sh lee el token — va
+    # al interprete de verdad, para no falsear la pieza que sigue siendo la que se prueba.
+    doble_python = binarios / "python3"
+    doble_python.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == "-m" ]]; then exit 0; fi\n'
+        'exec "${REAL_PYTHON}" "$@"\n',
+        encoding="utf-8",
+    )
+    doble_python.chmod(0o755)
+    return repo, sim / "scripts" / "run.sh"
+
+
+def test_run_sh_desmonta_el_stack_con_una_ruta_QUE_LLEVA_ESPACIOS(
+    tmp_path: pathlib.Path,
+) -> None:
+    """==El defecto, como el argv que compose habria recibido.==
+
+    Partido en palabras, `-f /ruta con espacios/aethercal/deploy/docker-compose.yml` llega como
+    tres argumentos (`-f`, `/ruta`, `con`, `espacios/...`) y `docker compose down` falla: el stack
+    desechable — con su base de datos y su `deploy/.env` sustituido — se queda vivo.
+    """
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - solo en un host sin bash
+        pytest.skip("no hay bash en este host")
+    repo, guion = _arbol_run_sh_con_espacios(tmp_path)
+    visto = tmp_path / "argv-visto.txt"
+
+    entorno = {k: v for k, v in os.environ.items() if k != "AETHERCAL_SIM_METRICS_TOKEN"}
+    entorno["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{entorno.get('PATH', '')}"
+    entorno["ARGV_VISTO"] = str(visto)
+    entorno["REAL_PYTHON"] = sys.executable
+    hecho = subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona aqui
+        [bash, str(guion)], capture_output=True, text=True, timeout=120, env=entorno
+    )
+
+    assert hecho.returncode == 0, f"run.sh no cerro limpio: {hecho.stderr}"
+    argv = visto.read_text(encoding="utf-8").splitlines() if visto.exists() else []
+    assert argv, f"el teardown no llamo a docker: {hecho.stdout}\n{hecho.stderr}"
+
+    overlays = [argv[i + 1] for i, parte in enumerate(argv) if parte == "-f"]
+    assert len(overlays) == 3, f"los tres overlays, enteros y ni uno mas: {argv}"
+    assert [pathlib.PurePosixPath(ruta).name for ruta in overlays] == [
+        "docker-compose.yml",
+        "compose.e2e.yml",
+        "compose.sim.yml",
+    ], f"alguna ruta llego partida: {argv}"
+    for ruta in overlays:
+        assert "ruta con espacios" in ruta, f"la ruta perdio su espacio: {ruta!r}"
+    assert argv[0] == "compose"
+    assert argv[-3:] == ["down", "-v", "--remove-orphans"]
+    assert len(argv) == 10, f"ni un argumento de mas ni de menos: {argv}"
+    assert repo.name == "aethercal"
 
 
 # --------------------------------------------------------------------------------------

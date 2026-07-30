@@ -51,7 +51,7 @@ invalidate that document.
 | **C11** | the no-show transition | `200` **and** the booking's status really becomes `no_show` |
 | **C12** | the drain finished, readably | `due == 0` before the run ends, with zero unexplained scrape failures |
 | **C13** | ==§1 itself: the organic phase is fully explained== | every planned intent lands in a known outcome, the outcomes **sum to the plan**, and no request failed unexpectedly |
-| **C14** | ==§2's slowest row: the confirmation sample is whole== | the mailbox was read to its own reported total and **every** created booking matched a message, with no negative deltas |
+| **C14** | ==§2's slowest row: the confirmation sample is whole== | the mailbox was read to its own reported total, every created booking is **accounted for** (matched / duplicated / superseded / unaccounted **sum to the bookings created**), no message carried a calendar part that could not be **read**, and there are no negative deltas |
 | **C15** | ==§4's premise: the bursts really OVERLAPPED== | every multi-contender race had **≥2 requests in flight at the same instant**, measured per request |
 
 > [!danger] ==A phase whose failures have nowhere to go will always report a quiet fortnight.==

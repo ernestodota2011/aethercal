@@ -42,7 +42,8 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from enum import Enum
+from typing import Any, assert_never
 
 from .client import Response
 
@@ -572,13 +573,80 @@ class CalendarInvite:
 
 
 @dataclass(frozen=True, slots=True)
+class NoInvite:
+    """The message carries no ``text/calendar`` part at all — ==an ABSENCE, and a legitimate one.==
+
+    A reminder and a workflow email are exactly this, and there are hundreds of them in a run.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class UnreadableInvite:
+    """A calendar part is PRESENT and this reader could not turn it into an identity.
+
+    ==This is the state that used to be indistinguishable from :class:`NoInvite`, and the two are
+    opposites.== "This message announces nothing" is a fact about a reminder; "this message
+    announces something and I cannot tell what" is a hole in the oracle. Collapsing them put the
+    hole on the reassuring side: a confirmation whose ``.ics`` came back mangled simply stopped
+    being a confirmation, the booking fell to "no confirmation", and a guest who ALSO received a
+    cancellation was then counted as ``superseded`` — accounted for, and C14 passed over it.
+    """
+
+    reason: str
+
+
+#: The THREE outcomes of reading a message's calendar identity, as a closed union. The policy that
+#: depends on them (:func:`invite_role`) matches on this alias and ends in ``assert_never``, so a
+#: fourth state cannot be added without the type checker naming every place that must decide about
+#: it — rather than having it fall silently into whichever branch happens to be the default.
+InviteReading = CalendarInvite | NoInvite | UnreadableInvite
+
+
+class InviteRole(Enum):
+    """What a message's calendar reading MEANS to the booking→confirmation reconciliation."""
+
+    CONFIRMATION = "confirmation"
+    """A first announcement: ``REQUEST``/``CONFIRMED``/``SEQUENCE:0``."""
+    SUPERSEDING = "superseding"
+    """A cancellation or a reschedule — it retires a confirmation instead of being one."""
+    UNCLASSIFIED = "unclassified"
+    """A readable invite that is neither (e.g. ``REQUEST``/``TENTATIVE`` at sequence 0)."""
+    ABSENT = "absent"
+    """No calendar part: a reminder or a workflow email."""
+    UNREADABLE = "unreadable"
+    """A calendar part that could not be read — ==counted and gated, never assumed harmless.=="""
+
+
+def invite_role(reading: InviteReading) -> InviteRole:
+    """Classify ONE calendar reading. ==The single place the three-state axis is decided.==
+
+    Every consumer asks this function instead of testing ``is not None``, which is how the
+    ``present but unreadable`` case used to disappear: a truthiness check has two answers and the
+    question has three.
+    """
+    match reading:
+        case CalendarInvite():
+            if reading.is_confirmation:
+                return InviteRole.CONFIRMATION
+            if reading.method == "CANCEL" or reading.sequence > 0:
+                return InviteRole.SUPERSEDING
+            return InviteRole.UNCLASSIFIED
+        case NoInvite():
+            return InviteRole.ABSENT
+        case UnreadableInvite():
+            return InviteRole.UNREADABLE
+        case _:
+            assert_never(reading)
+
+
+@dataclass(frozen=True, slots=True)
 class MailMessage:
     to: str
     subject: str
     created: datetime
     message_id: str = ""
-    invite: CalendarInvite | None = None
-    """``None`` when the message has no ``text/calendar`` part (reminder, workflow email)."""
+    invite: InviteReading = NoInvite()
+    """The message's calendar identity as one of THREE states — see :data:`InviteReading`."""
 
 
 #: How many messages ONE Mailpit request asks for. ==A page size, never a ceiling.== The difference
@@ -706,8 +774,27 @@ class Mailbox:
         return None
 
     @staticmethod
-    def parse_invite(raw_source: str) -> CalendarInvite | None:
-        """Pull the iTIP identity out of an RFC822 source, or ``None`` if it carries no invite.
+    def parse_invite(  # noqa: PLR0911 - each return names a DISTINCT reading of the calendar
+        raw_source: str,
+    ) -> InviteReading:
+        """Read the iTIP identity out of an RFC822 source as ONE of :data:`three states
+        <InviteReading>`.
+
+        .. rubric:: ==Why this is not a ``CalendarInvite | None``.==
+
+        It was, and that is a binary partition over a question with three answers: *no calendar
+        part*, *this calendar part*, and *a calendar part I could not read*. The middle answer has
+        no room in a boolean, so it fell to the optimistic side — a message whose ``.ics`` was
+        missing its ``UID``, or whose ``SEQUENCE`` was not a number, came back looking exactly like
+        the reminder that legitimately carries no calendar at all. ==Every consumer then asked ``is
+        not None``, got "no invite here", and moved on.== The failure was silent by construction:
+        a corrupted confirmation stopped counting as a confirmation, and a guest who also received
+        a cancellation was reconciled as ``superseded`` — an ACCOUNTED outcome that C14 passes.
+        A parse failure of the oracle presented as the product behaving correctly.
+
+        So the failures are now :class:`UnreadableInvite`, which carries WHY, and which C14 counts
+        and gates on; the absence is :class:`NoInvite`; and only a complete, well-typed identity
+        comes back as a :class:`CalendarInvite`.
 
         ==Parsed with the stdlib ``email`` package, not with a regex over the raw bytes.== The
         ``.ics`` arrives as a MIME part that may be base64 or quoted-printable encoded, so scanning
@@ -722,33 +809,49 @@ class Mailbox:
         """
         try:
             message: Any = email.message_from_string(raw_source, policy=email.policy.default)
-        except Exception:
-            return None
+        except Exception as exc:
+            return UnreadableInvite(
+                f"the RFC822 source could not be parsed: {type(exc).__name__}: {exc}"
+            )
         for part in message.walk():
             if part.get_content_type() != "text/calendar":
                 continue
             try:
                 payload: Any = part.get_payload(decode=True)
-            except Exception:
-                return None
+            except Exception as exc:
+                return UnreadableInvite(
+                    f"the text/calendar part could not be decoded: {type(exc).__name__}: {exc}"
+                )
             if not isinstance(payload, bytes):
-                continue
+                return UnreadableInvite(
+                    "the text/calendar part decoded to "
+                    f"{type(payload).__name__}, not to bytes — there is a calendar here and it "
+                    "cannot be read"
+                )
             text = payload.decode("utf-8", errors="replace")
             fields = _icalendar_properties(text)
-            uid = fields.get("UID")
-            method = fields.get("METHOD")
-            status = fields.get("STATUS")
-            raw_sequence = fields.get("SEQUENCE")
-            if uid is None or method is None or status is None or raw_sequence is None:
-                return None
+            required = ("UID", "METHOD", "STATUS", "SEQUENCE")
+            missing = [name for name in required if name not in fields]
+            if missing:
+                return UnreadableInvite(
+                    f"the text/calendar part is missing {', '.join(missing)}, so this announcement "
+                    "has no identity"
+                )
+            raw_sequence = fields["SEQUENCE"]
             try:
                 sequence = int(raw_sequence)
             except ValueError:
-                return None
+                return UnreadableInvite(
+                    f"SEQUENCE is {raw_sequence!r}, which is not an integer, so a reschedule "
+                    "cannot be told from a first announcement"
+                )
             return CalendarInvite(
-                uid=uid, method=method.upper(), status=status.upper(), sequence=sequence
+                uid=fields["UID"],
+                method=fields["METHOD"].upper(),
+                status=fields["STATUS"].upper(),
+                sequence=sequence,
             )
-        return None
+        return NoInvite()
 
     @staticmethod
     def parse(item: Any) -> MailMessage | None:

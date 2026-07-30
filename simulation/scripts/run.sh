@@ -29,7 +29,22 @@ if [[ "${1:-}" == "--" ]]; then
   shift
 fi
 
-COMPOSE_CMD="docker compose -f ${REPO_ROOT}/deploy/docker-compose.yml -f ${E2E_DIR}/compose.e2e.yml -f ${SIM_DIR}/compose.sim.yml"
+# ==An ARRAY, not a string, and the difference is a repository path with a space in it.==
+# This used to be one string word-split at the call site (`${COMPOSE_CMD} down`, with an SC2086
+# suppression to say so on purpose). Word splitting cannot know which spaces separate arguments and
+# which live inside a path, so a clone under `C:\Users\Firstname Lastname\` — or any
+# `~/My Projects/` — hands compose three shredded `-f` values and the teardown dies. That is the ONE
+# command that stops the throwaway stack, in a script whose whole job is to guarantee it goes away;
+# it is also the teardown that had already been found never to have run once, for an unrelated
+# reason. Twice broken by two different mechanisms is the argument for removing the mechanism, so
+# the arguments are kept as ELEMENTS and expanded with `"${COMPOSE_CMD[@]}"`, which passes each one
+# verbatim whatever it contains.
+COMPOSE_CMD=(
+  docker compose
+  -f "${REPO_ROOT}/deploy/docker-compose.yml"
+  -f "${E2E_DIR}/compose.e2e.yml"
+  -f "${SIM_DIR}/compose.sim.yml"
+)
 
 ENV_FILE="${REPO_ROOT}/deploy/.env"
 ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
@@ -74,8 +89,7 @@ cleanup() {
   # ==Same rule as stack-down.sh, and it lives in both because the defect did.== Restore the
   # environment either way; never announce a teardown that did not happen.
   local teardown_status=0
-  # shellcheck disable=SC2086 - COMPOSE_CMD is a command line, and must word-split here.
-  ${COMPOSE_CMD} down -v --remove-orphans || teardown_status=$?
+  "${COMPOSE_CMD[@]}" down -v --remove-orphans || teardown_status=$?
   restore_env
   if ((teardown_status != 0)); then
     echo "ERROR: the throwaway stack did NOT tear down cleanly (exit ${teardown_status})." >&2

@@ -32,17 +32,21 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .client import Client
 from .measure import (
+    CalendarInvite,
+    InviteRole,
     Latency,
     Mailbox,
     MailboxRead,
     MailMessage,
     OutboxSampler,
+    invite_role,
     wait_for_drain,
 )
 from .report import RunContext, render, render_json, verdict_for
@@ -352,7 +356,7 @@ def measure_confirmations(  # noqa: PLR0912, PLR0915 - the quiet window IS the e
     started = time.monotonic()
     attempts = 0
     read = _read_and_hydrate(mailbox)
-    confirmations: dict[str, list[MailMessage]] = {}
+    confirmations: dict[str, list[Confirmation]] = {}
     superseded_by: dict[str, int] = {}
     matched = 0
     last_identities: frozenset[str] = frozenset()
@@ -422,15 +426,20 @@ def measure_confirmations(  # noqa: PLR0912, PLR0915 - the quiet window IS the e
             else:
                 unaccounted += 1
             continue
-        message = found[0]
+        confirmation = found[0]
         # ==One confirmation must belong to ONE booking.== The recipient is unique per planned
         # booking, so a uid appearing twice would mean two guests were matched to one announcement.
-        uid = message.invite.uid if message.invite is not None else ""
-        if uid and uid in seen_uids:
+        #
+        # The uid is read straight off the pair, with no `if ... is not None else ""` in the way.
+        # That fallback used to be here, and an empty string is falsy: the very next line reads
+        # `if uid and uid in seen_uids`, so an announcement whose identity had not been read would
+        # have turned this guarantee OFF for itself. See :class:`Confirmation`.
+        uid = confirmation.invite.uid
+        if uid in seen_uids:
             collided_uids += 1
             continue
         seen_uids[uid] = ref.booking_id
-        delta_ms = (message.created.timestamp() - ref.sent_at_wall) * 1000.0
+        delta_ms = (confirmation.message.created.timestamp() - ref.sent_at_wall) * 1000.0
         if delta_ms < 0:
             negatives += 1
             worst_negative = min(worst_negative, delta_ms)
@@ -454,7 +463,12 @@ def measure_confirmations(  # noqa: PLR0912, PLR0915 - the quiet window IS the e
             colliding_uids=collided_uids,
             superseded=superseded,
             unaccounted=unaccounted,
-            messages_with_invite=sum(1 for m in read.messages if m.invite is not None),
+            messages_with_invite=sum(
+                1 for m in read.messages if isinstance(m.invite, CalendarInvite)
+            ),
+            unreadable_invites=sum(
+                1 for m in read.messages if invite_role(m.invite) is InviteRole.UNREADABLE
+            ),
         ),
     )
 
@@ -491,18 +505,40 @@ def superseding_notices_by_recipient(messages: list[MailMessage]) -> dict[str, i
     A cancellation (``CANCEL``/``CANCELLED``) or a reschedule (``REQUEST`` at a bumped sequence).
     Their presence is what makes "this booking has no confirmation" an accounted outcome rather
     than a lost message — see :func:`measure_confirmations`.
+
+    ==A reading this client could not parse is NOT a superseding notice==, and that matters more
+    here than anywhere: this dictionary is the one that turns a missing confirmation into an
+    accounted one. An unreadable ``.ics`` counted here would excuse the very loss it is evidence
+    of. :func:`~aethercal_sim.measure.invite_role` keeps the three states apart; the unreadable
+    ones are counted separately and gate C14.
     """
     grouped: dict[str, int] = {}
     for message in messages:
-        invite = message.invite
-        if invite is None or invite.is_confirmation:
-            continue
-        if invite.method == "CANCEL" or invite.sequence > 0:
+        if invite_role(message.invite) is InviteRole.SUPERSEDING:
             grouped[message.to] = grouped.get(message.to, 0) + 1
     return grouped
 
 
-def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[MailMessage]]:
+@dataclass(frozen=True, slots=True)
+class Confirmation:
+    """A confirmation message TOGETHER with the calendar identity that makes it one.
+
+    ==The pairing is carried in the TYPE, and that is the whole point of this class.== The matching
+    loop reads ``uid`` off every confirmation it pairs, and it used to do so through
+    ``message.invite.uid if message.invite is not None else ""``. That fallback is the shape of the
+    defect: an empty uid is FALSY, the collision check reads ``if uid and uid in seen_uids``, and so
+    a message that arrived without a readable identity would have SKIPPED the one-to-one guarantee
+    C14 exists to hold — silently, and in the reassuring direction.
+
+    Grouping into this pair instead means the identity is present by construction. There is no
+    ``None`` to fall back from, so the fallback cannot be written.
+    """
+
+    message: MailMessage
+    invite: CalendarInvite
+
+
+def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[Confirmation]]:
     """Group the CONFIRMATIONS — and only those — by recipient. ==Pure, so it is testable.==
 
     This replaces "the earliest message to that address". That rule worked by accident: a guest's
@@ -517,11 +553,20 @@ def confirmations_by_recipient(messages: list[MailMessage]) -> dict[str, list[Ma
     A confirmation is now identified by its iTIP identity: ``METHOD:REQUEST`` + ``STATUS:CONFIRMED``
     + ``SEQUENCE:0`` in the message's own ``.ics``. Locale-independent, tenant-independent, and not
     a substring of anything.
+
+    Each entry carries that identity with it (:class:`Confirmation`), so the caller never has to
+    reach for an invite that might not be there.
     """
-    grouped: dict[str, list[MailMessage]] = {}
+    grouped: dict[str, list[Confirmation]] = {}
     for message in messages:
-        if message.invite is not None and message.invite.is_confirmation:
-            grouped.setdefault(message.to, []).append(message)
+        invite = message.invite
+        # ==Two different questions, asked in the order that makes each one honest.== The
+        # `isinstance` is the TYPE guard — it is what narrows the three-state reading down to the
+        # identity `Confirmation` promises, so no caller ever meets an optional one. `invite_role`
+        # is the POLICY, and it stays the single place that decides what a reading means: this
+        # branch does not re-implement "REQUEST + CONFIRMED + sequence 0" alongside it.
+        if isinstance(invite, CalendarInvite) and invite_role(invite) is InviteRole.CONFIRMATION:
+            grouped.setdefault(message.to, []).append(Confirmation(message, invite))
     return grouped
 
 

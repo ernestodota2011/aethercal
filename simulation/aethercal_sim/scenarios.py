@@ -1777,6 +1777,17 @@ class ConfirmationCoverage:
     """Two bookings matched to confirmations carrying the SAME calendar uid: one announcement was
     counted for two bookings, which is the failure a per-recipient match cannot even see."""
     messages_with_invite: int = 0
+    """Messages whose calendar identity was READ — the population the pairing can reason about."""
+    unreadable_invites: int = 0
+    """Messages that carry a calendar part this client could NOT read.
+
+    ==Not the same fact as ``messages_with_invite`` simply being lower, which is how it used to be
+    recorded — that is to say, not recorded at all.== ``Mailbox.parse_invite`` returned ``None``
+    both for "no calendar here" and for "a calendar I could not parse", so an unreadable
+    confirmation quietly stopped being a confirmation. Its booking then fell to "no confirmation",
+    and if that guest had also received a cancellation the run reconciled it as ``superseded`` —
+    an ACCOUNTED outcome. ==A broken oracle presented as the product behaving correctly.== The two
+    states are distinct types now, this counts the second one, and C14 gates on it."""
     superseded: int = 0
     """Bookings with no confirmation whose guest received a cancellation or reschedule instead.
 
@@ -1820,8 +1831,50 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
 
     A confirmation is now identified by its iTIP identity in the message's own ``.ics``, the
     pairing must be one-to-one, and a calendar uid may be claimed by only one booking.
+
+    .. rubric:: ==And the control now reconciles its OWN arithmetic.==
+
+    ``expected`` promised "{created} of {created} bookings matched" and ``passed`` compared nothing
+    against ``matched``. The invariant held — every created booking lands in exactly one of matched
+    / duplicated / superseded / unaccounted, because the partition {0 confirmations, 1, more than 1}
+    covers the whole population — but it held by CONSTRUCTION, in two passes that never met:
+    ``matched`` is summed inside the polling loop and the other three are counted in a later loop
+    over the same bookings. Nothing checked that the two agree. Redefine ``matched`` and they
+    diverge in silence, while this control goes on passing and prints an ``observed`` line whose
+    numbers do not add up. So the identity is now asserted rather than assumed, and a total that
+    does not reconcile fails — as does any negative count, which is not a smaller number but a
+    broken one.
     """
     reasons: list[str] = []
+    parts = {
+        "matched": coverage.matched,
+        "duplicate_confirmations": coverage.duplicate_confirmations,
+        "superseded": coverage.superseded,
+        "unaccounted": coverage.unaccounted,
+    }
+    accounted = sum(parts.values())
+    negative = {name: value for name, value in parts.items() if value < 0} | (
+        {"created": coverage.created} if coverage.created < 0 else {}
+    )
+    if negative:
+        reasons.append(
+            "a count came back NEGATIVE, which is not a smaller population but a broken one: "
+            + ", ".join(f"{name}={value}" for name, value in sorted(negative.items()))
+        )
+    elif accounted != coverage.created:
+        reasons.append(
+            f"the accounting does not reconcile: matched {coverage.matched} + duplicates "
+            f"{coverage.duplicate_confirmations} + superseded {coverage.superseded} + unaccounted "
+            f"{coverage.unaccounted} = {accounted}, against {coverage.created} created — every "
+            "booking must land in exactly ONE of those, so this control is describing a population "
+            "it cannot see whole"
+        )
+    if coverage.unreadable_invites:
+        reasons.append(
+            f"{coverage.unreadable_invites} message(s) carried a calendar part that could NOT be "
+            "read, so their announcements have no identity — an unreadable confirmation is "
+            "indistinguishable from an absent one, and the absent reading is the flattering one"
+        )
     if not coverage.read_complete:
         reasons.append(f"the mailbox read was INCOMPLETE ({coverage.read_problem})")
     if coverage.created <= 0:
@@ -1859,12 +1912,14 @@ def judge_confirmation_coverage(coverage: ConfirmationCoverage) -> Control:
         observed=(
             f"matched {coverage.matched}/{coverage.created} (superseded {coverage.superseded}, "
             f"unaccounted {coverage.unaccounted}) after {coverage.attempts} read(s) in "
-            f"{coverage.waited_seconds:.1f}s; mailbox read complete={coverage.read_complete} "
-            f"(reported total {coverage.reported_total}, page size {coverage.page_size}); "
-            f"negative deltas={coverage.negative_deltas}; duplicate confirmations="
-            f"{coverage.duplicate_confirmations}; uid collisions={coverage.colliding_uids}; "
-            f"messages carrying a calendar invite={coverage.messages_with_invite}"
-            + (f" — {'; '.join(reasons)}" if reasons else "")
+            f"{coverage.waited_seconds:.1f}s; accounted for {accounted}/{coverage.created} "
+            f"(matched + duplicates + superseded + unaccounted); mailbox read "
+            f"complete={coverage.read_complete} (reported total {coverage.reported_total}, page "
+            f"size {coverage.page_size}); negative deltas={coverage.negative_deltas}; duplicate "
+            f"confirmations={coverage.duplicate_confirmations}; uid collisions="
+            f"{coverage.colliding_uids}; messages carrying a readable calendar invite="
+            f"{coverage.messages_with_invite}; unreadable calendar parts="
+            f"{coverage.unreadable_invites}" + (f" — {'; '.join(reasons)}" if reasons else "")
         ),
         passed=not reasons,
     )
