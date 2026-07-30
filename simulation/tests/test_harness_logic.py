@@ -884,26 +884,28 @@ def test_c4_fails_when_a_probe_read_a_BROKEN_offer() -> None:
 
 
 def test_c7_passes_on_exactly_one_delivery() -> None:
-    control = judge_cancel_idempotency(_cancel({"booking.created": 1, "booking.cancelled": 1}))
+    control = judge_cancel_idempotency(
+        _cancel({"booking.created": 1, "booking.cancelled": 1}), race=_carrera_limpia()
+    )
     assert control.passed and control.ran
 
 
 def test_c7_fails_on_a_duplicate_which_is_the_defect_it_guards() -> None:
-    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 2}))
+    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 2}), race=_carrera_limpia())
     assert not control.passed
     assert "2 booking.cancelled delivered" in control.observed
 
 
 def test_c7_names_a_missing_delivery_as_a_DELIVERY_failure() -> None:
-    control = judge_cancel_idempotency(_cancel({"booking.created": 1}))
+    control = judge_cancel_idempotency(_cancel({"booking.created": 1}), race=_carrera_limpia())
     assert not control.passed
     assert "DELIVERY failure" in control.observed
 
 
 def test_c7_tells_a_timeout_apart_from_a_duplication() -> None:
     """==The whole point, as one assertion.== Both fail; they must not fail the SAME way."""
-    never = judge_cancel_idempotency(_cancel({}))
-    duplicated = judge_cancel_idempotency(_cancel({"booking.cancelled": 2}))
+    never = judge_cancel_idempotency(_cancel({}), race=_carrera_limpia())
+    duplicated = judge_cancel_idempotency(_cancel({"booking.cancelled": 2}), race=_carrera_limpia())
     assert not never.passed and not duplicated.passed
     assert never.observed != duplicated.observed
     assert "NOTHING arrived" in never.observed
@@ -918,7 +920,9 @@ def test_c7_refuses_to_certify_over_deliveries_it_could_not_READ() -> None:
     reader always returns the reassuring answer -- `count_sink_events` had already learned that one
     function higher up and surfaced `unreadable`; this reader went on swallowing them.
     """
-    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}, unreadable=1))
+    control = judge_cancel_idempotency(
+        _cancel({"booking.cancelled": 1}, unreadable=1), race=_carrera_limpia()
+    )
     assert control.passed is False
     assert "could NOT be decoded" in control.observed
     assert "lower bound" in control.observed
@@ -926,14 +930,16 @@ def test_c7_refuses_to_certify_over_deliveries_it_could_not_READ() -> None:
 
 def test_c7_reports_unreadable_deliveries_even_when_it_passes() -> None:
     """Zero is a measurement here, so it is printed rather than left to be assumed."""
-    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}))
+    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}), race=_carrera_limpia())
     assert control.passed is True
     assert "unreadable deliveries 0" in control.observed
 
 
 def test_c7_refuses_to_judge_when_the_outbox_never_drained() -> None:
     """An unattempted delivery is not an absent one; the observation was simply never valid."""
-    control = judge_cancel_idempotency(_cancel({"booking.cancelled": 1}, drained=False))
+    control = judge_cancel_idempotency(
+        _cancel({"booking.cancelled": 1}, drained=False), race=_carrera_limpia()
+    )
     assert not control.passed
     assert "did NOT drain" in control.observed
 
@@ -1781,6 +1787,22 @@ def _race(name: str, intervals: list[tuple[float, float]], *, winners: int = 1) 
         unexpected=[],
         latency=Latency(name),
         intervals=intervals,
+    )
+
+
+def _carrera_limpia(contenders: int = 40) -> RaceOutcome:
+    """Una carrera de cancelacion en la que TODOS los contendientes llegaron a la API.
+
+    C7 exige ahora esta mitad: un webhook unico es el numero correcto para una carrera que no
+    ocurrio, asi que la idempotencia no se puede certificar sin saber que la carrera paso.
+    """
+    return RaceOutcome(
+        name="race_cancel_same_booking",
+        contenders=contenders,
+        winners=contenders,
+        refusals_by_code={},
+        unexpected=[],
+        latency=Latency("race_cancel_same_booking"),
     )
 
 
@@ -3964,7 +3986,7 @@ def test_C7_REFUSES_to_certify_when_the_sink_read_failed() -> None:
         read_complete=False,
         read_problem="the sink query FAILED: 500 None ''",
     )
-    control = judge_cancel_idempotency(failed)
+    control = judge_cancel_idempotency(failed, race=_carrera_limpia())
     assert control.passed is False, "C7 certified idempotency over a sink it never managed to read"
     # ==And it must fail for the RIGHT REASON.== Removing the gate leaves C7 failing anyway --
     # `delivered == 1` is false of an empty count -- so asserting only `passed is False` passes
@@ -3983,7 +4005,7 @@ def test_C7_REFUSES_to_certify_when_the_sink_read_failed() -> None:
         settle_seconds=5.0,
         read_complete=True,
     )
-    assert judge_cancel_idempotency(observed).passed is True
+    assert judge_cancel_idempotency(observed, race=_carrera_limpia()).passed is True
 
 
 def test_stop_SEALS_the_results_so_a_late_reading_cannot_move_them() -> None:
@@ -4169,3 +4191,89 @@ def test_the_writability_probe_does_not_DESTROY_a_file_that_was_already_there(
     assert sorted(p.name for p in tmp_path.iterdir()) == [".run.md.writable-probe"], (
         "la sonda dejo su propio archivo temporal en el directorio"
     )
+
+
+def test_C7_no_certifica_idempotencia_sobre_una_carrera_QUE_NO_OCURRIO() -> None:
+    """==Un webhook unico es el numero CORRECTO para una carrera que nunca paso.==
+
+    C7 juzgaba solo el resultado en el sink. Si de 40 contendientes 38 reventaron en transporte,
+    llega una `booking.cancelled`, el oraculo se cumple y el control certifica una idempotencia
+    que nadie ejercito. El fallo del arnes se publica como una propiedad del producto -- la misma
+    familia que el sink muerto leido como cero entregas, un objeto mas arriba.
+    """
+    observacion = _cancel({"booking.cancelled": 1})
+
+    reventados = RaceOutcome(
+        name="race_cancel_same_booking",
+        contenders=40,
+        winners=2,
+        refusals_by_code={},
+        unexpected=["ConnectError: connection reset"] * 38,
+        latency=Latency("race_cancel_same_booking"),
+    )
+    control = judge_cancel_idempotency(observacion, race=reventados)
+    assert control.passed is False, "C7 certifico idempotencia sobre una carrera que no ocurrio"
+    assert "did NOT happen as described" in control.observed
+
+    # La otra mitad del mismo defecto: contendientes que no dejaron NI rastro. No aparecen en
+    # `unexpected` porque no produjeron nada, y la resta es lo unico que los ve.
+    mudos = RaceOutcome(
+        name="race_cancel_same_booking",
+        contenders=40,
+        winners=3,
+        refusals_by_code={},
+        unexpected=[],
+        latency=Latency("race_cancel_same_booking"),
+    )
+    assert judge_cancel_idempotency(observacion, race=mudos).passed is False, (
+        "37 contendientes sin respuesta y el control no lo noto"
+    )
+
+    # ==Anti-vacuidad:== con la carrera entera contabilizada, C7 sigue pasando sobre un webhook.
+    assert judge_cancel_idempotency(observacion, race=_carrera_limpia()).passed is True
+    # Y una carrera contabilizada por RECHAZOS tambien es una carrera que ocurrio.
+    con_rechazos = RaceOutcome(
+        name="race_cancel_same_booking",
+        contenders=40,
+        winners=1,
+        refusals_by_code={"already_cancelled": 39},
+        unexpected=[],
+        latency=Latency("race_cancel_same_booking"),
+    )
+    assert judge_cancel_idempotency(observacion, race=con_rechazos).passed is True
+
+
+def test_la_carrera_es_OBLIGATORIA_y_keyword_only_en_el_juez_de_C7() -> None:
+    """==Sin default, porque los dos defaults posibles estan mal.==
+
+    `race: RaceOutcome | None = None` volveria el guard decorativo en cuanto un llamador nuevo lo
+    omitiera, y omitirlo es justo el error que se comete. Sin default, olvidarlo es un TypeError:
+    todo error del llamador falla hacia el lado estricto. Keyword-only para que no entre por
+    posicion en la firma equivocada.
+
+    Es una afirmacion de FORMA -- como esta escrita la funcion -- asi que la hace el AST: un
+    sabotaje que reintroduce el default no cambia el comportamiento mientras todos los llamadores
+    sigan pasandolo, de modo que ningun test de ejecucion puede verlo (medido: se queda verde).
+    """
+    arbol = ast.parse(
+        (pathlib.Path(__file__).resolve().parents[1] / "aethercal_sim" / "scenarios.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    jueces = [
+        nodo
+        for nodo in ast.walk(arbol)
+        if isinstance(nodo, ast.FunctionDef) and nodo.name == "judge_cancel_idempotency"
+    ]
+    assert len(jueces) == 1, "el juez de C7 se duplico o desaparecio"
+    juez = jueces[0]
+
+    solo_por_nombre = [argumento.arg for argumento in juez.args.kwonlyargs]
+    assert "race" in solo_por_nombre, "`race` dejo de ser keyword-only"
+    posicion = solo_por_nombre.index("race")
+    assert juez.args.kw_defaults[posicion] is None, (
+        "`race` recupero un valor por defecto: quien lo olvide volvera a certificar idempotencia "
+        "sobre una carrera que nadie observo, en silencio"
+    )
+    # Anti-vacuidad: el mismo AST ve los que SI tienen default, asi que no pasa por vacio.
+    assert juez.args.kw_defaults[solo_por_nombre.index("ident")] is not None

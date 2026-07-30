@@ -1780,7 +1780,11 @@ class CancelWebhookObservation:
 
 
 def judge_cancel_idempotency(
-    observation: CancelWebhookObservation, *, ident: str = "C7", guards: str = ""
+    observation: CancelWebhookObservation,
+    *,
+    race: RaceOutcome,
+    ident: str = "C7",
+    guards: str = "",
 ) -> Control:
     """==C7 — and the three different things a count of ``booking.cancelled`` can mean.==
 
@@ -1815,6 +1819,25 @@ def judge_cancel_idempotency(
         f"drained in {observation.drain_wait_seconds:.1f}s, then polled up to "
         f"{observation.appear_timeout_seconds:.0f}s + {observation.settle_seconds:.0f}s settling"
     )
+    # ==C7 juzgaba el webhook y no a quien lo provoco.== Su oraculo es "exactamente una
+    # `booking.cancelled`", y ese uno es igual de cierto si de los N contendientes solo uno llego a
+    # la API: los demas pudieron reventar en transporte, y entonces la idempotencia no se probo —
+    # se certifico una carrera que no ocurrio. Un contendiente que no produjo respuesta solo
+    # aparece en `unexpected`, que este control no miraba.
+    sin_contabilizar = race.contenders - (race.winners + sum(race.refusals_by_code.values()))
+    if race.unexpected or sin_contabilizar:
+        return Control(
+            ident=ident,
+            guards=guards or "exactly one booking.cancelled reaches the sink",
+            expected=f"{race.contenders} contenders all accounted for at the API",
+            observed=(
+                f"the cancel race did NOT happen as described: {len(race.unexpected)} unexpected "
+                f"outcome(s) {race.unexpected[:3]} and {sin_contabilizar} contender(s) that "
+                f"produced no response at all, out of {race.contenders}. One webhook is the right "
+                "count for a race that never took place, so this cannot certify idempotency"
+            ),
+            passed=False,
+        )
     if not observation.read_complete:
         verdict = (
             f"the sink could NOT be read ({observation.read_problem}), so the {delivered} counted "
