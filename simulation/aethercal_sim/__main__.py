@@ -220,7 +220,82 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "The Markdown report is written first and the JSON would overwrite it, so the run "
             "would end holding one artifact where it reports two. Give them different paths."
         )
+
+    # ==Both destinations are proved writable HERE, before two weeks of traffic are generated.==
+    # The two writes are the last statements of a run that takes hours, and an unwritable path
+    # (a parent directory that does not exist, a permission, a name that is really a directory)
+    # was discovered only there. Worse than losing the artifact: the FIRST write can succeed and
+    # the second fail, leaving a Markdown report with no JSON twin — an artifact that is neither
+    # the run nor an error, and indistinguishable from a run that only ever emitted Markdown.
+    # A precondition checked after the work is not a precondition.
+    for flag, path in (("--out", args.out), ("--json-out", args.json_out)):
+        problem = _unwritable_reason(path)
+        if problem:
+            parser.error(
+                f"{flag} ({path}) cannot be written: {problem}. Checked now, before the "
+                "simulation starts, because this is discovered otherwise at the END of a run "
+                "that takes hours — and by then the measurement is gone."
+            )
     return args
+
+
+def _unwritable_reason(path: Path) -> str:
+    """Why this destination could not be written — or ``""`` when it can be.
+
+    Creating the parent directory IS the contract: ``--out reports/2026-07/run.md`` should work on
+    a machine that has never had that directory, and the alternative is telling a person to mkdir
+    by hand at the moment they least want to. What is NOT the contract is discovering at the end
+    of the run that it could not be created.
+
+    The probe writes a real file into the real directory and removes it. ``os.access`` answers a
+    different question (the permission bits, not the mount's read-only-ness, not a quota, not
+    Windows ACLs), and this is the one place where a cheaper answer would be a wrong one.
+    """
+    resolved = path.resolve()
+    if resolved.is_dir():
+        return "it is a directory"
+    parent = resolved.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"its parent directory {parent} could not be created ({type(exc).__name__}: {exc})"
+    probe = parent / f".{resolved.name}.writable-probe"
+    try:
+        probe.write_text("", encoding="utf-8")
+    except OSError as exc:
+        return f"a test file could not be created in {parent} ({type(exc).__name__}: {exc})"
+    finally:
+        probe.unlink(missing_ok=True)
+    return ""
+
+
+def write_run_artifacts(*, out: Path, markdown: str, json_out: Path, payload: str) -> None:
+    """Write BOTH artifacts, or leave both destinations as they were. ==No half-run on disk.==
+
+    ``args.out.write_text(...)`` followed by ``args.json_out.write_text(...)`` is two independent
+    writes at the very end of a run that takes hours. The first succeeding and the second failing
+    leaves a Markdown report with no JSON twin — and a stale JSON from a PREVIOUS run sitting next
+    to it, which is worse than nothing: the pair is then readable, mutually inconsistent, and says
+    so nowhere.
+
+    Each artifact is materialised in full beside its destination first, so the only step that can
+    fail after the first destination has changed is a rename of an already-written file. Two
+    renames are not one atomic act — nothing in a filesystem makes them so — but they are
+    microseconds over complete data, rather than minutes of rendering over an empty file.
+    """
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for destination, content in ((out, markdown), (json_out, payload)):
+            temporary = destination.with_name(f".{destination.name}.partial")
+            temporary.write_text(content, encoding="utf-8")
+            staged.append((temporary, destination))
+        for temporary, destination in staged:
+            os.replace(temporary, destination)
+    finally:
+        # A staged file that was never promoted is this function's litter, and a `.partial` left in
+        # a reports directory is exactly the artifact somebody eventually reads by mistake.
+        for temporary, _destination in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def _compose(metrics_token: str, *args: str) -> str:
@@ -990,6 +1065,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         # ---- Drain, then measure booking → confirmation ------------------------------------------
         print("==> waiting for the outbox to drain")
         drained, drain_wait = wait_for_drain(sampler, timeout_seconds=300.0)
+        # ==The sampler is SEALED here, before a single number is read off it.== Nothing below needs
+        # another sample (`wait_for_drain` scrapes synchronously), and everything below reads the
+        # series: C12's failure count, §3's peak backlog, the JSON twin's sample count. Those used
+        # to be taken one at a time from a LIVE object whose thread was not stopped until the
+        # `finally` at the end of this function — three numbers, three different instants, in a
+        # report that presents them as one reading. `stop()` freezes them; the `finally` below is
+        # now only the safety net for the paths that never reach here.
+        sampler_results = sampler.stop()
         # ==C12 — a failed drain now INVALIDATES the run.== `drained` was computed, printed in §3
         # and
         # then ignored: a run whose queue never emptied still stamped MEASURED, while the
@@ -1001,7 +1084,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
             control_outbox_drained(
                 drained=drained,
                 waited_seconds=drain_wait,
-                scrape_failures=len(sampler.failures),
+                scrape_failures=len(sampler_results.failures),
             )
         )
 
@@ -1014,7 +1097,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
         drain_latency, mail_read, coverage = measure_confirmations(mailbox, organic.booked)
         controls.append(judge_confirmation_coverage(coverage))
 
-        sink_counts, sink_unreadable = count_sink_events(stack.sink_url)
+        # ==§5's sink read carries its own failure now.== `{}` from a sink that answered 500 and
+        # `{}` from a run that delivered nothing print identically, and the first is the one that
+        # reads as "no webhooks were sent all run".
+        sink = count_sink_events(stack.sink_url)
 
         context = RunContext(
             run_id=run_id,
@@ -1029,118 +1115,118 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
             workers=args.workers,
             contenders=args.contenders,
         )
-        args.out.write_text(
-            render(
-                context=context,
-                plan_summary=summary,
-                organic=organic,
-                races=races,
-                controls=controls,
-                sampler=sampler,
-                drain_stats=drain_stats,
-                drain_latency=drain_latency,
-                no_show_outcome=no_show_outcome,
-                sink_counts=sink_counts,
-                sink_unreadable=sink_unreadable,
-                mail_read=mail_read,
-                coverage=coverage,
-                drained=drained,
-                drain_wait_seconds=drain_wait,
-            ),
-            encoding="utf-8",
+        markdown = render(
+            context=context,
+            plan_summary=summary,
+            organic=organic,
+            races=races,
+            controls=controls,
+            sampler=sampler,
+            drain_stats=drain_stats,
+            drain_latency=drain_latency,
+            no_show_outcome=no_show_outcome,
+            sink_counts=sink.counts,
+            sink_unreadable=sink.unreadable,
+            sink_problem=sink.problem,
+            mail_read=mail_read,
+            coverage=coverage,
+            drained=drained,
+            drain_wait_seconds=drain_wait,
         )
-        args.json_out.write_text(
-            render_json(
-                {
-                    "run_id": run_id,
-                    "seed": args.seed,
-                    "verdict": verdict_for(controls),
-                    "plan": summary,
-                    "created": len(organic.booked),
-                    "cancelled": organic.cancelled,
-                    "rescheduled": organic.rescheduled,
-                    "organic_collisions": organic.collisions,
-                    # ==The whole taxonomy, not just the flattering members of it.== A diff
-                    # between two
-                    # runs must be able to show a category appearing, which is why the
-                    # create/follow-up
-                    # outcomes travel in the machine-readable twin rather than only in the prose.
-                    "organic_outcomes": {
-                        "planned": summary["total"],
-                        "create": organic.create_outcomes(),
-                        "follow_up": organic.follow_up_outcomes(),
-                        "follow_ups_attempted": organic.follow_ups_attempted,
-                        "unexpected_failures": organic.unexpected_organic_failures(),
-                        "slots_read_failures": organic.slots_read_failed[:10],
-                        "booking_unreadable": organic.booking_unreadable[:10],
-                    },
-                    "confirmations": {
-                        "created": coverage.created,
-                        "matched": coverage.matched,
-                        "superseded": coverage.superseded,
-                        "unaccounted": coverage.unaccounted,
-                        "duplicate_confirmations": coverage.duplicate_confirmations,
-                        "colliding_uids": coverage.colliding_uids,
-                        "negative_deltas": coverage.negative_deltas,
-                        "worst_negative_ms": coverage.worst_negative_ms,
-                        "mailbox_read_complete": coverage.read_complete,
-                        "mailbox_read_problem": coverage.read_problem,
-                        "mailbox_reported_total": coverage.reported_total,
-                        "mailbox_page_size": coverage.page_size,
-                        "mailbox_readable_messages": len(mail_read.messages),
-                        "mailbox_unparseable": mail_read.unparseable,
-                        "mailbox_pages": mail_read.pages,
-                        "reads": coverage.attempts,
-                        "waited_seconds": coverage.waited_seconds,
-                    },
-                    "latency": {
-                        latency.name: latency.summary()
-                        for latency in (
-                            organic.slots_latency,
-                            organic.booking_latency,
-                            organic.cancel_latency,
-                            organic.reschedule_latency,
-                            drain_latency,
-                        )
-                    },
-                    "races": [
-                        {
-                            "name": race.name,
-                            "contenders": race.contenders,
-                            "winners": race.winners,
-                            "refusals": race.refusals_by_code,
-                            "unexpected": race.unexpected,
-                            "peak_overlap": race.peak_overlap,
-                        }
-                        for race in races
-                    ],
-                    "controls": [
-                        {
-                            "id": control.ident,
-                            "passed": control.passed,
-                            "ran": control.ran,
-                            "observed": control.observed,
-                        }
-                        for control in controls
-                    ],
-                    "outbox": {
-                        "peak_due": sampler.peak_due(),
-                        "peak_oldest_age_seconds": sampler.peak_oldest_age(),
-                        "samples": len(sampler.samples),
-                        "scrape_failures": len(sampler.failures),
-                        "discarded_at_pause": sampler.discarded_at_pause,
-                        "drained": drained,
-                        "deadman": drain_stats,
-                    },
-                    "sink": sink_counts,
-                    "cancel_race_sink_events": cancel_race_events,
-                    "errors": [
-                        {"status": status, "code": code, "count": count}
-                        for status, code, count in organic.tally.rows()
-                    ],
-                }
-            ),
-            encoding="utf-8",
+        payload = render_json(
+            {
+                "run_id": run_id,
+                "seed": args.seed,
+                "verdict": verdict_for(controls),
+                "plan": summary,
+                "created": len(organic.booked),
+                "cancelled": organic.cancelled,
+                "rescheduled": organic.rescheduled,
+                "organic_collisions": organic.collisions,
+                # ==The whole taxonomy, not just the flattering members of it.== A diff
+                # between two
+                # runs must be able to show a category appearing, which is why the
+                # create/follow-up
+                # outcomes travel in the machine-readable twin rather than only in the prose.
+                "organic_outcomes": {
+                    "planned": summary["total"],
+                    "create": organic.create_outcomes(),
+                    "follow_up": organic.follow_up_outcomes(),
+                    "follow_ups_attempted": organic.follow_ups_attempted,
+                    "unexpected_failures": organic.unexpected_organic_failures(),
+                    "slots_read_failures": organic.slots_read_failed[:10],
+                    "booking_unreadable": organic.booking_unreadable[:10],
+                },
+                "confirmations": {
+                    "created": coverage.created,
+                    "matched": coverage.matched,
+                    "superseded": coverage.superseded,
+                    "unaccounted": coverage.unaccounted,
+                    "duplicate_confirmations": coverage.duplicate_confirmations,
+                    "colliding_uids": coverage.colliding_uids,
+                    "negative_deltas": coverage.negative_deltas,
+                    "worst_negative_ms": coverage.worst_negative_ms,
+                    "mailbox_read_complete": coverage.read_complete,
+                    "mailbox_read_problem": coverage.read_problem,
+                    "mailbox_reported_total": coverage.reported_total,
+                    "mailbox_page_size": coverage.page_size,
+                    "mailbox_readable_messages": len(mail_read.messages),
+                    "mailbox_unparseable": mail_read.unparseable,
+                    "mailbox_pages": mail_read.pages,
+                    "reads": coverage.attempts,
+                    "waited_seconds": coverage.waited_seconds,
+                },
+                "latency": {
+                    latency.name: latency.summary()
+                    for latency in (
+                        organic.slots_latency,
+                        organic.booking_latency,
+                        organic.cancel_latency,
+                        organic.reschedule_latency,
+                        drain_latency,
+                    )
+                },
+                "races": [
+                    {
+                        "name": race.name,
+                        "contenders": race.contenders,
+                        "winners": race.winners,
+                        "refusals": race.refusals_by_code,
+                        "unexpected": race.unexpected,
+                        "peak_overlap": race.peak_overlap,
+                    }
+                    for race in races
+                ],
+                "controls": [
+                    {
+                        "id": control.ident,
+                        "passed": control.passed,
+                        "ran": control.ran,
+                        "observed": control.observed,
+                    }
+                    for control in controls
+                ],
+                "outbox": {
+                    "peak_due": sampler.peak_due(),
+                    "peak_oldest_age_seconds": sampler.peak_oldest_age(),
+                    "samples": len(sampler_results.samples),
+                    "scrape_failures": len(sampler_results.failures),
+                    "discarded_at_pause": sampler_results.discarded_at_pause,
+                    "drained": drained,
+                    "deadman": drain_stats,
+                },
+                "sink": sink.counts,
+                "sink_unreadable": sink.unreadable,
+                "sink_read_problem": sink.problem,
+                "cancel_race_sink_events": cancel_race_events,
+                "errors": [
+                    {"status": status, "code": code, "count": count}
+                    for status, code, count in organic.tally.rows()
+                ],
+            }
+        )
+        write_run_artifacts(
+            out=args.out, markdown=markdown, json_out=args.json_out, payload=payload
         )
 
         verdict = verdict_for(controls)

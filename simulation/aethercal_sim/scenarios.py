@@ -784,14 +784,85 @@ def race_cancel_vs_reschedule(
 # --------------------------------------------------------------------------------------
 
 
-def _captured(sink_url: str) -> list[dict[str, Any]]:
-    body: Any = Client(sink_url).get("/_captured").body
-    captured: Any = body.get("captured", []) if isinstance(body, dict) else []
-    return (
-        [entry for entry in captured if isinstance(entry, dict)]
-        if isinstance(captured, list)
-        else []
-    )
+@dataclass(frozen=True, slots=True)
+class SinkRead:
+    """Every delivery the sink was seen to hold — and ==whether it was READ at all.==
+
+    This reader used to return a bare list, and three different facts arrived wearing that one
+    shape: a sink that legitimately captured nothing, a sink that answered 500 (or refused the
+    connection, which this client reports as status ``0``), and a body that was not the capture
+    contract. Every consumer branched on the length of the list and therefore took the most
+    flattering reading of all three: ==a dead instrument filed as "no webhook was delivered".==
+
+    That is the defect :class:`OfferRead` exists to prevent one instrument over, and it survived in
+    the reader whose consumers certify *"exactly one webhook was delivered"* — the count a broken
+    read silently shrinks to the answer they were hoping for. :func:`decode_delivery`, twenty lines
+    below, already carried the lesson in its own docstring (*"Strict, because the lax form does not
+    fail — it LIES"*) while the function feeding it went on doing exactly that.
+    """
+
+    entries: list[dict[str, Any]]
+    complete: bool
+    problem: str = ""
+
+
+def read_captured(sink_url: str) -> SinkRead:
+    """Ask the sink what it holds, and judge the ANSWER before its emptiness may mean anything.
+
+    A well-formed answer is a 2xx whose body is an object carrying a ``captured`` LIST of objects.
+    Anything else is a read that FAILED, and this names how — so the controls above refuse to
+    certify instead of counting zero.
+
+    ==A missing ``captured`` key is a CHANGED CONTRACT, not an empty sink.== It used to be
+    ``body.get("captured", [])``, and that default is the whole defect in one argument.
+    """
+    response = Client(sink_url).get("/_captured")
+    if not response.ok:
+        return SinkRead(
+            [],
+            False,
+            f"the sink query FAILED: {response.status} {response.error_code} "
+            f"{response.text[:120]!r}",
+        )
+    body: Any = response.body
+    if not isinstance(body, dict):
+        return SinkRead(
+            [], False, f"2xx but the body is not the capture contract: {response.text[:140]!r}"
+        )
+    captured: Any = body.get("captured")
+    if not isinstance(captured, list):
+        return SinkRead(
+            [],
+            False,
+            f"the `captured` field is {type(captured).__name__}, not a list: {captured!r}",
+        )
+    entries = [entry for entry in captured if isinstance(entry, dict)]
+    if len(entries) != len(captured):
+        # ==Filtering these silently is the same subtraction, one level down.== A delivery this
+        # reader cannot even recognise as an entry would leave the count it is missing from looking
+        # exactly like a count that is right.
+        return SinkRead(
+            [],
+            False,
+            f"{len(captured) - len(entries)} of {len(captured)} captured entries are not objects, "
+            "so the sink's contract changed and this list is not the set of deliveries",
+        )
+    return SinkRead(entries, True)
+
+
+@dataclass(frozen=True, slots=True)
+class SinkEvents:
+    """Deliveries counted by event name, ==with both of the ways that count can be short.==
+
+    ``unreadable`` is a delivery that arrived and could not be decoded. ``complete=False`` is the
+    strictly worse fact: the read itself failed, so there is no set to count over at all and
+    ``counts`` is empty for a reason that has nothing to do with what was delivered.
+    """
+
+    counts: dict[str, int]
+    unreadable: int = 0
+    complete: bool = True
+    problem: str = ""
 
 
 def decode_delivery(body_b64: str) -> bytes:
@@ -809,16 +880,20 @@ def decode_delivery(body_b64: str) -> bytes:
     return base64.b64decode(body_b64, validate=True)
 
 
-def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
-    """Count captured deliveries by event name. Returns ``(counts, unreadable)``.
+def count_sink_events(sink_url: str) -> SinkEvents:
+    """Count captured deliveries by event name.
 
     ``unreadable`` is surfaced rather than swallowed: a payload shape this cannot parse would
     otherwise present as "zero duplicate cancellations" — the answer we were hoping for, and the one
-    a broken reader always gives.
+    a broken reader always gives. ==And a read that never happened is surfaced too==, because
+    ``{}`` from a 500 and ``{}`` from a quiet sink are the same two characters in §5.
     """
+    read = read_captured(sink_url)
+    if not read.complete:
+        return SinkEvents({}, 0, False, read.problem)
     counts: dict[str, int] = {}
     unreadable = 0
-    for entry in _captured(sink_url):
+    for entry in read.entries:
         try:
             payload: Any = json.loads(decode_delivery(str(entry.get("body_b64", ""))))
         except (ValueError, TypeError):
@@ -829,7 +904,7 @@ def count_sink_events(sink_url: str) -> tuple[dict[str, int], int]:
             counts[event] = counts.get(event, 0) + 1
         else:
             unreadable += 1
-    return counts, unreadable
+    return SinkEvents(counts, unreadable, True)
 
 
 def identifier_values(payload: Any) -> set[str]:
@@ -852,7 +927,7 @@ def identifier_values(payload: Any) -> set[str]:
     return found
 
 
-def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, int], int]:
+def sink_events_for_booking(sink_url: str, booking_id: str) -> SinkEvents:
     """Deliveries by event name for one booking, plus ==how many could not be READ at all.==
 
     The per-booking duplicate check is C7's entire oracle, and it used to ``continue`` past any
@@ -869,10 +944,18 @@ def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, i
 
     An entry that decodes but mentions a different booking is NOT unreadable — it is simply not
     ours, and skipping it is the function's job.
+
+    ==And a read that failed outright is a third state again==, carried in ``complete``. The sink
+    answering 500 produced the same empty ``counts`` as a sink holding nothing, so C7 could report
+    "0 delivered — a DELIVERY failure" about a run in which the webhook may have been delivered
+    twice. The instrument's silence must never be published as the product's.
     """
+    read = read_captured(sink_url)
+    if not read.complete:
+        return SinkEvents({}, 0, False, read.problem)
     counts: dict[str, int] = {}
     unreadable = 0
-    for entry in _captured(sink_url):
+    for entry in read.entries:
         try:
             raw = decode_delivery(str(entry.get("body_b64", "")))
         except (ValueError, TypeError):
@@ -899,7 +982,7 @@ def sink_events_for_booking(sink_url: str, booking_id: str) -> tuple[dict[str, i
             counts[event] = counts.get(event, 0) + 1
         else:
             unreadable += 1
-    return counts, unreadable
+    return SinkEvents(counts, unreadable, True)
 
 
 def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of them share a meaning
@@ -933,24 +1016,26 @@ def observe_cancel_webhooks(  # noqa: PLR0913 - a deadline per phase; none of th
     drained, drain_wait = wait_for_drain(sampler, timeout_seconds=drain_timeout)
     started = time.monotonic()
     appeared_after: float | None = None
-    counts, unreadable = sink_events_for_booking(sink_url, booking_id)
-    while counts.get("booking.cancelled", 0) == 0 and time.monotonic() - started < (
+    events = sink_events_for_booking(sink_url, booking_id)
+    while events.counts.get("booking.cancelled", 0) == 0 and time.monotonic() - started < (
         appear_timeout_seconds
     ):
         time.sleep(poll_seconds)
-        counts, unreadable = sink_events_for_booking(sink_url, booking_id)
-    if counts.get("booking.cancelled", 0) > 0:
+        events = sink_events_for_booking(sink_url, booking_id)
+    if events.counts.get("booking.cancelled", 0) > 0:
         appeared_after = time.monotonic() - started
         time.sleep(settle_seconds)
-        counts, unreadable = sink_events_for_booking(sink_url, booking_id)
+        events = sink_events_for_booking(sink_url, booking_id)
     return CancelWebhookObservation(
-        counts=counts,
+        counts=events.counts,
         drained=drained,
         drain_wait_seconds=drain_wait,
         appeared_after_seconds=appeared_after,
         appear_timeout_seconds=appear_timeout_seconds,
         settle_seconds=settle_seconds,
-        unreadable=unreadable,
+        unreadable=events.unreadable,
+        read_complete=events.complete,
+        read_problem=events.problem,
     )
 
 
@@ -1686,6 +1771,12 @@ class CancelWebhookObservation:
     unreadable: int = 0
     """Deliveries in the sink this harness could not decode. ==A duplicate hiding in one of these
     is invisible to ``counts``==, so a non-zero value means C7 did not observe what it certifies."""
+    read_complete: bool = True
+    """Whether the sink was READ at all. ==``False`` makes ``counts`` describe nothing==: a 500, a
+    refused connection or a changed capture contract all yield an empty map, which is the same
+    reading a sink holding no duplicate gives. The instrument's silence, not the product's."""
+    read_problem: str = ""
+    """Why the read failed, when it did — named in the control's own ``observed`` line."""
 
 
 def judge_cancel_idempotency(
@@ -1708,13 +1799,31 @@ def judge_cancel_idempotency(
     * ``the outbox never drained`` — the observation was never valid; say so, do not judge on it;
     * ``nothing arrived within N s`` — a delivery/timeout fact, named as one;
     * ``k delivered`` — the real oracle: exactly one passes, two or more is the idempotency defect.
+
+    .. rubric:: ==And a fourth, which is the one that used to be invisible.==
+
+    The sink read itself can fail. ``_captured`` swallowed the status code entirely, so a 500 from
+    the sink — or a refused connection, or a body that was not the capture contract — produced the
+    same empty ``counts`` as a sink holding nothing, and this control published it as *"NOTHING
+    arrived: this is a DELIVERY failure"*. ==An accusation against the product, sourced from an
+    instrument that had stopped answering==, and in the run where the answer might well have been
+    two. It is checked FIRST because it subsumes every branch below it: with no reading, the
+    drain state and the count are statements about nothing.
     """
     delivered = observation.counts.get("booking.cancelled", 0)
     window = (
         f"drained in {observation.drain_wait_seconds:.1f}s, then polled up to "
         f"{observation.appear_timeout_seconds:.0f}s + {observation.settle_seconds:.0f}s settling"
     )
-    if observation.unreadable:
+    if not observation.read_complete:
+        verdict = (
+            f"the sink could NOT be read ({observation.read_problem}), so the {delivered} counted "
+            "here is not an observation of anything — a failed read and an idempotent cancel "
+            "return the identical empty set. Refusing to judge the product on the instrument's "
+            "silence"
+        )
+        passed = False
+    elif observation.unreadable:
         # ==An unreadable delivery could BE the duplicate.== Certifying "exactly one" over a set
         # this harness could not fully read is the reassuring answer a broken reader always gives.
         verdict = (

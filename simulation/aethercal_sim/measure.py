@@ -314,6 +314,19 @@ def parse_summary(payload: Any) -> OutboxSample:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SamplerResults:
+    """The sampler's series, ==frozen at the instant :meth:`OutboxSampler.stop` sealed it.==
+
+    A tuple rather than a list, and a value rather than a view: what the report is built from must
+    not be able to change between two reads of it. See :meth:`OutboxSampler.stop`.
+    """
+
+    samples: tuple[OutboxSample, ...]
+    failures: tuple[str, ...]
+    discarded_at_pause: int
+
+
 class OutboxSampler:
     """Polls the worker's ``/metrics/summary`` on a background thread for the life of the run.
 
@@ -334,6 +347,10 @@ class OutboxSampler:
         self._in_flight = threading.Lock()
         self._discarded_at_pause = 0
         self._thread: threading.Thread | None = None
+        #: The sealed snapshot, once :meth:`stop` has taken it. ==Its presence is what makes every
+        #: recording path a no-op==, which is the only form of "the results are stable" this class
+        #: can actually keep; see :meth:`stop`.
+        self._results: SamplerResults | None = None
 
     def scrape(self) -> OutboxSample:
         """One read. Raises :class:`OutboxScrapeError` rather than inventing zeros."""
@@ -429,17 +446,8 @@ class OutboxSampler:
     def _record_scrape(self) -> None:
         try:
             sample = self.scrape()
-            with self._lock:
-                if self._paused.is_set():
-                    self._discarded_at_pause += 1
-                else:
-                    self._samples.append(sample)
         except OutboxScrapeError as exc:
-            with self._lock:
-                if self._paused.is_set():
-                    self._discarded_at_pause += 1
-                else:
-                    self._failures.append(str(exc))
+            self._file(failure=str(exc))
         except Exception as exc:
             # ==An unexpected exception used to END this thread, in silence.== Only
             # OutboxScrapeError was caught, so anything else — and the old permissive reader could
@@ -447,13 +455,31 @@ class OutboxSampler:
             # `failures` stayed empty, C12 saw zero unexplained scrape failures, and §3 reported a
             # peak backlog computed over however many samples had been taken before the thread
             # died. Sampling that STOPPED must never present as sampling that found nothing wrong.
-            with self._lock:
-                if self._paused.is_set():
-                    self._discarded_at_pause += 1
-                else:
-                    self._failures.append(
-                        f"the sampler hit an unexpected {type(exc).__name__}: {exc}"
-                    )
+            self._file(failure=f"the sampler hit an unexpected {type(exc).__name__}: {exc}")
+        else:
+            self._file(sample=sample)
+
+    def _file(self, *, sample: OutboxSample | None = None, failure: str = "") -> None:
+        """The ONE place a reading enters this object — ==and therefore the one place it can be
+        refused.==
+
+        The three recording branches each held the lock and each decided for themselves whether the
+        run was paused. Adding the seal to two of them and forgetting the third is exactly the
+        "rule enforced at one of its call sites" this harness keeps finding, so there is now a
+        single site: sealed → dropped, paused → counted as a discard, otherwise recorded.
+        """
+        with self._lock:
+            if self._results is not None:
+                # ==After stop() sealed the snapshot, a still-running thread may not touch it.==
+                # This is what makes the guarantee in stop()'s docstring true rather than hoped
+                # for. The thread outliving its join is recorded there, as a FAILURE C12 gates on.
+                return
+            if self._paused.is_set():
+                self._discarded_at_pause += 1
+            elif sample is not None:
+                self._samples.append(sample)
+            else:
+                self._failures.append(failure)
 
     def start(self) -> None:
         """Prove the endpoint answers, ==and KEEP that first reading.==
@@ -477,31 +503,56 @@ class OutboxSampler:
         self._thread = threading.Thread(target=self._loop, name="outbox-sampler", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop sampling and ==prove the thread is finished before anyone reads the results.==
+    def stop(self) -> SamplerResults:
+        """Stop sampling and ==SEAL the results, so nothing can change under the report.==
 
-        This used to ``join(timeout=10.0)`` and return regardless. If the thread outlived the
-        timeout it kept appending to ``_samples`` and ``_failures`` while ``main()`` built C12 and
-        rendered §3 — a report constructed over a state that was still changing, with the peak
-        backlog and the scrape-failure count read mid-write. ==A ``stop()`` that cannot guarantee
-        the stop and carries on in silence is the same no-op this branch has been closing all
-        along==, and it is the sibling of C5 reading a durable counter at one instant.
+        .. rubric:: What this used to promise, and why the promise was the defect
 
-        The join now gets the time an in-flight scrape actually needs (the client's own socket
-        timeout plus an interval), and a thread still alive after that is recorded as a failure —
-        which C12 gates on, so it reaches the verdict instead of being swallowed.
+        It said it would "prove the thread is finished before anyone reads the results", and
+        implemented that as a bounded ``join`` followed by an appended failure if the thread was
+        still alive. ==Recording the problem is not preventing it.== A thread that outlived the
+        join went on appending to ``_samples`` and ``_failures`` while ``main()`` built C12 and
+        rendered §3, so the peak backlog, the sample count and the scrape-failure count could each
+        be read from a DIFFERENT state — and the failure note itself, which says "every backlog
+        number below was read while it was still being written", was filed into the very list it
+        was warning about.
+
+        .. rubric:: The guarantee that can actually be kept is about the DATA, not the thread
+
+        Killing a Python thread is not possible, and joining without a deadline would hang the run
+        on a socket that never times out — the caller would then have neither a report nor a
+        verdict, which is strictly worse than a warned one. So the invariant is inverted: the
+        snapshot is taken under the lock and stored, and its presence makes every recording path a
+        no-op (see :meth:`_file`). A zombie thread may keep scraping; it can no longer be heard.
+        ==After this returns, ``samples``, ``failures`` and ``discarded_at_pause`` are frozen —
+        including on a run where the join timed out.==
+
+        The thread outliving its join is still a fact about the run, so it is recorded as a scrape
+        failure INSIDE the sealed snapshot, where C12 gates on it. Idempotent: a second call (the
+        ``finally`` in ``main()``) returns the same snapshot without joining again.
         """
         self._stop.set()
-        if self._thread is None:
-            return
-        self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-        if self._thread.is_alive():
-            with self._lock:
+        with self._lock:
+            if self._results is not None:
+                return self._results
+        alive = False
+        if self._thread is not None:
+            self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+            alive = self._thread.is_alive()
+        with self._lock:
+            if self._results is not None:  # pragma: no cover - two concurrent stop() callers
+                return self._results
+            if alive:
                 self._failures.append(
                     "the sampler thread was STILL RUNNING "
-                    f"{_STOP_JOIN_TIMEOUT_SECONDS:.0f}s after stop() was asked for, so every "
-                    "backlog number below was read while it was still being written"
+                    f"{_STOP_JOIN_TIMEOUT_SECONDS:.0f}s after stop() was asked for. Its readings "
+                    "from this point on are DISCARDED, so the numbers below are stable — but the "
+                    "series they come from ended early"
                 )
+            self._results = SamplerResults(
+                tuple(self._samples), tuple(self._failures), self._discarded_at_pause
+            )
+            return self._results
 
     @property
     def samples(self) -> list[OutboxSample]:
@@ -978,12 +1029,30 @@ class Mailbox:
         and the loop ends when ``total`` DISTINCT messages have been observed. There is deliberately
         no second "and now reconcile the count" step: with repeats refused, the cursor and the
         unique count are the same number, and two statements of one fact are two things that drift.
+
+        .. rubric:: ==And the termination test is EQUALITY, because ``>=`` is not the invariant.==
+
+        It was ``len(seen) >= total``, which is a weaker claim than the one ``complete`` makes to
+        C14. Two readings satisfy it while contradicting it:
+
+        * the server hands back MORE distinct messages than its own envelope reports — a mailbox
+          that grew mid-read, a total computed under a filter the list does not apply — and the read
+          declares itself an exact reconciliation of a set it had already overrun;
+        * ``total`` is re-read on EVERY page, so a total that DROPS between pages (a purge, a
+          different backend behind a proxy) satisfies ``>=`` immediately and closes the read early.
+          The messages already collected then belong to the mailbox that existed before the drop.
+
+        Both produce ``complete=True`` over a mixture of two mailboxes, and ``complete`` is
+        precisely what C14 consults to say the confirmation sample is whole — so the failure lands
+        as *"the sample is entire"* rather than as a broken read. The total may therefore not
+        decrease, an overrun is refused by name, and the loop ends only on ``len(seen) == total``.
         """
         collected: list[MailMessage] = []
         seen: set[str] = set()
         unparseable = 0
         start = 0
         total = 0
+        previous_total: int | None = None
         for page in range(1, _MAX_MAILBOX_PAGES + 1):
             query = f"/api/v1/messages?start={start}&limit={self.page_size}"
             try:
@@ -1016,6 +1085,22 @@ class Mailbox:
                         "this read has nothing to reconcile against — the contract changed"
                     ),
                 )
+            if previous_total is not None and reported < previous_total:
+                # ==A shrinking total closes the read EARLY under `>=`.== Whatever has already been
+                # collected was taken from the larger mailbox, so the list and the bound it would
+                # be reconciled against describe two different moments.
+                return self._incomplete(
+                    collected=collected,
+                    total=reported,
+                    page=page,
+                    unparseable=unparseable,
+                    why=(
+                        f"the reported total DROPPED from {previous_total} to {reported} between "
+                        f"pages, so this list mixes two different mailboxes — the {len(seen)} "
+                        "messages already read were taken from the larger one"
+                    ),
+                )
+            previous_total = reported
             total = reported
             raw_messages: Any = payload.get("messages")
             if not isinstance(raw_messages, list):
@@ -1064,11 +1149,26 @@ class Mailbox:
                     unparseable += 1
                 else:
                     collected.append(message)
+            if len(seen) > total:
+                # ==Read MORE distinct messages than the server says it holds.== Under `>=` this
+                # was the completion condition; it is in fact the proof that the list and the total
+                # do not describe the same mailbox, and `complete` promises that they do.
+                return self._incomplete(
+                    collected=collected,
+                    total=total,
+                    page=page,
+                    unparseable=unparseable,
+                    why=(
+                        f"{len(seen)} distinct messages were returned against a reported total of "
+                        f"{total}: the read OVERRAN its own bound, so 'complete' would mean the "
+                        "list matches a count it does not match"
+                    ),
+                )
             start += len(raw_messages)
             if not raw_messages:
                 # An empty page BEFORE the reported total means the server and its own envelope
                 # disagree; trusting it truncates the mailbox, which is the whole defect.
-                if len(seen) >= total:
+                if len(seen) == total:
                     return self._whole(collected, total, page, unparseable)
                 return self._incomplete(
                     collected=collected,
@@ -1077,7 +1177,7 @@ class Mailbox:
                     unparseable=unparseable,
                     why=f"an empty page at start {start} of a reported total of {total}",
                 )
-            if len(seen) >= total:
+            if len(seen) == total:
                 return self._whole(collected, total, page, unparseable)
         return self._incomplete(
             collected=collected,

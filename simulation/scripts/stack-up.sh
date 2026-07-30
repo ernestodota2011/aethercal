@@ -132,7 +132,15 @@ fi
 
 echo "==> rendering ${ENV_FILE} (test-only values; the previous file is backed up)"
 if [[ -f "${ENV_FILE}" ]]; then
-  cp "${ENV_FILE}" "${ENV_BACKUP}"
+  # ==The same class as the `.stack.json` written at the end of this script.== This copy holds the
+  # developer's OWN deploy/.env — their database password, their provider keys — for as long as the
+  # simulation runs. `cp` gives a newly created destination the source's mode minus the umask, so a
+  # 0600 original stays 0600; but it also writes straight into a PRE-EXISTING file and keeps that
+  # file's permissions, so an orphaned backup left at 0644 would silently become the copy. It is
+  # removed first (the guard above has already established that no live backup exists here) and
+  # created under a 077 umask, so the result cannot be wider than 0600 either way.
+  rm -f "${ENV_BACKUP}"
+  (umask 077 && cp "${ENV_FILE}" "${ENV_BACKUP}")
   echo "existed" >"${ENV_BACKUP}.state"
 else
   echo "absent" >"${ENV_BACKUP}.state"
@@ -367,7 +375,25 @@ document = {
         for index in range(int(os.environ["SIM_BUSINESS_COUNT"]))
     ],
 }
-with open(sys.argv[1], "w", encoding="utf-8") as handle:
+# ==Created 0600 BY THE DESCRIPTOR, never by a chmod afterwards.==
+#
+# This file holds every business's API key and the operator metrics token. `open(path, "w")` asks
+# for 0666 masked by the process umask, which on a normal host is 022 — so it landed 0644 and every
+# other account on the machine could read those credentials for as long as the stack was up. A
+# `chmod` on the next line does not fix that: the file exists, populated and world-readable, for
+# the whole window between the two calls, and a reader that got in during it keeps what it read.
+# The permission has to be part of the act of CREATING the file, which is what the mode argument to
+# `os.open` is for. O_TRUNC preserves the semantics of the "w" this replaces.
+#
+# The mode is applied only when the file is created, so a `.stack.json` left behind by an earlier
+# run would keep whatever permissions it already had — it is removed first for exactly that reason.
+destination = sys.argv[1]
+try:
+    os.unlink(destination)
+except FileNotFoundError:
+    pass
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
     json.dump(document, handle, indent=2)
     handle.write("\n")
 PY

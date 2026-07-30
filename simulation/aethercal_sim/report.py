@@ -148,6 +148,7 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     no_show_outcome: str,
     sink_counts: dict[str, int],
     sink_unreadable: int,
+    sink_problem: str,
     mail_read: MailboxRead,
     coverage: ConfirmationCoverage,
     drained: bool,
@@ -330,6 +331,9 @@ def render(  # noqa: PLR0913, PLR0912, PLR0915 - a report IS every instrument's 
     add(
         f"- Webhook deliveries captured at the sink, by event: `{sink_counts}` "
         f"(unreadable payloads: {sink_unreadable})"
+        # ==An empty map from a sink that could not be READ says the same thing as a quiet run.==
+        # The reason travels with the number, on the same line, or the line is a lie.
+        + (f" — **the sink read FAILED**: {sink_problem}" if sink_problem else "")
     )
     add("")
     if sampler.failures:

@@ -32,6 +32,7 @@ import pytest
 
 from aethercal_sim.__main__ import (
     COMPOSE_FILES,
+    _unwritable_reason,
     assert_compose_targets_stack,
     compose_command,
     confirmations_by_recipient,
@@ -40,6 +41,7 @@ from aethercal_sim.__main__ import (
     parse_args,
     positive_int,
     superseding_notices_by_recipient,
+    write_run_artifacts,
 )
 from aethercal_sim.client import Response, extract_error_code
 from aethercal_sim.measure import (
@@ -79,6 +81,7 @@ from aethercal_sim.scenarios import (
     OfferRead,
     OrganicResult,
     RaceOutcome,
+    SinkRead,
     _fire_together,
     cap_probe_blocker,
     control_outbox_drained,
@@ -97,6 +100,7 @@ from aethercal_sim.scenarios import (
     next_saturday,
     peak_overlap,
     pick_micro_slot,
+    read_captured,
     read_offer,
     sink_events_for_booking,
 )
@@ -2610,10 +2614,13 @@ def test_sink_events_for_booking_does_not_cross_attribute(monkeypatch: pytest.Mo
             ).decode()
         },
     ]
-    monkeypatch.setattr("aethercal_sim.scenarios._captured", lambda _url: captured)
-    counts, unreadable = sink_events_for_booking("http://localhost:9099", "book-1")
-    assert unreadable == 0
-    assert counts == {"booking.created": 1}, "the successor's delivery is not book-1's"
+    monkeypatch.setattr(
+        "aethercal_sim.scenarios.read_captured", lambda _url: SinkRead(captured, True)
+    )
+    events = sink_events_for_booking("http://localhost:9099", "book-1")
+    assert events.unreadable == 0
+    assert events.complete is True
+    assert events.counts == {"booking.created": 1}, "the successor's delivery is not book-1's"
 
 
 def test_c5_reads_delivered_as_a_maximum_not_as_an_instant() -> None:
@@ -3860,3 +3867,212 @@ def test_el_stack_file_ya_no_se_arma_concatenando() -> None:
     assert 'os.environ[f"SIM_BUSINESS_{index}_API_KEY"]' in guion, (
         "la clave viaja por el entorno; por argv la publicaria en `ps` a todo el host"
     )
+
+
+# --------------------------------------------------------------------------------------
+# The sink read, and the sampler's seal: two instruments whose SILENCE used to be published
+# as the product's. Both fixes are about the same sentence -- an absence that was really a
+# failure. These pin the fix at the level that matters: the CONSUMER's verdict.
+# --------------------------------------------------------------------------------------
+
+
+class _SinkAnswering:
+    """A sink returning one canned response, so `read_captured` itself runs -- not a stub of it."""
+
+    def __init__(self, response: Response) -> None:
+        self._response = response
+
+    def get(self, _path: str) -> Response:
+        return self._response
+
+
+def _sink_answers(monkeypatch: pytest.MonkeyPatch, response: Response) -> None:
+    monkeypatch.setattr("aethercal_sim.scenarios.Client", lambda _url: _SinkAnswering(response))
+
+
+@pytest.mark.parametrize(
+    ("response", "names_it"),
+    [
+        (Response(500, None, "boom", 1.0, None), "FAILED"),
+        (Response(0, None, "URLError: refused", 1.0, "transport_error"), "FAILED"),
+        (Response(200, ["captured"], '["captured"]', 1.0, None), "capture contract"),
+        (Response(200, {"other": []}, '{"other": []}', 1.0, None), "not a list"),
+        (Response(200, {"captured": [{"body_b64": "e30="}, "nope"]}, "", 1.0, None), "not objects"),
+    ],
+)
+def test_a_sink_that_did_not_ANSWER_is_never_read_as_an_EMPTY_sink(
+    monkeypatch: pytest.MonkeyPatch, response: Response, names_it: str
+) -> None:
+    """==The four ways the read can fail, and none of them may present as "nothing was sent".==
+
+    Each of these used to come back as ``[]`` -- the same two characters as a quiet sink -- and the
+    consumers, whose oracle is a COUNT, took the most flattering reading of all of them.
+    """
+    _sink_answers(monkeypatch, response)
+    read = read_captured("http://localhost:9099")
+    assert read.complete is False, "a read that failed was reported as a completed read"
+    assert read.entries == [], "a failed read must not hand its consumer entries to count"
+    assert names_it in read.problem, f"the problem does not say WHICH failure: {read.problem!r}"
+
+
+def test_a_wellformed_sink_answer_is_still_read_normally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """==The anti-vacuity half.== Without it the assertions above pass on a reader that broke."""
+    _sink_answers(
+        monkeypatch,
+        Response(200, {"captured": [{"body_b64": "e30="}]}, "", 1.0, None),
+    )
+    read = read_captured("http://localhost:9099")
+    assert read.complete is True and read.problem == ""
+    assert len(read.entries) == 1, "a healthy answer must still yield its deliveries"
+
+
+def test_C7_REFUSES_to_certify_when_the_sink_read_failed() -> None:
+    """==The half that decides whether the fix is real: the VERDICT, not the reader.==
+
+    A reader that reports its own failure changes nothing if the control still counts zero and
+    calls it a clean run. C7's oracle is *"exactly one delivery"*, and a dead sink offers exactly
+    zero -- so the wrong answer is also the passing one.
+    """
+    failed = CancelWebhookObservation(
+        counts={},
+        drained=True,
+        drain_wait_seconds=1.0,
+        appeared_after_seconds=None,
+        appear_timeout_seconds=30.0,
+        settle_seconds=5.0,
+        read_complete=False,
+        read_problem="the sink query FAILED: 500 None ''",
+    )
+    control = judge_cancel_idempotency(failed)
+    assert control.passed is False, "C7 certified idempotency over a sink it never managed to read"
+    # ==And it must fail for the RIGHT REASON.== Removing the gate leaves C7 failing anyway --
+    # `delivered == 1` is false of an empty count -- so asserting only `passed is False` passes
+    # over the deleted guard. That verdict would read "0 delivered, a DELIVERY failure" about a run
+    # whose instrument was dead: the product blamed for the harness's blindness.
+    assert "could NOT be read" in control.observed, (
+        "C7 failed, but as a delivery failure -- it did not say the INSTRUMENT was the problem"
+    )
+    # Anti-vacuity: the same control, on a read that DID happen, still passes on one delivery.
+    observed = CancelWebhookObservation(
+        counts={"booking.cancelled": 1},
+        drained=True,
+        drain_wait_seconds=1.0,
+        appeared_after_seconds=2.0,
+        appear_timeout_seconds=30.0,
+        settle_seconds=5.0,
+        read_complete=True,
+    )
+    assert judge_cancel_idempotency(observed).passed is True
+
+
+def test_stop_SEALS_the_results_so_a_late_reading_cannot_move_them() -> None:
+    """==The guarantee is about the DATA, not the thread.== A zombie may scrape; it is not heard.
+
+    ``stop()`` used to promise the thread was finished and implement that as a bounded join plus a
+    note if it was not -- ==recording the problem instead of preventing it==. The peak backlog, the
+    sample count and the failure count could then each be read from a different state.
+    """
+    sampler = OutboxSampler("http://127.0.0.1:1", "t" * 40, interval_seconds=0.01)
+    before = OutboxSample(at=0.0, due=7, oldest_due_age_seconds=1.0, by_status={}, delivered=0)
+    sampler._file(sample=before)
+
+    sealed = sampler.stop()
+    assert sealed.samples == (before,)
+    # ==Assert on the LIVE lists, not on the snapshot.== `SamplerResults` holds `tuple(...)`, a
+    # copy taken at seal time, so it cannot change whatever happens next -- a test that only
+    # inspects it stays green with the seal deleted. What the seal actually buys is that the
+    # sampler's own state stops growing, which is what every later reader sees.
+
+    # The zombie keeps going -- through the ONE filing site, which is the whole point of the fix.
+    sampler._file(
+        sample=OutboxSample(at=9.0, due=999, oldest_due_age_seconds=9.9, by_status={}, delivered=9)
+    )
+    sampler._file(failure="a scrape that happened after the seal")
+
+    assert sampler.stop() == sealed, "a second stop() must return the same sealed snapshot"
+    assert sampler.samples == [before], "a late sample entered the state the report reads from"
+    assert "after the seal" not in " ".join(sampler.failures), (
+        "a scrape filed after the seal was still heard"
+    )
+    assert sampler.peak_due() == 7, "the peak backlog moved after the report had already used it"
+
+
+def test_a_read_that_OVERRAN_its_own_bound_is_not_a_complete_read() -> None:
+    """==`complete` means the list MATCHES the count, not that it reached it.==
+
+    The terminator was ``len(seen) >= total``, which also accepts a page set larger than the
+    envelope's own total -- a mailbox read mid-write, or two snapshots stitched together. Either
+    way `complete` would promise a correspondence that does not hold, and C14 consults exactly that
+    flag to say the confirmation sample is whole.
+    """
+    fake = _FakeMailpit([_envelope(f"g{n}@guests.sim.test") for n in range(5)], reported_total=3)
+    read = _mailbox(fake, page_size=500).read_all()
+    assert read.complete is False, "a read holding MORE than the reported total called itself whole"
+    assert "OVERRAN" in read.problem, f"the problem does not name the overrun: {read.problem!r}"
+
+
+def test_a_read_that_matches_its_total_exactly_is_still_complete() -> None:
+    """The anti-vacuity half: tightening the terminator must not fail an honest read."""
+    fake = _FakeMailpit([_envelope(f"g{n}@guests.sim.test") for n in range(3)], reported_total=3)
+    read = _mailbox(fake, page_size=500).read_all()
+    assert read.complete is True and read.problem == ""
+    assert len(read.messages) == 3
+
+
+def test_the_output_paths_are_judged_BEFORE_the_run_not_after_it(tmp_path: pathlib.Path) -> None:
+    """==A path the CLI accepted and cannot write must fail in the first second, not the last.==
+
+    Both artifacts are written after a run that takes hours; discovering there that the directory
+    does not exist throws the measurement away.
+    """
+    assert _unwritable_reason(tmp_path / "reports" / "2026-07" / "run.md") == ""
+    assert (tmp_path / "reports" / "2026-07").is_dir(), "creating the parent IS the contract"
+    assert "directory" in _unwritable_reason(tmp_path), "a directory is not a writable artifact"
+
+
+def test_a_failed_SECOND_artifact_leaves_the_first_destination_untouched(
+    tmp_path: pathlib.Path,
+) -> None:
+    """==No half-run on disk.== The pair must never be readable and mutually inconsistent.
+
+    Two bare ``write_text`` calls meant the Markdown could land while the JSON failed, leaving the
+    new report beside a JSON from a PREVIOUS run -- worse than nothing, because it reads fine.
+    """
+    out = tmp_path / "run.md"
+    out.write_text("THE PREVIOUS RUN", encoding="utf-8")
+    json_out = tmp_path / "no-such-directory" / "run.json"
+
+    with pytest.raises(OSError):
+        write_run_artifacts(out=out, markdown="THE NEW RUN", json_out=json_out, payload="{}")
+
+    assert out.read_text(encoding="utf-8") == "THE PREVIOUS RUN", (
+        "the Markdown was replaced while its JSON twin never arrived"
+    )
+    assert list(tmp_path.glob(".*.partial")) == [], "a staged file was left behind to be misread"
+
+    # Anti-vacuity: the same function, on a pair it CAN write, writes both.
+    good = tmp_path / "ok.json"
+    write_run_artifacts(out=out, markdown="THE NEW RUN", json_out=good, payload="{}")
+    assert out.read_text(encoding="utf-8") == "THE NEW RUN"
+    assert good.read_text(encoding="utf-8") == "{}"
+
+
+def test_the_stack_file_is_created_with_its_credentials_ALREADY_private() -> None:
+    """==`.stack.json` holds every business API key and the metrics token.==
+
+    Created with a plain ``open(..., "w")`` it inherits the umask -- `0644` on a normal box, so any
+    local user reads working credentials for as long as the stack is up. It is created through a
+    descriptor with the mode in the same call, ==never a `chmod` afterwards==, which would leave a
+    window in which the file already exists with the wide permissions.
+
+    ==This is a FORM assertion and that is a compromise, so it is named:== the write lives inside a
+    heredoc in a shell script, and the mode it produces is only observable on POSIX, while this
+    suite also runs on Windows where the concept does not exist. Debt, with its fix: execute the
+    extracted snippet in a POSIX-only test and stat the result.
+    """
+    guion = pathlib.Path("simulation/scripts/stack-up.sh").read_text(encoding="utf-8")
+    assert "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600" in guion, (
+        "the stack file is no longer created private"
+    )
+    assert "os.chmod" not in guion, "a chmod after the fact leaves the file briefly world-readable"
+    assert 'open(destination, "w")' not in guion, "the permissive write came back"
