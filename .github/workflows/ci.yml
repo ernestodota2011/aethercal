@@ -36,6 +36,17 @@ jobs:
         run: uv run pyright
       - name: Import contracts (import-linter)
         run: uv run lint-imports
+      # ==Los scripts de shell no tenian NINGUN guard automatico.== `run.sh` construia su
+      # invocacion de compose como una cadena con word-splitting deliberado, asi que una ruta con
+      # espacios rompia el teardown -- y el home del operador tiene espacios. Se arreglo a mano y
+      # nada impedia que volviera: el unico test que lo cubre es uno escrito para ese caso, no un
+      # linter que vea la clase entera. shellcheck es ese linter.
+      #
+      # SC1091 queda fuera: los `source` son relativos y resolverlos exigiria ejecutar el script.
+      - name: Lint (shellcheck)
+        run: |
+          shellcheck --version
+          shellcheck -e SC1091 $(git ls-files '*.sh')
       # React alignment DERIVED from the installed Reflex (the source of truth), so a Reflex bump is
       # tracked automatically instead of drifting against a hardcoded literal. Node is preinstalled
       # on the runner; `uv run` puts the venv's Python (with reflex_base) on PATH for the script's
