@@ -14,10 +14,31 @@ all, however good its numbers look — which is why the verdict is the first lin
 
 | Run | Date | Verdict | Notes |
 |---|---|---|---|
-| `1b3a66f9` | 2026-07-29 | MEASURED | **240** planned / 206 created, 44 follow-ups, 40-way races, **all fifteen** controls held, and the id set is the required set exactly. The plan is **byte-identical** to `bd6232d4`'s at the same seed — the `allocate_by_weight` normalisation moved nothing, because production already normalised at the call site. §6's 547 classified reconciles with §1; 36 `slot_unavailable` split across both legs — **34** on the create leg and **2** on the reschedule leg — and `240 − 34 = 206` closes the create leg on its own. Confirmations 180 matched + 26 superseded = 206, 0 unaccounted, 0 duplicates, 0 uid collisions, 0 unparseable envelopes. C5 on a drained baseline (due=0), 6 stranded, 6 delivered. Peak 40 of 40 in flight (C15). 388 samples, 0 scrape failures. ==The first run in this directory whose stack was actually torn down by its own script== — see the withdrawal below. Same observability limit as every predecessor: a **dead** worker is invisible to the backlog metric (§7). |
+| `d94af6c1` | 2026-07-29 | MEASURED | **240** planned / 210 created, 43 follow-ups, 40-way races, **all fifteen** controls held, and the id set is the required set exactly. The plan is **byte-identical** to `1b3a66f9`'s at the same seed, so none of the eight defects closed since it moved a planned value. §6's 545 classified reconciles with §1; 32 `slot_unavailable` split across both legs — **30** on the create leg and **2** on the reschedule leg — and `240 − 30 = 210` closes the create leg on its own. Confirmations 185 matched + 25 superseded = 210, 0 unaccounted, 0 duplicates, 0 uid collisions, 0 unparseable envelopes. C5 on a drained baseline (due=0), 6 stranded, 6 delivered. Peak 40 of 40 in flight (C15). 505 samples, 0 scrape failures. ==The first run whose C5 stopped a container the isolation check had actually verified, and the first booted by a script that could not proceed over a failed `down -v`== — see the withdrawal below. Same observability limit as every predecessor: a **dead** worker is invisible to the backlog metric (§7). |
 
-> [!warning] ==Twelve earlier runs were published here as `MEASURED` and have been withdrawn.==
-> Their numbers were plausible; what was wrong was the **certificate**, twelve times over.
+> [!warning] ==Thirteen earlier runs were published here as `MEASURED` and have been withdrawn.==
+> Their numbers were plausible; what was wrong was the **certificate**, thirteen times over.
+>
+> `1b3a66f9` — withdrawn because the gate that had cleared this branch was **reading half of it**.
+> The diff is ~466 000 characters against a 200 000 cap, silently truncated, so more than half had
+> never been reviewed by any of the passes that came back clean. Re-run one file at a time it
+> returned **eight** findings, and three of them are instruments this run's numbers were taken
+> with: the mailbox reader used its **cursor** as its oracle, so a server answering the same page
+> twice would have been read as whole with the arithmetic agreeing; the slots query interpolated
+> the timezone by hand, which survives for `America/*` and breaks any fixed-offset zone; and C5
+> **stopped a container nothing had verified** — `--compose-cmd` took an arbitrary invocation and
+> handed it straight to `stop worker`, so the stack the run *proves* it is talking to and the stack
+> that command could reach were two different objects. ==That last one is why this is a withdrawal
+> and not a supersession: the isolation guarantee this directory exists to enforce had a hole in it
+> exactly the width of one CLI flag, in the only code path that manipulates containers.== Its boot
+> also ran `docker compose down -v || true`, so nothing in it can claim the empty database every
+> number assumes — true here by luck (the container was fresh), unprovable in general.
+>
+> ==Two of the three did NOT fire in it, and saying so matters more than the withdrawal.== Its
+> mailbox held 279 messages against a page size of 500, so it paged **once** and no repeat was
+> possible; and its businesses are all `America/*`, so the unencoded `+` never appeared. Live traps
+> that happened not to spring, and nothing in the run could have told anyone that — which is the
+> whole reason they are guarded now rather than re-derived per run.
 >
 > `bd6232d4` — withdrawn with **no wrong number in it**, and the second one withdrawn on that
 > footing. Every total reconciled, its plan is byte-identical to the replacement's at the same seed,
