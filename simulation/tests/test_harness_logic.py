@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -3802,15 +3803,34 @@ def _entorno_del_stack_file(clave: str) -> dict[str, str]:
     }
 
 
+def _correr_generador(
+    fuente: str, destino: pathlib.Path, entorno: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Ejecuta el generador extraido ==como ARCHIVO, nunca por stdin.==
+
+    Por stdin (`python -`) el interprete no sabe en que esta codificado y cae al locale del
+    proceso: en el CI de Windows eso es cp1252, asi que un guion largo en un COMENTARIO del
+    heredoc reventaba con `SyntaxError: Non-UTF-8 code` -- ==prosa rompiendo un test, y solo en
+    una plataforma==. Un archivo `.py` se lee como UTF-8 por defecto (PEP 3120), asi que la
+    codificacion deja de depender de donde corra la suite.
+
+    Y no se cazo antes porque este entorno de desarrollo lleva `PYTHONUTF8=1`: ==el verde local
+    era prestado por una variable de entorno que el CI no tiene.==
+    """
+    with tempfile.TemporaryDirectory() as carpeta:
+        guion = pathlib.Path(carpeta) / "generador.py"
+        guion.write_text(fuente, encoding="utf-8")
+        return subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona en la prueba
+            [sys.executable, str(guion), str(destino)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=entorno,
+        )
+
+
 def _escribir_stack_file(destino: pathlib.Path, clave: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: PLW1510 - el returncode se inspecciona en la prueba
-        [sys.executable, "-", str(destino)],
-        input=_generador_del_stack_file(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env=_entorno_del_stack_file(clave),
-    )
+    return _correr_generador(_generador_del_stack_file(), destino, _entorno_del_stack_file(clave))
 
 
 def test_una_clave_con_comillas_y_barras_sobrevive_al_stack_file(tmp_path: pathlib.Path) -> None:
@@ -4115,13 +4135,7 @@ def test_the_stack_file_REALLY_lands_0600_under_a_permissive_umask(tmp_path: pat
     # entorno de CI resulte ser restrictivo. Sin esto el test pasaria con el codigo viejo en
     # cualquier maquina cuyo umask fuese 0o077 -- un verde prestado por la maquina.
     envoltorio = f"import os\nos.umask(0o000)\n{generador}"
-    completado = subprocess.run(
-        [sys.executable, "-c", envoltorio, str(destino)],
-        env=entorno,
-        capture_output=True,
-        text=True,
-        check=False,  # el fallo se afirma abajo CON su stderr; `check=True` lo escondería
-    )
+    completado = _correr_generador(envoltorio, destino, entorno)
     assert completado.returncode == 0, completado.stderr
 
     modo = stat.S_IMODE(destino.stat().st_mode)
