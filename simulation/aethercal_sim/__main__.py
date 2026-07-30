@@ -801,9 +801,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
                 )
             )
         else:
-            races.append(
-                race_cancel(stack, target, booking_id=cancel_id, contenders=args.contenders)
+            cancel_race = race_cancel(
+                stack, target, booking_id=cancel_id, contenders=args.contenders
             )
+            races.append(cancel_race)
             # ==Observed, not slept through.== This used to be `time.sleep(12)` and a single read: a
             # webhook arriving at 13 seconds made C7 fail in a way INDISTINGUISHABLE from the
             # duplication it exists to detect. `observe_cancel_webhooks` drains the outbox first (so
@@ -815,7 +816,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915, PLR0912 - a ru
             print(
                 f"    cancel race: drained={cancel_observation.drained} events={cancel_race_events}"
             )
-            controls.append(judge_cancel_idempotency(cancel_observation, ident="C7", guards=_C7))
+            controls.append(
+                judge_cancel_idempotency(
+                    cancel_observation, race=cancel_race, ident="C7", guards=_C7
+                )
+            )
 
         reschedule_id = subject(args.contenders + 2, "Reschedule")
         later_starts: list[str] = []
