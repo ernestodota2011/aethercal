@@ -14,7 +14,7 @@ classifiers = ["Development Status :: 2 - Pre-Alpha", "Typing :: Typed"]
 # only ever reaches the API through the SDK (the D4 rule), so it depends on the client + the shared
 # schemas (for the typed request/response DTOs), never on the server or core directly.
 dependencies = [
-    "python-fasthtml>=0.12",
+    "python-fasthtml>=0.14.9",
     "aethercal-client",
     "aethercal-schemas",
     # The published-placeholder guard (aethercal.core.placeholders) — the ONE place that answers
