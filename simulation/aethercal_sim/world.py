@@ -1,0 +1,411 @@
+"""The stack the harness was handed, and the world it builds on top of it.
+
+``.stack.json`` is written by ``scripts/stack-up.sh`` and read here. ==Its absence is a hard error,
+never a default.== A harness that invented ``http://localhost:8000`` when the file was missing would
+happily run against whatever answered on that port — which, on a developer's machine, is exactly how
+a "simulation" ends up writing hundreds of synthetic bookings into something nobody intended. The
+file is the proof that a throwaway stack was deliberately brought up for this run.
+
+.. rubric:: The four event types, and why each exists
+
+``standard`` (30 min) and ``long`` (60 min) carry the organic two-week traffic on a **Mon-Fri
+09:00-17:00** schedule, so weekends are closed the way a real business's are (``rules`` keys are
+``date.weekday()``: Monday is 0, so 5 and 6 are absent rather than empty).
+
+``micro`` (2 min) exists for one reason: **a no-show cannot be produced by compressing time.** The
+product refuses to mark a booking that has not ended (``BookingNotEndedError``), and every bookable
+slot is in the future — so on a 30-minute event type no booking made during a run can ever become a
+no-show, and the transition would go untested while the report implied otherwise. A two-minute event
+type on an always-open schedule ends *during* the run, which lets the real transition run against
+the real guard instead of being skipped, faked, or unlocked with a clock trick.
+
+``capped`` carries ``max_per_day=2`` and exists only to be refused — the daily-cap control.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.parse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .client import Client
+
+#: Mon-Fri 09:00-17:00, in each business's own timezone.
+BUSINESS_HOURS: dict[str, list[dict[str, str]]] = {
+    str(day): [{"start": "09:00", "end": "17:00"}] for day in range(5)
+}
+
+#: Always open. Only the ``micro`` event type uses it — see the module docstring.
+ALWAYS_OPEN: dict[str, list[dict[str, str]]] = {
+    str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)
+}
+
+#: How far ahead the world is bookable — comfortably past the two-week window the plan spans.
+MAX_ADVANCE_SECONDS = 60 * 24 * 60 * 60
+
+MICRO_DURATION_SECONDS = 120
+CAPPED_MAX_PER_DAY = 2
+
+
+@dataclass(frozen=True, slots=True)
+class BusinessConfig:
+    slug: str
+    name: str
+    timezone: str
+    tenant_id: str
+    host_user_id: str
+    api_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class StackConfig:
+    api_url: str
+    worker_url: str
+    booking_url: str
+    mailpit_url: str
+    sink_url: str
+    metrics_token: str
+    compose_project: str
+    nonce: str
+    businesses: list[BusinessConfig]
+
+
+#: ==Where the product is told to POST its webhooks, DERIVED rather than accepted.==
+#:
+#: This used to be read from `.stack.json` and used verbatim to register webhooks — the one value
+#: the isolation check never looked at. `assert_disposable_stack` proves the API, worker, booking
+#: page, mailbox and sink are all loopback, and then the harness handed the product an arbitrary
+#: URL out of a file and asked it to send traffic there. A stale `.stack.json` from another run, or
+#: a typo, would have pointed a real instance's webhooks somewhere unverified — and unlike every
+#: other endpoint here, this one is dialled by the SERVER, so no amount of loopback checking on the
+#: client side constrains it.
+#:
+#: A value the harness can compute has no business being configurable: what is never accepted needs
+#: no validation. It is the sink's name on the compose network, fixed by `e2e/compose.e2e.yml` —
+#: and it must stay globally routable, because the delivery worker's SSRF guard rejects private
+#: addresses.
+SINK_WEBHOOK_URL = "http://hooks:9099/hook"
+
+#: The only Compose project this harness may ever act on.
+EXPECTED_COMPOSE_PROJECT = "aethercal-sim"
+
+#: Hosts a throwaway stack is allowed to live on. It is published to the loopback interface of the
+#: machine that created it; anything else is, by definition, somebody else's instance.
+_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+#: Minimum entropy for the run nonce: 32 hex chars = 128 bits.
+_MIN_NONCE_LENGTH = 32
+
+#: The marker `stack-up.sh` plants inside the database it just created.
+MARKER_SCHEDULE_PREFIX = "sim-marker-"
+
+
+class NotADisposableStackError(RuntimeError):
+    """The target failed to prove it is this run's throwaway stack. Nothing has been touched."""
+
+
+def _host_of(url: str) -> str:
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+def assert_disposable_stack(stack: StackConfig) -> str:
+    """==Prove the target IS this run's throwaway stack, BEFORE anything is created or purged.==
+
+    This is the guarantee the rest of the harness rests on, and until it existed it was enforced
+    nowhere: it lived in the README and in whatever the operator had been told. The stack file was
+    just a path, so nothing structural stopped this harness being aimed at a live instance — and its
+    first acts are to purge a mailbox, create businesses, and (via `run.sh`) `down -v` a database. A
+    promise that is documented but not derived is the exact defect this harness exists to hunt, so
+    it had no business being the one thing taken on faith.
+
+    Four checks, cheapest first, each of which a real instance fails:
+
+    1. **the Compose project must be `aethercal-sim`** — the name that makes `down -v` unable to
+       reach any other project;
+    2. **every endpoint must be loopback** — a hostname or a LAN address means something else is
+       being addressed;
+    3. **a 128-bit nonce must be present**, generated by `stack-up.sh` for THIS stack;
+    4. ==**the database must contain that nonce.**== `stack-up.sh` plants a schedule named
+       ``sim-marker-<nonce>`` in the first business, and this reads it back through the API. This is
+       the check a hand-edited JSON file cannot pass: only the script that created the database
+       could have put the marker there, and only for this run. A stale simulation stack left from an
+       earlier run fails it too, because the nonce is fresh every time.
+
+    Returns the verified nonce, or raises :class:`NotADisposableStackError` — before any write, so a
+    refusal leaves the target untouched.
+    """
+    if stack.compose_project != EXPECTED_COMPOSE_PROJECT:
+        raise NotADisposableStackError(
+            f"compose project is {stack.compose_project!r}, not {EXPECTED_COMPOSE_PROJECT!r}.\n"
+            "This harness purges and recreates the world it runs against; it will only ever do "
+            "that inside the throwaway project."
+        )
+
+    for label, url in (
+        ("apiUrl", stack.api_url),
+        ("workerUrl", stack.worker_url),
+        ("bookingUrl", stack.booking_url),
+        ("mailpitUrl", stack.mailpit_url),
+        ("sinkUrl", stack.sink_url),
+    ):
+        host = _host_of(url)
+        if host not in _ALLOWED_HOSTS:
+            raise NotADisposableStackError(
+                f"{label} points at {host!r}, which is not loopback "
+                f"({sorted(_ALLOWED_HOSTS)}).\n"
+                "A throwaway stack is published to the machine that created it. A hostname or a "
+                "LAN address means this is aimed at an instance somebody else is using."
+            )
+
+    if len(stack.nonce) < _MIN_NONCE_LENGTH or any(
+        c not in "0123456789abcdef" for c in stack.nonce
+    ):
+        raise NotADisposableStackError(
+            f"the run nonce is missing or malformed ({stack.nonce!r}). It is written by "
+            "scripts/stack-up.sh and is what ties this file to the database it created."
+        )
+
+    # ---- The check a hand-edited file cannot pass -------------------------------------------
+    marker = f"{MARKER_SCHEDULE_PREFIX}{stack.nonce}"
+    first = stack.businesses[0]
+    response = Client(stack.api_url, first.api_key).get("/api/v1/schedules/")
+    if not response.ok:
+        raise NotADisposableStackError(
+            f"could not read schedules from {stack.api_url} to verify the stack marker "
+            f"({response.status} {response.error_code}). Refusing to touch a target that cannot "
+            "prove what it is."
+        )
+    body: Any = response.body
+    names = (
+        [str(row.get("name", "")) for row in body if isinstance(row, dict)]
+        if isinstance(body, list)
+        else []
+    )
+    if marker not in names:
+        raise NotADisposableStackError(
+            f"the target does NOT carry this run's marker schedule {marker!r}.\n"
+            "\n"
+            "==That means it is not the stack scripts/stack-up.sh just created.== The marker is "
+            "planted in the database at bootstrap and the nonce is fresh per run, so this refusal "
+            "fires both for a real instance and for a stale simulation stack left from an earlier "
+            "run. Nothing has been created, purged or modified."
+        )
+    return stack.nonce
+
+
+class StackUnavailableError(RuntimeError):
+    """No ``.stack.json``. The run stops; it does not guess a URL."""
+
+
+def load_stack(path: Path) -> StackConfig:
+    """Read ``.stack.json``, or refuse to run."""
+    if not path.exists():
+        raise StackUnavailableError(
+            f"{path} does not exist, so no throwaway stack was brought up for this run.\n"
+            "\n"
+            "Run simulation/scripts/stack-up.sh first. The harness deliberately does NOT fall back "
+            "to a default URL: a simulation that guesses where to point is one that can end up "
+            "writing hundreds of synthetic bookings into whatever happens to be listening — which "
+            "is the single outcome this harness exists to make impossible."
+        )
+    raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise StackUnavailableError(f"{path} is not a JSON object")
+    businesses_raw: Any = raw.get("businesses", [])
+    if not isinstance(businesses_raw, list) or not businesses_raw:
+        raise StackUnavailableError(f"{path} lists no businesses; stack-up.sh did not finish")
+    # ==A filter that can empty a non-empty list must say so HERE.== `if isinstance(item, dict)`
+    # silently dropped anything malformed, so a file with three broken entries produced zero
+    # businesses and the failure surfaced 200 lines later as `stack.businesses[0]` raising
+    # IndexError — an error naming neither the file nor the reason. Every drop is now a refusal
+    # that carries the path and the problem.
+    businesses: list[BusinessConfig] = []
+    for index, item in enumerate(businesses_raw):
+        if not isinstance(item, dict):
+            raise StackUnavailableError(
+                f"{path}: businesses[{index}] is {type(item).__name__}, not an object"
+            )
+        missing = [
+            field
+            for field in ("slug", "name", "timezone", "tenantId", "hostUserId", "apiKey")
+            if field not in item
+        ]
+        if missing:
+            raise StackUnavailableError(
+                f"{path}: businesses[{index}] is missing {missing}. It is written by "
+                "scripts/stack-up.sh; a file this incomplete means the bootstrap did not finish."
+            )
+        businesses.append(
+            BusinessConfig(
+                slug=str(item["slug"]),
+                name=str(item["name"]),
+                timezone=str(item["timezone"]),
+                tenant_id=str(item["tenantId"]),
+                host_user_id=str(item["hostUserId"]),
+                api_key=str(item["apiKey"]),
+            )
+        )
+    if not businesses:
+        raise StackUnavailableError(f"{path}: businesses is empty after parsing")
+    return StackConfig(
+        api_url=str(raw["apiUrl"]),
+        worker_url=str(raw["workerUrl"]),
+        booking_url=str(raw["bookingUrl"]),
+        mailpit_url=str(raw["mailpitUrl"]),
+        sink_url=str(raw["sinkUrl"]),
+        metrics_token=str(raw["metricsToken"]),
+        compose_project=str(raw.get("composeProject", "")),
+        nonce=str(raw.get("nonce", "")),
+        businesses=businesses,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EventTypeRef:
+    key: str
+    id: str
+    slug: str
+    duration_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class Business:
+    config: BusinessConfig
+    event_types: dict[str, EventTypeRef]
+    webhook_secret: str
+
+    @property
+    def slug(self) -> str:
+        return self.config.slug
+
+
+@dataclass(frozen=True, slots=True)
+class World:
+    businesses: list[Business]
+
+    def by_slug(self, slug: str) -> Business:
+        for business in self.businesses:
+            if business.slug == slug:
+                return business
+        raise KeyError(slug)
+
+
+def _create_schedule(
+    client: Client, *, name: str, timezone: str, rules: dict[str, list[dict[str, str]]]
+) -> str:
+    response = client.must(
+        "POST", "/api/v1/schedules/", {"name": name, "timezone": timezone, "rules": rules}
+    )
+    body: Any = response.body
+    return str(body["id"])
+
+
+def _create_event_type(  # noqa: PLR0913 - one keyword per event-type field the world declares
+    client: Client,
+    *,
+    host_id: str,
+    schedule_id: str,
+    key: str,
+    slug: str,
+    title: str,
+    duration_seconds: int,
+    max_per_day: int | None = None,
+    increment_seconds: int | None = None,
+) -> EventTypeRef:
+    payload: dict[str, Any] = {
+        "host_id": host_id,
+        "schedule_id": schedule_id,
+        "slug": slug,
+        "title": title,
+        # Both locales, because the organic traffic books in both and a world whose event types were
+        # monolingual could not tell a localisation defect from a working one.
+        "title_translations": {"es": title, "en": title},
+        "duration_seconds": duration_seconds,
+        "min_notice_seconds": 0,
+        "max_advance_seconds": MAX_ADVANCE_SECONDS,
+    }
+    if max_per_day is not None:
+        payload["max_per_day"] = max_per_day
+    if increment_seconds is not None:
+        payload["increment_seconds"] = increment_seconds
+    response = client.must("POST", "/api/v1/event-types/", payload)
+    body: Any = response.body
+    return EventTypeRef(
+        key=key,
+        id=str(body["id"]),
+        slug=str(body["slug"]),
+        duration_seconds=int(body["duration_seconds"]),
+    )
+
+
+def provision(stack: StackConfig, *, run_id: str) -> World:
+    """Build every business's schedules, event types and webhook. Fails loudly and early."""
+    businesses: list[Business] = []
+    for config in stack.businesses:
+        client = Client(stack.api_url, config.api_key)
+        hours_schedule = _create_schedule(
+            client, name=f"hours-{run_id}", timezone=config.timezone, rules=BUSINESS_HOURS
+        )
+        always_schedule = _create_schedule(
+            client, name=f"always-{run_id}", timezone=config.timezone, rules=ALWAYS_OPEN
+        )
+
+        event_types = {
+            "standard": _create_event_type(
+                client,
+                host_id=config.host_user_id,
+                schedule_id=hours_schedule,
+                key="standard",
+                slug=f"consulta-{run_id}",
+                title="Consulta inicial",
+                duration_seconds=30 * 60,
+            ),
+            "long": _create_event_type(
+                client,
+                host_id=config.host_user_id,
+                schedule_id=hours_schedule,
+                key="long",
+                slug=f"evaluacion-{run_id}",
+                title="Evaluacion completa",
+                duration_seconds=60 * 60,
+            ),
+            "micro": _create_event_type(
+                client,
+                host_id=config.host_user_id,
+                schedule_id=always_schedule,
+                key="micro",
+                slug=f"micro-{run_id}",
+                title="Micro cita",
+                duration_seconds=MICRO_DURATION_SECONDS,
+                increment_seconds=MICRO_DURATION_SECONDS,
+            ),
+            "capped": _create_event_type(
+                client,
+                host_id=config.host_user_id,
+                schedule_id=hours_schedule,
+                key="capped",
+                slug=f"capped-{run_id}",
+                title="Cita con tope diario",
+                duration_seconds=30 * 60,
+                max_per_day=CAPPED_MAX_PER_DAY,
+            ),
+        }
+
+        webhook = client.must(
+            "POST",
+            "/api/v1/webhooks",
+            {
+                "url": SINK_WEBHOOK_URL,
+                "events": ["booking.created", "booking.cancelled", "booking.rescheduled"],
+            },
+        )
+        webhook_body: Any = webhook.body
+        secret = str(webhook_body.get("secret", ""))
+        if not secret:
+            raise RuntimeError(
+                f"{config.slug}: the API created a webhook without returning its secret."
+            )
+        businesses.append(Business(config=config, event_types=event_types, webhook_secret=secret))
+    return World(businesses=businesses)

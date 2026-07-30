@@ -25,6 +25,9 @@ from typing import Any
 
 import httpx
 import pytest
+from live_harness_modules import provider_touching_modules
+
+from aethercal.server.integrations.stripe import StripeGateway
 from conftest import (
     PHASE_A_PURPOSE,
     PROVENANCE_SECRET_ENV,
@@ -32,9 +35,6 @@ from conftest import (
     _state_path,
     provenance_secret_from_env,
 )
-from live_harness_modules import provider_touching_modules
-
-from aethercal.server.integrations.stripe import StripeGateway
 
 SECRET_KEY_ENV = "AETHERCAL_LIVE_STRIPE_SECRET_KEY"
 

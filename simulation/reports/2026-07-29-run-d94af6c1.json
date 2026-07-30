@@ -1,0 +1,309 @@
+{
+  "cancel_race_sink_events": {
+    "booking.cancelled": 1,
+    "booking.created": 1
+  },
+  "cancelled": 21,
+  "confirmations": {
+    "colliding_uids": 0,
+    "created": 210,
+    "duplicate_confirmations": 0,
+    "mailbox_page_size": 500,
+    "mailbox_pages": 1,
+    "mailbox_read_complete": true,
+    "mailbox_read_problem": "",
+    "mailbox_readable_messages": 279,
+    "mailbox_reported_total": 279,
+    "mailbox_unparseable": 0,
+    "matched": 185,
+    "negative_deltas": 0,
+    "reads": 3,
+    "superseded": 25,
+    "unaccounted": 0,
+    "waited_seconds": 7.646854137070477,
+    "worst_negative_ms": 0.0
+  },
+  "controls": [
+    {
+      "id": "C10",
+      "observed": "1 winner(s), 39 refused {'slot_unavailable': 39}",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C2",
+      "observed": "40 winners, refusals {}",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C1",
+      "observed": "409 slot_unavailable",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C7",
+      "observed": "exactly 1 booking.cancelled delivered \u00b7 all events {'booking.created': 1, 'booking.cancelled': 1} \u00b7 unreadable deliveries 0 \u00b7 drained in 8.1s, then polled up to 60s + 10s settling",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C8",
+      "observed": "race winners 1/40; 1 active: ['1f5e7eb7-3f66-4bbd-b0d2-7cbcd851b94f confirmed']; subject 89d53aaf-61f6-47d0-b35b-4a0e4ca7c6be",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C9",
+      "observed": "race winners 1/2; 0 active: none; subject add98998-7359-4e9f-ac5e-dd07a962847f",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C3",
+      "observed": "0 slots offered (availability='ok')",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C4",
+      "observed": "created(201) \u2192 created(201) \u2192 no_slots_offered",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C6",
+      "observed": "409 not_ended",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C11",
+      "observed": "200 ok \u2192 status=no_show",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C5",
+      "observed": "stranded 6 booking(s); surface unreachable during the outage: yes; outbox rows 578\u2192590 (+12); restarted worker delivered=6; backlog caught in flight: yes (first reading due=6, oldest 30.0s); drained in 7.9s",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C12",
+      "observed": "drained=True after 0.0s; unexplained scrape failures=0",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C13",
+      "observed": "creates 240/240 `{'booked': 210, 'collisions': 30, 'no_slots_offered': 0, 'slots_read_failed': 0, 'booking_refused': 0, 'booking_unreadable': 0}`; follow-ups 43/43 `{'cancelled': 21, 'cancel_refused': 0, 'rescheduled': 20, 'reschedule_collisions': 2, 'reschedule_refused': 0, 'reschedule_no_target': 0, 'reschedule_slots_read_failed': 0}`; unexpected failures: none",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C15",
+      "observed": "peak overlap by race: {'race_same_slot': 40, 'control_race_distinct_slots': 40, 'race_cancel_same_booking': 40, 'race_reschedule_same_booking': 40, 'race_cancel_vs_reschedule': 2}",
+      "passed": true,
+      "ran": true
+    },
+    {
+      "id": "C14",
+      "observed": "matched 185/210 (superseded 25, unaccounted 0) after 3 read(s) in 7.6s; mailbox read complete=True (reported total 279, page size 500); negative deltas=0; duplicate confirmations=0; uid collisions=0; messages carrying a calendar invite=279",
+      "passed": true,
+      "ran": true
+    }
+  ],
+  "created": 210,
+  "errors": [
+    {
+      "code": "ok",
+      "count": 303,
+      "status": 200
+    },
+    {
+      "code": "ok",
+      "count": 210,
+      "status": 201
+    },
+    {
+      "code": "slot_unavailable",
+      "count": 32,
+      "status": 409
+    }
+  ],
+  "latency": {
+    "booking_cancel": {
+      "count": 21,
+      "max": 255.1141413860023,
+      "min": 17.99466274678707,
+      "p50": 89.13177903741598,
+      "p95": 234.87247619777918,
+      "p99": 255.1141413860023
+    },
+    "booking_create": {
+      "count": 240,
+      "max": 441.7030909098685,
+      "min": 17.000125255435705,
+      "p50": 83.09340197592974,
+      "p95": 264.582890085876,
+      "p99": 392.9380369372666
+    },
+    "booking_reschedule": {
+      "count": 22,
+      "max": 333.5732468403876,
+      "min": 23.4076757915318,
+      "p50": 88.31904595717788,
+      "p95": 182.51830711960793,
+      "p99": 333.5732468403876
+    },
+    "booking_to_confirmation_email": {
+      "count": 185,
+      "max": 7471.282005310059,
+      "min": 3426.816463470459,
+      "p50": 4463.042736053467,
+      "p95": 6045.2611446380615,
+      "p99": 7462.16344833374
+    },
+    "slots_read": {
+      "count": 262,
+      "max": 542.9909988306463,
+      "min": 7.2077978402376175,
+      "p50": 78.99846602231264,
+      "p95": 278.34009006619453,
+      "p99": 376.0598902590573
+    }
+  },
+  "organic_collisions": 30,
+  "organic_outcomes": {
+    "booking_unreadable": [],
+    "create": {
+      "booked": 210,
+      "booking_refused": 0,
+      "booking_unreadable": 0,
+      "collisions": 30,
+      "no_slots_offered": 0,
+      "slots_read_failed": 0
+    },
+    "follow_up": {
+      "cancel_refused": 0,
+      "cancelled": 21,
+      "reschedule_collisions": 2,
+      "reschedule_no_target": 0,
+      "reschedule_refused": 0,
+      "reschedule_slots_read_failed": 0,
+      "rescheduled": 20
+    },
+    "follow_ups_attempted": 43,
+    "planned": 240,
+    "slots_read_failures": [],
+    "unexpected_failures": {}
+  },
+  "outbox": {
+    "deadman": {
+      "backlog_caught_in_flight": 1.0,
+      "baseline_due": 0.0,
+      "delivered_after_restart": 6.0,
+      "drain_recovery_seconds": 7.851462404709309,
+      "first_reading_after_restart": 6.0,
+      "first_reading_oldest_age_seconds": 29.972091,
+      "outbox_rows_baseline": 578.0,
+      "outbox_rows_final": 590.0,
+      "surface_unreachable_during_outage": 1.0,
+      "work_created": 6.0
+    },
+    "discarded_at_pause": 0,
+    "drained": true,
+    "peak_due": 176,
+    "peak_oldest_age_seconds": 7.979505,
+    "samples": 505,
+    "scrape_failures": 0
+  },
+  "plan": {
+    "by_business": {
+      "clinica-sonrisa": 80,
+      "estudio-legal": 80,
+      "katy-hvac": 80
+    },
+    "by_event_type": {
+      "long": 54,
+      "standard": 186
+    },
+    "by_follow_up": {
+      "cancel": 24,
+      "none": 188,
+      "reschedule": 28
+    },
+    "by_locale": {
+      "en": 110,
+      "es": 130
+    },
+    "by_weekday": {
+      "0": 60,
+      "1": 54,
+      "2": 48,
+      "3": 48,
+      "4": 30
+    },
+    "distinct_days": 10,
+    "total": 240
+  },
+  "races": [
+    {
+      "contenders": 40,
+      "name": "race_same_slot",
+      "peak_overlap": 40,
+      "refusals": {
+        "slot_unavailable": 39
+      },
+      "unexpected": [],
+      "winners": 1
+    },
+    {
+      "contenders": 40,
+      "name": "control_race_distinct_slots",
+      "peak_overlap": 40,
+      "refusals": {},
+      "unexpected": [],
+      "winners": 40
+    },
+    {
+      "contenders": 40,
+      "name": "race_cancel_same_booking",
+      "peak_overlap": 40,
+      "refusals": {},
+      "unexpected": [],
+      "winners": 40
+    },
+    {
+      "contenders": 40,
+      "name": "race_reschedule_same_booking",
+      "peak_overlap": 40,
+      "refusals": {
+        "not_active": 39
+      },
+      "unexpected": [],
+      "winners": 1
+    },
+    {
+      "contenders": 2,
+      "name": "race_cancel_vs_reschedule",
+      "peak_overlap": 2,
+      "refusals": {
+        "not_active": 1
+      },
+      "unexpected": [],
+      "winners": 1
+    }
+  ],
+  "rescheduled": 20,
+  "run_id": "d94af6c1",
+  "seed": 20260725,
+  "sink": {
+    "booking.cancelled": 23,
+    "booking.created": 263,
+    "booking.rescheduled": 21
+  },
+  "verdict": "MEASURED"
+}
