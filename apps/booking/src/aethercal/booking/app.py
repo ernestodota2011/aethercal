@@ -1525,6 +1525,17 @@ class _BookingApp:
         body = "User-agent: *\nAllow: /$\nDisallow: /\n"
         return PlainTextResponse(body)
 
+    def favicon_ico(self, request: Request) -> Response:
+        """Redirect the browser's UNASKED-FOR ``/favicon.ico`` to the icon this app really has.
+
+        Every page declares ``/static/favicon.svg``, but a browser still probes ``/favicon.ico``
+        on its own, and the answer was a 404 on every visit — noise in the log that looks like a
+        broken asset in every audit that reads it (GA3, 2026-07-31). A redirect, not an alias:
+        the file is an SVG and serving it under an ``.ico`` name would lie about its type.
+        """
+        del request
+        return RedirectResponse("/static/favicon.svg", status_code=301)
+
     def embed_js(self, request: Request) -> Response:
         """Serve the embed loader (B2) at a clean, memorable URL — ``/embed.js``, not just
         ``/static/embed.js`` — the way any third-party widget script is conventionally referenced.
@@ -1611,6 +1622,7 @@ def create_app(
     _register(app, "/", booking.index, ["GET"])
     _register(app, "/healthz", booking.healthz, ["GET"])
     _register(app, "/robots.txt", booking.robots_txt, ["GET"])
+    _register(app, "/favicon.ico", booking.favicon_ico, ["GET"])
     # B2.2: a clean-URL alias for the embed widget loader (also reachable, unversioned, at
     # /static/embed.js — kept for both since some integrators reference /static/* directly).
     _register(app, "/embed.js", booking.embed_js, ["GET"])

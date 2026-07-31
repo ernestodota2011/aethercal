@@ -171,7 +171,12 @@ main { max-width: var(--maxw); margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
 /* The business's mark. Height-bounded and `width: auto`, so ANY logo an operator uploads sits on
    the baseline of the header instead of resizing it — a tall PNG must not push the page down. */
 .brand-logo { height: 1.75rem; width: auto; max-width: 10rem; object-fit: contain; }
-.langs a { color: var(--muted); text-decoration: none; font-size: .85rem; padding: 0 .35rem; }
+/* WCAG 2.2 SC 2.5.8: el area tactil minima es 24x24. Con `padding: 0 .35rem` estos enlaces
+   median 59x18 y 54x18 en los cuatro viewports (medido por el launch-gate GA3, 2026-07-31):
+   anchos de sobra y BAJOS, que es la forma en que un enlace de texto incumple esto sin que se
+   note mirandolo. El `inline-block` es lo que hace que el relleno vertical cuente. */
+.langs a { color: var(--muted); text-decoration: none; font-size: .85rem;
+           display: inline-block; padding: .35rem .5rem; min-height: 24px; }
 .langs a[aria-current="true"] { color: var(--text); font-weight: 600; }
 h1 {
   font-family: var(--font-display); font-weight: 630; line-height: 1.03;
