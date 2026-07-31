@@ -131,6 +131,29 @@ class AetherCalClient:
     def close(self) -> None:
         self._client.close()
 
+    def on_behalf_of_guest(self, address: str | None) -> None:
+        """Bind EVERY request this client makes to the guest's address (``X-Forwarded-For``).
+
+        ==Per client, not per call, and that is the whole point.== The forwarding used to be an
+        argument on :meth:`create_public_booking` alone, so the three READ calls a page view
+        repeats — branding, event types, slots — arrived unattributed and the API billed them to
+        the page. With a 30/minute cap and three calls per view, the entire business worldwide got
+        ten page views a minute before the API answered 429 and the page turned it into a 503 for
+        everyone. The comment above :meth:`get_public_branding` had named that outcome exactly ("a
+        silent, self-inflicted outage") while one of the four call sites carried the defense.
+
+        Binding it to the client means a call site added tomorrow is covered by construction: there
+        is no per-call argument left to forget. A per-call ``forwarded_for`` still overrides this
+        for the one method that takes it (httpx gives request headers precedence).
+
+        ``None`` clears it — an unattributable request must arrive with no claim at all rather than
+        inherit the previous guest's address.
+        """
+        if address:
+            self._client.headers[_FORWARDED_FOR] = address
+        else:
+            self._client.headers.pop(_FORWARDED_FOR, None)
+
     def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Issue a request, translating transport failures into :class:`AetherCalTransportError`.
 

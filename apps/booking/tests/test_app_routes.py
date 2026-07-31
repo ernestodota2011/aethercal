@@ -134,6 +134,11 @@ class FakeAPI:
     def __init__(self) -> None:
         self.last_auth: str | None = None
         self.forwarded_for: str | None = None
+        #: Every call the page made, as ``path -> the X-Forwarded-For it carried``. It records ALL
+        #: of them, not just the booking POST: the read calls are the ones a page view repeats, so
+        #: they are the ones whose forwarding decides whether the API's per-IP cap counts guests or
+        #: counts the page. A path recorded with ``None`` is a call the API will bill to the page.
+        self.forwarded_by_path: dict[str, str | None] = {}
         self.created_bookings: list[dict[str, Any]] = []
         # Failure injection: when set, the matching endpoint answers with a 500 that carries an
         # internal message (LEAK_MARKER) the guest must never see.
@@ -229,6 +234,7 @@ class FakeAPI:
     def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911 - the route table
         self.last_auth = request.headers.get("Authorization")
         path, method = request.url.path, request.method
+        self.forwarded_by_path[path] = request.headers.get("X-Forwarded-For")
         # ==The PUBLIC surface the page talks to now — NO API key on any of these.==
         if method == "GET" and re.fullmatch(r"/api/v1/public/[^/]+/event-types", path):
             return self._boom() if self.fail_event_types else self._event_types()
@@ -1374,3 +1380,54 @@ def test_security_headers_present_on_404() -> None:
     response = client.get("/e/does-not-exist")
     assert response.status_code == 404
     _assert_security_headers(response)
+
+
+# --- El comprador que la API no ve (C1 del launch-gate GA3, 2026-07-31) --------------------
+#
+# Medido en produccion: la pagina caia con 503 a la peticion 11 y se recuperaba sola tras ~25 s.
+# La traza decia `AetherCalAPIError: 429 rate_limited` en `list_public_event_types`. Una carga de
+# pagina cuesta TRES llamadas de lectura (branding + event-types + slots) contra un cupo de 30 por
+# minuto: 10 cargas por minuto **para el negocio entero, en todo el mundo**, porque las tres se
+# contaban contra la direccion de la PAGINA y no contra la del comprador.
+#
+# El SDK ya documentaba este final —"una caida silenciosa y autoinfligida"— y ya traia el reenvio
+# de la direccion. Estaba cableado a UNA de las cuatro llamadas: la que reserva. Las tres que
+# repite cada carga de pagina, no. La defensa existia y era inerte donde mas se usa.
+
+
+def test_las_LECTURAS_de_una_carga_de_pagina_tambien_llevan_la_direccion_del_comprador() -> None:
+    """Las tres llamadas de lectura deben viajar a nombre del comprador, no de la pagina.
+
+    Si no lo hacen, la API las cuenta todas contra una sola direccion: un cubo compartido por
+    todos los compradores del mundo y servicio denegado a todos al alcanzarlo.
+    """
+    client, fake = _make_client()
+
+    # `CF-Connecting-IP` is the header the page resolves the guest FROM (Cloudflare sets it); the
+    # page then re-states that address to the API as `X-Forwarded-For`. Two different headers on
+    # purpose: one is what a trusted edge told us, the other is what we tell the next hop.
+    response = client.get("/e/intro", headers={"CF-Connecting-IP": "203.0.113.7"})
+
+    assert response.status_code == 200
+    llamadas = fake.forwarded_by_path
+    assert llamadas, "la carga de pagina no hizo ninguna llamada: la prueba no probaria nada"
+    sin_reenviar = [ruta for ruta, xff in llamadas.items() if xff != "203.0.113.7"]
+    assert not sin_reenviar, (
+        f"estas llamadas se cobran a la pagina y no al comprador: {sin_reenviar} "
+        f"(reenviado por ruta: {llamadas})"
+    )
+
+
+def test_CONTROL_una_direccion_que_el_comprador_se_INVENTA_no_se_reenvia() -> None:
+    """El control lleva al adversario dentro: sin el, la prueba de arriba pasaria igual con un
+    reenvio ingenuo que copiase la cabecera que el propio comprador escribio — que es la forma de
+    saltarse el cupo por IP, no de repartirlo. Con un par no confiable, manda la direccion real."""
+    client, fake = _make_client(client_host="203.0.113.9")
+
+    response = client.get("/e/intro", headers={"CF-Connecting-IP": "1.2.3.4"})
+
+    assert response.status_code == 200
+    reenviadas = set(fake.forwarded_by_path.values())
+    assert reenviadas == {"203.0.113.9"}, (
+        f"se creyo la cabecera que escribio el propio comprador: {fake.forwarded_by_path}"
+    )

@@ -756,11 +756,22 @@ class _BookingApp:
             settings=self._settings,
         )
 
-    async def _call(self, call: Callable[[AetherCalClient], T]) -> T:
-        """Run a (blocking) SDK call in a threadpool with a fresh client, closing it after."""
+    async def _call(self, request: Request, call: Callable[[AetherCalClient], T]) -> T:
+        """Run a (blocking) SDK call in a threadpool with a fresh client, closing it after.
+
+        ==``request`` is not decoration: it is what tells the API WHOSE call this is.== Every call
+        made from here is bound to the guest's address before it leaves, so the API's per-IP cap
+        counts guests instead of counting this page. Taking the request POSITIONALLY (rather than
+        an optional keyword) is deliberate: the address cannot be forgotten at a call site, because
+        there is no call site that compiles without it. It was forgotten at three of four before —
+        the three that every page view repeats — and the result was a 503 for everybody at ten page
+        views a minute (GA3/C1, 2026-07-31).
+        """
+        guest = self._guest_ip(request)
 
         def invoke() -> T:
             with self._client_factory() as client:
+                client.on_behalf_of_guest(guest)
                 return call(client)
 
         return await run_in_threadpool(invoke)
@@ -814,6 +825,7 @@ class _BookingApp:
         # is the routing base (B1: "/e/{slug}", "/embed/{slug}", or their /t/{tenant} twins) — not
         # derivable from `event`.
         self,
+        request: Request,
         event: PublicEventTypeRead,
         tz: str,
         window_from: date,
@@ -826,6 +838,7 @@ class _BookingApp:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
             result = await self._call(
+                request,
                 lambda c: c.get_public_slots(
                     tenant, event.slug, window_from=window_from, window_to=window_to, tz=tz
                 )
@@ -852,7 +865,7 @@ class _BookingApp:
             prev_disabled=(window_from <= today),
         )
 
-    async def _events(self, tenant: str) -> list[PublicEventTypeRead] | None:
+    async def _events(self, request: Request, tenant: str) -> list[PublicEventTypeRead] | None:
         """Load the tenant's event types, or ``None`` if the backend can't be reached (RF-16).
 
         A public-page trust boundary: an API error, a dropped connection, or a malformed response
@@ -860,7 +873,7 @@ class _BookingApp:
         ``None`` here, and the caller renders the service-unavailable page.
         """
         try:
-            return await self._call(lambda c: c.list_public_event_types(tenant))
+            return await self._call(request, lambda c: c.list_public_event_types(tenant))
         except Exception:
             logger.exception("booking page: failed to load event types for %s", tenant)
             return None
@@ -899,7 +912,7 @@ class _BookingApp:
             request.state.brand = None
             return None
         try:
-            brand = await self._call(lambda c: c.get_public_branding(tenant))
+            brand = await self._call(request, lambda c: c.get_public_branding(tenant))
         except Exception:
             logger.exception("booking page: failed to load branding")
             brand = None
@@ -991,7 +1004,7 @@ class _BookingApp:
         brand = await self._brand(request)
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
-        events = await self._events(tenant)
+        events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -1031,7 +1044,7 @@ class _BookingApp:
         window_from = _window_of(request, today)
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        events = await self._events(tenant)
+        events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -1044,7 +1057,7 @@ class _BookingApp:
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         section = await self._slots_section(
-            found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
+            request, found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
         # I4 (PRG): a 409 slot-conflict redirect from book_submit lands back here carrying
         # `?err=slot_unavailable` — render it as an inline notice, never re-post on a refresh.
@@ -1090,7 +1103,7 @@ class _BookingApp:
         window_from = _window_of(request, today)
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        events = await self._events(tenant)
+        events = await self._events(request, tenant)
         if events is None:
             # HTMX swaps only on 2xx: degrade the fragment in place, not with a non-swapping 5xx.
             return views.slots_unavailable_fragment(locale)
@@ -1098,7 +1111,7 @@ class _BookingApp:
         if found is None:
             return _not_found(request, locale, base_url=self._settings.base_url, brand=brand)
         return await self._slots_section(
-            found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
+            request, found, tz, window_from, today, locale, event_path=event_path, tenant=tenant
         )
 
     async def book_form(self, request: Request) -> object:
@@ -1112,7 +1125,7 @@ class _BookingApp:
         start = request.query_params.get("start", "")
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        events = await self._events(tenant)
+        events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -1240,6 +1253,7 @@ class _BookingApp:
         guest_ip = self._guest_ip(request)
         try:
             booking = await self._call(
+                request,
                 lambda c: c.create_public_booking(
                     tenant, slug, booking_create, forwarded_for=guest_ip
                 )
@@ -1297,7 +1311,7 @@ class _BookingApp:
         locale = self._locale(request, form.get("lang"))
         if tenant is None:
             return _not_found(request, locale, base_url=self._settings.base_url)
-        events = await self._events(tenant)
+        events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
                 locale,
@@ -1357,7 +1371,7 @@ class _BookingApp:
                 is_error=True,
             )
         try:
-            await self._call(lambda c: c.cancel_booking(booking_id, token=token))
+            await self._call(request, lambda c: c.cancel_booking(booking_id, token=token))
         except Exception as exc:
             return self._error_response(
                 locale,
@@ -1397,6 +1411,7 @@ class _BookingApp:
         window_to = window_from + timedelta(days=WINDOW_DAYS - 1)
         try:
             result = await self._call(
+                request,
                 # ==The token, and this is what keeps RF-09 alive.== The page holds no API key any
                 # more, and the reschedule link in a guest's inbox carries a token, a booking id and
                 # an event-type ID — no business, no slug — so the picker cannot be rendered through
@@ -1473,7 +1488,8 @@ class _BookingApp:
             )
         try:
             await self._call(
-                lambda c: c.reschedule_booking(booking_id, new_start=new_start, token=token)
+                request,
+                lambda c: c.reschedule_booking(booking_id, new_start=new_start, token=token),
             )
         except Exception as exc:
             return self._error_response(
