@@ -11,6 +11,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from fasthtml.common import to_xml
 
 from aethercal.booking import views
@@ -18,6 +19,7 @@ from aethercal.booking.forms import FieldError, parse_questions
 from aethercal.booking.i18n import Locale
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, SlotChoice
+from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 
 LANG_URLS = {"es": "/e/intro?lang=es", "en": "/e/intro?lang=en"}
@@ -155,7 +157,7 @@ def test_page_shell_self_hosts_the_display_font_not_a_font_cdn() -> None:
 
 
 def test_accent_family_tokens_derive_from_the_brand_accent_not_a_frozen_ember() -> None:
-    # A tenant brand override (`_brand_style`) sets ONLY --accent/--focus, so every accent-derived
+    # A tenant brand override (`_brand_style`) sets --accent/--focus/--accent-ink, so every derived
     # surface (the slot hover tint --accent-wash, the input hairline --accent-line) must follow it —
     # not stay the product's ember. They derive from --accent via color-mix, so overriding --accent
     # (and the light/dark switch) re-tints them with no extra override. Guards the regression Crisol
@@ -963,3 +965,88 @@ def test_la_etiqueta_de_una_pregunta_se_TRADUCE_al_idioma_activo() -> None:
     )
     assert "Tu WhatsApp" in es
     assert "Your WhatsApp" not in es
+
+
+# --- La marca del inquilino no puede dejar ilegible su propio boton (GA3 2a vuelta/C-1) ----
+#
+# `_brand_style` reemplazaba `--accent` y `--focus` y dejaba `--accent-ink` como estuviera.
+# Los pares de la plataforma estan afinados a AA (6.91:1 en oscuro, 4.75:1 en claro), pero un
+# acento de inquilino OSCURO sobre la tinta oscura del tema oscuro da **2.84:1** — medido en
+# produccion sobre "Confirmar reserva", que es el boton que cierra la reserva.
+#
+# El test que debia cazarlo renderizaba la pagina SIN marca y solo miraba que los tokens
+# estuvieran escritos como `color-mix`: media COMO esta escrito el token, no si el par que
+# resulta se puede leer. Este calcula la razon.
+
+
+def _luminancia(hexa: str) -> float:
+    hexa = hexa.lstrip("#")
+    canales = [int(hexa[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    lineal = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in canales]
+    return 0.2126 * lineal[0] + 0.7152 * lineal[1] + 0.0722 * lineal[2]
+
+
+def _razon(a: str, b: str) -> float:
+    la, lb = _luminancia(a), _luminancia(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _tinta_declarada(css: str) -> str:
+    import re
+
+    m = re.findall(r"--accent-ink:\s*(#[0-9a-fA-F]{6})", css)
+    assert m, f"el bloque de marca no declara --accent-ink: {css}"
+    return m[-1]
+
+
+@pytest.mark.parametrize(
+    "acento",
+    [
+        "#9c4318",  # el de DeskUp: oscuro, el que rompio en produccion
+        "#e0894b",  # claro
+        "#000000",  # los dos extremos, que es donde una formula ingenua se parte
+        "#ffffff",
+        "#808080",  # el punto medio, donde blanco y negro casi empatan
+    ],
+)
+def test_el_acento_de_CUALQUIER_inquilino_deja_su_boton_legible(acento: str) -> None:
+    from fasthtml.common import to_xml as _to_xml
+
+    marca = TenantBrandingRead(
+        display_name="Negocio", accent_color=acento, timezone="America/New_York"
+    )
+    css = _to_xml(views._brand_style(marca)[0])
+    tinta = _tinta_declarada(css)
+    r = _razon(acento, tinta)
+    assert r >= 4.5, f"acento {acento} con tinta {tinta} da {r:.2f}:1, y AA pide 4.5"
+
+
+def test_CONTROL_sin_color_de_marca_no_se_emite_nada() -> None:
+    """El control fija el otro lado: si el arreglo emitiera SIEMPRE un bloque, el negocio que no
+    eligio color perderia los tokens afinados del tema y la prueba de arriba pasaria igual."""
+    sin_color = TenantBrandingRead(display_name="Negocio", timezone="America/New_York")
+    assert views._brand_style(sin_color) == []
+    assert views._brand_style(None) == []
+
+
+def test_la_pantalla_que_PIDE_los_datos_lleva_el_texto_del_negocio() -> None:
+    """El aviso de para que son los datos y como darse de baja vivia en la pantalla ANTERIOR,
+    que es donde no se pide nada. Aqui es donde se escriben nombre, correo y telefono."""
+    evento = _event()
+    html = to_xml(
+        views.booking_form_page(
+            "es",
+            event=evento,
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="martes 14 de julio de 2026, 09:00",
+            questions=[],
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert evento.description and evento.description in html, (
+        "la pantalla que recoge los datos no lleva el texto del negocio"
+    )

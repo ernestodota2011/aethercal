@@ -885,8 +885,13 @@ class _BookingApp:
         """
         try:
             return await self._call(request, lambda c: c.list_public_event_types(tenant))
-        except Exception:
+        except Exception as exc:
             logger.exception("booking page: failed to load event types for %s", tenant)
+            # ==El limite RF-16 sigue siendo el mismo: nada de esto llega al comprador.== Lo que
+            # cambia es que el FALLO no se pierde: colapsarlo todo a `None` borraba la diferencia
+            # entre "el backend esta caido" y "te pasaste del cupo, espera un minuto", y las dos
+            # salian como 503. `_service_error` lee esto para elegir el estado y el texto.
+            request.state.ultimo_fallo = exc
             return None
 
     async def _brand(self, request: Request) -> TenantBrandingRead | None:
@@ -942,18 +947,36 @@ class _BookingApp:
 
     def _service_error(
         self,
+        request: Request,
         locale: Locale,
         *,
         lang_urls: dict[Locale, str],
         retry_url: str,
         embed: bool = False,
-        brand: TenantBrandingRead | None = None,
     ) -> Response:
-        """The friendly 'service temporarily unavailable' page (503) with a retry affordance."""
+        """The friendly 'this did not work' page, with a retry affordance.
+
+        ==Toma la peticion, y por eso ya no puede olvidarse de quien es la pagina.== Se titulaba
+        con el nombre del PRODUCTO y recibia `brand=None` en sus cuatro llamadores, asi que el
+        error de un negocio con marca propia mostraba "AetherCal", perdia su acento y firmaba con
+        el pie del producto — mientras el 404, que si recibia la marca, salia bien. La marca blanca
+        estaba hecha en el camino feliz y viva en el de fallo, que es justo donde se cae al valor
+        por defecto de la plataforma (GA3 2a vuelta, 2026-07-31).
+
+        ==Y el estado ya no es siempre 503.== Un `429` de arriba es "espera un minuto", no "esto
+        esta roto": servirlo como 503 le miente al comprador y, peor, hace que un limite de tasa
+        sea indistinguible de una caida para quien vigila el servicio. `Retry-After` viaja con el
+        429 porque un "espera" sin cuanto no es una instruccion.
+        """
+        brand = getattr(request.state, "brand", None)
+        fallo = getattr(request.state, "ultimo_fallo", None)
+        estado = _http_status_for(fallo)
         body = views.message_page(
             locale,
-            title=t(locale, "app_name"),
-            message=t(locale, "error_generic"),
+            title=views.site_name(locale, brand),
+            message=(
+                t(locale, "error_rate_limited") if estado == 429 else t(locale, "error_generic")
+            ),
             lang_urls=lang_urls,
             base_url=self._settings.base_url,
             brand=brand,
@@ -962,7 +985,8 @@ class _BookingApp:
             is_error=True,
             embed=embed,
         )
-        return HTMLResponse(views.render(body), status_code=503)
+        cabeceras = {"Retry-After": "60"} if estado == 429 else None
+        return HTMLResponse(views.render(body), status_code=estado, headers=cabeceras)
 
     def _error_response(  # noqa: PLR0913 - each kwarg is a distinct rendering axis (copy/nav/embed)
         self,
@@ -1018,10 +1042,10 @@ class _BookingApp:
         events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
+                request,
                 locale,
                 lang_urls=_lang_links_here(request),
                 retry_url=str(request.url),
-                brand=brand,
             )
         # No `active` filter here any more: the PUBLIC listing only ever contains what is on sale.
         # Filtering in the client was never a defence — it was the server trusting its client.
@@ -1058,11 +1082,11 @@ class _BookingApp:
         events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
+                request,
                 locale,
                 lang_urls=_lang_links_here(request),
                 retry_url=str(request.url),
                 embed=embed,
-                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:
@@ -1139,11 +1163,11 @@ class _BookingApp:
         events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
+                request,
                 locale,
                 lang_urls=_lang_links_here(request),
                 retry_url=str(request.url),
                 embed=embed,
-                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:
@@ -1325,11 +1349,11 @@ class _BookingApp:
         events = await self._events(request, tenant)
         if events is None:
             return self._service_error(
+                request,
                 locale,
                 lang_urls=_lang_links(f"{event_path}/book", {"start": start, "tz": tz}),
                 retry_url=f"{event_path}?{urlencode({'tz': tz, 'lang': locale})}",
                 embed=embed,
-                brand=brand,
             )
         found = _find_event(events, slug)
         if found is None:

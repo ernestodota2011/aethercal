@@ -94,6 +94,10 @@ class FakeAPI:
 
     def __init__(self) -> None:
         self.brand_status = 200
+        #: Tumba `event-types` DEJANDO la marca en pie: asi la pagina sabe de quien es y aun asi
+        #: tiene que renderizar un error. Es el caso en que se descubrio que el error se firmaba
+        #: con el nombre del producto (GA3 2a vuelta, 2026-07-31).
+        self.event_types_status = 200
         self.branding_slugs: list[str] = []
         self.slots_tz: list[str] = []
         self.last_auth: str | None = None
@@ -116,6 +120,10 @@ class FakeAPI:
             return httpx.Response(200, json=brand)
 
         if method == "GET" and _EVENT_TYPES_RE.fullmatch(path):
+            if self.event_types_status != 200:
+                return httpx.Response(
+                    self.event_types_status, json={"error": "boom", "message": "internal detail"}
+                )
             return httpx.Response(200, json=[_event_json()])
 
         slots = _SLOTS_RE.fullmatch(path)
@@ -419,3 +427,40 @@ def test_an_UNBRANDED_page_keeps_the_credit() -> None:
     body = client.get("/t/sol").text
 
     assert "AetherCal" in body
+
+
+# --------------------------------------------------------------------------------------
+# La pagina de FALLO tambien es del negocio (GA3 2a vuelta, 2026-07-31)
+#
+# El 404 si estaba marcado; el 503 no. `_service_error` se titulaba con el nombre del PRODUCTO
+# y recibia `brand=None` en sus cuatro llamadores, asi que el error de un negocio con marca
+# propia mostraba "AetherCal", perdia su acento y firmaba con el pie del producto. La marca
+# blanca estaba hecha en el camino feliz y viva en el de fallo -- que es justo donde se cae al
+# valor por defecto de la plataforma.
+
+
+def test_la_pagina_de_ERROR_sigue_firmada_por_el_negocio_y_no_por_el_producto() -> None:
+    client, fake = _make_client()
+    fake.event_types_status = 500  # la marca SIGUE respondiendo: sabemos de quien es la pagina
+
+    response = client.get("/e/intro")
+
+    assert response.status_code >= 400
+    cuerpo = response.text
+    assert SOL_BRAND["display_name"] in cuerpo, f"la pagina de error no nombra al negocio: {cuerpo[:300]}"
+    assert "Con la tecnología de AetherCal" not in cuerpo, "el error anuncia el producto"
+    assert 'id="brand"' in cuerpo, "el error perdio el acento del negocio"
+
+
+def test_CONTROL_sin_marca_el_error_SI_puede_llevar_el_nombre_del_producto() -> None:
+    """El control fija el otro lado. Si el arreglo hubiera sido "no nombrar nunca al producto",
+    el auto-hospedado sin marca se quedaria con una pagina de error anonima. Cuando de verdad no
+    hay negocio que nombrar, el nombre del producto es la respuesta honesta, no publicidad."""
+    client, fake = _make_client()
+    fake.brand_status = 500  # ni siquiera sabemos de quien es la pagina
+    fake.event_types_status = 500
+
+    response = client.get("/e/intro")
+
+    assert response.status_code >= 400
+    assert 'id="brand"' not in response.text

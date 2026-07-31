@@ -95,8 +95,9 @@ _HTMX_SRC = "/static/htmx-2.0.4.min.js"
 # a slot picker with real hover/focus states), because an unstyled system-font page reads
 # "templated" no matter how much whitespace it has. Dark is primary; a warm light mode is provided
 # for preference/accessibility. The four accent tokens (--accent/--accent-ink/--focus/--danger)
-# are contrast-AA-tuned and MUST NOT drift: a tenant's brand override (`_brand_style`) replaces
-# --accent/--focus only, and the rest of the sheet keeps working on top of whatever it sets.
+# are contrast-AA-tuned and MUST NOT drift. A tenant's brand override (`_brand_style`) replaces
+# --accent/--focus AND DERIVES --accent-ink from the new accent: those AA numbers belong to THIS
+# accent, so inheriting the ink while replacing the colour is how a tenant button reached 2.84:1.
 #
 # The display face (Bricolage Grotesque, SIL OFL 1.1 — redistributable) is VENDORED at
 # `static/bricolage-grotesque.woff2` and served by the app itself, never a font CDN: same reason
@@ -112,8 +113,8 @@ _CSS = """
   --hairline: rgba(255,255,255,0.08);
   --text: #ededee; --muted: #a2a2aa; --accent: #e0894b; --accent-ink: #1b1206;
   --focus: #f4b477; --danger: #e08497;
-  /* DERIVED from --accent via color-mix, so a tenant's brand override (`_brand_style` sets only
-     --accent/--focus) AND the light/dark switch both cascade into the hover tint + hairline for
+  /* DERIVED from --accent via color-mix, so a tenant's brand override (`_brand_style` sets
+     --accent/--focus/--accent-ink) AND the light/dark switch both cascade into the hover tint + hairline for
      free — the whole accent family tracks one token. The rgba line is the pre-color-mix fallback
      (ember); a browser without color-mix keeps the product's own accent, never a broken value. */
   --accent-wash: rgba(224,137,75,0.12);
@@ -415,7 +416,55 @@ def _brand_style(brand: TenantBrandingRead | None) -> list[Any]:
     if brand is None or not brand.accent_color:
         return []
     accent = brand.accent_color
-    return [Style(f":root {{ --accent: {accent}; --focus: {accent}; }}", id="brand")]
+    # ==El acento sin su tinta es media marca, y la mitad que falta es la legible.== Este bloque
+    # reemplazaba `--accent`/`--focus` y dejaba `--accent-ink` como lo dejara el tema. Los pares
+    # de la plataforma estan afinados a AA (6.91:1 en oscuro con tinta casi negra, 4.75:1 en claro
+    # con blanca) — pero esos numeros son de ESE acento. Un inquilino con un acento OSCURO hereda
+    # la tinta casi negra del tema oscuro y su boton de confirmar cae a **2.84:1**. Medido en
+    # produccion sobre "Confirmar reserva" (GA3 2a vuelta, 2026-07-31).
+    #
+    # `:root:root` y no `:root`: el bloque de tema claro es `:root:not([data-theme="dark"])`
+    # (0,2,0) y ganaba a un `:root` pelado (0,1,0), asi que en claro el color del inquilino ni
+    # siquiera se aplicaba. Duplicar el selector iguala la especificidad y el orden de fuente
+    # (este `<style>` va despues) decide. Sin esto, arreglar el contraste seria invisible en
+    # claro justo porque el override entero era invisible en claro.
+    return [
+        Style(
+            f":root:root {{ --accent: {accent}; --focus: {accent};"
+            f" --accent-ink: {_tinta_legible_sobre(accent)}; }}",
+            id="brand",
+        )
+    ]
+
+
+#: Las dos tintas candidatas: la casi-negra del tema oscuro y el blanco del claro. No se inventa
+#: un tercer color — se elige entre los dos que la hoja ya usa, para que la marca del inquilino
+#: siga viviendo dentro de la paleta y no al lado de ella.
+_TINTAS_CANDIDATAS = ("#1b1206", "#ffffff")
+
+
+def _luminancia_relativa(hexa: str) -> float:
+    """Luminancia relativa WCAG de un ``#rrggbb``. La entrada ya viene validada como hex."""
+    canales = [int(hexa.lstrip("#")[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    lineal = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in canales]
+    return 0.2126 * lineal[0] + 0.7152 * lineal[1] + 0.0722 * lineal[2]
+
+
+def _tinta_legible_sobre(fondo: str) -> str:
+    """La candidata que MAS contrasta con ``fondo``.
+
+    Se elige por medicion y no por una regla de bolsillo ("si es oscuro, blanco"): esas reglas se
+    parten justo en los grises medios, que es donde las dos candidatas casi empatan y donde
+    equivocarse cuesta el par entero. Con dos candidatas fijas, calcular las dos razones y
+    quedarse con la mayor es tan barato como adivinar y no se puede equivocar.
+    """
+    fondo_l = _luminancia_relativa(fondo)
+
+    def razon(tinta: str) -> float:
+        tinta_l = _luminancia_relativa(tinta)
+        return (max(fondo_l, tinta_l) + 0.05) / (min(fondo_l, tinta_l) + 0.05)
+
+    return max(_TINTAS_CANDIDATAS, key=razon)
 
 
 def _header(
@@ -1165,6 +1214,16 @@ def booking_form_page(
             P(f"{t(locale, 'selected_time')}: {when_label}", cls="meta"),
             H2(t(locale, "your_details")),
             form,
+            # ==El texto del negocio viaja al paso donde se ESCRIBEN los datos.== Vivia solo en la
+            # pantalla anterior, que es donde no se pide nada: el comprador leia para que sirven
+            # sus datos y como darse de baja *antes* de que se los pidieran, y en la pantalla del
+            # nombre, el correo y el telefono no habia una sola linea (GA3 2a vuelta, 2026-07-31).
+            # Es el mismo texto ya traducido del evento, no una copia que pueda divergir.
+            *(
+                [P(resolve_description(event, locale), cls="meta")]
+                if resolve_description(event, locale)
+                else []
+            ),
             A(t(locale, "back_to_times"), href=_with_lang(event_path, locale), cls="meta"),
             cls="stack",
         ),

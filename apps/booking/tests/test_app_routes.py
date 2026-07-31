@@ -143,6 +143,10 @@ class FakeAPI:
         # Failure injection: when set, the matching endpoint answers with a 500 that carries an
         # internal message (LEAK_MARKER) the guest must never see.
         self.fail_event_types = False
+        #: Cuando es True, event-types responde 429 en vez de 500. Son dos fallos distintos y el
+        #: comprador tiene que verlos distintos: uno es "espera un minuto", el otro es "esto esta
+        #: roto". Colapsarlos en 503 despierta a devops por algo que funciona como se diseno.
+        self.rate_limit_event_types = False
         self.fail_slots = False
         self.fail_create_booking = False
 
@@ -237,6 +241,12 @@ class FakeAPI:
         self.forwarded_by_path[path] = request.headers.get("X-Forwarded-For")
         # ==The PUBLIC surface the page talks to now — NO API key on any of these.==
         if method == "GET" and re.fullmatch(r"/api/v1/public/[^/]+/event-types", path):
+            if self.rate_limit_event_types:
+                return httpx.Response(
+                    429,
+                    json={'error': 'rate_limited', 'message': 'Too many requests; try again shortly'},
+                    headers={'Retry-After': '60'},
+                )
             return self._boom() if self.fail_event_types else self._event_types()
         public_slots = re.fullmatch(r"/api/v1/public/[^/]+/([^/]+)/slots", path)
         if method == "GET" and public_slots:
@@ -1431,3 +1441,41 @@ def test_CONTROL_una_direccion_que_el_comprador_se_INVENTA_no_se_reenvia() -> No
     assert reenviadas == {"203.0.113.9"}, (
         f"se creyo la cabecera que escribio el propio comprador: {fake.forwarded_by_path}"
     )
+
+
+# --- La pagina de FALLO tambien es del negocio, y un cupo no es una caida ------------------
+#
+# GA3 2a vuelta (2026-07-31), dos hallazgos de la misma funcion:
+#
+#  M-2  El 503 se titulaba "AetherCal", perdia el acento del inquilino y firmaba "Con la
+#       tecnologia de AetherCal" — mientras el 404 SI iba bien marcado. La marca blanca se
+#       habia aplicado al camino feliz y quedaba viva en el de error, que es justo donde se
+#       cae al valor por defecto de la plataforma.
+#  M-4  Un 429 de arriba (cupo) se servia como 503 sin `Retry-After`. Para el comprador es
+#       "roto" en vez de "espera un minuto"; para el monitoreo, un limite de tasa es
+#       indistinguible de una caida.
+
+
+def test_un_CUPO_de_arriba_llega_como_429_con_Retry_After_y_no_como_caida() -> None:
+    client, fake = _make_client()
+    fake.rate_limit_event_types = True
+
+    response = client.get("/e/intro")
+
+    assert response.status_code == 429, (
+        f"un cupo se sirvio como {response.status_code}: el comprador no sabe que solo debe "
+        f"esperar, y el monitoreo no distingue el limite de una caida"
+    )
+    assert response.headers.get("Retry-After"), "un 429 sin Retry-After no dice cuanto esperar"
+
+
+def test_CONTROL_una_caida_de_VERDAD_sigue_siendo_503() -> None:
+    """El control fija el otro lado: si el arreglo devolviera 429 a todo, el 503 desapareceria y
+    una caida real pasaria por 'espera un minuto'. Un backend con 500 sigue siendo 503."""
+    client, fake = _make_client()
+    fake.fail_event_types = True
+
+    response = client.get("/e/intro")
+
+    assert response.status_code == 503, response.status_code
+    assert LEAK_MARKER not in response.text, "se filtro el mensaje interno del backend"
