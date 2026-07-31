@@ -105,6 +105,9 @@ MESSAGES: dict[Locale, dict[str, str]] = {
             "Gracias. Hemos recibido tu solicitud y te contactaremos pronto."
         ),
         "meta_description": "Reserva tu cita en línea de forma rápida y sencilla con AetherCal.",
+        # La misma frase cuando la pagina es de un negocio: quien la comparte por WhatsApp
+        # tiene que ver el nombre del NEGOCIO, no el de la herramienta.
+        "meta_description_branded": "Reserva tu cita en línea con {negocio}, de forma rápida y sencilla.",
         "footer_powered": "Con la tecnología de AetherCal",
     },
     "en": {
@@ -191,6 +194,7 @@ MESSAGES: dict[Locale, dict[str, str]] = {
             "Thank you. We've received your request and will be in touch soon."
         ),
         "meta_description": "Book your appointment online, quickly and easily, with AetherCal.",
+        "meta_description_branded": "Book your appointment online with {negocio}, quickly and easily.",
         "footer_powered": "Powered by AetherCal",
     },
 }

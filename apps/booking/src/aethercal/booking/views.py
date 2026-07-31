@@ -362,6 +362,22 @@ def site_name(locale: Locale, brand: TenantBrandingRead | None) -> str:
     return brand.display_name if brand is not None else t(locale, "app_name")
 
 
+def _meta_description(locale: Locale, brand: TenantBrandingRead | None) -> str:
+    """What a preview says the page is about — naming the BUSINESS when there is one.
+
+    ==One function, two call sites that must not drift== (``<meta name="description">`` and
+    ``og:description``), for the same reason as :func:`site_name`.
+
+    This module already stated the rule for ``og:site_name`` — "naming the product there, while
+    the page itself is branded, is the same half-shipped feature" — and the description
+    contradicted it: every branded page described itself as "…con AetherCal". Measured on the
+    DeskUp pilot's buyer-facing agenda, 2026-07-30, where the string appeared three times.
+    """
+    if brand is None:
+        return t(locale, "meta_description")
+    return t(locale, "meta_description_branded", negocio=site_name(locale, brand))
+
+
 def _brand_mark(brand: TenantBrandingRead | None) -> list[Any]:
     """The business's logo, or nothing at all.
 
@@ -408,7 +424,22 @@ def _header(
     )
 
 
-def _footer(locale: Locale) -> Any:
+def _footer(locale: Locale, brand: TenantBrandingRead | None = None) -> Any:
+    """The product credit — and ==only on the product's own pages==.
+
+    A branded page belongs to the business whose name is in the header. Advertising the tool to
+    *their* customers is the same half-shipped feature that :func:`site_name` exists to prevent:
+    a page whose header says "Toyota Hollywood" and whose footer says "Con la tecnología de
+    AetherCal" is telling the guest which of the two is really talking to them.
+
+    ==Found on a real page, not in review==: the DeskUp pilot's buyer-facing agenda carried the
+    line at the bottom of the booking form (2026-07-30). It is a per-tenant question with a
+    per-tenant answer already in hand — no new column, exactly like ``collects_phone``.
+
+    Unbranded pages keep the credit: there, the product IS the business the guest came to.
+    """
+    if brand is not None:
+        return Footer(cls="site-footer")
     return Footer(P(t(locale, "footer_powered")), cls="site-footer")
 
 
@@ -456,7 +487,7 @@ def _social_meta(
     into WhatsApp, the unfurl must name the BUSINESS. Naming the product there — while the page
     itself is branded — is the same half-shipped feature, in the one place the guest sees first.
     """
-    description = t(locale, "meta_description")
+    description = _meta_description(locale, brand)
     image_url = f"{base_url}{_OG_IMAGE_PATH}"
     return [
         Meta(property="og:title", content=full_title),
@@ -518,13 +549,13 @@ def page(
     if embed:
         body_children.append(_embed_resize_script())
     else:
-        body_children.append(_footer(locale))
+        body_children.append(_footer(locale, brand))
     return Html(
         Head(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
-            Meta(name="description", content=t(locale, "meta_description")),
+            Meta(name="description", content=_meta_description(locale, brand)),
             *_social_meta(
                 locale,
                 full_title=full_title,

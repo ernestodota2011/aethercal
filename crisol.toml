@@ -1,0 +1,11 @@
+# Politica de privacidad para la revision cruzada de Crisol.
+# ==Se declara AQUI, en el repo, no en la linea de comandos.== Desde RF-13-bis
+# (2026-07-30) `--policy` solo ENDURECE: un repo sin declarar no lo abre ningun
+# flag. Antes 7 de 10 repos no declaraban, el operador tecleaba `--policy agencia`
+# por costumbre y esa costumbre abria tambien lo que no debia.
+#
+# agencia     = codigo propio de AetherLogik -> se revisa
+# cliente-std = cliente sin BAA/PHI          -> se revisa
+# cliente-baa = cliente con BAA/PHI          -> NUNCA sale a un motor externo
+[project]
+policy = "agencia"   # producto propio (calendario OSS)

@@ -274,35 +274,38 @@ def test_the_social_unfurl_names_the_business_not_the_product() -> None:
     assert '<meta property="og:title" content="Reserva una cita · Clinica Sol">' in head
 
 
-def test_the_meta_DESCRIPTION_still_names_the_product_and_that_is_a_KNOWN_GAP() -> None:
-    """==Recorded, not hidden.== The description a business's page ships still says "AetherCal".
+def test_the_meta_DESCRIPTION_names_the_BUSINESS_on_a_branded_page() -> None:
+    """==Este hueco estaba documentado, asertado... y abierto. Hoy se cierra.==
 
-    ``meta_description`` is a translated COPY string ("Reserva tu cita en línea de forma rápida y
-    sencilla con AetherCal."), and it is reused for ``og:description`` and ``twitter:description``.
-    So a branded page still carries the product's name in the sentence a search engine and a social
-    unfurl quote.
+    Habia una prueba llamada `..._and_that_is_a_KNOWN_GAP` que fijaba el defecto en vez de
+    arreglarlo: la descripcion de la pagina de un negocio decia "…con AetherCal", y de ahi
+    salian tambien `og:description` y `twitter:description` — la frase que citan un buscador y
+    la vista previa de WhatsApp. Su docstring dejaba escrito el arreglo exacto (una variante
+    `meta_description_branded` elegida en el mismo `brand is None` que usa `site_name`) y
+    decia, con razon, que queria un dueno que decidiera la copia.
 
-    This is deliberately NOT fixed here, and the reason is that it is not obviously a defect: the
-    footer says "Con la tecnología de AetherCal" ON PURPOSE — the product's attribution on a page it
-    powers is a choice this project has already made once, visibly. Whether the *description* should
-    carry it too is a copy decision (and an ES/EN parity one), not a branding-plumbing decision, and
-    quietly rewriting a user-facing translated string under cover of a schema change is how copy
-    ends up nobody's.
-
-    ==The real fix, when someone decides they want it==: give the description a branded variant in
-    ``i18n`` (e.g. ``meta_description_branded``, taking the business's name) and choose between the
-    two in :func:`views.page` on ``brand is None`` — the exact seam ``site_name`` already uses. It
-    is a copy change with a translation per locale, and it wants an owner allowed to make it.
-
-    This test exists so the gap is a KNOWN, ASSERTED fact rather than something the next person
-    discovers in production. When the copy changes, this test fails and points at the decision.
+    Se decidio: en la pagina de un negocio manda el negocio. Lo empujo verlo en una pagina de
+    verdad — la agenda del piloto DeskUp, donde la cadena salia tres veces delante del
+    comprador (2026-07-30). ==Documentar un hueco no lo cierra; solo evita la sorpresa.==
     """
     client, _ = _make_client()
 
     head = client.get("/t/sol").text.split("</head>")[0]
 
-    assert 'name="description" content="Reserva tu cita en línea' in head
-    assert "AetherCal" in head, "the known gap: see this test's docstring for the real fix"
+    assert 'name="description" content="Reserva tu cita en línea con Clinica Sol' in head
+    assert "AetherCal" not in head, (
+        "la descripcion que cita un buscador o WhatsApp sigue nombrando la herramienta"
+    )
+
+
+def test_an_UNBRANDED_page_keeps_the_product_in_its_description() -> None:
+    """==El control.== Sin el, vaciar la descripcion entera pasaria la prueba de arriba."""
+    client, fake = _make_client()
+    fake.brand_status = 500
+
+    head = client.get("/t/sol").text.split("</head>")[0]
+
+    assert "AetherCal" in head
 
 
 def test_the_embed_shell_keeps_the_colour_even_though_it_has_no_header() -> None:
@@ -379,3 +382,40 @@ def test_the_csp_permits_an_https_logo() -> None:
     assert "img-src 'self' data: https:" in csp
     # And it stays narrow where narrowness is what matters: an image cannot execute, a script can.
     assert "script-src 'self'" in csp
+
+
+# --------------------------------------------------------------------------------------
+# El credito del producto — solo en las paginas del producto.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_branded_page_does_NOT_advertise_the_tool_to_that_businesss_guests() -> None:
+    """==Encontrado en una pagina de verdad, no en una revision.==
+
+    La agenda que ve el COMPRADOR del piloto DeskUp llevaba "Con la tecnologia de AetherCal"
+    al pie del formulario de reserva (2026-07-30). Una pagina cuya cabecera dice el nombre del
+    negocio y cuyo pie dice el nuestro le esta contando al invitado cual de los dos le habla
+    de verdad — la misma media-funcion que `site_name` existe para evitar.
+    """
+    client, _ = _make_client()
+
+    body = client.get("/t/sol").text
+
+    assert "Clinica Sol" in body
+    assert "AetherCal" not in body, (
+        "la pagina de un negocio le anuncia la herramienta a SUS clientes"
+    )
+
+
+def test_an_UNBRANDED_page_keeps_the_credit() -> None:
+    """==El control, y es el que decide que la prueba de arriba mide algo.==
+
+    Sin el, borrar el pie entero pasaria las dos. Aqui no hay negocio detras: el producto ES
+    a quien vino a ver el invitado, asi que el credito se queda.
+    """
+    client, fake = _make_client()
+    fake.brand_status = 500  # la pagina cae al chrome propio del producto
+
+    body = client.get("/t/sol").text
+
+    assert "AetherCal" in body
