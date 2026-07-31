@@ -468,12 +468,21 @@ def _tinta_legible_sobre(fondo: str) -> str:
 
 
 def _header(
-    locale: Locale, lang_urls: Mapping[Locale, str], brand: TenantBrandingRead | None
+    locale: Locale,
+    lang_urls: Mapping[Locale, str],
+    brand: TenantBrandingRead | None,
+    nombre: str | None = None,
 ) -> Any:
+    """``nombre`` sustituye lo que la cabecera dice llamarse.
+
+    Existe por la pagina de fallo sin marca: `site_name` cae al nombre del PRODUCTO, y la
+    cabecera fue el cuarto sitio (tras el pie, la pestana y los metadatos) por el que se colaba
+    delante del comprador de otro negocio. Medido en vivo, GA3 2a vuelta.
+    """
     return Header(
         A(
             *_brand_mark(brand),
-            Span(site_name(locale, brand)),
+            Span(nombre if nombre is not None else site_name(locale, brand)),
             href=_with_lang("/", locale),
             cls="brand",
         ),
@@ -606,7 +615,7 @@ def page(
     body_children: list[Any] = []
     if not embed:
         body_children.append(A(t(locale, "skip_to_content"), href="#main", cls="skip-link"))
-        body_children.append(_header(locale, lang_urls, brand))
+        body_children.append(_header(locale, lang_urls, brand, None if credit else title))
     body_children.append(Main(*content, id="main"))
     if embed:
         body_children.append(_embed_resize_script())
@@ -624,13 +633,26 @@ def page(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
-            Meta(name="description", content=_meta_description(locale, brand)),
-            *_social_meta(
-                locale,
-                full_title=full_title,
-                base_url=base_url,
-                current_url=current_url,
-                brand=brand,
+            # ==Una pagina que no puede decir de quien es tampoco se anuncia.== Los `og:` son
+            # metadatos de PREVISUALIZACION: existen para que un enlace pegado en WhatsApp se
+            # despliegue con el nombre del negocio. Una pagina de fallo no se comparte, y con
+            # `credit=False` no sabemos que nombre poner — asi que ponerlos era exactamente el
+            # camino por el que "AetherCal" seguia colandose cinco veces despues de callar el pie
+            # y la pestana (medido en vivo, GA3 2a vuelta). Se omiten en bloque, y la descripcion
+            # cae a la neutra del producto sin nombrarlo.
+            *(
+                [
+                    Meta(name="description", content=_meta_description(locale, brand)),
+                    *_social_meta(
+                        locale,
+                        full_title=full_title,
+                        base_url=base_url,
+                        current_url=current_url,
+                        brand=brand,
+                    ),
+                ]
+                if credit
+                else []
             ),
             Title(full_title),
             *_hreflang_links(lang_urls, base_url),
