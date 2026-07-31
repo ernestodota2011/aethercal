@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.crypto import derive_fernet_key, encrypt_secret
 from aethercal.server.db.models import Tenant, TenantCredential
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
     CredentialSource,
@@ -96,6 +97,7 @@ class TestStoringACredential:
             provider=CredentialProvider.STRIPE,
             secrets=STRIPE_A,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         await sqlite_session.flush()
 
@@ -116,6 +118,7 @@ class TestStoringACredential:
                 provider=CredentialProvider.STRIPE,
                 secrets=secrets,
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
         await sqlite_session.flush()
 
@@ -147,6 +150,7 @@ class TestStoringACredential:
                 provider=CredentialProvider.STRIPE,
                 secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_a"},
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
         assert (await sqlite_session.scalars(sa.select(TenantCredential))).all() == []
 
@@ -161,6 +165,7 @@ class TestStoringACredential:
                 provider=CredentialProvider.STRIPE,
                 secrets={"secret_key": "   ", "webhook_secret": "whsec_FAKE_a"},
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
 
     async def test_listing_a_businesss_providers_never_returns_a_secret(
@@ -178,6 +183,7 @@ class TestStoringACredential:
             provider=CredentialProvider.STRIPE,
             secrets=STRIPE_A,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         await sqlite_session.flush()
 
@@ -211,6 +217,7 @@ class TestCriterion40TheChargeGoesIntoThatBusinessesAccount:
                 provider=CredentialProvider.STRIPE,
                 secrets=secrets,
                 fernet_key=KEY,
+                current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
             )
         await sqlite_session.flush()
 
@@ -261,6 +268,7 @@ class TestCriterion41ABusinessWithNoCredentialOfItsOwnDoesNotCharge:
             provider=CredentialProvider.STRIPE,
             secrets=STRIPE_A,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         await sqlite_session.flush()
 
@@ -339,6 +347,7 @@ class TestPrecedenceTheBusinessWins:
             provider=CredentialProvider.SMTP,
             secrets=SMTP_TENANT,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
         await sqlite_session.flush()
 
@@ -404,6 +413,7 @@ class TestPrecedenceTheBusinessWins:
             provider=CredentialProvider.SMTP,
             secrets=SMTP_TENANT,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
         await sqlite_session.flush()
 
@@ -440,6 +450,7 @@ class TestAResolvedCredentialDoesNotLeakIntoALog:
             provider=CredentialProvider.STRIPE,
             secrets=STRIPE_A,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         await sqlite_session.flush()
 

@@ -33,7 +33,7 @@ from aethercal.server.services.guest_tokens import (
     hash_token,
     verify_guest_token,
 )
-from aethercal.server.services.slots import compute_slots
+from aethercal.server.services.slots import MAX_FUTURE_DAYS, MAX_PAST_DAYS, compute_slots
 from aethercal.server.services.tenant_resolution import tenant_by_guest_token_hash
 from aethercal.server.settings import Settings
 
@@ -48,13 +48,12 @@ _WINDOW_TOO_LARGE = "window_too_large"
 _OUT_OF_RANGE = "window_out_of_range"
 _NOT_FOUND = "not_found"
 
-# The absolute band, relative to "now", a request may ask about. Availability is inherently a
-# near-future question, so a query about year 1 or year 9999 is meaningless — and rejecting it up
-# front keeps every downstream date computation (the ±1-day busy padding and the wall-time->instant
-# timezone conversion) clear of date.min/date.max, where it would otherwise overflow. Generous
-# enough for any real booking horizon, and nowhere near the representable extremes.
-MAX_PAST_DAYS = 1
-MAX_FUTURE_DAYS = 366 * 5
+# The absolute band, relative to "now", a request may ask about — DEFINED in ``services.slots`` and
+# re-exported here, because it is not merely this endpoint's input guard: the background busy
+# refresh must keep the cache complete over the SAME band, or a perfectly legal query lands on a
+# window the cache never claims and the host degrades to UNAVAILABLE (see ``busy_refresh_window``).
+# Two copies of "how far back may a caller ask" is precisely how the producer and the consumer of
+# that window drifted apart in the first place.
 
 # The widest ``from``..``to`` a single request may span. A booking calendar rarely needs more than a
 # couple of months of look-ahead at once; bounding it keeps the availability computation O(window)

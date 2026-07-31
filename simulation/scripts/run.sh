@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# One command: bring up a throwaway stack, run the two-week simulation, tear it down.
+#
+#   simulation/scripts/run.sh [--keep] [-- <extra args for the harness>]
+#
+# ==This is the only supported way to run the simulation, because it is the only path that guarantees
+# the stack is a throwaway.== The harness itself refuses to start without a `.stack.json` (see
+# aethercal_sim/world.py) precisely so that nobody can point it at a live instance by hand.
+#
+# `--keep` leaves the stack up afterwards so the database, the mailbox and the sink can be inspected.
+# The report is written either way, before the teardown.
+#
+# ==The exit code is the verdict.== The harness exits non-zero when a control failed (VOID) or did
+# not run (INCOMPLETE), and `set -e` carries that out through this script — so a run that proved
+# nothing can never be mistaken for a green one by whatever wraps it.
+
+set -euo pipefail
+
+SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "${SIM_DIR}/.." && pwd)"
+E2E_DIR="${REPO_ROOT}/e2e"
+
+KEEP=0
+if [[ "${1:-}" == "--keep" ]]; then
+  KEEP=1
+  shift
+fi
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+# ==An ARRAY, not a string, and the difference is a repository path with a space in it.==
+# This used to be one string word-split at the call site (`${COMPOSE_CMD} down`, with an SC2086
+# suppression to say so on purpose). Word splitting cannot know which spaces separate arguments and
+# which live inside a path, so a clone under `C:\Users\Firstname Lastname\` — or any
+# `~/My Projects/` — hands compose three shredded `-f` values and the teardown dies. That is the ONE
+# command that stops the throwaway stack, in a script whose whole job is to guarantee it goes away;
+# it is also the teardown that had already been found never to have run once, for an unrelated
+# reason. Twice broken by two different mechanisms is the argument for removing the mechanism, so
+# the arguments are kept as ELEMENTS and expanded with `"${COMPOSE_CMD[@]}"`, which passes each one
+# verbatim whatever it contains.
+COMPOSE_CMD=(
+  docker compose
+  -f "${REPO_ROOT}/deploy/docker-compose.yml"
+  -f "${E2E_DIR}/compose.e2e.yml"
+  -f "${SIM_DIR}/compose.sim.yml"
+)
+
+ENV_FILE="${REPO_ROOT}/deploy/.env"
+ENV_BACKUP="${SIM_DIR}/.env.deploy-backup"
+
+# ==Give the developer their `deploy/.env` back, whatever happened.==
+#
+# `stack-up.sh` overwrites that file because the shipping compose stack genuinely reads it
+# (`env_file: .env` on each service), and it backs the original up first. Restoring is THIS
+# script's job because it owns the whole lifecycle — the stack must go on reading the simulation's
+# values until it is torn down. The trap fires on success, on failure and on Ctrl-C, so a boot that
+# dies halfway no longer leaves shared repo configuration replaced by test-only values.
+# shellcheck source=restore-env.sh
+source "${SIM_DIR}/scripts/restore-env.sh"
+# shellcheck source=compose-env.sh
+source "${SIM_DIR}/scripts/compose-env.sh"
+
+restore_env() {
+  aethercal_restore_env "${ENV_FILE}" "${ENV_BACKUP}"
+}
+
+cleanup() {
+  # ==El estado con el que se entra al trap es el de la SIMULACION.== Se captura
+  # primero y se conserva: un teardown fallido no puede TAPAR una corrida fallida.
+  local run_status=$?
+  if ((KEEP == 1)); then
+    # ==One teardown command, and it is the one that also restores deploy/.env.== This used to
+    # print a bare `down -v`, which drops the containers and leaves shared repo configuration
+    # replaced by the simulation's own — and leaves the backup sitting exactly where the NEXT
+    # `stack-up.sh` would have overwritten it with test-only values. stack-down.sh does both.
+    echo "==> --keep: leaving the stack up. Tear it down with:"
+    echo "    ${SIM_DIR}/scripts/stack-down.sh"
+    echo "    deploy/.env stays in place while it runs; your original is at ${ENV_BACKUP}"
+    echo "    (stack-up.sh will REFUSE to start again until that backup has been restored)"
+    return
+  fi
+  echo "==> tearing down the throwaway stack"
+  # ==`docker compose` cannot even PARSE the overlay without the operator token in its
+  # environment.== compose.sim.yml declares it `:?` — required, no default — and interpolates the
+  # whole file on every subcommand, so `down` fails on a variable that only `up` has any use for.
+  # This teardown had therefore never once run; see scripts/compose-env.sh.
+  aethercal_export_compose_token "${SIM_DIR}/.stack.json"
+  # ==Same rule as stack-down.sh, and it lives in both because the defect did.== Restore the
+  # environment either way; never announce a teardown that did not happen.
+  local teardown_status=0
+  "${COMPOSE_CMD[@]}" down -v --remove-orphans || teardown_status=$?
+  restore_env
+  if ((teardown_status != 0)); then
+    echo "ERROR: the throwaway stack did NOT tear down cleanly (exit ${teardown_status})." >&2
+    echo "       It may still be running. deploy/.env has been restored regardless." >&2
+    echo "       Tear it down with: ${SIM_DIR}/scripts/stack-down.sh" >&2
+    # ==Y SALE distinto de cero.== Antes solo lo imprimia: quien invoca esto veia
+    # exit 0 y un contenedor vivo, que es la misma familia de defecto que el propio
+    # arnes persigue — una operacion que fallo reportando exito. Un fallo de la
+    # simulacion manda sobre este, para no ocultar la causa con la consecuencia.
+    exit $((run_status != 0 ? run_status : teardown_status))
+  fi
+  exit "${run_status}"
+}
+trap cleanup EXIT
+
+"${SIM_DIR}/scripts/stack-up.sh"
+
+echo "==> running the simulation"
+cd "${SIM_DIR}"
+# ==The harness runs on the system Python with no dependencies.== That is not a shortcut, it is the
+# point: a throwaway host needs a stack and an interpreter, and nothing else has to be installed
+# before a measurement can happen.
+# ==The compose invocation is NOT passed in any more.== It used to be handed over as a string and
+# used verbatim to `stop`/`start` a container — the one input the isolation check never looked at,
+# in the one code path that manipulates containers. The harness derives the same three overlays
+# itself (`aethercal_sim.__main__.COMPOSE_FILES`) and proves they resolve to the project it just
+# verified, before it touches anything. `COMPOSE_CMD` above stays: it is this script's own teardown.
+python3 -m aethercal_sim \
+  --out "${SIM_DIR}/simulation-report.md" \
+  --json-out "${SIM_DIR}/simulation-report.json" \
+  "$@"

@@ -1,0 +1,80 @@
+# The SIMULATION stack = the E2E stack + the operator's instruments, under a DIFFERENT project name.
+#
+# Used as the THIRD overlay, never alone, so what runs is still the artifact users deploy:
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f e2e/compose.e2e.yml \
+#                  -f simulation/compose.sim.yml up -d
+#
+# It inherits everything the E2E overlay already solved (the three roles, Mailpit, the webhook sink
+# on a globally-routable subnet, the fast tick, the raised public rate limit) and adds only what a
+# LOAD simulation needs on top.
+#
+# ==`name:` is the safety belt, and it is the most important line in this file.==
+#
+# `deploy/docker-compose.yml` names the project `aethercal`. A simulation's first act is `down -v` —
+# it must start from an empty database, or "the slot was released" would depend on history nobody
+# can see. Run that against the project named `aethercal` on a host that has a real instance, and
+# the simulation destroys the very data it exists to avoid disturbing.
+#
+# `deploy/README.md` ("Redeploying in production") warns that the production volume survives a
+# down/up cycle *only as long as `name: aethercal` is never removed or overridden*. That warning is
+# about losing production data by accident. This file overrides it ON PURPOSE and in the opposite
+# direction: the simulation's database becomes `aethercal-sim_aethercal-pgdata`, a different volume
+# in a different project, so `down -v` here CANNOT reach an instance named anything else — whatever
+# directory it is invoked from, whatever host it lands on. The isolation is structural rather than a
+# matter of remembering, which is the only kind worth having in a script whose job is to delete.
+#
+# ==This overlay is never part of the production or CI stack.== CI brings up
+# `deploy/docker-compose.yml + e2e/compose.e2e.yml` only (.github/workflows/ci.yml), so nothing here
+# reaches the `aethercal` project.
+
+name: aethercal-sim
+
+services:
+  postgres:
+    # A simulation opens far more concurrent sessions than the golden flow: the organic phase runs a
+    # pool of guests, and the adversarial phase fires N simultaneous requests at ONE slot. The
+    # headroom matters more than the memory here — a `FATAL: sorry, too many clients` would be
+    # recorded as a product error class when it is really a ceiling this file chose.
+    command: ["postgres", "-c", "max_connections=300"]
+
+  worker:
+    environment:
+      # ==The operator surface, opened deliberately for the run.== `/metrics/summary` is how the
+      # harness reads the outbox backlog — the one number that says whether the drain is keeping up.
+      # With no token configured the endpoint is CLOSED (503, by design: see api/operator.py), so a
+      # simulation that forgot this would scrape a 503 and, unless it checked, report a backlog of
+      # zero for a queue on fire. The harness treats a non-200 scrape as a hard error for exactly
+      # that reason.
+      #
+      # ==REQUIRED, with no default here on purpose.== `scripts/stack-up.sh` decides this value and
+      # hands the SAME string to the harness through `.stack.json`; a fallback default in this file
+      # would be a second copy of that decision, and the two would eventually disagree — at which
+      # point the worker boots happily with token A, every scrape presents token B, and the backlog
+      # reads as "never measured". One decision, one place, and a loud failure if it is missing.
+      #
+      # It must be at least 32 characters: `Settings` refuses to boot on anything shorter, because
+      # the endpoint is instance-wide and publicly reachable, so a guessable token is as good as
+      # none. Test-only, and destroyed with the stack.
+      AETHERCAL_METRICS_TOKEN: ${AETHERCAL_SIM_METRICS_TOKEN:?set by simulation/scripts/stack-up.sh}
+    ports:
+      # Publish the operator surface so the harness can scrape it.
+      #
+      # ==Bound to 127.0.0.1 on purpose.== It reports every business on the instance, so even on a
+      # throwaway host it does not go on the LAN. `deploy/docker-compose.yml` deliberately does not
+      # publish this port at all; that default is right, and this override is scoped to a stack that
+      # is destroyed at the end of the run.
+      - "127.0.0.1:${SIM_WORKER_HOST_PORT:-8001}:8001"
+
+  mailpit:
+    environment:
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      # ==The E2E's 500-message cap would silently truncate this run.== Two simulated weeks send one
+      # confirmation per booking, plus every reschedule and cancellation notice — well past 500. When
+      # Mailpit rolls, the OLDEST messages are evicted first, so the confirmations the harness times
+      # its EARLIEST bookings against would simply disappear, and the drain-latency distribution
+      # would be computed over the tail of the run only: a better-looking number produced by losing
+      # data. Raised well above the run's ceiling; the harness also asserts the mailbox never rolled,
+      # because a cap can always be outgrown by a bigger run.
+      MP_MAX_MESSAGES: "20000"

@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.guc import bind_tenant, reset_tenant_binding
 from aethercal.server.db.models import TenantCredential
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.key_rotation import KeyRotationError, rotate_fernet_key
 from aethercal.server.services.tenant_credentials import (
     CredentialProvider,
@@ -72,6 +73,7 @@ async def _seed_credential(
             provider=CredentialProvider.STRIPE,
             secrets=secrets,
             fernet_key=key,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
 
 
@@ -148,6 +150,9 @@ class TestCriterion40TheChargeCannotLandInAnotherBusinessesAccount:
                     provider=CredentialProvider.STRIPE,
                     secrets=STRIPE_A,
                     fernet_key=KEY,
+                    current_implementations=current_gateway_implementations(
+                        CredentialProvider.STRIPE
+                    ),
                 )
 
 
@@ -277,4 +282,7 @@ class TestACredentialBelongingToNoBusinessCannotExist:
                     provider=CredentialProvider.STRIPE,
                     secrets=STRIPE_A,
                     fernet_key=KEY,
+                    current_implementations=current_gateway_implementations(
+                        CredentialProvider.STRIPE
+                    ),
                 )

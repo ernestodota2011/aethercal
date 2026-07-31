@@ -88,7 +88,17 @@
              assets-src/ (plain text, safe to publish); `pnpm build`/`pnpm dev` decode it here via
              scripts/decode-assets.mjs before Vite ever runs. Crisol gate round 4 flagged an
              earlier inline-base64 version of this same image as bloating and un-caching the HTML
-             — this is the fix, not a workaround. -->
+             — this is the fix, not a workaround.
+
+             CLS (2026-07-25 launch audit, gap closed): the live audit reported mobile CLS 0.154
+             "from hero .webp images without width/height". That did NOT reproduce — `width`/
+             `height` were already here (see above) matching this file's real pixels, and a traced
+             measurement of both the built dist/ and the live URL recorded ZERO LayoutShift events
+             (CLS 0.000). The inline `aspect-ratio` below is added defense-in-depth: it makes the
+             reserved-space guarantee explicit CSS instead of leaning solely on the browser's
+             implicit width/height-attribute-derived default, and `hero-image-dimensions.test.ts`
+             now locks the real invariant (declared attrs == decoded pixels) so a future edit can't
+             silently reintroduce the mismatch this finding assumed existed. -->
         <div class="landing-shot">
           <img
             src="/screenshot-calendar.webp"
@@ -99,6 +109,7 @@
             fetchpriority="high"
             decoding="async"
             class="landing-shot-img"
+            style="aspect-ratio: 760 / 674"
           />
         </div>
       </section>
@@ -157,6 +168,7 @@
           alt="Página de reservas de book.aetherlogik.com con franjas horarias disponibles para agendar una llamada de descubrimiento."
           width="900"
           height="557"
+          style="aspect-ratio: 900 / 557"
           loading="lazy"
           decoding="async"
           class="landing-shot-img"

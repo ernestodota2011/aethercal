@@ -26,7 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant
 from aethercal.server.integrations.mercadopago import MercadoPagoGateway
-from aethercal.server.integrations.money import build_payment_gateways
+from aethercal.server.integrations.money import (
+    build_payment_gateways,
+    current_gateway_implementations,
+)
 from aethercal.server.integrations.stripe import StripeGateway
 from aethercal.server.services.payments import (
     CHECKOUT_SESSION_TTL,
@@ -43,9 +46,19 @@ from aethercal.server.services.tenant_credentials import (
 
 _KEY = derive_fernet_key("test-app-secret-not-a-real-one")
 
+# ==Synthetic, and key-SHAPED on purpose.== These go through the real `store_credential`, whose
+# permanent type check refuses a value with nothing of key-like length after the prefix — so a stub
+# like `sk_test_x` is no longer a usable fixture. It never was a redaction of anything: there is no
+# real credential in this repository.
 _SECRETS: dict[CredentialProvider, dict[str, str]] = {
-    CredentialProvider.STRIPE: {"secret_key": "sk_test_x", "webhook_secret": "whsec_x"},
-    CredentialProvider.MERCADO_PAGO: {"access_token": "TEST-x", "webhook_secret": "mp_x"},
+    CredentialProvider.STRIPE: {
+        "secret_key": "sk_test_NOTAREALKEY0000000000",
+        "webhook_secret": "whsec_x",
+    },
+    CredentialProvider.MERCADO_PAGO: {
+        "access_token": "TEST-NOTAREALTOKEN0000000000",
+        "webhook_secret": "mp_x",
+    },
     CredentialProvider.SMTP: {"host": "smtp.example.com", "from_addr": "a@example.com"},
 }
 
@@ -61,6 +74,7 @@ async def _tenant(session: AsyncSession, *providers: CredentialProvider) -> uuid
             provider=provider,
             secrets=_SECRETS[provider],
             fernet_key=_KEY,
+            current_implementations=current_gateway_implementations(provider),
         )
     return tenant.id
 

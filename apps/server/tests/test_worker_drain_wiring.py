@@ -21,8 +21,10 @@ from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.guc import tenant_scope
 from aethercal.server.db.models import Booking, Payment, PaymentStatus, Schedule, Tenant, User
 from aethercal.server.db.pools import WorkerPools
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.scheduler import build_drain_executor
 from aethercal.server.services.outbox import OutboxEffect, OutboxWork, refund_dedupe_key
+from aethercal.server.services.payments import RefundOutcome
 from aethercal.server.services.tenant_credentials import CredentialProvider, store_credential
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
@@ -41,9 +43,14 @@ class _GatewaySpy:
 
     async def refund(
         self, *, provider_ref: str, idempotency_key: str, secrets: Mapping[str, str]
-    ) -> None:
+    ) -> RefundOutcome:
         assert secrets.get("secret_key", "").startswith("sk_test_")
+        del provider_ref
         self.refunds.append(idempotency_key)
+        # A provider that accepted the refund and named none: the runner reads this, so a double
+        # that returned nothing would be asserting that the drain works against a shape no gateway
+        # produces.
+        return RefundOutcome.succeeded(None)
 
     async def create_checkout_session(
         self, **_: object
@@ -107,6 +114,7 @@ async def test_the_worker_drain_arms_a_functional_invocable_refund_runner(
             provider=CredentialProvider.STRIPE,
             secrets={"secret_key": "sk_test_NOT_A_REAL_KEY_x", "webhook_secret": "whsec_x"},
             fernet_key=_KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
         )
         tenant_id, booking_id = tenant.id, booking.id
 

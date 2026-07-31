@@ -11,6 +11,32 @@ Every package in the repository shares one version number.
 
 ### Changed
 
+**The live harness's ORDER invariants are measured by executing them.** The guards over the money
+path — *provenance is demanded before the refund is sent*, *nothing that can abort runs outside the
+refund guarantee*, *the evidence block is composed only after the fact it certifies* — were checked
+by reading the source, and had been approximated three times: substring (a mention in a comment
+satisfied it), then AST position (a real call, but ==presence is not execution==: one inside a
+nested function, a lambda or an untaken branch counts the same as one that runs), and the next fix
+would have been AST-with-exclusions — another approximation, wrong again at the next syntactic
+construction nobody thought to exclude.
+
+- `tests/live/test_phase_b_execution_order.py` drives phase B and the checkout harness with doubles
+  that RECORD, and asserts the sequence that actually happened. It also asserts what an ordering
+  check never could: a session refused by provenance is **never** refunded, a validation that fails
+  on a genuinely paid session **still** reaches `ensure_refunded`, and a run that could not return
+  the money **shouts without certifying** — the alarm is reached, the evidence block is absent, and
+  the attempt precedes the alarm. ==And the case the guarantee was BUILT for==: when
+  `gateway.refund` itself raises (a timeout, a 500, the connection dropping), the exception
+  propagates, `ensure_refunded` still runs, it runs *after* the attempt, nothing is certified, and a
+  cleanup that also fails never replaces the original failure — asserted by IDENTITY (`is`), not by class: both stories end in a `ConnectError`, so the class is compatible with the thing being proved AND the thing being feared. ==Shouting and certifying in the same breath would put a claim
+  into `live_verifications()` that the alarm itself contradicts.==
+- Offline and unmarked: no credential, no network, so the money harness's own invariants run on
+  every commit instead of only on the day somebody runs it for real.
+- The AST guards stay for claims about SHAPE ("the guarantee is the last statement", "the creation
+  is wrapped by its recovery", "every provider-touching test declares the control fixture") — those
+  are statements about how the code is written, and reading it is the right way to answer them.
+
+
 **A business's messages now go out on that business's own account** — B-03 stored per-business
 credentials; nothing sent with them.
 
@@ -158,9 +184,234 @@ account (BYOK). ==Neither provider has been run against a live account in this c
   an explicit error rather than a silent pick — a per-tenant preference needs its own migration. See
   [docs/byok-credentials.md](docs/byok-credentials.md#which-payment-provider-a-business-charges-with).
 - Neither adapter has been exercised against a live or sandbox account: Stripe's is unit-tested
-  against a stubbed HTTP transport only; no Mercado Pago account exists for this project at all. Read
-  [docs/byok-credentials.md](docs/byok-credentials.md#neither-payment-adapter-has-been-verified-against-a-live-account)
+  against a stubbed HTTP transport only; no Mercado Pago account exists for this project at all.
+  **A live credential is refused for exactly that reason** — see the next entry, and read
+  [docs/byok-credentials.md](docs/byok-credentials.md#which-payment-operations-have-been-run-against-the-real-api--and-what-that-gates)
   before taking a real charge.
+
+**A live payment credential is now refused per GATEWAY OPERATION, on evidence** — the guard used to
+require an `sk_test_`/`TEST-` prefix, which asked a question no amount of testing could ever answer
+differently, so it could only be overruled and never discharged.
+
+- The product now keeps a register of what has actually been **run against the real provider API**,
+  one record per operation (`checkout`, `refund`), each carrying the date and what was observed. A
+  live credential is refused while any operation of that gateway has no record.
+- **Nothing is verified today**, so the refusal is byte-for-byte what it was: Stripe's gateway has
+  only ever spoken to a stubbed transport, and no Mercado Pago account exists. What changed is that
+  the refusal can now be **retired by evidence** instead of by editing the guard.
+- The evidence comes from a new opt-in harness (`apps/server/tests/live/`, marked `live_provider`)
+  that exercises the real `StripeGateway` against `api.stripe.com`. It takes its key from the
+  environment, never a flag, and never runs in CI.
+  - **`checkout` is verified at zero cost**: create a Checkout Session, read it back through a
+    separate request, expire it. No card, no charge.
+  - **`refund` costs a real charge, so it is a two-phase run** — in live mode there are no test
+    cards, and a live Checkout Session is completed by a person. Phase A opens a **$1** session and
+    leaves it payable (behind its own opt-in); phase B runs the real refund and confirms it with an
+    independent request.
+  - The money barriers are structural: the session opener takes **no amount** (a units bug is what
+    turns $1 into $100), phase A's idempotency key is fixed so a retry cannot charge twice, phase B
+    uses production's own `refund_dedupe_key`, the refund is re-checked in a `finally` through an
+    **independent** client, and if it cannot be completed the run prints the **charge id** with
+    manual-refund instructions rather than failing quietly.
+  - The cleanup verifies the **whole** capture came back: it sums only `succeeded` refunds (a
+    `pending` one is in flight, not done), issues any remainder on its own derived key, and polls
+    to a terminal state. A partial or pending refund raises the alarm instead of passing.
+  - The **evidence block** is composed only after the fact it certifies has been established — the
+    refund settled to a terminal `succeeded`, the checkout session actually expired. That block is
+    what gets pasted into `live_verifications()`, so certifying ahead of the measurement would put
+    a false record into the very register the money guard reads.
+  - Phase A validates amount, currency, mode and status after creating the session and **expires it
+    on any failure**: a payable invitation is left standing only once it has passed. The pay-URL it
+    publishes is Stripe's own, checked against the gateway's.
+  - **Phase B refunds only what phase A opened.** The session is marked at creation (its return URL
+    carries the harness name and the run id; Stripe echoes it back as `success_url`), and phase B
+    demands that mark before resolving the PaymentIntent. The account this runs against holds real
+    customer payments and a $1 amount identifies nothing, so a mistyped, stale or hostile session
+    id is refused rather than refunded.
+- **Each verification records the `ProviderMode` it was gathered in, and only `LIVE` authorises a
+  live credential.** Test mode is a different backend — different keys, no card networks, no money —
+  so a free test-mode round-trip proves the transport and buys nothing the money guard will spend.
+  Without this, the cheap and obvious way to "verify" would have paid for real money.
+- **The credential TYPE check no longer expires when verification completes.** It used to ride on
+  the test-mode prefix, so a fully verified provider had nothing checking `secret_key` at all — a
+  truncated paste or a key from another account stored unexamined, at exactly the moment real money
+  starts moving. `credential_key_families()` is permanent and separate; only the restriction to the
+  TEST variant relaxes. A value that is not a recognisable key is now `UnrecognisedCredentialError`,
+  reported as itself rather than as a mode problem.
+- **Each verification names the implementation it exercised** (`implementation_fingerprint`, a hash
+  of the gateway method's source). Editing `StripeGateway.refund` invalidates that operation's
+  verification and demands a fresh run — otherwise the register would go on saying "verified" about
+  code nobody has ever run.
+  - **That comparison runs in the DOOR, not only in the suite.** It used to live in
+    `tests/test_credential_mode_guard.py` alone, because `services` cannot import `integrations` —
+    so a rewritten gateway method expired its verification in CI while `verified_operations()`, the
+    function the credential door consults, went on authorising a live key against an implementation
+    nobody had ever exercised. The evidence expired in the tests and stayed valid in production. The
+    dependency is now inverted rather than dropped: `verified_operations()`,
+    `unverified_operations()`, `required_test_mode_prefixes()` and `store_credential()` take
+    `current_implementations`, **with no default**, and `cli.run_credentials_set` — the operator's
+    own command — supplies `integrations.money.current_gateway_implementations(provider)`. Every way
+    of getting that argument wrong (empty, partial) makes the door *stricter*, never laxer. The
+    refusal now distinguishes *nobody ran this*, *somebody ran it in TEST mode* and *somebody ran it
+    against code that has since changed*, so an operator is not sent to re-run what they just ran —
+    which, for `refund`, would mean another real charge.
+  - **The fingerprint is of the gateway's whole MODULE, not of the method.** It hashed
+    `inspect.getsource(method)`, and `StripeGateway.refund` is four lines that delegate: the request
+    is built by `self._client` out of `_STRIPE_API_BASE` (the URL the run supposedly spoke to) and
+    `_HTTP_TIMEOUT`. Repointing the base URL left the method's text — and therefore the fingerprint
+    — byte-identical, so the verification stayed valid for code that now talks somewhere else.
+    Mercado Pago's gateway delegates the same way. The precise alternative (walk the AST for the
+    method's transitive closure) was rejected because an incomplete analysis fails as a false "still
+    verified", which is the expensive direction; a hash of the file cannot be incomplete about the
+    file. The cost is that an edit to either half of a gateway module invalidates both of its
+    operations. What the hash still does not cover — other modules, `httpx`, an injected transport,
+    the runtime environment — is written down in the function itself.
+- **The evidence is re-checked when a credential is USED, not only when it is stored.** The door
+  answers once, on the day the key is typed; a gateway edited afterwards kept moving real money on a
+  verification that no longer described it, and nothing re-asked. Every charge and every refund now
+  re-asks against the fingerprints of the code in that process — and the answer is **asymmetric by
+  the money's direction**, decided by an exhaustive `blocks_on_stale_evidence` so a third operation
+  cannot inherit a policy by omission:
+  - **taking** payment through unexercised code is **refused** (the public 402, alerted). That
+    failure is the silent one — every status code says success — and the refusal costs new bookings,
+    is visible at once, and clears at zero cost by re-running the free checkout harness;
+  - **returning** payment is **never refused**, only alarmed. Blocking a refund does not prevent the
+    harm it guards against; it *is* that harm — "the guest's money does not come back" — produced
+    with certainty on a card already charged. An unexercised refund fails loudly (gateway raises,
+    outbox retries, intent dead-letters with an alert) rather than silently.
+  - Only **live** credentials are gated, so test-mode self-hosters and the whole suite are
+    untouched. Every way of getting the injected fingerprints wrong is restrictive on the charging
+    side and noisy on the refund side, never silent. An AST guard fails if any gateway call site
+    stops consulting the gate.
+- **A terminally failed refund is no longer permanently unretryable.** `refund_dedupe_key` served
+  as both the outbox row's identity and the key sent to the provider — and a provider replays the
+  answer it gave for a repeated idempotency key. So once a refund ended `failed`/`canceled` (the
+  money did not move and never will), every retry got that same dead refund back: the guest was
+  never paid back, and the retry reported success. `PaymentGateway.refund` now returns a
+  `RefundOutcome` (the provider's own verdict, instead of "the HTTP call worked"), and
+  `refund_idempotency_key` carries a **generation** named by the failure it follows.
+  - **The generation is a function of OBSERVED STATE, never of the attempt.** A key derived from a
+    counter, the clock or randomness would satisfy "retryable" while issuing a *second* refund on
+    every ordinary crash-retry — trading a bug that never returns the money for one that returns it
+    twice. While the state is unchanged the key is unchanged, so a retry replays.
+  - **One new generation per drain, not a chain**, and a second terminal failure raises instead of
+    marking the payment refunded: the outbox retries (creating nothing new — the keys are stable)
+    and its ceiling dead-letters it with an alert for a human. A card that rejects refunds needs a
+    person, not a hundred attempts.
+  - An unrecognised provider status reads as **not** terminally failed, in both adapters: the
+    consequence of calling it a failure is another refund, so the safe direction is silence.
+- **A refund still in flight is no longer recorded as money returned.** The fix above left
+  `RefundOutcome` **binary** — terminally failed, or not — and the "not" absorbed two facts that are
+  not the same: *the money went back* and *it has not gone back yet*. So a `pending`,
+  `requires_action` or unrecognised status marked the payment `REFUNDED` while the money was still
+  sitting there. ==It is the same defect one layer up, wearing the other half of the partition==: a
+  failure recorded as a success, then a pending recorded as a success. The handling was not wrong;
+  the partition was.
+  - `RefundStatus` models **three** states (`succeeded`, `pending`, `failed`) and the runner
+    dispatches on them with `assert_never`, so a fourth cannot arrive quietly — the same lock the
+    money's *direction* already had.
+  - `PaymentStatus.REFUNDED` is set **only** on a terminal success. A pending raises
+    `RefundNotSettledError` so the outbox retries with backoff — and that retry is a real route to
+    terminal, not a busy-wait: `charge.refunded` lands independently and marks the payment refunded,
+    so the next attempt short-circuits on the status re-check and completes; a refund that never
+    settles exhausts the attempts and dead-letters with an alert. Both directions end somewhere.
+  - An **unknown** provider status reads as `pending` in both adapters, because that is the only
+    reading that claims nothing: calling it a failure issues a second refund, calling it a success
+    records money that has not moved.
+  - The live harness had the same binary read in its **evidence** path (`not terminally_failed`) and
+    would have certified a pending refund into `live_verifications()`; it now requires
+    `RefundStatus.SUCCEEDED`.
+- **A pending refund converges by ASKING, not only by waiting for a webhook.** `charge.refunded`
+  was the single route to convergence on the success side, so one lost delivery, one signature that
+  failed to verify, or a settlement slower than six attempts of backoff would dead-letter a refund
+  that had **succeeded** — no money lost, but a human summoned to something that was fine, and
+  invited to refund it again. `PaymentGateway.refund_status` reads one refund back (a GET: it moves
+  no money) and the runner consults it whenever an answer is pending, so the outbox's retry is a
+  real poll. The webhook stays the fast path; this is the net under it.
+  - The gateway protocol now holds **two kinds** of call, and the anti-omission lock knows it: money
+    operations (`GatewayOperation`, each of which must be verified against the real provider before
+    a live credential may be stored) and declared **reads** (`read_only_gateway_methods`). The suite
+    asserts the protocol's coroutines are exactly those two sets, disjoint — so a new gateway method
+    is unclassified until somebody says which it is, and a read carries no verification burden
+    because its worst failure is a refund that settles late.
+- **The live harness's order guards are parsed, not grepped.** They pinned the money path's
+  invariants — nothing that can abort outside the `try` that refunds, no creation outside its
+  recovery, provenance before the refund — with `in source` / `source.index(...)`, a substring
+  search over the whole file. ==A mention in a comment or a string literal satisfied them exactly as
+  well as a call==, so a guard could stay green over an invariant that had been deleted. They now
+  locate real `ast.Call` nodes inside the specific function and compare their positions; the alarm
+  guard requires its text inside an executable `pytest.fail`, not merely somewhere in the file.
+- **The live harness's run id is validated by shape.** It becomes part of a filename, so a separator
+  or `..` would write a run's state (its nonce) outside the directory the harness owns. It is
+  checked against an allowlist (`[A-Za-z0-9_-]+`) *and* the resolved path is required to stay inside
+  the state directory. We generate the run id today — the check is on the **form** because the
+  origin is what changes.
+- **A terminal refund failure can no longer be nameless.** The new generation is derived from the
+  failed refund's id, so a terminal failure without one leaves nothing to derive it from — and the
+  code would have claimed a second attempt it never made. `RefundOutcome.failed()` takes a
+  **non-optional** id (with the dataclass refusing the state even when built field by field), and an
+  adapter that receives a nameless terminal failure raises `MalformedRefundResponseError` naming the
+  payment reference, rather than issuing a refund blind.
+- **The live harness's provenance mark is authenticated, not published.**
+  `require_phase_a_provenance` demanded a fixed, public `success_url` prefix — every character of it
+  in this repository — so any session in the account could carry it and pass the one barrier between
+  the harness's $1 and the real customer invoices beside it. The mark is now an **HMAC** over the
+  purpose, the run id and a per-run nonce, keyed by `AETHERCAL_LIVE_STRIPE_PROVENANCE_SECRET`
+  (environment only), applied at creation through the return URL and compared with
+  `hmac.compare_digest`.
+  - **Two questions, both required**: the HMAC answers *did I create this?*; the session id phase A
+    persisted (outside the repo, `~/.aethercal` by default) answers *is it THE one?* A mark travels
+    in a URL a guest can read, so a copy of it on another session fails the id check.
+  - **Without the signing key the money harness refuses to run** — a hard failure, never a skip and
+    never an unauthenticated fallback.
+- **A failed creation of a payable session is resolved rather than assumed away.** The live harness
+  guarded everything *after* the session existed and nothing around the call that creates it: if
+  Stripe processed the request and the response never landed, a live $1 invitation stood in a real
+  account with no id to name it, invisible to every cleanup path. The shared creation seam now
+  replays the identical request on the **same idempotency key** — Stripe returns the session it
+  already made, which is expired — and if the replay fails too, the run shouts the idempotency key
+  with manual-search instructions. Both harnesses create through that seam, and an AST guard pins
+  the creation inside its recovery.
+- **A prefix on its own is no longer accepted as a key.** The permanent type check was
+  `value.startswith(prefixes)` while its own refusal promised to catch "a truncated paste" — so
+  `sk_live_`, typed alone, was stored as a payment credential. `credential_key_families()` now
+  returns a `KeyFamily` (prefixes + a floor on what follows + one unbroken token), which refuses the
+  bare prefix, a paste truncated to a stub, and a value carrying a space, a line break or its
+  surrounding quotes. The floor is deliberately far below the shortest key any of these providers
+  issues: refusing a genuine key stops a business charging, while admitting a well-formed impostor
+  costs a `401` and moves no money.
+  - **And the refusal no longer claims what it cannot check.** It used to say it caught "a key from
+    another account"; nothing local can. The message now states that limit — only an authenticated
+    call to the provider decides whether a well-formed key is genuine, current or yours, and this
+    door deliberately makes none.
+- **The live harness's connectivity control is a fixture, so it cannot be selected around.** It was
+  a test standing beside the runs it vouched for — and a sibling is not a precondition: running the
+  evidence-producing test by name (`pytest <file>::<test>`) left the control uncollected, so a record
+  could reach `live_verifications()` with nothing having shown the process reaches Stripe at all.
+  `stripe_reachable` now demands Stripe's own `401` for a key Stripe never issued, before the body of
+  any provider-touching test, and the refund harness — which had no control whatsoever — gets one in
+  both phases. An offline AST guard fails if any live test omits it.
+  - **Both gates now identify a "live" module by PARSING it, not by grepping for the marker.** The
+    substring test counted any file *containing* `pytestmark = pytest.mark.live_provider` — including
+    a guard that named the marker in order to search for it, which then classified itself as a
+    provider harness and broke the neighbouring gate. Shared in `tests/live_harness_modules.py`, so
+    the two gates cannot answer it differently.
+- **The live refund harness guarantees the refund from the moment it can aim one.** Phase B's
+  `try`/`finally` used to start *after* the currency, `paid`, amount and PaymentIntent-shape
+  assertions; any of those can fail on a session a human has genuinely paid, and then the run ended
+  with a real dollar on a real card and no `finally` left to send it back. The PaymentIntent is now
+  resolved defensively immediately after the provenance check (which still runs first — a stranger's
+  payment must never become a target), and every remaining validation moved inside the guarantee. If
+  the PaymentIntent cannot be resolved on a `paid` session, the run raises a loud alarm naming the
+  **session id** for a manual refund. Pinned structurally by an AST guard in
+  `tests/live/test_live_harness_guardrails.py`: no assertion may sit outside that `try`.
+- The live suite is the one exception to the repo-wide network guard, and the exception is an
+  **allowlist**: `api.stripe.com:443` and nothing else, with SMTP and the Google API still shut. A
+  marked test reaching anywhere else is refused exactly as an ordinary test would be.
+- **Granularity is per operation because the two cost different things to prove.** Checkout is free
+  to verify; refund is not (it needs a real charge to refund). Verifying checkout alone therefore
+  does **not** open the door — a stored credential is the row `refund` will read weeks later, for a
+  guest who has already paid.
 
 **Per-business branding** — a business's booking page is now *theirs*, not the product's.
 

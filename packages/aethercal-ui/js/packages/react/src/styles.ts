@@ -177,7 +177,22 @@ ${defaultBaseTokenCss()}
    recognizer — the same touch-action split every swipeable-carousel pattern uses. The transient
    'is-swiping-*' nudge is a MICRO cue (transform + opacity only, ~120ms) confirming the gesture was
    caught; it never implies the new period's content, which the host still has to fetch and re-render
-   the calendar with. */
+   the calendar with.
+
+   ASSUMPTION this decision rests on (H2, hardening pass): none of the five views scroll
+   HORIZONTALLY inside this wrapper today (verified against the shipped month/week/day/agenda/
+   timeline views — the timeline's resource rows and the time-grid's hour columns both scroll only
+   vertically). 'pan-y' is exactly right for that: native vertical scroll stays completely untouched,
+   and every horizontal drag is free for the swipe recognizer. If a FUTURE view (or a host's custom
+   content slotted in here) ever needs native horizontal scroll of its own, 'pan-y' will fight it —
+   the browser will try to hand that gesture to the recognizer too, and NOT because of anything the
+   descendant declares: 'touch-action' is the INTERSECTION of an element's own value and every
+   ancestor's, so a child cannot relax a restriction this wrapper already set (Crisol caught an
+   earlier draft of this comment claiming a plain descendant override would work — it will not).
+   Supporting that case for real needs a CODE change here, not a CSS override further down: a mode
+   that switches THIS selector's own touch-action to 'auto' for the affected instance, and teaches
+   useSwipeNavigation to ignore drags starting on that region. Whoever adds horizontal scroll inside
+   '.aethercal-swipe-viewport' owns that change — don't assume the current 'pan-y' still holds. */
 .aethercal-swipe-viewport {
   touch-action: pan-y;
 }
@@ -221,9 +236,15 @@ ${defaultBaseTokenCss()}
     min-width: 44px;
   }
   .aethercal-more {
+    /* U-02.2 set min-height here but not min-width — a launch audit measured the rendered chip at
+       ~37px wide (its "+N" text is short), under the 44px minimum on ITS narrow axis even though
+       the tall axis already passed. min-width closes that gap the same way .aethercal-nav-arrow
+       already does above. */
     min-height: 44px;
+    min-width: 44px;
     display: flex;
     align-items: center;
+    justify-content: center;
     padding: 4px 10px;
   }
 }

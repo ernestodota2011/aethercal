@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aethercal.schemas.webhooks import WebhookCreate
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant, User
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.services.calendars import (
     GoogleCredential,
     load_credentials,
@@ -71,6 +72,7 @@ async def test_a_tenant_credential_written_under_the_old_key_is_read_under_both(
         provider=CredentialProvider.STRIPE,
         secrets=STRIPE,
         fernet_key=OLD,
+        current_implementations=current_gateway_implementations(CredentialProvider.STRIPE),
     )
     await sqlite_session.flush()
 

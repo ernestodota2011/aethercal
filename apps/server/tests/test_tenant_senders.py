@@ -30,6 +30,7 @@ from aethercal.server.channels import Channel
 from aethercal.server.crypto import derive_fernet_key
 from aethercal.server.db.models import Tenant
 from aethercal.server.integrations.messaging.status import is_definitely_undelivered
+from aethercal.server.integrations.money import current_gateway_implementations
 from aethercal.server.integrations.smtp.config import SmtpConfig
 from aethercal.server.integrations.smtp.sender import SmtpEmailSender
 from aethercal.server.integrations.whatsapp.sender import EvolutionWhatsAppSender
@@ -285,6 +286,7 @@ class TestABusinessSendsOnItsOwnPhoneAccountOrOnNoneAtAll:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -313,6 +315,7 @@ class TestABusinessSendsOnItsOwnPhoneAccountOrOnNoneAtAll:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -381,6 +384,7 @@ class TestEmailKeepsTheRelayItAlwaysHad:
             provider=CredentialProvider.SMTP,
             secrets=_TENANT_SMTP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -424,6 +428,7 @@ class TestACredentialWithNoCeilingIsNotACeilingAtAll:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
         capless = InstanceSenderDefaults.from_env(
             {
@@ -463,6 +468,7 @@ class TestACredentialWithNoCeilingIsNotACeilingAtAll:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -548,6 +554,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             provider=provider,
             secrets=_secrets_pointing_at(provider, target),
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(provider),
         )
 
         async with httpx.AsyncClient() as client:
@@ -577,6 +584,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             provider=provider,
             secrets=_secrets_pointing_at(provider, "https://evil.example/"),
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(provider),
         )
 
         async def _resolves_inward(host: str) -> list[str]:
@@ -612,6 +620,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             provider=provider,
             secrets=_secrets_pointing_at(provider, "https://mixed.example/"),
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(provider),
         )
 
         async def _mixed(host: str) -> list[str]:
@@ -648,6 +657,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             provider=provider,
             secrets=_secrets_pointing_at(provider, "http://evolution.public.example/"),
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(provider),
         )
 
         async def _public(host: str) -> list[str]:
@@ -680,6 +690,7 @@ class TestATenantsBaseUrlCannotReachTheInternalNetwork:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async def _public(host: str) -> list[str]:
@@ -750,6 +761,7 @@ class TestATenantsSmtpRelayCannotBeInternalEither:
             provider=CredentialProvider.SMTP,
             secrets={"host": host, "from_addr": "a@x.example", "port": "25"},
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -771,6 +783,7 @@ class TestATenantsSmtpRelayCannotBeInternalEither:
             provider=CredentialProvider.SMTP,
             secrets={"host": "relay.evil.example", "from_addr": "a@x.example"},
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
 
         async def _inward(host: str) -> list[str]:
@@ -794,6 +807,7 @@ class TestATenantsSmtpRelayCannotBeInternalEither:
             provider=CredentialProvider.SMTP,
             secrets=_TENANT_SMTP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -840,6 +854,7 @@ class TestTheWitnessPairsTheUrlWithTheClientThatMayDialIt:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
         operator, tenant = httpx.AsyncClient(), httpx.AsyncClient()
         try:
@@ -1109,6 +1124,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.WHATSAPP,
             secrets={"base_url": "https://169.254.169.254/", "instance": "i", "api_key": "k"},
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -1135,6 +1151,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.SMTP,
             secrets={"host": "127.0.0.1", "from_addr": "a@b.example"},
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
         await store_credential(
             sqlite_session,
@@ -1142,6 +1159,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async with httpx.AsyncClient() as client:
@@ -1171,6 +1189,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async def _dns_is_down(host: str) -> list[str]:
@@ -1210,6 +1229,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async def _explodes_oddly(host: str) -> list[str]:
@@ -1256,6 +1276,7 @@ class TestOneBrokenChannelDoesNotSilenceTheOthers:
             provider=CredentialProvider.WHATSAPP,
             secrets=_TENANT_WHATSAPP,
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.WHATSAPP),
         )
 
         async def _cancelled(host: str) -> list[str]:
@@ -1635,6 +1656,7 @@ class TestAStoredCredentialWhoseValueCannotBeUsed:
             provider=CredentialProvider.SMTP,
             secrets={"host": "smtp.x.example", "from_addr": "a@x.example", "port": "abc"},
             fernet_key=KEY,
+            current_implementations=current_gateway_implementations(CredentialProvider.SMTP),
         )
 
         async with httpx.AsyncClient() as client:

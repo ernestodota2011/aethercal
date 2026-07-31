@@ -51,6 +51,25 @@ from aethercal.server.services.schedules import to_core_overrides, to_core_sched
 # refresher (F1-07) keeps the cache warm.
 _BUSY_CACHE_TTL = timedelta(minutes=15)
 
+# The absolute band, relative to today, a slots query may ask about. Availability is inherently a
+# near-future question, so a query about year 1 or year 9999 is meaningless — and rejecting it up
+# front keeps every downstream date computation (the ±1-day busy padding and the wall-time->instant
+# timezone conversion) clear of date.min/date.max, where it would otherwise overflow. Generous
+# enough for any real booking horizon, and nowhere near the representable extremes.
+#
+# ==They live HERE, beside :func:`busy_window`, and not in the endpoint that rejects out-of-band
+# input.== They describe the same thing from both directions: which dates a caller may ASK about,
+# and therefore which dates the busy cache must be COMPLETE for. ``api.slots`` re-exports them for
+# its 422, and ``scheduler.busy_refresh_window`` reads them to size the refresh — one definition,
+# two readers, no way for the two ends to drift.
+#
+# ``MAX_PAST_DAYS`` is not a theoretical allowance: the booking page anchors its window to today in
+# the VISITOR's zone (``booking.app._window_of``), so a guest anywhere west of UTC — every one of
+# them in the Americas, for part of each day — legitimately asks about a date that is already
+# yesterday in UTC.
+MAX_PAST_DAYS = 1
+MAX_FUTURE_DAYS = 366 * 5
+
 
 @dataclass(frozen=True, slots=True)
 class SlotsResult:
@@ -82,7 +101,7 @@ def _shift_clamped(day: date, days: int) -> date:
     return date.fromordinal(min(date.max.toordinal(), max(date.min.toordinal(), ordinal)))
 
 
-def _busy_window(window_from: date, window_to: date) -> TimeInterval:
+def busy_window(window_from: date, window_to: date) -> TimeInterval:
     """A UTC instant window that safely covers every localized availability in ``[from, to]``.
 
     Availability ranges are wall-time in the schedule's zone, so a day's open window can shift by up
@@ -91,6 +110,14 @@ def _busy_window(window_from: date, window_to: date) -> TimeInterval:
     bounds by a day on each side guarantees the busy sets (internal bookings + the external
     ``read_busy`` coverage) span every candidate slot, so no conflict can slip through the gap. The
     pad is clamped to the representable date range so an extreme window bound never overflows.
+
+    ==PUBLIC because it is the ONE definition of the busy window's referential.== The background
+    refresh (``scheduler.busy_refresh_window``) stamps its coverage with this same function, so the
+    window a query ASKS about and the window the cache CLAIMS are drawn on the same grid — UTC
+    midnights, same padding. They used to be drawn differently (this one from midnights, the refresh
+    from the wall-clock instant of its tick), and ``read_busy``'s containment check — reading a
+    stamp that is never ``<=`` the midnight preceding it — correctly reported "not covered" for
+    every near date, degrading a perfectly healthy calendar to ``UNAVAILABLE``.
     """
     start = datetime.combine(_shift_clamped(window_from, -1), time.min, tzinfo=UTC)
     end = datetime.combine(_shift_clamped(window_to, 2), time.min, tzinfo=UTC)
@@ -223,7 +250,7 @@ async def _days_at_cap(  # noqa: PLR0913 — the window + the zone + the exclusi
 
     # The same padded UTC window the busy sets use: it provably covers every local day in
     # [window_from, window_to] for any zone, so no booking on a capped day can be missed.
-    window = _busy_window(window_from, window_to)
+    window = busy_window(window_from, window_to)
     rows = (
         await session.execute(
             select(Booking.id, Booking.start_at).where(
@@ -340,7 +367,7 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
             to_core_schedule(schedule), to_core_overrides(overrides), window_from, window_to
         )
 
-    window = _busy_window(window_from, window_to)
+    window = busy_window(window_from, window_to)
 
     external = await read_busy(
         session,
@@ -380,4 +407,11 @@ async def compute_slots(  # noqa: PLR0913 — full window + injected clock/busy-
     return SlotsResult(slots=slots, availability=availability)
 
 
-__all__ = ["SlotsResult", "compute_slots", "day_is_at_cap"]
+__all__ = [
+    "MAX_FUTURE_DAYS",
+    "MAX_PAST_DAYS",
+    "SlotsResult",
+    "busy_window",
+    "compute_slots",
+    "day_is_at_cap",
+]
