@@ -971,9 +971,19 @@ class _BookingApp:
         brand = getattr(request.state, "brand", None)
         fallo = getattr(request.state, "ultimo_fallo", None)
         estado = _http_status_for(fallo)
+        # ==Que la marca no se pueda CARGAR no convierte la pagina en nuestra.== Cuando la ruta
+        # nombra un negocio y su marca no llego (tipicamente porque el mismo fallo que trajo al
+        # comprador aqui tumbo tambien la llamada de branding), lo honesto es una identidad
+        # NEUTRA: ni inventamos la suya ni ponemos la nuestra delante de su comprador. El nombre
+        # del producto solo es correcto donde de verdad no hay negocio que nombrar.
+        de_un_negocio = self._route_tenant(request) is not None or self._settings.tenant_slug
+        titulo = views.site_name(locale, brand)
+        if brand is None and de_un_negocio:
+            titulo = t(locale, "error_generic_title")
         body = views.message_page(
             locale,
-            title=views.site_name(locale, brand),
+            title=titulo,
+            credit=not de_un_negocio,
             message=(
                 t(locale, "error_rate_limited") if estado == 429 else t(locale, "error_generic")
             ),

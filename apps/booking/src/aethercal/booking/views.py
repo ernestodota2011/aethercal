@@ -570,6 +570,7 @@ def page(
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
     brand: TenantBrandingRead | None = None,
+    credit: bool = True,
 ) -> Any:
     """The full HTML document shell: head, accessible chrome, and ``content`` inside ``<main>``.
 
@@ -607,7 +608,14 @@ def page(
     if embed:
         body_children.append(_embed_resize_script())
     else:
-        body_children.append(_footer(locale, brand))
+        # ==`credit=False` es "esta pagina NO es del producto, aunque no sepamos de quien es".==
+        # Sin ese tercer estado, `brand=None` significaba a la vez "auto-hospedado sin marca"
+        # (donde acreditar al producto es correcto) y "no pude cargar la marca del negocio"
+        # (donde acreditarlo le ensena al comprador un producto que no conoce). La ruta de fallo
+        # caia siempre en el segundo caso y se comportaba como el primero: fallaba ABIERTO hacia
+        # la identidad de la plataforma. GA3 2a vuelta, 2026-07-31.
+        if credit:
+            body_children.append(_footer(locale, brand))
     return Html(
         Head(
             Meta(charset="utf-8"),
@@ -1374,6 +1382,7 @@ def message_page(
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
     brand: TenantBrandingRead | None = None,
+    credit: bool = True,
 ) -> Any:
     """A minimal, friendly single-message page (errors, not-found, done states) — never leaks.
     ``embed`` (B1) renders the compact, chrome-less shell so a backend hiccup or a 404 inside an
@@ -1389,6 +1398,7 @@ def message_page(
         base_url=base_url,
         embed=embed,
         brand=brand,
+        credit=credit,
     )
 
 

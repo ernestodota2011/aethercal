@@ -100,6 +100,9 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "error_link_invalid": "Este enlace expiró o no es válido. Solicita uno nuevo.",
         "error_not_active": "Esta cita ya no se puede modificar.",
         "error_generic": "Algo salió mal. Vuelve a intentarlo en unos minutos.",
+        #: Titulo de la pagina de fallo cuando la pagina ES de un negocio pero su marca no se
+        #: pudo cargar. Ni su nombre (no lo sabemos) ni el nuestro (no es nuestra pagina).
+        "error_generic_title": "No disponible",
         "error_rate_limited": "Demasiadas solicitudes. Espera un momento e inténtalo de nuevo.",
         "honeypot_received_message": (
             "Gracias. Hemos recibido tu solicitud y te contactaremos pronto."
@@ -189,6 +192,7 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "error_link_invalid": "This link has expired or is invalid. Please request a new one.",
         "error_not_active": "This booking can no longer be changed.",
         "error_generic": "Something went wrong. Please try again in a few minutes.",
+        "error_generic_title": "Unavailable",
         "error_rate_limited": "Too many requests. Please wait a moment and try again.",
         "honeypot_received_message": (
             "Thank you. We've received your request and will be in touch soon."
