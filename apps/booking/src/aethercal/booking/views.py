@@ -598,7 +598,10 @@ def page(
     size the iframe to the guest's content. The skip-link is also omitted — with no header there
     is nothing before ``<main>`` to skip past.
     """
-    full_title = f"{title} · {site_name(locale, brand)}"
+    # El sufijo es la firma de la pagina, asi que sigue la MISMA regla que el pie: si esta pagina
+    # no es del producto, su titulo tampoco lo anuncia. Sin esto el arreglo quedaba a medias y el
+    # comprador leia "No disponible · AetherCal" en la pestana (medido en vivo, GA3 2a vuelta).
+    full_title = f"{title} · {site_name(locale, brand)}" if credit else title
     current_url = f"{base_url}{lang_urls.get(locale, '')}"
     body_children: list[Any] = []
     if not embed:

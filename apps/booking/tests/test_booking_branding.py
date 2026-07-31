@@ -468,3 +468,6 @@ def test_CONTROL_sin_marca_el_error_SI_puede_llevar_el_nombre_del_producto() -> 
     # convierte la pagina en nuestra: el comprador vino a la de un negocio.
     assert "Con la tecnología de AetherCal" not in response.text
     assert "No disponible" in response.text, "el titulo deberia ser neutro, no el del producto"
+    assert "<title>No disponible</title>" in response.text, (
+        "la pestana sigue anunciando el producto: el sufijo del titulo es su firma"
+    )
