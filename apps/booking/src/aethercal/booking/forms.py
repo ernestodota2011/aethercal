@@ -71,6 +71,13 @@ class QuestionSpec:
     kind: str
     required: bool
     options: tuple[str, ...]
+    #: Sparse per-locale overrides for ``label``, exactly like an event type's
+    #: ``title_translations``. ==Without this the question label was the ONE guest-facing string
+    #: with no way to translate it==: the English page showed a translated title, translated
+    #: chrome, and then asked for the phone number in Spanish. Measured on the DeskUp booking
+    #: page (GA3/M3, 2026-07-31). Empty (the default) keeps the canonical label everywhere,
+    #: which is what every existing configuration already means.
+    label_translations: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +147,17 @@ def _coerce_question(raw: Any, index: int) -> QuestionSpec | None:
     if not label:
         label = key
 
+    traducciones_crudas = raw.get("label_translations")
+    label_translations = (
+        {
+            str(idioma).strip().lower(): str(texto).strip()
+            for idioma, texto in traducciones_crudas.items()
+            if isinstance(idioma, str) and isinstance(texto, str) and texto.strip()
+        }
+        if isinstance(traducciones_crudas, Mapping)
+        else {}
+    )
+
     kind_raw = str(raw.get("type", "text")).strip().lower()
     kind = kind_raw if kind_raw in _KNOWN_KINDS else "text"
     required = bool(raw.get("required", False))
@@ -154,7 +172,14 @@ def _coerce_question(raw: Any, index: int) -> QuestionSpec | None:
     # "select" that would accept any crafted value.
     if kind == "select" and not options:
         kind = "text"
-    return QuestionSpec(key=key, label=label, kind=kind, required=required, options=options)
+    return QuestionSpec(
+        key=key,
+        label=label,
+        kind=kind,
+        required=required,
+        options=options,
+        label_translations=label_translations,
+    )
 
 
 def parse_questions(raw_questions: Sequence[Any]) -> list[QuestionSpec]:

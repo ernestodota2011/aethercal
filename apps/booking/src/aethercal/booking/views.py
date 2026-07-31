@@ -75,7 +75,11 @@ from aethercal.booking.i18n import DEFAULT_LOCALE, SUPPORTED_LOCALES, Locale, t
 from aethercal.booking.settings import DEFAULT_BASE_URL
 from aethercal.booking.timefmt import DayGroup, slot_aria_label
 from aethercal.schemas.branding import TenantBrandingRead
-from aethercal.schemas.event_types import resolve_description, resolve_title
+from aethercal.schemas.event_types import (
+    resolve_description,
+    resolve_title,
+    resolve_translation,
+)
 from aethercal.schemas.public import PublicBookingRead, PublicEventTypeRead
 from aethercal.schemas.slots import Availability
 
@@ -871,6 +875,22 @@ def _errors_by_field(errors: Sequence[FieldError]) -> dict[str, str]:
     return mapping
 
 
+#: What each question kind means to a BROWSER. ``_KNOWN_KINDS`` has accepted tel/email/url/number
+#: since questions existed, and ``forms.py`` validates all four server-side — but this mapping did
+#: not exist, so every one of them rendered as ``type="text"``: no native validation, and on a
+#: phone the LETTER keyboard for a number. The guest most affected is the one on a phone, which on
+#: a booking page is nearly all of them (GA3/M4, 2026-07-31).
+#:
+#: Only kinds with a real HTML equivalent appear. ``text``/``textarea``/``select`` are absent on
+#: purpose: the first is the fallback, the other two are not ``<input>`` at all.
+_AFORO_POR_TIPO: dict[str, dict[str, str]] = {
+    "email": {"type": "email", "inputmode": "email", "autocomplete": "email"},
+    "tel": {"type": "tel", "inputmode": "tel", "autocomplete": "tel"},
+    "url": {"type": "url", "inputmode": "url"},
+    "number": {"type": "number", "inputmode": "decimal"},
+}
+
+
 def _field_control(
     *,
     field_name: str,
@@ -897,7 +917,15 @@ def _field_control(
         if not required:
             opts.insert(0, Option("", value=""))
         return Select(*opts, **common)
-    return Input(type=input_type, value=value, **common)
+    # An explicit `input_type` from the caller (the name/e-mail fields pass one) still wins: those
+    # are not questions and carry no `kind`. For a question, the kind IS the type.
+    aforo = _AFORO_POR_TIPO.get(kind, {})
+    tipo = aforo.get("type", input_type)
+    if "inputmode" in aforo:
+        common["inputmode"] = aforo["inputmode"]
+    if "autocomplete" in aforo:
+        common.setdefault("autocomplete", aforo["autocomplete"])
+    return Input(type=tipo, value=value, **common)
 
 
 def _labelled_field(
@@ -1072,7 +1100,9 @@ def booking_form_page(
             _labelled_field(
                 locale,
                 field_name=name,
-                label=spec.label,
+                # The same resolution an event type's title already gets. Skipping it here left
+                # the English page asking for a phone number in Spanish (GA3/M3, 2026-07-31).
+                label=resolve_translation(spec.label, spec.label_translations, locale),
                 kind=spec.kind,
                 value=values.get(name, ""),
                 required=spec.required,

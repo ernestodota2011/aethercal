@@ -853,3 +853,113 @@ def test_the_consent_box_asks_the_booker_to_claim_the_number_as_their_own() -> N
     english = _form_html("en", event=_event(collects_phone=True))
     assert "Este número es mío" in spanish
     assert "This is my own number" in english
+
+
+# --- El tipo de pregunta llegaba al servidor y no al navegador (GA3/M4, 2026-07-31) --------
+#
+# `_KNOWN_KINDS` admite tel/email/url/number y `forms.py` los VALIDA en el servidor. Pero
+# `_field_control` solo traducia `textarea` y `select`: todo lo demas caia a `type="text"`.
+# Efecto medido en la reserva de DeskUp: la pregunta declarada `type: tel` se servia como
+# texto, sin `inputmode` ni `autocomplete`. En un movil —que es de donde llega el comprador
+# de un carro usado— eso significa teclado de LETRAS para escribir un telefono.
+#
+# El patron correcto ya vivia en este mismo archivo: `_phone_fields` pone type/autocomplete/
+# inputmode al telefono nativo. Estaba en un campo y no en los otros.
+
+
+def test_una_pregunta_de_telefono_se_sirve_como_TELEFONO_no_como_texto() -> None:
+    questions = parse_questions(
+        [{"key": "whatsapp", "label": "Tu WhatsApp", "type": "tel", "required": True}]
+    )
+    html = to_xml(
+        views.booking_form_page(
+            "es",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="martes 14 de julio, 09:00",
+            questions=questions,
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    campo = [t for t in html.split("<input") if 'name="q_whatsapp"' in t]
+    assert campo, f"no se encontro el campo de la pregunta en el HTML: {html[:400]}"
+    marca = campo[0]
+    assert 'type="tel"' in marca, f"se sirvio con teclado de letras: {marca}"
+    assert 'inputmode="tel"' in marca, f"sin inputmode el movil abre el teclado normal: {marca}"
+
+
+def test_CONTROL_una_pregunta_de_TEXTO_sigue_siendo_texto() -> None:
+    """Sin este caso, "mapea el tipo" pasaria igual con un cambio que pusiera `tel` a TODO.
+    El control fija el otro lado: lo que no declara tipo se sirve como texto, como siempre."""
+    questions = parse_questions([{"key": "company", "label": "Empresa", "required": True}])
+    html = to_xml(
+        views.booking_form_page(
+            "es",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="martes 14 de julio, 09:00",
+            questions=questions,
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    campo = [t for t in html.split("<input") if 'name="q_company"' in t][0]
+    assert 'type="text"' in campo, campo
+    assert "inputmode" not in campo, campo
+
+
+def test_la_etiqueta_de_una_pregunta_se_TRADUCE_al_idioma_activo() -> None:
+    """Era el unico texto visible sin traduccion posible: la pagina inglesa mostraba titulo y
+    chrome en ingles, y pedia el telefono en espanol (medido en la reserva de DeskUp)."""
+    questions = parse_questions(
+        [
+            {
+                "key": "whatsapp",
+                "label": "Tu WhatsApp",
+                "label_translations": {"en": "Your WhatsApp"},
+                "type": "tel",
+                "required": True,
+            }
+        ]
+    )
+    en = to_xml(
+        views.booking_form_page(
+            "en",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="Tuesday, July 14 at 9:00 AM",
+            questions=questions,
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "Your WhatsApp" in en
+    assert "Tu WhatsApp" not in en
+
+    # CONTROL: el idioma canonico no cambia, y una traduccion ausente NO deja el campo en blanco.
+    es = to_xml(
+        views.booking_form_page(
+            "es",
+            event=_event(),
+            start_iso="2026-07-14T13:00:00+00:00",
+            tz="America/New_York",
+            when_label="martes 14 de julio, 09:00",
+            questions=questions,
+            values={},
+            errors=[],
+            action="/e/intro/book",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "Tu WhatsApp" in es
+    assert "Your WhatsApp" not in es
