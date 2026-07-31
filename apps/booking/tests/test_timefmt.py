@@ -11,6 +11,7 @@ from aethercal.booking.timefmt import (
     slot_aria_label,
     today_in_zone,
 )
+from aethercal.booking import timefmt
 from aethercal.schemas.slots import SlotRead
 
 
@@ -77,3 +78,28 @@ def test_group_slots_choice_iso_is_absolute_utc() -> None:
     choice = group_slots(slots, "America/New_York", "es")[0].slots[0]
     # The iso the picker submits round-trips to the original UTC instant.
     assert datetime.fromisoformat(choice.iso) == datetime(2026, 7, 14, 13, 0, tzinfo=UTC)
+
+
+# --- La fecha del horario ELEGIDO lleva el ano (GA3/M5, 2026-07-31) ------------------------
+#
+# Los encabezados de la lista de horarios no lo necesitan: la ventana son 7 dias y el ano se
+# deduce solo. La confirmacion es otra cosa. Ese enlace se reenvia por WhatsApp y se abre
+# dias despues, y "martes 14 de julio, 09:00" es una fecha PERFECTAMENTE creible en 2027.
+# El launch-gate lo midio pidiendo un `start` de 2020: la pagina mostraba la fecha sin ano y
+# un boton de confirmar debajo.
+
+
+def test_la_fecha_ELEGIDA_lleva_el_ano_y_el_encabezado_de_la_lista_no() -> None:
+    dia = date(2026, 7, 14)
+
+    elegida_es = timefmt.format_chosen_day(dia, "es")
+    elegida_en = timefmt.format_chosen_day(dia, "en")
+    assert "2026" in elegida_es, elegida_es
+    assert "2026" in elegida_en, elegida_en
+
+    # CONTROL: el encabezado de la lista sigue SIN ano — si el cambio se hubiera aplicado a
+    # `format_day_heading`, cada dia de la lista repetiria un ano que nadie necesita ahi.
+    encabezado = timefmt.format_day_heading(dia, "es")
+    assert "2026" not in encabezado, encabezado
+    # y sigue nombrando el mismo dia, para que "no tiene ano" no pase por estar vacio
+    assert "14" in encabezado and "julio" in encabezado, encabezado

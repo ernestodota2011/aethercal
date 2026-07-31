@@ -105,6 +105,20 @@ def format_day_heading(day: date, locale: Locale) -> str:
     return f"{weekday} {day.day} de {month}"
 
 
+def format_chosen_day(day: date, locale: Locale) -> str:
+    """The day of the slot a guest is about to CONFIRM — ``"martes 14 de julio de 2026"``.
+
+    ==Deliberately not :func:`format_day_heading`, and the difference is the year.== A heading in
+    the slot list sits inside a seven-day window the guest just navigated, so the year is noise
+    there. The confirmation screen is reached by a LINK — one that gets forwarded on WhatsApp and
+    opened days later — and "martes 14 de julio, 09:00" is a perfectly believable date in any
+    year. Showing which one is what lets a guest notice that the time they are looking at is not
+    the time they were offered (GA3/M5, 2026-07-31).
+    """
+    base = format_day_heading(day, locale)
+    return f"{base}, {day.year}" if locale == "en" else f"{base} de {day.year}"
+
+
 def slot_aria_label(time_label: str, day_heading: str) -> str:
     """A screen-reader label combining a slot's ``time_label`` and localized ``day_heading``.
 

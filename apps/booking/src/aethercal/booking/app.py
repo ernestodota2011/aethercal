@@ -58,7 +58,13 @@ from aethercal.booking.errors import friendly_api_error, friendly_unexpected
 from aethercal.booking.forms import BookingRequest, build_booking, parse_questions
 from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
-from aethercal.booking.timefmt import format_day_heading, format_time, group_slots, today_in_zone
+from aethercal.booking.timefmt import (
+    format_chosen_day,
+    format_day_heading,
+    format_time,
+    group_slots,
+    today_in_zone,
+)
 from aethercal.client import AetherCalAPIError, AetherCalClient
 from aethercal.core.tz import require_iana_zone
 from aethercal.schemas.branding import TenantBrandingRead
@@ -663,8 +669,13 @@ def _lang_links_here(request: Request) -> dict[Locale, str]:
 
 
 def _when_label(instant: datetime, tz: str, locale: Locale) -> str:
+    """La fecha y hora que el comprador esta a punto de CONFIRMAR — con el ano.
+
+    `format_chosen_day` y no `format_day_heading`: esta pantalla se alcanza por un enlace que
+    se reenvia y se abre dias despues (GA3/M5).
+    """
     local = instant.astimezone(ZoneInfo(tz))
-    day = format_day_heading(local.date(), locale)
+    day = format_chosen_day(local.date(), locale)
     clock = format_time(instant, tz, locale)
     joiner = " at " if locale == "en" else ", "
     return f"{day}{joiner}{clock}"
