@@ -36,7 +36,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.4",
-    "cryptography>=43",
+    "cryptography>=50.0.0",
     "apscheduler>=3.10",
     "aiosmtplib>=3.0",
     # Builds the .ics calendar invite attached to booking emails (F1-08). Declared directly here
