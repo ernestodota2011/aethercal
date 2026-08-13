@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "python-dateutil>=2.9",
-    "icalendar>=6",
+    "icalendar>=7.2.2",
     "pydantic>=2.7",
     # The IANA zone LISTING is what `core.tz` decides "is this a real timezone" against, so it is
     # required on every platform — not just the one with no system tz tree. The old
