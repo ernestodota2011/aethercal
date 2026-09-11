@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -244,8 +244,11 @@ class FakeAPI:
             if self.rate_limit_event_types:
                 return httpx.Response(
                     429,
-                    json={'error': 'rate_limited', 'message': 'Too many requests; try again shortly'},
-                    headers={'Retry-After': '60'},
+                    json={
+                        "error": "rate_limited",
+                        "message": "Too many requests; try again shortly",
+                    },
+                    headers={"Retry-After": "60"},
                 )
             return self._boom() if self.fail_event_types else self._event_types()
         public_slots = re.fullmatch(r"/api/v1/public/[^/]+/([^/]+)/slots", path)
@@ -414,7 +417,8 @@ def test_event_page_pager_prev_disabled_at_the_floor() -> None:
 
 def test_event_page_pager_prev_enabled_when_a_later_window() -> None:
     client, _ = _make_client()
-    response = client.get("/e/intro?tz=UTC&from=2026-08-01")
+    later = (date.today() + timedelta(days=14)).isoformat()
+    response = client.get(f"/e/intro?tz=UTC&from={later}")
     assert response.status_code == 200
     assert 'aria-disabled="true"' not in response.text
 

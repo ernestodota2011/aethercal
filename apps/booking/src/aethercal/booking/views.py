@@ -114,9 +114,10 @@ _CSS = """
   --text: #ededee; --muted: #a2a2aa; --accent: #e0894b; --accent-ink: #1b1206;
   --focus: #f4b477; --danger: #e08497;
   /* DERIVED from --accent via color-mix, so a tenant's brand override (`_brand_style` sets
-     --accent/--focus/--accent-ink) AND the light/dark switch both cascade into the hover tint + hairline for
-     free — the whole accent family tracks one token. The rgba line is the pre-color-mix fallback
-     (ember); a browser without color-mix keeps the product's own accent, never a broken value. */
+     --accent/--focus/--accent-ink) AND the light/dark switch both cascade into the hover tint
+     + hairline for free — the whole accent family tracks one token. The rgba line is the
+     pre-color-mix fallback (ember); a browser without color-mix keeps the product's own accent,
+     never a broken value. */
   --accent-wash: rgba(224,137,75,0.12);
   --accent-wash: color-mix(in srgb, var(--accent) 12%, transparent);
   --accent-line: rgba(224,137,75,0.55);
@@ -619,15 +620,14 @@ def page(
     body_children.append(Main(*content, id="main"))
     if embed:
         body_children.append(_embed_resize_script())
-    else:
+    elif credit:
         # ==`credit=False` es "esta pagina NO es del producto, aunque no sepamos de quien es".==
         # Sin ese tercer estado, `brand=None` significaba a la vez "auto-hospedado sin marca"
         # (donde acreditar al producto es correcto) y "no pude cargar la marca del negocio"
         # (donde acreditarlo le ensena al comprador un producto que no conoce). La ruta de fallo
         # caia siempre en el segundo caso y se comportaba como el primero: fallaba ABIERTO hacia
         # la identidad de la plataforma. GA3 2a vuelta, 2026-07-31.
-        if credit:
-            body_children.append(_footer(locale, brand))
+        body_children.append(_footer(locale, brand))
     return Html(
         Head(
             Meta(charset="utf-8"),
