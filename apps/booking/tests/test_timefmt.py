@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
+from aethercal.booking import timefmt
 from aethercal.booking.timefmt import (
     format_day_heading,
     format_time,
@@ -11,7 +12,6 @@ from aethercal.booking.timefmt import (
     slot_aria_label,
     today_in_zone,
 )
-from aethercal.booking import timefmt
 from aethercal.schemas.slots import SlotRead
 
 
