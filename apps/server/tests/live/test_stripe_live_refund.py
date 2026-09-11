@@ -166,7 +166,7 @@ def paid_session_id() -> str:
     return value
 
 
-async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
+async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913, PLR0917
     stripe_reachable: int,
     real_charge_allowed: None,
     open_one_dollar_session: Callable[..., Any],
@@ -300,7 +300,7 @@ async def test_phase_a_opens_a_payable_one_dollar_session(  # noqa: PLR0913
             )
 
 
-async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR0913
+async def test_phase_b_refunds_the_real_charge_through_the_gateway(  # noqa: PLR0913, PLR0917
     stripe_reachable: int,
     paid_session_id: str,
     refund_reconnected: None,

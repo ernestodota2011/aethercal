@@ -202,7 +202,7 @@ def require_window_is_sane(window_from: date, window_to: date, *, today: date) -
 
 
 @router.get("/", response_model=SlotsResponse)
-async def list_slots(  # noqa: PLR0913 — FastAPI declares each query param + dependency as a parameter
+async def list_slots(  # noqa: PLR0913, PLR0917 — FastAPI declares each query param + dependency as a parameter
     request: Request,
     session: SessionDep,
     event_type: Annotated[uuid.UUID, Query(description="Event type id to compute slots for")],

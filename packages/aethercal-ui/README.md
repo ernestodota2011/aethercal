@@ -15,21 +15,26 @@ build step. (The `[reflex]` extra pulls in Reflex itself; the bare package stays
 import reflex as rx
 from aethercal.ui import Calendar, CalendarEvent
 
+
 class State(rx.State):
     view: str = "week"
     anchor: str = "2026-07-13"
     events: list[CalendarEvent] = [
-        {"id": "1", "title": "Intro call",
-         "start": "2026-07-13T09:00:00", "end": "2026-07-13T09:30:00"},
+        {
+            "id": "1",
+            "title": "Intro call",
+            "start": "2026-07-13T09:00:00",
+            "end": "2026-07-13T09:30:00",
+        },
     ]
 
     @rx.event
-    def on_drop(self, payload: dict):
-        ...   # persist payload["id"], payload["start"], payload["end"]
+    def on_drop(self, payload: dict): ...  # persist payload["id"], payload["start"], payload["end"]
 
     @rx.event
     def on_range_change(self, payload: dict):
         self.anchor = payload["from"]
+
 
 def index() -> rx.Component:
     return Calendar.create(

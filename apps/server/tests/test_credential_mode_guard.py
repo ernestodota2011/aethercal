@@ -839,7 +839,7 @@ class TestAPrefixIsNotAKey:
             ("the surrounding quotes came too", '"sk_test_NOTAREALKEY0000000000"', "NOTAREALKEY"),
         ],
     )
-    async def test_a_value_that_is_not_a_key_is_refused(  # noqa: PLR0913
+    async def test_a_value_that_is_not_a_key_is_refused(  # noqa: PLR0913, PLR0917
         self,
         sqlite_session: AsyncSession,
         tenant_factory: TenantFactory,

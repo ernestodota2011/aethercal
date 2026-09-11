@@ -275,7 +275,7 @@ async def get_public_branding(tenant_slug: TenantSlug, session: SessionDep) -> T
 
 
 @router.get("/{tenant_slug}/{event_slug}/slots", response_model=PublicSlotsResponse)
-async def list_public_slots(  # noqa: PLR0913 - FastAPI declares each query param as a parameter
+async def list_public_slots(  # noqa: PLR0913, PLR0917 - FastAPI declares each query param as a parameter
     tenant_slug: TenantSlug,
     event_slug: EventSlug,
     session: SessionDep,

@@ -831,7 +831,7 @@ class _BookingApp:
             default=self._settings.default_locale,
         )
 
-    async def _slots_section(  # noqa: PLR0913 - each is a distinct query/render input; `event_path`
+    async def _slots_section(  # noqa: PLR0913, PLR0917 - each is a distinct query/render input; `event_path`
         # is the routing base (B1: "/e/{slug}", "/embed/{slug}", or their /t/{tenant} twins) — not
         # derivable from `event`.
         self,

@@ -29,9 +29,9 @@ from aethercal.core.recurrence import expand
 NY = ZoneInfo("America/New_York")
 
 event = Event(
-    dtstart=dt.datetime(2026, 3, 6, 9, 0),       # naive wall-time
+    dtstart=dt.datetime(2026, 3, 6, 9, 0),  # naive wall-time
     duration=dt.timedelta(minutes=30),
-    timezone="America/New_York",                  # ...the zone is stored separately
+    timezone="America/New_York",  # ...the zone is stored separately
     rrule="FREQ=WEEKLY;COUNT=3",
 )
 window = TimeInterval(

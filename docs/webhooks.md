@@ -180,10 +180,11 @@ reproduce those bytes.
 import hashlib
 import hmac
 
+
 def verify(raw_body: bytes, header: str, secret: bytes) -> bool:
     presented = header.removeprefix("sha256=")
     expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(presented, expected)   # constant-time; never ==
+    return hmac.compare_digest(presented, expected)  # constant-time; never ==
 ```
 
 Reject anything that fails. An unsigned or wrongly signed POST did not come from AetherCal.
@@ -208,8 +209,8 @@ you have already processed, and make a repeat a no-op:
 
 ```python
 key = (payload["data"]["id"], payload["event"])
-if already_processed(key):        # this exact effect has been seen
-    return 200                    # ack again; do nothing
+if already_processed(key):  # this exact effect has been seen
+    return 200  # ack again; do nothing
 process(payload)
 mark_processed(key)
 return 200

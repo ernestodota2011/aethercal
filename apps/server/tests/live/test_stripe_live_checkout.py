@@ -79,7 +79,7 @@ def test_the_control_proves_this_process_really_reaches_stripe(stripe_reachable:
     )
 
 
-async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(  # noqa: PLR0913
+async def test_the_gateway_opens_a_real_checkout_session_and_expires_it(  # noqa: PLR0913, PLR0917
     stripe_reachable: int,
     gateway: StripeGateway,
     open_one_dollar_session: Callable[..., Any],

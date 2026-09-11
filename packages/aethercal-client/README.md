@@ -53,10 +53,10 @@ from aethercal.client import AetherCalAPIError, AetherCalTransportError
 
 try:
     booking = client.create_booking(payload)
-except AetherCalAPIError as exc:      # the API answered — with a non-2xx
+except AetherCalAPIError as exc:  # the API answered — with a non-2xx
     if exc.status_code == 409:
-        ...                           # the slot is gone; re-fetch and let the guest choose again
-except AetherCalTransportError:       # no response at all: DNS, refused, TLS, timeout
+        ...  # the slot is gone; re-fetch and let the guest choose again
+except AetherCalTransportError:  # no response at all: DNS, refused, TLS, timeout
     ...
 ```
 

@@ -14,8 +14,8 @@ pip install aethercal-client
 from aethercal.client import AetherCalClient
 
 with AetherCalClient("http://localhost:8000", api_key="ack_....") as client:
-    print(client.health())      # {'status': 'ok'}
-    print(client.ping())        # True
+    print(client.health())  # {'status': 'ok'}
+    print(client.ping())  # True
 ```
 
 The client is a context manager — use it that way and it closes its connection pool for you. The
@@ -66,7 +66,7 @@ with AetherCalClient("http://localhost:8000", api_key="ack_....") as client:
             guest_timezone="America/New_York",
         )
     )
-    print(booking.id, booking.status)      # ... BookingStatus.CONFIRMED
+    print(booking.id, booking.status)  # ... BookingStatus.CONFIRMED
 ```
 
 A runnable version of exactly this is in [`examples/sdk/`](../examples/sdk/).
@@ -148,12 +148,12 @@ from aethercal.client import AetherCalAPIError, AetherCalError, AetherCalTranspo
 
 try:
     booking = client.create_booking(payload)
-except AetherCalAPIError as exc:          # the API answered — with a non-2xx
+except AetherCalAPIError as exc:  # the API answered — with a non-2xx
     if exc.status_code == 409:
-        print("that slot was taken while we were deciding")   # re-fetch the slots
+        print("that slot was taken while we were deciding")  # re-fetch the slots
     else:
         print(exc.status_code, exc.error, exc.message)
-except AetherCalTransportError:           # no HTTP response at all: DNS, refused, TLS, timeout
+except AetherCalTransportError:  # no HTTP response at all: DNS, refused, TLS, timeout
     print("the server was unreachable")
 ```
 

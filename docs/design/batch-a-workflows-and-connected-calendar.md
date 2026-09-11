@@ -70,13 +70,15 @@ class BookingStatus(StrEnum):
     PENDING = "pending"
     CONFIRMED = "confirmed"
     CANCELLED = "cancelled"
-    NO_SHOW = "no_show"      # NEW
+    NO_SHOW = "no_show"  # NEW
+
 
 # apps/server/src/aethercal/server/channels.py
 class Channel(StrEnum):
     EMAIL = "email"
     WHATSAPP = "whatsapp"
     SMS = "sms"
+
 
 # apps/server/src/aethercal/server/services/workflows.py
 class WorkflowTrigger(StrEnum):
@@ -86,11 +88,12 @@ class WorkflowTrigger(StrEnum):
     ON_CANCEL = "on_cancel"
     ON_NO_SHOW = "on_no_show"
 
+
 # apps/server/src/aethercal/server/services/outbox.py
 class OutboxEffect(StrEnum):
-    EMAIL = "email"     # existing
-    GOOGLE = "google"   # existing
-    NOTIFY = "notify"   # NEW — one workflow step on one channel
+    EMAIL = "email"  # existing
+    GOOGLE = "google"  # existing
+    NOTIFY = "notify"  # NEW — one workflow step on one channel
 ```
 
 **`NO_SHOW` does not free the slot.** The appointment time has passed; releasing it would corrupt history and permit a retroactive booking over it. `Booking.occupies` is `status is not CANCELLED` (`core/model/booking.py:29-31`), so `no_show` occupies automatically and the partial index predicate `WHERE status <> 'cancelled'` is **unchanged**. Prove it against Postgres.
@@ -161,6 +164,7 @@ Declare the **lease TTL** and the **recovery interval** explicitly: a lease long
 @runtime_checkable
 class ChannelSender(Protocol):
     channel: Channel
+
     async def send(self, *, to: str, subject: str | None, body: str) -> None: ...
 ```
 

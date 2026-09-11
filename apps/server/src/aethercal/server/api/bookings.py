@@ -276,7 +276,7 @@ async def create(
 
 
 @router.get("/", response_model=Page[BookingRead])
-async def list_all(  # noqa: PLR0913 - FastAPI declares each query param + dependency as a parameter
+async def list_all(  # noqa: PLR0913, PLR0917 - FastAPI declares each query param + dependency as a parameter
     session: SessionDep,
     ctx: AuthDep,
     status_filter: Annotated[BookingStatus | None, Query(alias="status")] = None,
