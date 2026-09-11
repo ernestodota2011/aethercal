@@ -102,7 +102,7 @@ class FakeAPI:
         self.slots_tz: list[str] = []
         self.last_auth: str | None = None
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911 - the route table
         self.last_auth = request.headers.get("Authorization")
         path, method = request.url.path, request.method
 
@@ -447,7 +447,9 @@ def test_la_pagina_de_ERROR_sigue_firmada_por_el_negocio_y_no_por_el_producto() 
 
     assert response.status_code >= 400
     cuerpo = response.text
-    assert SOL_BRAND["display_name"] in cuerpo, f"la pagina de error no nombra al negocio: {cuerpo[:300]}"
+    assert SOL_BRAND["display_name"] in cuerpo, (
+        f"la pagina de error no nombra al negocio: {cuerpo[:300]}"
+    )
     assert "Con la tecnología de AetherCal" not in cuerpo, "el error anuncia el producto"
     assert 'id="brand"' in cuerpo, "el error perdio el acento del negocio"
 
