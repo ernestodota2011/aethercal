@@ -60,7 +60,6 @@ from aethercal.booking.i18n import SUPPORTED_LOCALES, Locale, select_locale, t
 from aethercal.booking.settings import BookingSettings
 from aethercal.booking.timefmt import (
     format_chosen_day,
-    format_day_heading,
     format_time,
     group_slots,
     today_in_zone,
@@ -852,7 +851,7 @@ class _BookingApp:
                 request,
                 lambda c: c.get_public_slots(
                     tenant, event.slug, window_from=window_from, window_to=window_to, tz=tz
-                )
+                ),
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability
@@ -1301,7 +1300,7 @@ class _BookingApp:
                 request,
                 lambda c: c.create_public_booking(
                     tenant, slug, booking_create, forwarded_for=guest_ip
-                )
+                ),
             )
         except Exception as exc:
             if isinstance(exc, AetherCalAPIError) and exc.status_code == HTTP_409_CONFLICT:
@@ -1466,7 +1465,7 @@ class _BookingApp:
                 # booking.
                 lambda c: c.get_slots(
                     event_id, window_from=window_from, window_to=window_to, tz=tz, token=token
-                )
+                ),
             )
             groups = group_slots(result.slots, tz, locale)
             availability = result.availability

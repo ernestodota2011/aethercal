@@ -7,6 +7,7 @@ states (RF-13), inline form errors, and that internals are never surfaced (RF-16
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -912,7 +913,7 @@ def test_CONTROL_una_pregunta_de_TEXTO_sigue_siendo_texto() -> None:
             lang_urls=LANG_URLS,
         )
     )
-    campo = [t for t in html.split("<input") if 'name="q_company"' in t][0]
+    campo = next(t for t in html.split("<input") if 'name="q_company"' in t)
     assert 'type="text"' in campo, campo
     assert "inputmode" not in campo, campo
 
@@ -992,8 +993,6 @@ def _razon(a: str, b: str) -> float:
 
 
 def _tinta_declarada(css: str) -> str:
-    import re
-
     m = re.findall(r"--accent-ink:\s*(#[0-9a-fA-F]{6})", css)
     assert m, f"el bloque de marca no declara --accent-ink: {css}"
     return m[-1]
@@ -1010,12 +1009,10 @@ def _tinta_declarada(css: str) -> str:
     ],
 )
 def test_el_acento_de_CUALQUIER_inquilino_deja_su_boton_legible(acento: str) -> None:
-    from fasthtml.common import to_xml as _to_xml
-
     marca = TenantBrandingRead(
         display_name="Negocio", accent_color=acento, timezone="America/New_York"
     )
-    css = _to_xml(views._brand_style(marca)[0])
+    css = to_xml(views._brand_style(marca)[0])
     tinta = _tinta_declarada(css)
     r = _razon(acento, tinta)
     assert r >= 4.5, f"acento {acento} con tinta {tinta} da {r:.2f}:1, y AA pide 4.5"
