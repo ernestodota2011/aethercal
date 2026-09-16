@@ -549,6 +549,46 @@ async def test_a_reply_never_acts_on_an_appointment_that_already_started(
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_booking_is_not_a_target(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+) -> None:
+    """Un "2" sobre una reserva ya cancelada no encuentra cita: el filtro es ``CONFIRMED``, así que
+    canceladas (y holds/pendientes) quedan fuera, y nada se re-cancela ni se re-sella."""
+    tenant, _, booking = seeded_whatsapp_booking
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    booking.status = BookingStatus.CANCELLED
+    booking.cancelled_at = now
+    await sqlite_session.flush()
+
+    cancel = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="2",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert cancel.status == "no_booking_found"
+    assert cancel.booking_id is None
+
+    confirm = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="1",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert confirm.status == "no_booking_found"
+
+    reloaded = await sqlite_session.get(Booking, booking.id)
+    assert reloaded is not None
+    assert reloaded.status == BookingStatus.CANCELLED
+    assert reloaded.attendance_confirmed_at is None
+
+
+@pytest.mark.asyncio
 async def test_process_inbound_cancel_booking(
     sqlite_session: AsyncSession,
     seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],

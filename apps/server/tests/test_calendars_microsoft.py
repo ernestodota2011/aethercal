@@ -289,6 +289,7 @@ class FakeMicrosoftService:
         self.deleted_events: list[tuple[str, str]] = []
         self.should_404_on_delete = False
         self.should_error_on_delete = False
+        self.generic_error: Exception | None = None
 
     def get_schedule(self, schedule_id: str, window: TimeInterval) -> dict[str, Any]:
         return self.schedule_response
@@ -301,6 +302,8 @@ class FakeMicrosoftService:
         return created
 
     def delete_event(self, schedule_id: str, event_id: str) -> None:
+        if self.generic_error is not None:
+            raise self.generic_error
         if self.should_404_on_delete:
             req = httpx.Request("DELETE", f"https://graph.microsoft.com/v1.0/me/events/{event_id}")
             resp = httpx.Response(404, request=req)
@@ -310,6 +313,16 @@ class FakeMicrosoftService:
             resp = httpx.Response(500, request=req)
             raise httpx.HTTPStatusError("Internal Error", request=req, response=resp)
         self.deleted_events.append((schedule_id, event_id))
+
+
+class _SdkStyleError(Exception):
+    """An error shaped like a vendor SDK's: the status lives on ``.response``."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.response = httpx.Response(
+            status_code, request=httpx.Request("DELETE", "https://graph.microsoft.com/v1.0/x")
+        )
 
 
 def test_client_query_busy_and_event_lifecycle() -> None:
@@ -362,6 +375,22 @@ def test_client_query_busy_and_event_lifecycle() -> None:
     svc.should_error_on_delete = True
     with pytest.raises(httpx.HTTPStatusError):
         delete_event(svc, "doctor@clinic.com", "ms-evt-999")
+
+
+def test_delete_event_reads_the_already_gone_status_from_the_RESPONSE_too() -> None:
+    """La firma «ya no existe» puede llegar en la excepción o en su respuesta; las dos formas son
+    el mismo hecho, y una de ellas se perdía: se reintentaba contra un evento que ya no está."""
+    svc = FakeMicrosoftService()
+
+    svc.generic_error = _SdkStyleError(404)
+    delete_event(svc, "doctor@clinic.com", "ms-evt-404")  # no raise
+
+    svc.generic_error = _SdkStyleError(410)
+    delete_event(svc, "doctor@clinic.com", "ms-evt-410")  # no raise
+
+    svc.generic_error = _SdkStyleError(500)
+    with pytest.raises(_SdkStyleError):
+        delete_event(svc, "doctor@clinic.com", "ms-evt-500")
 
 
 # --------------------------------------------------------------------------------------

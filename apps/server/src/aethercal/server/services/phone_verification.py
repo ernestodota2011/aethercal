@@ -470,7 +470,10 @@ async def verify_phone_code(  # noqa: PLR0913
     matches = hmac.compare_digest(challenge.code_hmac or "", expected_hmac)
 
     if not matches:
-        next_attempt = PhoneVerificationChallenge.attempts + 1
+        # ``attempts + 1`` is a COLUMN EXPRESSION: it compiles to SQL (``SET attempts = attempts +
+        # 1``), never a Python read-modify-write. The CASE below decides the burn inside the SAME
+        # statement, so there is no window where the counter reads 5 and the secret is still live.
+        attempts_next = PhoneVerificationChallenge.attempts + 1
         increment = (
             update(PhoneVerificationChallenge)
             .where(
@@ -482,12 +485,13 @@ async def verify_phone_code(  # noqa: PLR0913
                 PhoneVerificationChallenge.attempts < MAX_ATTEMPTS,
             )
             .values(
-                attempts=next_attempt,
+                attempts=attempts_next,
                 # The burn rides IN the same statement as the attempt that exhausts the budget:
                 # two statements would leave a window where the counter reads 5 and the secret is
                 # still live.
                 code_hmac=case(
-                    (next_attempt >= MAX_ATTEMPTS, None), else_=PhoneVerificationChallenge.code_hmac
+                    (attempts_next >= MAX_ATTEMPTS, None),
+                    else_=PhoneVerificationChallenge.code_hmac,
                 ),
             )
             .returning(PhoneVerificationChallenge.attempts)

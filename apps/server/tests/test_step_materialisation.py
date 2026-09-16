@@ -789,6 +789,31 @@ async def test_an_UNVERIFIED_phone_is_never_messaged(
     assert not any("no-phone-consent" in message for message in messages)
 
 
+async def test_a_MISSING_suppression_key_skips_the_step_instead_of_raising(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """==Sin la clave de la lista de bajas, el mensaje NO sale — y se dice por qué.==
+
+    La clave no se deriva a propósito (D-12), así que un worker mal configurado no puede consultar
+    la lista. La respuesta es rechazar el envío con su propia razón (`suppression-key-missing`), no
+    una excepción: una excepción reintentaría para siempre contra un problema que solo un operador
+    puede arreglar, y peor, dejaría el mensaje colgado en vez de visible como salto.
+    """
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    monkeypatch.delenv("AETHERCAL_SUPPRESSION_KEY", raising=False)
+
+    whatsapp = _RecordingChannelSender()
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == [], "un mensaje salió sin poder consultar la lista de bajas"
+    assert step.status == "skipped"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("suppression-key-missing" in message for message in messages)
+
+
 async def test_a_SUPPRESSED_phone_is_never_messaged_even_with_consent_and_verification(
     migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
 ) -> None:

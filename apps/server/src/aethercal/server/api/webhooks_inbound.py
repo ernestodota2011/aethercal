@@ -285,6 +285,13 @@ async def receive_whatsapp_webhook(
     log, proxy log and browser history between the provider and here== — and the provider sends a
     header just as happily. (An unknown slug, a missing credential and a wrong key all answer the
     same 401, so the endpoint is no oracle for which businesses exist.)
+
+    ==Why a shared key and not a signature:== the money webhook verifies an HMAC because Stripe and
+    Mercado Pago SIGN their events. Evolution API does not sign its webhooks — there is no HMAC to
+    verify — so the tenant's own provider credential is the authentication, presented over TLS and
+    compared in constant time. What an authenticated caller can reach is narrow by construction:
+    the handler only ever acts on an UPCOMING booking whose phone matches the sender's (the
+    intent parser cannot name a booking, and the suppression list has no read surface).
     """
     raw_body = await _read_body_within_limit(request)
 

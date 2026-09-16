@@ -68,7 +68,14 @@ def delete_event(service: Any, schedule_id: str, event_id: str) -> None:
             return
         raise
     except Exception as exc:
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        # The already-gone signal can arrive in three shapes: an ``httpx`` error (caught above),
+        # an SDK-style exception carrying ``status_code``/``code``, or an exception whose RESPONSE
+        # carries it (``exc.response.status_code``). All three mean the same thing here.
+        status = (
+            getattr(exc, "status_code", None)
+            or getattr(exc, "code", None)
+            or getattr(getattr(exc, "response", None), "status_code", None)
+        )
         if status in _ALREADY_GONE_STATUSES:
             _logger.info(
                 "Microsoft event %s for %s was already deleted (status %s); treating as success.",

@@ -106,6 +106,7 @@ from aethercal.server.services.notifications import (
     record_booking_notification,
 )
 from aethercal.server.services.phone_verification import (
+    SuppressionKeyNotConfigured,
     get_suppression_key,
     is_phone_suppressed,
 )
@@ -2534,6 +2535,13 @@ _PHONE_UNVERIFIED = "phone-unverified"
 _PHONE_SUPPRESSED = "phone-suppressed"
 """The guest replied STOP/BAJA (D-12). Unlike the three above, this one is NOT curable by the
 tenant: it is the recipient's own instruction, and it stays until THEY withdraw it."""
+_SUPPRESSION_KEY_MISSING = "suppression-key-missing"
+"""The instance has no ``AETHERCAL_SUPPRESSION_KEY``, so the opt-out list cannot be read.
+
+A misconfiguration, and it REFUSES the send rather than skipping past it: a message may not go out
+while the list that says "do not message this number" is unreadable. It is reported as a skip (not
+raised) so the row, the log and the metrics all say exactly what is wrong — an exception here would
+retry forever against a key that only an operator can set."""
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
 _UNKNOWN_OUTCOME = "unknown-outcome"
 """The provider was given the message and the answer was lost. NEVER re-sent blind."""
@@ -2700,7 +2708,14 @@ async def _require_phone_not_suppressed(
             f"{_NO_PHONE}: the booking lost its phone number mid-flight, so the {channel.value} "
             "step cannot run"
         )
-    if await is_phone_suppressed(session, phone, suppression_key=get_suppression_key()):
+    try:
+        suppression_key = get_suppression_key()
+    except SuppressionKeyNotConfigured as exc:
+        raise OutboxSkipped(
+            f"{_SUPPRESSION_KEY_MISSING}: {exc} The {channel.value} step is refused rather than "
+            "sent unchecked: the opt-out list cannot be read without its key"
+        ) from exc
+    if await is_phone_suppressed(session, phone, suppression_key=suppression_key):
         raise OutboxSkipped(
             f"{_PHONE_SUPPRESSED}: the guest opted out of messages (D-12), so the {channel.value} "
             "step must not run; the suppression stands until the guest withdraws it"
