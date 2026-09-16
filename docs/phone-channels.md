@@ -12,16 +12,17 @@ is not a footnote, and it is the reason this page exists.
 ## The consent limitation
 
 > [!WARNING]
-> **The phone number is typed into a public form by whoever is booking, and this product never
-> verifies that the number belongs to them.**
+> **The phone number is typed into a public form by whoever is booking, and the FIRST message is
+> therefore addressed to a number nobody has proven they own.**
 >
 > The booking page shows an explicit, unticked consent checkbox, and nothing is sent unless it is
 > ticked. But a ticked box only proves that **somebody** ticked it. It does **not** prove that **the
 > owner of that number** agreed to anything.
 >
 > Anyone can book an appointment, type in a stranger's phone number, tick the box on their behalf,
-> and your business will send that stranger a WhatsApp or SMS message — **under your brand, from
-> your number**.
+> and your business will send that stranger **one** verification code (C-02b) — and nothing else,
+> because every later reminder waits for a code that only the owner of the number can read. The
+> stranger still receives that one message **under your brand, from your number**.
 >
 > **A box ticked by a stranger is not consent from the owner of the number.**
 >
@@ -41,23 +42,26 @@ is not a footnote, and it is the reason this page exists.
 | Asks for a phone at all | **Only** where an *active* WhatsApp/SMS rule governs that event type. No phone rule → no phone field, and no personal data collected. |
 | The consent checkbox | Explicit, **never** pre-ticked, **never** required. Booking without a phone always works. |
 | Records it | `bookings.guest_phone_consent_at` — the timestamp at which **the box was ticked**. |
-| Refuses to send | No number, or no ticked box → the step is `skipped` with its own reason (`no-phone` / `no-phone-consent`) and nothing goes out. |
+| Proves possession | One verification code (C-02b) sent to the number; reminders and every other phone step wait for `bookings.guest_phone_verified_at`. That is what makes the checkbox's claim testable. |
+| Refuses to send | No number, no ticked box, no verified stamp, or a number on the opt-out list → the step is `skipped` with its own reason (`no-phone`, `no-phone-consent`, `phone-unverified`, `phone-suppressed`) and nothing goes out. |
 | Revocation | Setting `guest_phone_consent_at` back to `NULL` closes the gate again. There is no special code path: the absence of the stamp *is* the revocation. |
+| Opt-out | Replying `STOP`, `BAJA`, `ALTO`, `DESUSCRIBIR`, `UNSUBSCRIBE`, `PARAR`, `DETENER`, `QUITAR` or `BLOQUEAR` to a WhatsApp reminder suppresses the number instance-wide, and it stays suppressed even through guest erasure. |
 | Bounds the damage | Per-phone and per-IP daily caps, which a channel **refuses to start without**. |
 
 ### What it does NOT do — a declared gap
 
-**It never verifies that the person booking possesses the number they typed.** There is no OTP and
-no confirmation link. This is not implemented, not partially implemented, and no code path
-approximates it.
+**A ticked consent box is still not consent from the number's owner.** The verification code closes
+the loop *before the reminders*: an attacker who types a stranger's number cannot get a single
+reminder delivered, because the code lands on the stranger's phone and the reminder gate waits for
+it to be entered (`phone-unverified`). What the code cannot do is prevent that **one** message from
+arriving, or make the checkbox itself evidence of anything other than "somebody claimed this number".
 
 So read `guest_phone_consent_at` for exactly what it is: **a stamp that the box on the form was
-ticked**. It is evidence of a claim made by whoever filled in that form. It is not verified
-permission from the number's owner — and the product does not pretend otherwise anywhere: not in the
-schema, not in the column comment, not in the outbox gate, not here.
-
-Closing this gap (verifying possession before the first message) is a whole feature. It is **not in
-this batch**, and you should not plan around it existing.
+ticked**. Read `guest_phone_verified_at` for exactly what it is: **a stamp that whoever could read
+the code on that number asked for this booking's reminders** — a much stronger claim, and the one
+the send path actually requires. Neither is verified permission *from the number's owner for your
+business*: the product does not pretend otherwise anywhere — not in the schema, not in the column
+comments, not in the outbox gate, not here.
 
 ---
 
@@ -132,6 +136,28 @@ error, loudly, rather than as "mostly configured".
 
 Silence means "off". Anything else is loud.
 
+## Opting out
+
+A guest can stop the messages at any time by replying to a WhatsApp reminder:
+
+```
+STOP · BAJA · ALTO · DESUSCRIBIR · UNSUBSCRIBE · PARAR · DETENER · QUITAR · BLOQUEAR
+```
+
+The reply writes the phone into the **instance-level opt-out list** (`phone_suppressions`), keyed by
+`HMAC(AETHERCAL_SUPPRESSION_KEY, phone)`, and the send path checks that list **before** the channel,
+the template and the caps: a suppressed number is `skipped` with `phone-suppressed`, and nothing goes
+out. The suppression is written regardless of consent, and it is deliberately **not** removed by
+guest erasure — an erasure must not reactivate messaging to somebody who asked to be left alone.
+
+```bash
+# REQUIRED whenever AETHERCAL_PUBLIC_API_ENABLED is on (the app refuses to boot without it), because
+# that is the door the booking page and the reminders speak through.
+# Generate one and keep it STABLE: rotating it re-keys the list, and every number already suppressed
+# becomes invisible again. It is deliberately not derived from AETHERCAL_APP_SECRET.
+AETHERCAL_SUPPRESSION_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+```
+
 ## Templates
 
 A WhatsApp/SMS step renders its body from a `workflow_templates` row for that channel, kind and
@@ -145,7 +171,9 @@ text is rendered into a message that carries your brand.
 
 ## Erasing a guest's phone
 
-`guest_phone` and `guest_phone_consent_at` are both covered by guest erasure (RNF-8):
+`guest_phone`, `guest_phone_consent_at` and `guest_phone_verified_at` are all covered by guest
+erasure (RNF-8): the stamps go with the number they were given for, because a permission attached to
+a person who no longer exists is a permission nobody can withdraw.
 
 ```bash
 aethercal-admin guest purge --tenant <slug> --email <addr>
@@ -154,3 +182,7 @@ aethercal-admin guest purge --tenant <slug> --email <addr>
 `--tenant` is mandatory and the command fails without it: one person can be a guest of several
 businesses on the same instance, and an unscoped purge would erase them from businesses that never
 received the request.
+
+The **opt-out list is the one thing erasure does not touch**, on purpose: it holds no name, no
+booking and no tenant, only the HMAC of a number that asked not to be messaged — and forgetting it
+would start messaging them again.

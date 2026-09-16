@@ -74,6 +74,8 @@ Sessionmaker = async_sessionmaker[AsyncSession]
 
 _ALWAYS_OPEN = {str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)}
 _TURNSTILE_SECRET = "1x0000000000000000000000000000000AA"
+# The dedicated opt-out-list key (D-12); >= 32 chars, and never derived from APP_SECRET.
+_SUPPRESSION_KEY = "test-suppression-key-0123456789abcdef"
 _GUEST_IP = "203.0.113.9"
 _OTHER_GUEST_IP = "198.51.100.4"
 # The ASGI transport's peer address. Declaring it trusted is what lets these tests speak as a guest
@@ -140,6 +142,7 @@ async def public_app(
         app_secret="test-app-secret",
         public_api_enabled=True,
         turnstile_secret=_TURNSTILE_SECRET,
+        suppression_key=_SUPPRESSION_KEY,
         trusted_proxies=_LOOPBACK_CIDR,
         public_rate_limit_per_minute=_RATE_LIMIT,
     )

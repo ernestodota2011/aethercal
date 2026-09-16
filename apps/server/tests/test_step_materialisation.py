@@ -63,6 +63,7 @@ from aethercal.server.services.outbox import (
     drain_outbox,
     make_booking_effect_executor,
 )
+from aethercal.server.services.phone_verification import suppress_phone
 from aethercal.server.services.tenant_senders import TenantSenders
 from aethercal.server.services.workflows import seed_default_workflows
 
@@ -754,6 +755,41 @@ async def test_no_phone_at_all_has_its_own_distinct_reason(
     messages = [record.getMessage() for record in caplog.records]
     assert any("no-phone:" in message for message in messages)
     assert not any("no-phone-consent" in message for message in messages)
+
+
+async def test_a_SUPPRESSED_phone_is_never_messaged_even_with_consent_and_verification(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """==El opt-out del huésped le gana al consentimiento del formulario (D-12).==
+
+    Consent and an opt-out can both be true: the tick was taken on the booking form, before anybody
+    could reply STOP, and nothing withdraws it. Without this gate the next reminder would message a
+    number that asked to be left alone — the opt-out list honoured by the OTP path and ignored by
+    the reminder path, which is the "protection that is not one" this project keeps hunting.
+
+    The key is the SUITE's own (``apps/server/tests/conftest.py``), not a literal passed here: the
+    send path resolves it from the environment in production, and a test that handed its own key
+    around would not be exercising that resolution at all.
+    """
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    async with migrated() as session, session.begin():
+        await suppress_phone(session, "+13055551234")
+
+    whatsapp = _RecordingChannelSender()
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == [], "a message went out to a phone that replied STOP"
+    assert step.attempts == 0
+    assert step.status == "skipped"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("phone-suppressed" in message for message in messages), (
+        "the skip reason must say the guest opted out, not 'no consent' or 'unverified'"
+    )
+    assert not any("no-phone-consent" in message for message in messages)
+    assert not any("phone-unverified" in message for message in messages)
 
 
 # --------------------------------------------------------------------------------------

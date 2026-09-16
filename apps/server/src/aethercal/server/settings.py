@@ -42,6 +42,13 @@ whose instances are exposed. A short token is not a *weaker* secret, it is a gue
 configured token below this length fails at BOOT instead of standing quietly in front of the
 endpoint while everyone assumes it is protected."""
 
+SUPPRESSION_KEY_MIN_LENGTH = 32
+"""The shortest ``AETHERCAL_SUPPRESSION_KEY`` this instance will boot with (D-12).
+
+It is the HMAC key behind the opt-out list, and it is deliberately NOT derivable from
+``app_secret``: an instance whose key is short, published, or a function of another secret does not
+have an opaque opt-out list — it has a list anybody can query by guessed phone number."""
+
 
 class Settings(BaseSettings):
     """The server's runtime configuration.
@@ -167,6 +174,18 @@ class Settings(BaseSettings):
     # The Cloudflare Turnstile SECRET (server side). ==Required whenever the public API is on — see
     # the validator below, which refuses to build the settings without it.==
     turnstile_secret: str | None = None
+
+    # The DEDICATED key behind the instance-level opt-out list (D-12): the phone numbers hashed
+    # into ``phone_suppressions`` when a guest replies STOP/BAJA/UNSUBSCRIBE.
+    #
+    # ==Required whenever the public API is on, and deliberately NOT derivable from APP_SECRET.==
+    # An earlier revision derived it from ``AETHERCAL_APP_SECRET`` (and from a constant default when
+    # that too was absent), which made the "dedicated, non-rotatable" key neither: rotating the
+    # master secret re-keyed the suppression list and split it in two, and a misconfigured instance
+    # carried a PUBLISHED key — anyone holding it can HMAC a guessed phone number and ask the list
+    # whether that person opted out. The validator below refuses to boot the public router without
+    # it, exactly like the Turnstile pair: a list nobody can read is a list nobody is honouring.
+    suppression_key: str | None = None
 
     # The networks whose ``X-Forwarded-For`` this instance may believe, as CIDRs (e.g. the compose
     # network the booking page runs on).
@@ -390,6 +409,58 @@ class Settings(BaseSettings):
                 "that switches the captcha off."
             )
         return self
+
+    @model_validator(mode="after")
+    def _the_public_api_may_not_run_without_a_suppression_key(self) -> Self:
+        """The opt-out list has its own key, and the public router is where opt-outs are honoured.
+
+        A guest who replies STOP writes a tombstone keyed by ``HMAC(suppression_key, phone)``, and
+        the OTP path consults that list before sending anything. Booting the public router without
+        the key would leave the list unreadable — no OTP can be checked against it — and the only
+        ways out would be to skip the check (messaging people who opted out) or to derive a key
+        (the defect this field exists to close). So the combination is refused at BOOT, next to the
+        Turnstile pair, rather than discovered by the first guest who says STOP.
+        """
+        if not self.public_api_enabled:
+            return self
+        if self.suppression_key is None or not self.suppression_key.strip():
+            raise ValueError(
+                "AETHERCAL_SUPPRESSION_KEY is required when AETHERCAL_PUBLIC_API_ENABLED is on.\n"
+                "\n"
+                "It is the dedicated HMAC key of the instance opt-out list (D-12): the public "
+                "booking flow issues phone OTPs, and every message it sends must first be checked "
+                "against the list of numbers that asked not to be messaged. There is no derived "
+                "fallback on purpose — a key derived from APP_SECRET re-keys the list every time "
+                "that secret rotates, and a published default is a list anybody can query.\n"
+                "\n"
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        return self
+
+    @field_validator("suppression_key", mode="after")
+    @classmethod
+    def _validate_suppression_key(cls, value: str | None) -> str | None:
+        """Blank means UNSET (and the validator below then refuses the public router); anything
+        else must be a real secret, checked with the same three lenses as the metrics token."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if not stripped.isascii():
+            raise ValueError(
+                "AETHERCAL_SUPPRESSION_KEY must be ASCII; a homoglyph key is a different key that "
+                "looks identical in the .env file. Generate one with: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        if len(stripped) < SUPPRESSION_KEY_MIN_LENGTH:
+            raise ValueError(
+                f"AETHERCAL_SUPPRESSION_KEY must be at least {SUPPRESSION_KEY_MIN_LENGTH} "
+                "characters: it is the HMAC key of the instance opt-out list, and a guessable key "
+                "lets anybody test whether a phone number opted out. Generate one with: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        return assert_not_published_placeholder(stripped, env_var="AETHERCAL_SUPPRESSION_KEY")
 
     def database_config(self) -> DatabaseConfig:
         """The APP role's config (``aethercal_app``) — the request path and the admin, under RLS."""

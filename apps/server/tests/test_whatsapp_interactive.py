@@ -52,7 +52,7 @@ from aethercal.server.services.whatsapp_interactive import (
 from aethercal.server.settings import Settings
 
 _APP_SECRET = "test-app-secret-12345"
-_SUPPRESSION_KEY = "test-suppression-key-67890"
+_SUPPRESSION_KEY = "test-suppression-key-67890-0123456789"
 _FERNET_KEY = derive_fernet_key(_APP_SECRET)
 _TEST_API_KEY = "evo_api_key_secure_12345"
 
@@ -349,6 +349,96 @@ async def test_process_inbound_confirm_attendance(
     assert result.booking_id == booking.id
     assert "confirmado tu asistencia" in (result.reply_message or "")
 
+    # The confirmation is PERSISTED, not just announced: before this stamp the handler returned
+    # "attendance_confirmed" and wrote nothing (a no-op wearing a success message).
+    reloaded = await sqlite_session.get(Booking, booking.id)
+    assert reloaded is not None
+    assert reloaded.attendance_confirmed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_confirm_is_idempotent_and_keeps_the_first_stamp(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+) -> None:
+    """A guest may answer "1" twice (or answer "1" and then "confirmo"). The second reply is
+    idempotent: it reports success and does NOT move the instant of the first confirmation."""
+    tenant, _, booking = seeded_whatsapp_booking
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+
+    first = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="1",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert first.status == "attendance_confirmed"
+    reloaded = await sqlite_session.get(Booking, booking.id)
+    assert reloaded is not None
+    first_stamp = reloaded.attendance_confirmed_at
+    assert first_stamp is not None
+
+    again = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="confirmo",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now + timedelta(hours=3),
+    )
+    assert again.status == "attendance_confirmed"
+    final = await sqlite_session.get(Booking, booking.id)
+    assert final is not None
+    assert final.attendance_confirmed_at == first_stamp
+
+
+@pytest.mark.asyncio
+async def test_a_reply_never_acts_on_an_appointment_that_already_started(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==Una respuesta tardía no puede cancelar una cita que ya pasó.==
+
+    El recordatorio se manda ANTES de la cita; un "2" que llega después (o un "2" reenviado) no
+    tiene cita viva sobre la cual actuar. Antes de este arreglo el buscador caía a la reserva
+    pasada más reciente y disparaba toda la cadena de cancelación sobre una visita terminada.
+    """
+    tenant, _, booking = seeded_whatsapp_booking
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    booking.start_at = now - timedelta(days=1)
+    booking.end_at = booking.start_at + timedelta(minutes=30)
+    await sqlite_session.flush()
+
+    cancel = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="2 - Cancelar cita",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert cancel.status == "no_booking_found"
+    assert cancel.booking_id is None
+
+    confirm = await process_inbound_whatsapp(
+        sqlite_session,
+        tenant_id=tenant.id,
+        sender_phone="+13055551111",
+        message_text="1 - Sí",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert confirm.status == "no_booking_found"
+
+    # Nada se escribió: ni cancelación ni sello de asistencia sobre una cita pasada.
+    reloaded = await sqlite_session.get(Booking, booking.id)
+    assert reloaded is not None
+    assert reloaded.status == BookingStatus.CONFIRMED
+    assert reloaded.cancelled_at is None
+    assert reloaded.attendance_confirmed_at is None
+
 
 @pytest.mark.asyncio
 async def test_process_inbound_cancel_booking(
@@ -466,6 +556,7 @@ class _DummyAppState:
             app_secret=app_secret,
             database_url="sqlite+aiosqlite://",
             app_name="AetherCal",
+            suppression_key=_SUPPRESSION_KEY,
         )
         self.fernet_keys = (_FERNET_KEY,)
         self.sender_defaults = sender_defaults

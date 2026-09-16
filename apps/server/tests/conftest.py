@@ -100,6 +100,12 @@ if sys.platform == "win32":
 PG_ENV = "AETHERCAL_TEST_DATABASE_URL"
 ROLE_PASSWORD_ENV = "AETHERCAL_TEST_ROLE_PASSWORD"
 
+# The phone send path consults the instance opt-out list, whose key (D-12) is deliberately NOT
+# derivable and NOT defaulted: without it the send path refuses (fail-closed), which is exactly the
+# production behaviour. The suite therefore gives the process a real test key, and the tests that
+# assert the refusal (``test_phone_verification``) delete/patch it explicitly.
+os.environ.setdefault("AETHERCAL_SUPPRESSION_KEY", "test-suppression-key-0123456789abcdef")
+
 TenantFactory = Callable[..., Awaitable[Tenant]]
 
 

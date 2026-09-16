@@ -18,9 +18,13 @@ from aethercal.core.model import TimeInterval
 
 # Statuses in Graph API `scheduleItems` that block a host's availability.
 # Statuses: "free", "tentative", "busy", "oof" (Out of Office), "workingElsewhere", "unknown".
-# In accordance with RF-13 (fail-closed anti-double-booking), any status indicating
-# non-free time or away time is treated as busy.
-GRAPH_BUSY_STATUSES: frozenset[str] = frozenset({"busy", "tentative", "oof", "workingelsewhere"})
+#
+# ==Only ``free`` is free; EVERYTHING else is busy, including statuses this code has never seen.==
+# The list below therefore exists to DOCUMENT the states we know, not to allow-list the busy ones:
+# an allow-list fails open exactly once — the day Graph adds a status (or returns ``unknown``), the
+# new string is not in it and the host's calendar reads as empty, which is the double-booking this
+# integration exists to prevent. A deny-list of one cannot rot.
+GRAPH_FREE_STATUS = "free"
 
 # Regex to normalize Graph's 7-digit subsecond precision (e.g. .0000000Z)
 # down to 6 digits for Python.
@@ -41,6 +45,72 @@ def _parse_graph_datetime(value: str) -> datetime:
     return dt.astimezone(UTC)
 
 
+def _select_schedule_entry(
+    entries: list[dict[str, Any]], schedule_id: str | None
+) -> dict[str, Any]:
+    """The entry for ``schedule_id`` (or the first one), refusing to guess when it is missing."""
+    if schedule_id is None:
+        return entries[0]
+    target_norm = schedule_id.strip().lower()
+    for entry in entries:
+        if str(entry.get("scheduleId", "")).strip().lower() == target_norm:
+            return entry
+    raise RuntimeError(
+        f"Microsoft Graph response omitted schedule {schedule_id!r}; "
+        f"refusing to treat as free (prevents double-booking)"
+    )
+
+
+def _busy_intervals(target_entry: dict[str, Any], schedule_id: str | None) -> list[TimeInterval]:
+    """Every interval the entry says the host is NOT free, with fail-closed parsing.
+
+    ==Only an EXPLICIT ``free`` status is free.== Every other status -- ``busy``, ``tentative``,
+    ``oof``, ``workingElsewhere``, ``unknown``, or any status this code has never seen -- blocks
+    time. A non-free item whose instants cannot be read or whose end precedes its start is refused
+    rather than skipped: the host may be busy at a moment this parser cannot name, and guessing it
+    is how a double-booking ships.
+    """
+    raw_items = target_entry.get("scheduleItems")
+    if not isinstance(raw_items, list):
+        raise RuntimeError(
+            "Microsoft Graph schedule entry carried no usable 'scheduleItems' list; refusing to "
+            "treat the calendar as free (prevents double-booking)"
+        )
+
+    intervals: list[TimeInterval] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                "Microsoft Graph returned a scheduleItem that is not an object; refusing to guess "
+                "the host's availability (prevents double-booking)"
+            )
+        status = str(item.get("status", "")).strip().lower()
+        if status == GRAPH_FREE_STATUS:
+            continue
+        start_block = item.get("start")
+        end_block = item.get("end")
+        raw_start = start_block.get("dateTime") if isinstance(start_block, dict) else None
+        raw_end = end_block.get("dateTime") if isinstance(end_block, dict) else None
+        if not raw_start or not raw_end:
+            raise RuntimeError(
+                f"Microsoft Graph returned a non-free scheduleItem (status={status!r}) with no "
+                "valid start/end instants; the host may be busy at a time this parser cannot name, "
+                "so refusing to treat the calendar as free (prevents double-booking)"
+            )
+        start_dt = _parse_graph_datetime(str(raw_start))
+        end_dt = _parse_graph_datetime(str(raw_end))
+        if end_dt < start_dt:
+            raise RuntimeError(
+                f"Microsoft Graph returned a scheduleItem (status={status!r}) whose end precedes "
+                "its start; refusing to guess the host's availability (prevents double-booking)"
+            )
+        if end_dt > start_dt:
+            intervals.append(TimeInterval(start=start_dt, end=end_dt))
+
+    intervals.sort(key=lambda interval: (interval.start, interval.end))
+    return intervals
+
+
 def parse_graph_schedule(
     response: dict[str, Any],
     schedule_id: str | None = None,
@@ -52,6 +122,8 @@ def parse_graph_schedule(
     - `value` is absent or empty.
     - `schedule_id` was specified and is absent from the schedule entries.
     - The matched schedule entry carries a per-schedule error.
+    - The schedule entry carries no usable ``scheduleItems`` list, or a non-free item with no
+      valid start/end instants, or one whose end precedes its start.
 
     Refusing to return an empty list on error prevents silent double-booking (RF-13).
     """
@@ -67,22 +139,7 @@ def parse_graph_schedule(
             "refusing to treat calendar as free"
         )
 
-    target_entry: dict[str, Any] | None = None
-    if schedule_id is not None:
-        target_norm = schedule_id.strip().lower()
-        for entry in entries:
-            entry_id = str(entry.get("scheduleId", "")).strip().lower()
-            if entry_id == target_norm:
-                target_entry = entry
-                break
-        if target_entry is None:
-            raise RuntimeError(
-                f"Microsoft Graph response omitted schedule {schedule_id!r}; "
-                f"refusing to treat as free (prevents double-booking)"
-            )
-    else:
-        target_entry = entries[0]
-
+    target_entry = _select_schedule_entry(entries, schedule_id)
     entry_error = target_entry.get("error")
     if entry_error:
         raise RuntimeError(
@@ -90,22 +147,7 @@ def parse_graph_schedule(
             f"{entry_error}"
         )
 
-    intervals: list[TimeInterval] = []
-    items: list[dict[str, Any]] = target_entry.get("scheduleItems", [])
-    for item in items:
-        status = str(item.get("status", "")).strip().lower()
-        if status in GRAPH_BUSY_STATUSES:
-            raw_start = item.get("start", {}).get("dateTime")
-            raw_end = item.get("end", {}).get("dateTime")
-            if not raw_start or not raw_end:
-                continue
-            start_dt = _parse_graph_datetime(raw_start)
-            end_dt = _parse_graph_datetime(raw_end)
-            if end_dt > start_dt:
-                intervals.append(TimeInterval(start=start_dt, end=end_dt))
-
-    intervals.sort(key=lambda i: (i.start, i.end))
-    return intervals
+    return _busy_intervals(target_entry, schedule_id)
 
 
 def build_schedule_request_body(

@@ -25,6 +25,7 @@ from aethercal.server.integrations.turnstile import SITEVERIFY_URL, CloudflareTu
 from aethercal.server.settings import Settings
 
 _SECRET = "1x0000000000000000000000000000000AA"  # Cloudflare's documented ALWAYS-PASSES test secret
+_SUPPRESSION_KEY = "test-suppression-key-0123456789abcdef"  # >= 32 chars (D-12)
 
 
 def _settings(**over: Any) -> dict[str, Any]:
@@ -54,10 +55,43 @@ def test_a_blank_turnstile_secret_is_not_a_secret() -> None:
 
 
 def test_the_public_api_with_a_turnstile_secret_boots() -> None:
-    settings = Settings(**_settings(public_api_enabled=True, turnstile_secret=_SECRET))  # type: ignore[arg-type]
+    settings = Settings(
+        **_settings(
+            public_api_enabled=True,
+            turnstile_secret=_SECRET,
+            suppression_key=_SUPPRESSION_KEY,
+        )
+    )  # type: ignore[arg-type]
 
     assert settings.public_api_enabled is True
     assert settings.turnstile_secret == _SECRET
+
+
+def test_the_public_api_without_a_suppression_key_refuses_to_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """==The opt-out list's key is not derivable, so it cannot be silently defaulted.== Booting the
+    public router without it would leave the STOP list unreadable by the very flow that must honour
+    it, and the OTP path would send to numbers that asked not to be messaged.
+
+    The suite exports a test key (the send path resolves it from the environment), so this test
+    removes it first: the question here is what a DEPLOYMENT without the variable does.
+    """
+    monkeypatch.delenv("AETHERCAL_SUPPRESSION_KEY", raising=False)
+    with pytest.raises(ValueError, match="AETHERCAL_SUPPRESSION_KEY"):
+        Settings(**_settings(public_api_enabled=True, turnstile_secret=_SECRET))  # type: ignore[arg-type]
+
+
+def test_a_short_suppression_key_is_refused() -> None:
+    """A short key is a list anybody can query by guessed phone number."""
+    with pytest.raises(ValueError, match="at least 32"):
+        Settings(
+            **_settings(
+                public_api_enabled=True,
+                turnstile_secret=_SECRET,
+                suppression_key="corta",
+            )
+        )  # type: ignore[arg-type]
 
 
 def test_the_public_api_is_OFF_by_default_and_needs_no_captcha_to_boot() -> None:

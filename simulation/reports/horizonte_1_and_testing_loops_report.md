@@ -81,11 +81,37 @@
 
 ---
 
-## 4. Próximos Pasos para el Siguiente Agente
-1. Aplicar las correcciones a los 3 archivos de pruebas mencionados (`test_guest_tokens_unit.py`, `test_rls_isolation.py`, `test_step_materialisation.py`).
-2. Implementar el testing loop `simulation/whatsapp_intent_loop.py` que evalúe `whatsapp_intents_benchmark.jsonl` certificando 0% de falsos positivos en `OPT_OUT`.
-3. Ejecutar la verificación final con **Crisol Gate**:
-   ```powershell
-   python "C:\Users\Ernesto_ Olema y Amy\.aetherlogik\bin\crisol_remote.py" --mode gate
-   ```
-   Asegurar veredicto **GO**.
+## 4. Lazo Continuo de WhatsApp y Compuerta de Salida
+
+### `simulation/whatsapp_intent_loop.py`
+- Carga el corpus, corre el parser REAL del producto y emite **matriz de confusión** + precisión /
+  recall / F1 por acción.
+- Certifica dos propiedades: **0 falsos positivos en `OPT_OUT`** (presupuesto duro: cero) y exactitud
+  ≥ 0,98. Sale 0 solo si certifica.
+- Resultado sobre las 625 muestras: **625/625 (exactitud 1,0000), OPT_OUT con 0 falsos positivos y 0
+  falsos negativos.** El parser se afinó contra el corpus (selección numérica con separadores,
+  palabras guía por posición, erratas por distancia de edición, re-agenda por verbo+objeto, emojis y
+  el léxico de baja con su propia prioridad de seguridad).
+- Prueba automatizada: `simulation/tests/test_whatsapp_loop.py` (incluye un caso anti-vacuidad que
+  verifica que la compuerta muerde ante un falso positivo).
+
+### Endurecimiento exigido por el gate (Crisol, primer pase: NO-GO)
+Los seis hallazgos del revisor cruzado se corrigieron de raíz, cada uno con su prueba:
+1. **Graph trataba estados desconocidos como tiempo libre** → ahora solo `free` es libre; cualquier
+   otro estado bloquea, y un ítem no libre sin instantes válidos aborta la consulta (fail-closed).
+2. **El contador de intentos OTP se perdía bajo concurrencia** → incremento atómico
+   (`UPDATE ... SET attempts = attempts + 1 ... RETURNING`) que consume un intento por cada fallo.
+3. **Los topes de emisión OTP eran evadibles con carreras** → cerrojo de asesoría por teléfono e IP
+   (`pg_advisory_xact_lock`) alrededor de la comprobación e inserción.
+4. **Confirmar asistencia no escribía nada** → `bookings.attendance_confirmed_at` (migración 0019),
+   sello idempotente que conserva el primer "1".
+5. **Una respuesta tardía podía cancelar una cita pasada** → solo se consideran citas que no han
+   comenzado; una respuesta tardía recibe `no_booking_found` y no escribe nada.
+6. **La clave de supresión caía a un secreto público y predecible** → sin derivación: se exige
+   `AETHERCAL_SUPPRESSION_KEY` (≥32 caracteres, sin placeholder), cableada desde `Settings`, con
+   validador de arranque cuando el API público está encendido.
+
+Hallazgo adicional detectado al auditar el camino del opt-out y corregido: **la lista de supresión
+no se consultaba antes de enviar un recordatorio** (solo el flujo de OTP la miraba), así que un "STOP"
+no detenía los mensajes siguientes. Ahora el portero del outbox la comprueba con su propia razón de
+salto (`phone-suppressed`).

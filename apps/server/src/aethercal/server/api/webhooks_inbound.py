@@ -344,7 +344,7 @@ async def receive_whatsapp_webhook(
         tenant_id=tenant_id,
         sender_phone=sender_phone,
         message_text=message_text,
-        suppression_key=get_suppression_key(),
+        suppression_key=get_suppression_key(settings.suppression_key),
         now=_now(),
         effects=effects,
     )

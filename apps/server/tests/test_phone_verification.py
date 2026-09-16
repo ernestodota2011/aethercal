@@ -45,7 +45,7 @@ from aethercal.server.services.phone_verification import (
 from aethercal.server.services.tenant_senders import TenantSenders
 
 _APP_SECRET = "test-app-secret-12345"
-_SUPPRESSION_KEY = "test-suppression-key-67890"
+_SUPPRESSION_KEY = "test-suppression-key-67890-0123456789"
 
 
 class DummySender:

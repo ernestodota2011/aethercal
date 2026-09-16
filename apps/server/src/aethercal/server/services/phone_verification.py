@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Final
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.channels import Channel
@@ -75,6 +75,14 @@ class IPRateLimitError(PhoneVerificationError):
     """Raised when source IP challenge rate limit is exceeded."""
 
 
+class SuppressionKeyNotConfigured(PhoneVerificationError):
+    """The instance-level suppression key is missing from the configuration (D-12).
+
+    Fail-closed on purpose: without the key the opt-out list cannot be consulted, and a message
+    must not be sent when the list that says "do not message this number" is unreadable.
+    """
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -99,18 +107,22 @@ def compute_hmac(key: str, data: str) -> str:
 def get_suppression_key(explicit_key: str | None = None) -> str:
     """Resolve the dedicated instance suppression key (D-12, A-1).
 
-    Non-rotatable dedicated key separate from AETHERCAL_APP_SECRET.
-    If not provided in environment, derives a deterministic instance suppression key
-    to avoid silent resets while remaining functional without extra setup.
+    ==There is NO derived fallback, and that is a fix.== An earlier revision derived the key from
+    ``AETHERCAL_APP_SECRET`` — and, when that too was absent, from a constant default. That made
+    the "dedicated, non-rotatable" key neither: it was a function of the master secret (so rotating
+    that secret silently re-keyed the suppression list and split it in two), and on a misconfigured
+    instance it was a PUBLISHED constant. Anyone holding it can compute the HMAC of a guessed phone
+    number, so the list stops being opaque. Missing configuration is now a loud refusal: the caller
+    cannot consult the opt-out list, so it must not message anybody.
     """
-    if explicit_key:
-        return explicit_key
-    env_val = os.environ.get("AETHERCAL_SUPPRESSION_KEY")
-    if env_val:
-        return env_val
-    # Fallback to a stable instance suppression key derived with salt
-    app_secret = os.environ.get("AETHERCAL_APP_SECRET", "aethercal-default-secret")
-    return hashlib.sha256(f"aethercal-suppression-salt-v1:{app_secret}".encode()).hexdigest()
+    key = (explicit_key or os.environ.get("AETHERCAL_SUPPRESSION_KEY") or "").strip()
+    if not key:
+        raise SuppressionKeyNotConfigured(
+            "AETHERCAL_SUPPRESSION_KEY is required to consult the instance opt-out list (D-12). "
+            "Refusing to message without it. Generate one with: "
+            "python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        )
+    return key
 
 
 async def is_phone_suppressed(
@@ -152,6 +164,47 @@ async def suppress_phone(
     return entry
 
 
+_ISSUANCE_LOCK_NAMESPACE = "aethercal-phone-issuance"
+
+
+def _issuance_lock_key(scope: str) -> int:
+    """A stable signed 64-bit advisory-lock key for one issuance scope.
+
+    Same shape as the booking path's per-host key (``services.bookings._host_lock_key``):
+    ``pg_advisory_xact_lock`` takes a signed ``bigint`` and an 8-byte BLAKE2b digest fits exactly.
+    """
+    digest = hashlib.blake2b(scope.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+async def _serialize_issuance(
+    session: AsyncSession, *, phone_hmac: str, source_ip: str | None
+) -> None:
+    """Serialize concurrent OTP issuance for one phone, and one source network, on PostgreSQL.
+
+    ==The rate-limit queries are check-then-insert, and that is a race.== Two concurrent resends
+    for the same phone can both count the same committed rows, both pass, and both insert: the
+    per-phone 3/24h and per-IP 20/24h ceilings become advisory. The ceiling is not cosmetic — it
+    caps how many messages an attacker can make the instance send at their victim's expense
+    (SMS/WhatsApp pumping), so it has to hold under concurrency, not just in a serial test.
+
+    The transaction-scoped advisory lock makes the check and the insert one critical section: a
+    second transaction blocks on the same key, and once the first commits it re-counts and sees
+    the new row. The locks are taken in a FIXED order (phone, then IP): two transactions that took
+    them in opposite orders would deadlock. On SQLite (the offline backend) this is a no-op —
+    SQLite serializes writers anyway.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    scopes = [f"{_ISSUANCE_LOCK_NAMESPACE}:phone:{phone_hmac}"]
+    if source_ip:
+        scopes.append(f"{_ISSUANCE_LOCK_NAMESPACE}:ip:{source_ip}")
+    for scope in scopes:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"), {"key": _issuance_lock_key(scope)}
+        )
+
+
 async def check_challenge_rate_limits(
     session: AsyncSession,
     *,
@@ -166,7 +219,12 @@ async def check_challenge_rate_limits(
     - At most 1 challenge per phone per 60 seconds.
     - At most 20 challenges per source IP per 24 hours.
     Counts on tombstones (rows survive 24h even if code_hmac is nulled).
+
+    The counters are taken under the issuance advisory lock (see :func:`_serialize_issuance`), so
+    the ceilings hold against concurrent resends and not only against a serial attacker.
     """
+    await _serialize_issuance(session, phone_hmac=phone_hmac, source_ip=source_ip)
+
     cutoff_24h = now - TOMBSTONE_WINDOW
     cutoff_60s = now - PHONE_MIN_INTERVAL
 
@@ -372,6 +430,12 @@ async def verify_phone_code(  # noqa: PLR0913
     - Timing-safe verification using compare_digest.
     - If valid, seals booking.guest_phone_verified_at = now and destroys secret (code_hmac=None).
     - Returns True if verified, False otherwise.
+
+    ==The attempt counter is incremented by ONE atomic statement.== It used to be a
+    read-modify-write (``challenge.attempts += 1``): under concurrent guesses every attempt read
+    the same value and wrote the same value back, so the 5-attempt budget was spent N times for
+    the price of one — a brute-force limiter that only limited a serial attacker. The
+    ``WHERE attempts < MAX`` predicate now makes each guess consume a distinct slot.
     """
     current_time = now or _now()
     clean_code = code.strip()
@@ -394,21 +458,42 @@ async def verify_phone_code(  # noqa: PLR0913
     if challenge is None:
         return False
 
-    # Check attempt count
-    if challenge.attempts >= MAX_ATTEMPTS:
-        challenge.code_hmac = None
-        await session.flush()
-        return False
-
     expected_hmac = compute_hmac(app_secret, clean_code)
     matches = hmac.compare_digest(challenge.code_hmac or "", expected_hmac)
 
     if not matches:
-        challenge.attempts += 1
-        if challenge.attempts >= MAX_ATTEMPTS:
-            # Burn code upon reaching max attempts
-            challenge.code_hmac = None
-        await session.flush()
+        increment = (
+            update(PhoneVerificationChallenge)
+            .where(
+                PhoneVerificationChallenge.id == challenge.id,
+                PhoneVerificationChallenge.tenant_id == tenant_id,
+                PhoneVerificationChallenge.consumed_at.is_(None),
+                PhoneVerificationChallenge.code_hmac.is_not(None),
+                PhoneVerificationChallenge.expires_at > current_time,
+                PhoneVerificationChallenge.attempts < MAX_ATTEMPTS,
+            )
+            .values(attempts=PhoneVerificationChallenge.attempts + 1)
+            .returning(PhoneVerificationChallenge.attempts)
+            # Bulk statement: the in-session copy is stale afterwards and nothing reads it (the
+            # caller returns immediately), while the evaluation strategy would trip over SQLite's
+            # naive datetimes against the aware bound parameter.
+            .execution_options(synchronize_session=False)
+        )
+        attempts = (await session.execute(increment)).scalar_one_or_none()
+        if attempts is None:
+            # The budget was already spent — or the challenge died — under a concurrent guess.
+            return False
+        if attempts >= MAX_ATTEMPTS:
+            # Burn the code in the same breath as the attempt that exhausted the budget, so the
+            # challenge has no live secret left to guess (D-7·bis).
+            await session.execute(
+                update(PhoneVerificationChallenge)
+                .where(
+                    PhoneVerificationChallenge.id == challenge.id,
+                    PhoneVerificationChallenge.consumed_at.is_(None),
+                )
+                .values(code_hmac=None)
+            )
         return False
 
     # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7)

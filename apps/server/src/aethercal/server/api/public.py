@@ -441,6 +441,7 @@ async def create_public_booking(
                 business_name=business_name,
                 senders=senders,
                 source_ip=client_ip,
+                suppression_key=settings.suppression_key,
                 locale=payload.locale or "es",
             )
         except Exception as exc:
@@ -979,6 +980,7 @@ async def resend_public_phone_otp(
             business_name=business_name,
             senders=senders,
             source_ip=client_ip,
+            suppression_key=settings.suppression_key,
         )
     except IPRateLimitError as exc:
         raise HTTPException(

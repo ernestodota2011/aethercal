@@ -48,6 +48,8 @@ Sessionmaker = async_sessionmaker[AsyncSession]
 
 _ALWAYS_OPEN = {str(day): [{"start": "00:00", "end": "23:30"}] for day in range(7)}
 _TURNSTILE_SECRET = "1x0000000000000000000000000000000AA"
+# The dedicated opt-out-list key (D-12); >= 32 chars, and never derived from APP_SECRET.
+_SUPPRESSION_KEY = "test-suppression-key-0123456789abcdef"
 _LOOPBACK_CIDR = "127.0.0.0/8"
 _KEY = derive_fernet_key("test-app-secret")
 _PRICE = 5000
@@ -139,6 +141,7 @@ async def paid_app(
         app_secret="test-app-secret",
         public_api_enabled=True,
         turnstile_secret=_TURNSTILE_SECRET,
+        suppression_key=_SUPPRESSION_KEY,
         trusted_proxies=_LOOPBACK_CIDR,
     )
     application = create_app(settings)

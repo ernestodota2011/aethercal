@@ -145,6 +145,12 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     # When the host marked the guest a no-show (RF-25). Only ever set from ``confirmed``, and only
     # after the appointment has ENDED. The booking keeps occupying its slot (see BookingStatus).
     no_show_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # When the guest CONFIRMED they will attend, by replying "1" to the WhatsApp reminder
+    # (Horizon 1, migration 0019). Stamp set once and kept: a second "1" is idempotent and does not
+    # move the first confirmation's instant. The column exists because the alternative was the
+    # defect this project keeps finding: a handler that answered "attendance_confirmed" and wrote
+    # NOTHING — a no-op wearing a success message.
+    attendance_confirmed_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     # The persisted iCal SEQUENCE for this booking's UID (RFC 5545, F1-08). Starts at 0 (the
     # confirmation), and every mutation that emits an updated ``.ics`` bumps it — a cancellation
     # bumps it, a reschedule carries the predecessor + 1 — so successive updates strictly increase

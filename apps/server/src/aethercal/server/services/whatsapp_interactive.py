@@ -1,9 +1,15 @@
 """Bidirectional interactive WhatsApp processing via Evolution API (Horizon 1).
 
 Handles incoming guest responses:
-- "1" / "si" / "confirmo" -> Confirms attendance for the upcoming appointment.
+- "1" / "si" / "confirmo" -> Confirms attendance for the upcoming appointment, stamping
+  ``bookings.attendance_confirmed_at`` (a first-wins, idempotent seal).
 - "2" / "no" / "cancelar" -> Cancels the booking in-transaction via `cancel_booking`.
 - "STOP" / "BAJA" / "ALTO" -> Registers instance-level phone suppression (D-12).
+
+Only UPCOMING bookings are eligible for confirm/cancel: the reminder goes out before the
+appointment, so a reply that arrives after it has no live appointment to act on and is answered
+as ``no_booking_found`` — a late or replayed reply must never cancel a visit that already
+happened.
 
 All transitions and notifications obey RLS, multi-tenant isolation, and the transactional outbox.
 
@@ -473,13 +479,18 @@ async def find_target_booking(
     phone_e164: str,
     now: datetime,
 ) -> Booking | None:
-    """Find the most relevant CONFIRMED booking for this guest phone and tenant.
+    """Find the closest UPCOMING confirmed booking for this guest phone and tenant.
 
-    Prefers the closest upcoming booking (`start_at >= now`).
-    Falls back to the most recent past booking if none is upcoming.
+    ==Only bookings that have not started are eligible, and that is a safety rule.== This used to
+    fall back to the most recent PAST confirmed booking, so a late (or replayed) "2" could cancel an
+    appointment that already happened — firing the whole cancellation chain, including the guest
+    email, for a visit that is over — and a stale "1" could "confirm" one. The reminder that invites
+    the reply goes out BEFORE the appointment, so a reply that arrives after the start has no live
+    appointment to act on: the guest is told exactly that (``no_booking_found``), and nothing is
+    written. An appointment already under way is excluded for the same reason: a cancellation must
+    never fire on a visit that is happening.
     """
-    # 1. Look for upcoming confirmed bookings
-    upcoming = (
+    return (
         await session.scalars(
             select(Booking)
             .where(
@@ -491,24 +502,6 @@ async def find_target_booking(
             .order_by(Booking.start_at.asc())
         )
     ).first()
-
-    if upcoming is not None:
-        return upcoming
-
-    # 2. Look for recent past confirmed booking
-    recent = (
-        await session.scalars(
-            select(Booking)
-            .where(
-                Booking.tenant_id == tenant_id,
-                Booking.guest_phone == phone_e164,
-                Booking.status == BookingStatus.CONFIRMED,
-            )
-            .order_by(Booking.start_at.desc())
-        )
-    ).first()
-
-    return recent
 
 
 async def process_inbound_whatsapp(  # noqa: PLR0913
@@ -553,11 +546,17 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
                 reply_message="No encontramos una cita activa asociada a este número.",
             )
 
-        # Mark attendance confirmation
+        # Mark attendance confirmation — and PERSIST it. Returning "attendance_confirmed" while
+        # writing nothing was the no-op this stamp closes: an operator managing no-shows had no way
+        # to tell a guest who answered "1" from one who never replied.
+        if booking.attendance_confirmed_at is None:
+            booking.attendance_confirmed_at = now
+            await session.flush()
         _logger.info(
-            "Attendance confirmed via WhatsApp for booking %s (tenant %s)",
+            "Attendance confirmed via WhatsApp for booking %s (tenant %s) at %s",
             booking.id,
             tenant_id,
+            booking.attendance_confirmed_at,
         )
         return WhatsAppProcessResult(
             action=action,

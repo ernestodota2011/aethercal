@@ -105,6 +105,10 @@ from aethercal.server.services.notifications import (
     notification_already_sent,
     record_booking_notification,
 )
+from aethercal.server.services.phone_verification import (
+    get_suppression_key,
+    is_phone_suppressed,
+)
 from aethercal.server.services.templates import (
     TemplateError,
     build_template_context,
@@ -2527,6 +2531,9 @@ async def _record_notify_sent(
 _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
 _PHONE_UNVERIFIED = "phone-unverified"
+_PHONE_SUPPRESSED = "phone-suppressed"
+"""The guest replied STOP/BAJA (D-12). Unlike the three above, this one is NOT curable by the
+tenant: it is the recipient's own instruction, and it stays until THEY withdraw it."""
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
 _UNKNOWN_OUTCOME = "unknown-outcome"
 """The provider was given the message and the answer was lost. NEVER re-sent blind."""
@@ -2672,6 +2679,34 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
         )
 
 
+async def _require_phone_not_suppressed(
+    session: AsyncSession, booking: Booking, channel: Channel
+) -> None:
+    """Refuse to message a phone the guest asked us to stop messaging (D-12).
+
+    ==Consent and an opt-out can both be true at once, and the opt-out WINS.== The consent stamp
+    records a tick on a form, taken before anybody could reply STOP; nothing withdraws it
+    automatically. So a guest who replies STOP keeps ``guest_phone_consent_at`` set, and without
+    this gate the very next reminder would go to a number that asked to be left alone — the opt-out
+    list would be honoured by the OTP path and ignored by the reminder path, which is the same
+    "protection that is not one" this project keeps hunting.
+
+    Ordering is deliberate: this runs right after the consent gate and BEFORE the channel registry
+    or the template, so no send plan can exist for a suppressed number.
+    """
+    phone = booking.guest_phone
+    if not phone:  # pragma: no cover - the consent gate above already refused the empty one
+        raise OutboxSkipped(
+            f"{_NO_PHONE}: the booking lost its phone number mid-flight, so the {channel.value} "
+            "step cannot run"
+        )
+    if await is_phone_suppressed(session, phone, suppression_key=get_suppression_key()):
+        raise OutboxSkipped(
+            f"{_PHONE_SUPPRESSED}: the guest opted out of messages (D-12), so the {channel.value} "
+            "step must not run; the suppression stands until the guest withdraws it"
+        )
+
+
 def _refuse_channel(
     channel: Channel, channel_errors: Mapping[Channel, Exception], *, when_off: Exception
 ) -> NoReturn:
@@ -2794,6 +2829,7 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
     # template. Not as a nicety of ordering: it must be impossible to reach a send plan for a phone
     # we have no permission to message, however the checks below are later reordered.
     _require_phone_consent(booking, channel)
+    await _require_phone_not_suppressed(session, booking, channel)
 
     phone_sender = channels.get(channel)
     if phone_sender is None:

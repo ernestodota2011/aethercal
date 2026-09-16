@@ -145,6 +145,91 @@ def test_parse_graph_schedule_fail_closed_on_errors() -> None:
         )
 
 
+def test_an_unknown_status_blocks_time_instead_of_reading_as_free() -> None:
+    """==El defecto que este test fija: la lista de estados "ocupado" estaba al revés.==
+
+    Con una allow-list de ocupados, cualquier estado nuevo (o ``unknown``, que Graph documenta)
+    caía del lado del tiempo libre — el fallo abierto que produce una doble reserva. Ahora solo
+    ``free`` es libre y el resto bloquea, aunque el parser nunca haya visto el estado.
+    """
+    response = {
+        "value": [
+            {
+                "scheduleId": "host@example.com",
+                "scheduleItems": [
+                    {
+                        "status": "unknown",
+                        "start": {"dateTime": "2026-09-16T10:00:00Z", "timeZone": "UTC"},
+                        "end": {"dateTime": "2026-09-16T11:00:00Z", "timeZone": "UTC"},
+                    },
+                    {
+                        "status": "aStatusFromTheFuture",
+                        "start": {"dateTime": "2026-09-16T12:00:00Z", "timeZone": "UTC"},
+                        "end": {"dateTime": "2026-09-16T13:00:00Z", "timeZone": "UTC"},
+                    },
+                ],
+            }
+        ]
+    }
+
+    intervals = parse_graph_schedule(response, schedule_id="host@example.com")
+
+    assert [i.start for i in intervals] == [
+        datetime(2026, 9, 16, 10, 0, tzinfo=UTC),
+        datetime(2026, 9, 16, 12, 0, tzinfo=UTC),
+    ]
+
+
+def test_a_non_free_item_without_usable_instants_aborts_the_query() -> None:
+    """Un bloque no libre sin instantes válidos no se puede nombrar: adivinar sería reservar a
+    ciegas, así que la consulta entera se rechaza (fail-closed)."""
+    missing_instants = {
+        "value": [
+            {
+                "scheduleId": "host@example.com",
+                "scheduleItems": [
+                    {
+                        "status": "busy",
+                        "start": {"dateTime": "2026-09-16T10:00:00Z", "timeZone": "UTC"},
+                    }
+                ],
+            }
+        ]
+    }
+    with pytest.raises(RuntimeError, match="no valid start/end instants"):
+        parse_graph_schedule(missing_instants, schedule_id="host@example.com")
+
+    # Un ítem que no es un objeto tampoco se puede interpretar.
+    with pytest.raises(RuntimeError, match="not an object"):
+        parse_graph_schedule(
+            {"value": [{"scheduleId": "host@example.com", "scheduleItems": ["busy"]}]},
+            schedule_id="host@example.com",
+        )
+
+    # Una entrada sin la lista de ítems es una respuesta malformada, no un día vacío.
+    with pytest.raises(RuntimeError, match="no usable 'scheduleItems'"):
+        parse_graph_schedule({"value": [{"scheduleId": "host@example.com"}]})
+
+    # Extremos invertidos: la ventana es un sinsentido y no se adivina.
+    with pytest.raises(RuntimeError, match="end precedes its start"):
+        parse_graph_schedule(
+            {
+                "value": [
+                    {
+                        "scheduleId": "host@example.com",
+                        "scheduleItems": [
+                            {
+                                "status": "busy",
+                                "start": {"dateTime": "2026-09-16T12:00:00Z", "timeZone": "UTC"},
+                                "end": {"dateTime": "2026-09-16T11:00:00Z", "timeZone": "UTC"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+
 def test_build_schedule_request_body() -> None:
     w = TimeInterval(
         start=datetime(2026, 9, 16, 9, 0, tzinfo=UTC),
