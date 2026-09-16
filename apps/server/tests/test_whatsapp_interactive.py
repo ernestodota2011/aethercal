@@ -45,6 +45,7 @@ from aethercal.server.services.tenant_credentials import (
 from aethercal.server.services.tenant_senders import InstanceSenderDefaults
 from aethercal.server.services.whatsapp_interactive import (
     WhatsAppReplyAction,
+    _distance_within,
     extract_evolution_payload,
     parse_reply_action,
     process_inbound_whatsapp,
@@ -250,6 +251,34 @@ def test_the_opt_out_lexicon_wins_over_cancellation(text: str) -> None:
     """==La baja gana: es la única acción sin camino de vuelta.== "cancelar suscripción" contiene
     "cancelar", y sin embargo suprimir es la lectura correcta."""
     assert parse_reply_action(text) == WhatsAppReplyAction.OPT_OUT
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "limit", "expected"),
+    [
+        ("confirmo", "confirmo", 0, True),  # idénticos
+        ("confimo", "confirmo", 1, True),  # una inserción
+        ("cofirmo", "confirmo", 1, True),  # un borrado
+        ("canceo", "cancelo", 1, True),  # una sustitución
+        (
+            "confrimo",
+            "confirmo",
+            1,
+            True,
+        ),  # UNA transposición (el caso que un Levenshtein puro cobra 2)
+        ("confrmado", "confirmado", 1, True),  # transposición más larga
+        ("cancelar", "confirmo", 1, False),  # lejos
+        ("asdfghjkl", "confirmo", 2, False),  # ruido
+        ("confirmo", "confirmo", -1, False),  # ni el caso trivial pasa con límite negativo
+    ],
+)
+def test_distance_within_is_bounded_OSA_and_a_swap_costs_ONE(
+    source: str, target: str, limit: int, expected: bool
+) -> None:
+    """La tolerancia a erratas del parser se apoya en esta distancia. Si una transposición costara
+    dos, ``confrimo`` (la errata más común al teclear) quedaría fuera del umbral de 1 y volvería a
+    ser UNKNOWN — que es exactamente el defecto que el corpus mide."""
+    assert _distance_within(source, target, limit) is expected
 
 
 # --------------------------------------------------------------------------------------

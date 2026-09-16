@@ -489,6 +489,11 @@ async def find_target_booking(
     appointment to act on: the guest is told exactly that (``no_booking_found``), and nothing is
     written. An appointment already under way is excluded for the same reason: a cancellation must
     never fire on a visit that is happening.
+
+    ==No verification seal is demanded of a REPLY, deliberately:== the guest is answering FROM that
+    phone — the message's own origin is the possession evidence — and the seal (OTP-4) gates the
+    messages the BUSINESS sends, not the ones the guest starts. Requiring it here would leave every
+    guest who skipped or lost the OTP unable to cancel or confirm.
     """
     return (
         await session.scalars(

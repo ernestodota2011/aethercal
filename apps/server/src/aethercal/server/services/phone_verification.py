@@ -105,7 +105,15 @@ def _now() -> datetime:
 
 
 def normalize_e164(phone: str) -> str:
-    """Normalize phone number to digits or standard E.164 representation."""
+    """Normalize a phone number to ``+<digits>`` (best-effort; validation lives at the edge).
+
+    This is a NORMALIZER, not a validator: it strips formatting and prefixes a ``+`` to whatever
+    digits it finds, so an inbound webhook's ``13055551234@s.whatsapp.net`` and a form's
+    ``+1 (305) 413-1728`` compare equal. Length and country-prefix rules belong to the booking
+    schema (``E164Phone``), which refuses an unaddressable number with a 422 on the way IN — a
+    webhook sender, by contrast, is whatever WhatsApp says it is, and refusing it here would only
+    turn a legacy-format number into silence.
+    """
     cleaned = phone.strip()
     if not cleaned:
         return ""
@@ -367,6 +375,17 @@ async def issue_verification_challenge(  # noqa: PLR0913
     - Generates 6-digit CSPRNG code and persists challenge with code_hmac.
     - Dispatches message with WhatsApp preference and SMS fallback (D-8, D-8·bis).
     - If sending fails permanently before delivery, annuls secret so slot is not consumed.
+
+    .. rubric:: A TRANSIENT failure is deliberately different
+
+    A ``PermanentSendError`` means nothing was delivered and nothing ever will be (the number
+    has no WhatsApp account, the provider refuses the recipient): the secret is annulled and the
+    slot is not spent (D-7·bis). A TRANSIENT failure (timeout, 500, connection reset) is
+    ambiguous — the provider may already have accepted the message — so it propagates with the
+    challenge LIVE and its slot spent. Annulling on an ambiguous outcome would free a rate-limit
+    slot that a real message may have consumed; retrying it here would risk a second code. The
+    guest's own RESEND (after the 60-second cooldown) is the retry, and the caller reports the
+    failed dispatch to the page.
     """
     if not booking.guest_phone:
         raise ValueError("Booking has no guest phone number to verify.")

@@ -150,11 +150,22 @@ class PublicBookingRead(BaseModel):
 
 
 class PhoneVerificationRequest(BaseModel):
-    """Payload for verifying phone possession code (C-02b)."""
+    """Payload for verifying phone possession code (C-02b).
+
+    The code is EXACTLY six digits — the same shape the service enforces (D-4). The schema used to
+    accept 4 to 10 characters, which let a payload the product can never satisfy travel all the way
+    to the verifier to be rejected there; the edge refuses it now, and the guest gets the page's
+    "invalid or expired" copy instead of a fifth identical round trip."""
 
     token: Annotated[str, Field(description="Signed guest token with purpose phone_verification")]
     code: Annotated[
-        str, Field(min_length=4, max_length=10, description="6-digit verification code")
+        str,
+        Field(
+            min_length=6,
+            max_length=6,
+            pattern=r"^[0-9]{6}$",
+            description="6-digit verification code",
+        ),
     ]
 
 

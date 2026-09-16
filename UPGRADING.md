@@ -99,6 +99,16 @@ the form is not possession of the number — and it is declared here rather than
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> AETHERCAL_SUPPRESSION_KEY
 ```
 
+**Retention note (declared, not silent).** ``phone_verification_challenges`` keeps a 24-hour
+counting tombstone per challenge, and **no periodic job sweeps them yet**: the table grows linearly
+with OTP volume (order of KB/day for a small business) until the sweep is wired to the worker
+scheduler. The rate limits stay correct — every counting query filters by ``created_at >= cutoff``.
+An operator with very high volume can delete rows older than a day manually:
+
+```sql
+DELETE FROM phone_verification_challenges WHERE created_at < now() - interval '24 hours';
+```
+
 Full detail: [CHANGELOG.md](CHANGELOG.md) and [docs/phone-channels.md](docs/phone-channels.md).
 
 ---
