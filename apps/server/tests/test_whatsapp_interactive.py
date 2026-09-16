@@ -254,6 +254,30 @@ def test_the_opt_out_lexicon_wins_over_cancellation(text: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "text", ["quitar", "Quitar", "QUITAR", "bloquear", "Bloquear", "bloquear remitente"]
+)
+def test_the_contextual_verbs_opt_out_when_they_are_an_instruction(text: str) -> None:
+    """Solas (o con su objeto de supresión) son una orden de baja, y la baja es lo que el huésped
+    quiso decir."""
+    assert parse_reply_action(text) == WhatsAppReplyAction.OPT_OUT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "¿Puedo quitar a mi acompañante?",
+        "¿se puede bloquear el estacionamiento?",
+        "consulta: quitar el cargo de la factura",
+    ],
+)
+def test_a_QUESTION_that_merely_uses_quitar_or_bloquear_does_NOT_suppress(text: str) -> None:
+    """==El único error sin vuelta atrás en este parser.== "quitar"/"bloquear" tienen una lectura
+    benigna ("¿puedo quitar a mi acompañante?"), así que no bastan por sí solos: sin un objeto de
+    supresión (lista, número, mensajes) no son una baja, y una pregunta no puede suprimir."""
+    assert parse_reply_action(text) != WhatsAppReplyAction.OPT_OUT
+
+
+@pytest.mark.parametrize(
     ("source", "target", "limit", "expected"),
     [
         ("confirmo", "confirmo", 0, True),  # idénticos

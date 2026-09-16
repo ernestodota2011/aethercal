@@ -98,7 +98,31 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 #: A bare mention of any of these words IS an opt-out request. They have no other meaning a
 #: guest would put in a reply to an appointment reminder.
 _OPT_OUT_WORDS = frozenset(
-    {"stop", "baja", "alto", "desuscribir", "unsubscribe", "parar", "detener", "quitar", "bloquear"}
+    {"stop", "baja", "alto", "desuscribir", "unsubscribe", "parar", "detener"}
+)
+
+#: Verbs that mean "remove/block" — which is an opt-out ALONE or next to an object ("quitar de la
+#: lista", "bloquear remitente"), and a legitimate QUESTION next to anything else ("¿puedo quitar a
+#: mi acompañante?"). They are the two words in this lexicon with a benign reading, so they get the
+#: stricter rule: bare word alone, or accompanied by an opt-out object. ==The asymmetry is the
+#: point: a false OPT_OUT suppresses a guest permanently, and it is the one mistake with no undo.==
+_OPT_OUT_CONTEXTUAL_VERBS = frozenset({"quitar", "bloquear"})
+_OPT_OUT_OBJECTS = frozenset(
+    {
+        "lista",
+        "numero",
+        "mensajes",
+        "suscripcion",
+        "recordatorios",
+        "avisos",
+        "alertas",
+        "notificaciones",
+        "comunicaciones",
+        "envios",
+        "remitente",
+        "base",
+        "datos",
+    }
 )
 
 #: Multi-word opt-out requests. Substrings, because the request is a sentence ("no me envíen
@@ -369,6 +393,10 @@ def _is_typo_of(token: str, vocabulary: frozenset[str], *, minimum_length: int =
 
 def _is_opt_out(normalized: str, tokens: tuple[str, ...]) -> bool:
     if any(token in _OPT_OUT_WORDS for token in tokens):
+        return True
+    if any(token in _OPT_OUT_CONTEXTUAL_VERBS for token in tokens) and (
+        len(tokens) == 1 or any(token in _OPT_OUT_OBJECTS for token in tokens)
+    ):
         return True
     if any(token.startswith(_OPT_OUT_PREFIXES) and len(token) >= 5 for token in tokens):
         return True

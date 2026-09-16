@@ -1,6 +1,7 @@
 """Phone possession verification service (C-02b, RF-24).
 
-Implements the approved spec AetherCal-19-Spec-C02b-OTP.md:
+Implements the approved C-02b design package, whose decisions live in this module and in
+``docs/phone-channels.md``:
 - 6-digit CSPRNG codes, TTL 10 min, max 5 attempts, single-use (D-4).
 - HMAC-SHA256 storage under AETHERCAL_APP_SECRET; timing-attack safe compare_digest (D-5, A-4).
 - Anti-enumeration: identical byte-for-byte failure response

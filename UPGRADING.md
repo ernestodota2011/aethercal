@@ -89,6 +89,10 @@ the form is not possession of the number — and it is declared here rather than
   booking page.
 - For bookings that predate the upgrade: **rebook through the public form** (or ask the guest to) if
   a phone step matters for them; their e-mail steps are unaffected.
+- **Inbound replies** ("1" confirms, "2" cancels, STOP/BAJA/… opts out) are processed and take
+  effect on the booking and the opt-out list, ==but the guest does NOT receive an acknowledgement
+  message yet==: the reply text is returned to the caller and not sent — an outbound chat message has
+  to pass consent, the seal, the opt-out list, the daily caps and the notification ledger first.
 - **Set `AETHERCAL_SUPPRESSION_KEY`** (≥32 random characters) — ==required whenever
   `AETHERCAL_PUBLIC_API_ENABLED=true`, and the app refuses to boot without it.== It is the HMAC key
   behind the instance opt-out list (STOP replies), deliberately not derived from

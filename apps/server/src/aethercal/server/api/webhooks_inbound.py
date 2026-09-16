@@ -107,6 +107,28 @@ def _payload_too_large() -> HTTPException:
     return HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="payload too large")
 
 
+def _reject_an_oversized_declaration(request: Request) -> None:
+    """The HEADER half of the size cap: a declared ``Content-Length`` over the cap is a 413 here.
+
+    ==Split out of the read so an UNAUTHENTICATED caller cannot make the process buffer a body.==
+    The money webhook MUST read the raw bytes before it can verify (the HMAC is over them), so its
+    order is forced; the WhatsApp webhook authenticates with a header, so it can — and now does —
+    check this, authenticate, and only THEN read the stream. Same cap, same 413, but the bytes of a
+    request that cannot authenticate are never pulled into memory at all.
+    """
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return
+    try:
+        length = int(declared)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="malformed Content-Length"
+        ) from None
+    if length > MAX_WEBHOOK_BODY_BYTES:
+        raise _payload_too_large()
+
+
 async def _read_body_within_limit(request: Request) -> bytes:
     """Read the raw body, but NEVER more than :data:`MAX_WEBHOOK_BODY_BYTES` (finding 3).
 
@@ -114,16 +136,7 @@ async def _read_body_within_limit(request: Request) -> bytes:
     read is also capped, byte for byte, so a missing or lying length cannot smuggle a large body
     past the header check. Either way the body is never fully buffered before the limit is enforced,
     so the memory this endpoint can be made to allocate is bounded by the cap."""
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            length = int(declared)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="malformed Content-Length"
-            ) from None
-        if length > MAX_WEBHOOK_BODY_BYTES:
-            raise _payload_too_large()
+    _reject_an_oversized_declaration(request)
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
@@ -309,7 +322,13 @@ async def receive_whatsapp_webhook(
     the handler only ever acts on an UPCOMING booking whose phone matches the sender's (the
     intent parser cannot name a booking, and the suppression list has no read surface).
     """
-    raw_body = await _read_body_within_limit(request)
+    # ==The body is read AFTER authenticating.== The size cap is checked from the header first (a
+    # declared oversize is still a 413 before any work), but the BYTES are pulled from the stream
+    # only once the caller has proven it holds the tenant's provider key: an unauthenticated POST
+    # must not be able to make the process buffer up to MAX_WEBHOOK_BODY_BYTES. (The money webhook
+    # below reads first because its HMAC is over the raw bytes — the order there is forced; here it
+    # is a choice, and this is the strictly better one.)
+    _reject_an_oversized_declaration(request)
 
     tenant_id = await tenant_by_slug(session, tenant_slug)
     if tenant_id is None:
@@ -350,6 +369,9 @@ async def receive_whatsapp_webhook(
         # scope down on the way out either way; doing it here makes the intent explicit at the
         # exact point where authentication failed.
         raise _deny_after_binding()
+
+    # Authenticated: NOW the bytes are worth reading (still under the streamed cap).
+    raw_body = await _read_body_within_limit(request)
 
     try:
         payload = json.loads(raw_body)
