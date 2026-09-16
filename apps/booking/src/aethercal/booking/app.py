@@ -1427,7 +1427,10 @@ class _BookingApp:
                     tenant, booking_id, code=code, token=token, forwarded_for=guest_ip
                 ),
             )
-            if res.verified:
+            # `status` is compared explicitly (not via the model's `verified` property) so the
+            # success branch is legible without chasing the schema: this is the WIRE value the
+            # endpoint returns.
+            if res.status == "verified":
                 return views.message_page(
                     locale,
                     title=t(locale, "phone_verify_title"),

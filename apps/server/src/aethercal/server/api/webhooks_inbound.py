@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated
@@ -71,6 +72,8 @@ caller who cannot sign anything exhaust the process's memory with one giant POST
 service that never reaches the signature check. The body is read with this cap instead."""
 
 _ConfirmEffects = Callable[[AsyncSession, Booking, datetime], Awaitable[None]]
+
+_logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -350,7 +353,10 @@ async def receive_whatsapp_webhook(
 
     try:
         payload = json.loads(raw_body)
-    except Exception:
+    except Exception as exc:
+        # Acked as ignored (the provider gets a 200 and stops retrying), but NOT silently: an
+        # operator wondering why a guest's "1" never landed needs this line.
+        _logger.debug("inbound WhatsApp webhook body is not JSON (%s); ignoring", exc)
         return {"status": "ignored"}
 
     if not isinstance(payload, dict):

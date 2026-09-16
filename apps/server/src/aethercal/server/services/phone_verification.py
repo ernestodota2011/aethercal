@@ -450,7 +450,7 @@ async def issue_verification_challenge(  # noqa: PLR0913
     return challenge, channel_used
 
 
-async def verify_phone_code(  # noqa: PLR0913
+async def verify_phone_code(  # noqa: PLR0913, PLR0911 - one early exit per verification state
     session: AsyncSession,
     *,
     booking_id: uuid.UUID,
@@ -483,6 +483,21 @@ async def verify_phone_code(  # noqa: PLR0913
         # paragraph). Hashing it would only burn budget against the wrong thing.
         return VerificationStatus.INVALID
 
+    booking = (
+        await session.scalars(
+            select(Booking).where(Booking.id == booking_id, Booking.tenant_id == tenant_id)
+        )
+    ).one_or_none()
+    if booking is None or not booking.guest_phone:
+        return VerificationStatus.INVALID
+
+    # ==A challenge verifies the phone the booking has NOW.== The challenge carries the HMAC of the
+    # number it was issued for; if the booking's phone changed after issuance (a reschedule with a
+    # different number, a host edit), the old code would otherwise seal a possession stamp for a
+    # number whose code nobody proved they could read. OTP-10 clears the stamp on a phone write;
+    # this closes the same hole for the live challenge, which the write path cannot reach.
+    current_phone_hmac = compute_hmac(app_secret, normalize_e164(booking.guest_phone))
+
     # Look up the live challenge
     challenge = (
         await session.scalars(
@@ -490,6 +505,7 @@ async def verify_phone_code(  # noqa: PLR0913
             .where(
                 PhoneVerificationChallenge.booking_id == booking_id,
                 PhoneVerificationChallenge.tenant_id == tenant_id,
+                PhoneVerificationChallenge.phone_hmac == current_phone_hmac,
                 PhoneVerificationChallenge.code_hmac.is_not(None),
                 PhoneVerificationChallenge.consumed_at.is_(None),
                 PhoneVerificationChallenge.expires_at > current_time,
@@ -514,6 +530,7 @@ async def verify_phone_code(  # noqa: PLR0913
             .where(
                 PhoneVerificationChallenge.id == challenge.id,
                 PhoneVerificationChallenge.tenant_id == tenant_id,
+                PhoneVerificationChallenge.phone_hmac == current_phone_hmac,
                 PhoneVerificationChallenge.consumed_at.is_(None),
                 PhoneVerificationChallenge.code_hmac.is_not(None),
                 PhoneVerificationChallenge.expires_at > current_time,
@@ -550,6 +567,7 @@ async def verify_phone_code(  # noqa: PLR0913
         .where(
             PhoneVerificationChallenge.id == challenge.id,
             PhoneVerificationChallenge.tenant_id == tenant_id,
+            PhoneVerificationChallenge.phone_hmac == current_phone_hmac,
             PhoneVerificationChallenge.consumed_at.is_(None),
             PhoneVerificationChallenge.code_hmac.is_not(None),
             PhoneVerificationChallenge.expires_at > current_time,
@@ -564,15 +582,9 @@ async def verify_phone_code(  # noqa: PLR0913
     if result.scalar_one_or_none() is None:
         return VerificationStatus.INVALID
 
-    # Seal the booking
-    booking = (
-        await session.scalars(
-            select(Booking).where(Booking.id == booking_id, Booking.tenant_id == tenant_id)
-        )
-    ).one_or_none()
-    if booking is not None:
-        booking.guest_phone_verified_at = current_time
-        await session.flush()
+    # Seal the booking (loaded above, under this tenant, for the phone HMAC check)
+    booking.guest_phone_verified_at = current_time
+    await session.flush()
 
     return VerificationStatus.SUCCESS
 

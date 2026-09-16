@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
@@ -41,6 +42,7 @@ from aethercal.server.services.phone_verification import (
     inherit_phone_verification_on_reschedule,
     issue_verification_challenge,
     suppress_phone,
+    sweep_stale_challenges,
     verify_phone_code,
 )
 from aethercal.server.services.tenant_senders import TenantSenders
@@ -308,6 +310,102 @@ async def test_a_code_that_cannot_be_a_code_is_refused_WITHOUT_spending_an_attem
     assert challenge.attempts == 0, "un texto que no es un código gastó un intento"
     assert challenge.code_hmac is not None, "el código vivo se quemó por un texto que no era código"
     assert booking.guest_phone_verified_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_does_NOT_verify_a_phone_the_booking_no_longer_has(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==El sello atestigua el número ACTUAL, no el que había cuando se emitió el desafío.==
+
+    Si el teléfono de la reserva cambia después de emitir (una reprogramación con otro número, una
+    edición del anfitrión), el código viejo no puede sellar posesión del número nuevo: nadie probó
+    que pudiera leer un código en él. OTP-10 limpia el sello en cada escritura del teléfono; esto
+    cierra el mismo agujero para el desafío vivo, que la escritura no alcanza.
+    """
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+
+    sender = DummySender(Channel.WHATSAPP)
+    senders = TenantSenders(tenant_id=tenant.id, email=None, channels={Channel.WHATSAPP: sender})  # type: ignore[arg-type]
+    challenge, _ = await issue_verification_challenge(
+        sqlite_session,
+        booking=booking,
+        app_secret=_APP_SECRET,
+        business_name="Acme Corp",
+        senders=senders,
+        source_ip="198.51.100.1",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    code = next(
+        w.strip(".:,")
+        for w in sender.sent_messages[0]["body"].split()
+        if w.strip(".:,").isdigit() and len(w.strip(".:,")) == 6
+    )
+
+    booking.guest_phone = "+13055559999"  # el número cambió tras emitirse el desafío
+    await sqlite_session.flush()
+
+    outcome = await verify_phone_code(
+        sqlite_session,
+        booking_id=booking.id,
+        tenant_id=tenant.id,
+        code=code,  # el código CORRECTO del número viejo
+        app_secret=_APP_SECRET,
+        now=now,
+    )
+
+    assert outcome is VerificationStatus.INVALID
+    assert booking.guest_phone_verified_at is None, "se selló posesión de un número que ya no es"
+    await sqlite_session.refresh(challenge)
+    assert challenge.consumed_at is None
+    assert challenge.code_hmac is not None, "el desafío del número viejo se consumió"
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_challenges_deletes_only_what_is_older_than_the_window(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """La retención de 24 h del diseño (D-7·bis) es una REGLA del barrido: borra lo viejo y deja la
+    lápida reciente que los topes todavía cuentan. El barrido existe aunque hoy nadie lo llame desde
+    el worker (cablearlo es el hilo abierto declarado en su docstring)."""
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    phone_hmac = compute_hmac(_APP_SECRET, "+13055550001")
+    sqlite_session.add_all(
+        [
+            PhoneVerificationChallenge(
+                tenant_id=tenant.id,
+                booking_id=booking.id,
+                phone_hmac=phone_hmac,
+                code_hmac=None,
+                attempts=0,
+                expires_at=now - timedelta(days=2),
+                created_at=now - timedelta(hours=25),
+            ),
+            PhoneVerificationChallenge(
+                tenant_id=tenant.id,
+                booking_id=booking.id,
+                phone_hmac=phone_hmac,
+                code_hmac=None,
+                attempts=0,
+                expires_at=now - timedelta(hours=10),
+                created_at=now - timedelta(hours=1),
+            ),
+        ]
+    )
+    await sqlite_session.flush()
+
+    deleted = await sweep_stale_challenges(sqlite_session, now=now)
+
+    assert deleted == 1
+    remaining = await sqlite_session.scalar(
+        sa.select(sa.func.count()).select_from(PhoneVerificationChallenge)
+    )
+    assert remaining == 1
 
 
 # --------------------------------------------------------------------------------------
