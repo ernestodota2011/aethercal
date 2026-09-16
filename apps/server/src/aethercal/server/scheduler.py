@@ -63,6 +63,7 @@ from aethercal.server.services.outbox import (
     make_booking_effect_executor,
 )
 from aethercal.server.services.payments import build_money_runners, run_parked_payment_tick
+from aethercal.server.services.phone_verification import sweep_stale_challenges
 from aethercal.server.services.slots import MAX_PAST_DAYS, busy_window
 from aethercal.server.services.tenant_senders import TenantSenders, resolve_tenant_senders
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
@@ -77,14 +78,18 @@ _logger = logging.getLogger(__name__)
 WEBHOOK_DELIVERY_JOB_ID = "webhook-delivery"
 BUSY_REFRESH_JOB_ID = "busy-cache-refresh"
 OUTBOX_DRAIN_JOB_ID = "outbox-drain"
+PHONE_CHALLENGE_SWEEP_JOB_ID = "phone-challenge-sweep"
 
 # The outbound-webhook worker fires often (near-real-time delivery); the busy-cache refresh is
 # heavier and only needs to keep the slot math roughly warm, so it runs every few minutes. The
 # outbox drain carries the booking's post-commit effects (email/Google), so it fires often like the
-# webhook worker to keep the guest's confirmation timely.
+# webhook worker to keep the guest's confirmation timely. The phone-challenge sweep is pure
+# maintenance (delete rows older than a day): hourly is generous, and each pass is one indexed
+# DELETE over a table that only ever holds a day of tombstones.
 DEFAULT_WEBHOOK_INTERVAL_SECONDS = 60
 DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS = 60
+DEFAULT_PHONE_SWEEP_INTERVAL_SECONDS = 3600
 
 # How far ahead the periodic busy-cache refresh keeps each connected calendar complete. Read as
 # DATES, not as an offset from the tick: the cache answers any slots query whose ``to`` lands within
@@ -142,11 +147,14 @@ def register_scheduler_jobs(  # noqa: PLR0913 - one keyword per recurring job/in
     webhook_tick: Tick,
     busy_refresh_tick: Tick,
     outbox_tick: Tick,
+    phone_challenge_sweep_tick: Tick,
     webhook_interval_seconds: int = DEFAULT_WEBHOOK_INTERVAL_SECONDS,
     busy_refresh_interval_seconds: int = DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
     outbox_drain_interval_seconds: int = DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
+    phone_sweep_interval_seconds: int = DEFAULT_PHONE_SWEEP_INTERVAL_SECONDS,
 ) -> None:
-    """Register the recurring interval jobs (webhook delivery + busy-cache refresh + outbox drain).
+    """Register the recurring interval jobs (webhook delivery + busy-cache refresh + outbox drain +
+    phone-challenge sweep).
 
     ``replace_existing`` keeps a restart idempotent — a re-registered id overwrites rather than
     duplicating the job.
@@ -172,6 +180,13 @@ def register_scheduler_jobs(  # noqa: PLR0913 - one keyword per recurring job/in
         id=OUTBOX_DRAIN_JOB_ID,
         replace_existing=True,
     )
+    scheduler.add_job(
+        phone_challenge_sweep_tick,
+        trigger="interval",
+        seconds=phone_sweep_interval_seconds,
+        id=PHONE_CHALLENGE_SWEEP_JOB_ID,
+        replace_existing=True,
+    )
 
 
 def start_scheduler(  # noqa: PLR0913 - one keyword per recurring job/interval (a flat seam)
@@ -180,9 +195,11 @@ def start_scheduler(  # noqa: PLR0913 - one keyword per recurring job/interval (
     webhook_tick: Tick,
     busy_refresh_tick: Tick,
     outbox_tick: Tick,
+    phone_challenge_sweep_tick: Tick,
     webhook_interval_seconds: int = DEFAULT_WEBHOOK_INTERVAL_SECONDS,
     busy_refresh_interval_seconds: int = DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
     outbox_drain_interval_seconds: int = DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
+    phone_sweep_interval_seconds: int = DEFAULT_PHONE_SWEEP_INTERVAL_SECONDS,
 ) -> None:
     """Register the interval jobs, then start the scheduler."""
     register_scheduler_jobs(
@@ -190,9 +207,11 @@ def start_scheduler(  # noqa: PLR0913 - one keyword per recurring job/interval (
         webhook_tick=webhook_tick,
         busy_refresh_tick=busy_refresh_tick,
         outbox_tick=outbox_tick,
+        phone_challenge_sweep_tick=phone_challenge_sweep_tick,
         webhook_interval_seconds=webhook_interval_seconds,
         busy_refresh_interval_seconds=busy_refresh_interval_seconds,
         outbox_drain_interval_seconds=outbox_drain_interval_seconds,
+        phone_sweep_interval_seconds=phone_sweep_interval_seconds,
     )
     scheduler.start()
 
@@ -254,6 +273,34 @@ async def run_outbox_drain_once(
         return await drain_outbox(pools, now=moment, execute=execute)
     except Exception:
         _logger.exception("outbox-drain tick failed; scheduler continues")
+        return None
+
+
+async def run_phone_challenge_sweep_once(
+    *,
+    pools: WorkerPools,
+    now: datetime | None = None,
+) -> int | None:
+    """One pass of the phone-OTP retention sweep. Returns how many tombstones it deleted, or
+    ``None`` if the tick failed (logged) — a failure never propagates, so the scheduler keeps
+    ticking.
+
+    ==Why this needs the bypass pool:== "delete the challenges older than their 24-hour window" is
+    an INSTANCE-level statement. On the app role with no GUC bound, the same DELETE would match
+    **zero rows** — under RLS it would not fail, it would silently retain everything, which is the
+    unbounded growth this job exists to end. The delete touches only rows past the window every
+    counting query already excludes, so no live rate-limit state depends on it.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    try:
+        async with pools.scan_session(BypassReason.SWEEP_PHONE_CHALLENGES) as session:
+            deleted = await sweep_stale_challenges(session, now=moment)
+            # ``scan_session`` closes the session on the way out; a DELETE with no commit would be
+            # rolled back and the tick would report a count for work that never landed.
+            await session.commit()
+        return deleted
+    except Exception:
+        _logger.exception("phone-challenge sweep tick failed; scheduler continues")
         return None
 
 
@@ -653,7 +700,7 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:
 
     Thin on purpose: every decision it makes lives in :func:`build_drain_executor` (the drain) and
     :func:`build_parked_payment_runner` (the parked-payment pass), both TESTED against the real
-    lifespan. Not ``# pragma: no cover`` any more — B-09's last residual was the boot-seam read that
+    lifespan. Not ``# pragma: no cover`` any more - B-09's last residual was the boot-seam read that
     used to hide in here, and it now lives in a build function a test drives, same as its two
     siblings.
     """
@@ -661,6 +708,19 @@ def make_outbox_drain_tick(app: FastAPI) -> Tick:
     async def _tick() -> None:
         await run_outbox_drain_once(pools=app.state.pools, execute=build_drain_executor(app))
         await build_parked_payment_runner(app)()
+
+    return _tick
+
+
+def make_phone_challenge_sweep_tick(app: FastAPI) -> Tick:
+    """Bind the OTP retention sweep to the worker's pools.
+
+    The retention rule of D-7·bis ("the tombstone lives 24 h and the sweeper deletes it") is only a
+    rule once something runs it: before this job the table grew with every challenge ever issued.
+    """
+
+    async def _tick() -> None:
+        await run_phone_challenge_sweep_once(pools=app.state.pools)
 
     return _tick
 

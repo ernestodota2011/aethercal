@@ -615,26 +615,16 @@ async def sweep_stale_challenges(
 ) -> int:
     """Prune challenges and tombstones older than 24 hours (D-7·bis, OTP.0).
 
-    .. rubric:: ==KNOWN GAP: nothing calls this yet (found by the Crisol gate, 2026-09-16).==
+    ==Wired to the worker's scheduler==
+    (:func:`~aethercal.server.scheduler.run_phone_challenge_sweep_once`, job
+    ``phone-challenge-sweep``, hourly): the 24-hour retention is an ENFORCED rule, not a
+    documented one. It runs on the declared ``BypassReason.SWEEP_PHONE_CHALLENGES`` because
+    "delete every expired challenge" is an instance-level statement — on the app role with no GUC
+    it would match zero rows and retain everything, silently.
 
-    The 24-hour retention the whole tombstone design rests on is, at this moment, a documented
-    rule and not an enforced one: ``phone_verification_challenges`` only grows. The counting
-    queries filter by ``created_at >= cutoff``, so the ceilings stay CORRECT — this is unbounded
-    storage growth linear in OTP volume, not a wrong answer.
-
-    Wiring it is a change to the worker's boot, and that is why it is a written plan and not a
-    five-line patch:
-
-    1. a new ``BypassReason`` member (the sweep crosses every business) with its rationale, and
-       the pool audit that reason feeds;
-    2. a guarded tick next to ``run_webhook_delivery_once`` (its own session, a failure logs and
-       the scheduler continues);
-    3. the job id + interval in ``scheduler.register_scheduler_jobs``/``start_scheduler``, the
-       ``SchedulerIntervals`` TypedDict, and a default in ``Settings``;
-    4. tests for the tick and the registration, like the other three jobs have.
-
-    It is deferred deliberately, not forgotten: see ``ESTADO-ACTUAL.md`` in the AetherLogik vault
-    (thread "barrido de tombstones OTP").
+    The counting queries keep filtering by ``created_at >= cutoff`` regardless, so this job is
+    housekeeping, never a correctness dependency: a missed tick delays deletion, it does not
+    resurrect a tombstone into a rate-limit slot.
     """
     current_time = now or _now()
     cutoff = current_time - older_than

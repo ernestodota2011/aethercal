@@ -97,6 +97,14 @@ class BypassReason(StrEnum):
     ``/health/ready``. It is the OPERATOR's view of every business at once, and it is the dead-man
     switch: under RLS without the bypass it would not fail, it would report **zeros**."""
 
+    SWEEP_PHONE_CHALLENGES = "sweep_phone_challenges"
+    """Deleting the phone-OTP tombstones older than their 24-hour window (D-7·bis retention).
+
+    The rows belong to businesses nobody named — the whole point of the sweep is that it is the
+    INSTANCE's maintenance, and "delete the old ones" cannot be expressed per tenant. The delete
+    touches only rows past the window every counting query already excludes, so no business's live
+    rate-limit state is affected by which tenant happened to be bound (or not)."""
+
 
 def why_bypass(reason: BypassReason) -> str:  # noqa: PLR0911 - one branch per reason, on purpose
     """One sentence per reason — and, far more importantly, the ``assert_never`` that keeps the enum
@@ -118,6 +126,8 @@ def why_bypass(reason: BypassReason) -> str:  # noqa: PLR0911 - one branch per r
             return "re-scanning parked payment events (payments batch)"
         case BypassReason.OPERATOR_METRICS:
             return "collecting the operator's instance-wide metrics"
+        case BypassReason.SWEEP_PHONE_CHALLENGES:
+            return "sweeping the expired phone-OTP challenges of every business"
         case _ as unreachable:  # pragma: no cover - unreachable while the match stays exhaustive
             assert_never(unreachable)
 

@@ -79,6 +79,7 @@ from aethercal.server.scheduler import (
     build_interval_scheduler,
     make_busy_refresh_tick,
     make_outbox_drain_tick,
+    make_phone_challenge_sweep_tick,
     make_webhook_delivery_tick,
     start_scheduler,
     stop_scheduler,
@@ -100,12 +101,13 @@ class SchedulerIntervals(TypedDict):
     webhook_interval_seconds: int
     busy_refresh_interval_seconds: int
     outbox_drain_interval_seconds: int
+    phone_sweep_interval_seconds: int
 
 
 def scheduler_intervals(settings: Settings) -> SchedulerIntervals:
     """The scheduler's tick intervals, sourced from the environment (RF-19).
 
-    A ``TypedDict`` unpacked into :func:`start_scheduler`, rather than three loose arguments, so the
+    A ``TypedDict`` unpacked into :func:`start_scheduler`, rather than loose arguments, so the
     keys are type-checked against that function's keywords: a knob the scheduler does not accept
     fails to type-check, instead of being read from the environment, documented, and then silently
     dropped while the scheduler keeps ticking at its default.
@@ -114,6 +116,7 @@ def scheduler_intervals(settings: Settings) -> SchedulerIntervals:
         webhook_interval_seconds=settings.webhook_interval_seconds,
         busy_refresh_interval_seconds=settings.busy_refresh_interval_seconds,
         outbox_drain_interval_seconds=settings.outbox_drain_interval_seconds,
+        phone_sweep_interval_seconds=settings.phone_sweep_interval_seconds,
     )
 
 
@@ -227,6 +230,7 @@ def create_worker_app(settings: Settings) -> FastAPI:
                 webhook_tick=make_webhook_delivery_tick(app),
                 busy_refresh_tick=make_busy_refresh_tick(app),
                 outbox_tick=make_outbox_drain_tick(app),
+                phone_challenge_sweep_tick=make_phone_challenge_sweep_tick(app),
                 **scheduler_intervals(settings),
             )
             stack.callback(stop_scheduler, interval_scheduler)

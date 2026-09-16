@@ -99,15 +99,11 @@ the form is not possession of the number — and it is declared here rather than
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> AETHERCAL_SUPPRESSION_KEY
 ```
 
-**Retention note (declared, not silent).** ``phone_verification_challenges`` keeps a 24-hour
-counting tombstone per challenge, and **no periodic job sweeps them yet**: the table grows linearly
-with OTP volume (order of KB/day for a small business) until the sweep is wired to the worker
-scheduler. The rate limits stay correct — every counting query filters by ``created_at >= cutoff``.
-An operator with very high volume can delete rows older than a day manually:
-
-```sql
-DELETE FROM phone_verification_challenges WHERE created_at < now() - interval '24 hours';
-```
+**Retention.** ``phone_verification_challenges`` keeps a 24-hour counting tombstone per challenge;
+the worker's **hourly** ``phone-challenge-sweep`` job deletes what is past that window (it is the
+same retention rule D-7·bis always described, now enforced by a scheduled job rather than by a
+docstring). The rate limits stay correct either way — every counting query filters by
+``created_at >= cutoff`` — so a missed tick only delays deletion.
 
 Full detail: [CHANGELOG.md](CHANGELOG.md) and [docs/phone-channels.md](docs/phone-channels.md).
 

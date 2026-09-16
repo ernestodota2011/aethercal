@@ -30,6 +30,7 @@ from aethercal.server.integrations.turnstile import (
 from aethercal.server.scheduler import (
     DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS,
     DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS,
+    DEFAULT_PHONE_SWEEP_INTERVAL_SECONDS,
     DEFAULT_WEBHOOK_INTERVAL_SECONDS,
 )
 from aethercal.server.webhooks.allowlist import PrivateTargetAllowlist
@@ -121,6 +122,10 @@ class Settings(BaseSettings):
     webhook_interval_seconds: int = Field(default=DEFAULT_WEBHOOK_INTERVAL_SECONDS, gt=0)
     busy_refresh_interval_seconds: int = Field(default=DEFAULT_BUSY_REFRESH_INTERVAL_SECONDS, gt=0)
     outbox_drain_interval_seconds: int = Field(default=DEFAULT_OUTBOX_DRAIN_INTERVAL_SECONDS, gt=0)
+    # The phone-OTP retention sweep: one indexed DELETE of tombstones past their 24-hour window
+    # (D-7·bis). Hourly by default; the table only ever holds a day of rows, so there is nothing to
+    # gain from ticking it harder.
+    phone_sweep_interval_seconds: int = Field(default=DEFAULT_PHONE_SWEEP_INTERVAL_SECONDS, gt=0)
 
     # Public base URL of the booking page, used to mint guest cancel/reschedule links. When unset,
     # the request path falls back to the incoming request's base URL.
