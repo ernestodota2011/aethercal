@@ -145,6 +145,114 @@ def test_parse_reply_action_unknown(text: str) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# Border cases of the lexicon, one per rule whose error mode would be a WRONG STATE CHANGE
+# (a false OPT_OUT suppresses forever; a truthy lookahead would confirm an injection).
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(1)",
+        "[1]",
+        "#1",
+        "/1",
+        "1.",
+        "1)",
+        "1 - Sí",
+        "opción 1",
+        "número uno",
+        "el uno",
+        "1️⃣",
+        "1 👍",
+    ],
+)
+def test_a_leading_selection_confirms(text: str) -> None:
+    assert parse_reply_action(text) == WhatsAppReplyAction.CONFIRM_ATTENDANCE
+
+
+@pytest.mark.parametrize("text", ["(2)", "[2]", "#2", "/2", "2.", "2 - No", "opción dos", "2️⃣"])
+def test_a_leading_selection_cancels(text: str) -> None:
+    assert parse_reply_action(text) == WhatsAppReplyAction.CANCEL
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "123456",
+        "99",
+        "0",
+        "15",
+        "1; EXEC xp_cmdshell('net user');",
+        "' OR '1'='1",
+    ],
+)
+def test_a_digit_that_is_not_a_selection_never_picks_an_option(text: str) -> None:
+    """==El lookahead de ``_SELECTION_RE`` es lo que separa "1" de "123456" y de una inyección.==
+
+    Después del dígito solo se acepta un separador real (o el fin del texto): un segundo dígito o
+    un ``;`` no lo son. Sin esa condición, ``1; EXEC ...`` sería una confirmación de asistencia.
+    """
+    assert parse_reply_action(text) == WhatsAppReplyAction.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["no", "NO", "nop", "negativo", "para nada", "2 - No", "no puedo", "no podré llegar"],
+)
+def test_a_leading_no_cancels(text: str) -> None:
+    assert parse_reply_action(text) == WhatsAppReplyAction.CANCEL
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Seguro, no falto",  # el "no" de una confirmación: negación, no respuesta
+        "seguro voy",
+        "seguro que sí mi pana",
+    ],
+)
+def test_no_mid_sentence_does_not_cancel(text: str) -> None:
+    """==Un ``no`` que no encabeza el mensaje es gramática, no una respuesta.== "Seguro, no falto"
+    es un SÍ; leerlo como cancelación borraría una cita por una frase hecha."""
+    assert parse_reply_action(text) == WhatsAppReplyAction.CONFIRM_ATTENDANCE
+
+
+def test_seguro_only_answers_as_the_leading_word() -> None:
+    """``seguro`` al inicio es una respuesta ("seguro voy"); en medio de una pregunta es la palabra
+    "insurance" (una consulta que NO es una confirmación)."""
+    assert parse_reply_action("seguro voy") == WhatsAppReplyAction.CONFIRM_ATTENDANCE
+    assert parse_reply_action("¿Atienden por seguro médico?") == WhatsAppReplyAction.UNKNOWN
+
+
+def test_a_conjunctive_si_inside_a_sentence_does_not_confirm() -> None:
+    """El "si" condicional ("no sé si alcance a volver") no es un "sí" de respuesta."""
+    long_text = (
+        "Disculpe, estaba revisando mi calendario y creo que voy a estar en otra ciudad, "
+        "así que no sé si alcance a volver a tiempo."
+    )
+    assert parse_reply_action(long_text) == WhatsAppReplyAction.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cancelar suscripción",  # cancelar + suscripción = BAJA, no cancelación de la cita
+        "cancelar las alertas",
+        "no me envíen más mensajes",
+        "no quiero recibir más mensajes",
+        "eliminar de la lista",
+        "desuscribirme de este canal",
+        "dejen de molestar",
+    ],
+)
+def test_the_opt_out_lexicon_wins_over_cancellation(text: str) -> None:
+    """==La baja gana: es la única acción sin camino de vuelta.== "cancelar suscripción" contiene
+    "cancelar", y sin embargo suprimir es la lectura correcta."""
+    assert parse_reply_action(text) == WhatsAppReplyAction.OPT_OUT
+
+
+# --------------------------------------------------------------------------------------
 # 2. Payload Extraction Tests (Evolution API)
 # --------------------------------------------------------------------------------------
 

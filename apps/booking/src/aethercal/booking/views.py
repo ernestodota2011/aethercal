@@ -1400,11 +1400,18 @@ def phone_verification_page(
     lang_urls: Mapping[Locale, str],
     error_message: str | None = None,
     success_message: str | None = None,
+    delivery_failed: bool = False,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
     brand: TenantBrandingRead | None = None,
 ) -> Any:
-    """Phone verification page (C-02b): 6-digit OTP entry and resend action."""
+    """Phone verification page (C-02b): 6-digit OTP entry and resend action.
+
+    ``delivery_failed`` is the server's word that the code did not go out (no phone channel
+    configured, or the provider refused the number). The panel renders either way — RESEND is the
+    guest's only recovery, and it lives here — but the lead must not claim a code is on its way
+    when none was accepted."""
+    lead_key = "phone_verify_lead_failed" if delivery_failed else "phone_verify_lead"
     notices: list[Any] = []
     if error_message:
         notices.append(Div(error_message, cls="notice error", role="alert"))
@@ -1467,7 +1474,7 @@ def phone_verification_page(
         t(locale, "phone_verify_title"),
         Div(
             H1(t(locale, "phone_verify_heading")),
-            P(t(locale, "phone_verify_lead"), cls="lead"),
+            P(t(locale, lead_key), cls="lead"),
             *notices,
             form,
             Div(resend_form, cls="pager"),

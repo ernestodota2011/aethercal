@@ -1093,3 +1093,39 @@ def test_phone_verification_page_renders_accessible_form_and_bilingual_copy() ->
     assert "Enter verification code" in html_en
     assert "Code sent" in html_en
     assert "Resend code" in html_en
+
+
+def test_phone_verification_page_tells_the_truth_when_the_code_did_not_go_out() -> None:
+    """==El panel se abre igual —reenviar es la única salida del huésped— pero NO puede decir
+    "revisa tu teléfono" si ningún canal aceptó el mensaje.== El servidor lo declara con
+    ``phone_verification_delivery_failed`` y el encabezado cambia en los dos idiomas."""
+    bid = uuid.uuid4()
+
+    html_es = to_xml(
+        views.phone_verification_page(
+            "es",
+            booking_id=bid,
+            token="t",
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+            delivery_failed=True,
+        )
+    )
+    assert "No pudimos enviarte el código" in html_es
+    assert "Te hemos enviado un código" not in html_es
+    assert "Reenviar código" in html_es  # la salida sigue ahí
+
+    html_en = to_xml(
+        views.phone_verification_page(
+            "en",
+            booking_id=bid,
+            token="t",
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+            delivery_failed=True,
+        )
+    )
+    assert "We could not send the code" in html_en
+    assert "We sent a 6-digit code" not in html_en

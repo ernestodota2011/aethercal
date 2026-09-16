@@ -141,6 +141,12 @@ class PublicBookingRead(BaseModel):
     #: The signed guest token that authorizes phone possession verification (C-02b, D-11).
     phone_verification_token: str | None = None
     phone_verification_required: bool = False
+    #: ==The verification UI is open, but the code did NOT go out.== The booking is confirmed and
+    #: the token lives (so the page can offer RESEND — often the provider recovers), but the page
+    #: must not tell the guest "we sent you a code" when no channel accepted the message (no
+    #: phone credential configured, a number without WhatsApp and no SMS fallback). It is the
+    #: difference between "check your phone" and "we could not reach you, try again".
+    phone_verification_delivery_failed: bool = False
 
 
 class PhoneVerificationRequest(BaseModel):

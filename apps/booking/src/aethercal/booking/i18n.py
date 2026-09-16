@@ -120,6 +120,13 @@ MESSAGES: dict[Locale, dict[str, str]] = {
             "Te hemos enviado un código de 6 dígitos por WhatsApp o SMS para "
             "confirmar que el número te pertenece."
         ),
+        # El código NO salió (sin canal configurado o el proveedor rechazó el número). La reserva
+        # está confirmada y el panel sigue abierto para poder REENVIAR; lo que no se puede decir es
+        # "revisa tu teléfono".
+        "phone_verify_lead_failed": (
+            "No pudimos enviarte el código en este momento. Tu reserva está confirmada: puedes "
+            "intentarlo de nuevo con «Reenviar código»."
+        ),
         "phone_verify_code_label": "Código de verificación",
         "phone_verify_code_hint": "Código numérico de 6 dígitos.",
         "phone_verify_submit": "Verificar",
@@ -234,6 +241,13 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "phone_verify_heading": "Enter verification code",
         "phone_verify_lead": (
             "We sent a 6-digit code via WhatsApp or SMS to verify you own this phone number."
+        ),
+        # The code did NOT go out (no channel configured, or the provider refused the number). The
+        # booking is confirmed and the panel stays open so the guest can RESEND; what cannot be
+        # said is "check your phone".
+        "phone_verify_lead_failed": (
+            "We could not send the code right now. Your booking is confirmed: you can try again "
+            'with "Resend code".'
         ),
         "phone_verify_code_label": "Verification code",
         "phone_verify_code_hint": "6-digit numerical code.",

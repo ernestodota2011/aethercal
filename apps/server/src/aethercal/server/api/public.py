@@ -414,15 +414,30 @@ async def create_public_booking(
     await session.refresh(booking)
     res = PublicBookingRead.model_validate(booking)
 
-    # If a phone was provided and consented, dispatch the initial challenge (C-02b) and — ONLY if
-    # it actually went out — hand the page the token it needs to verify or resend.
+    # If a phone was provided and consented, mint the verification token (C-02b) and dispatch the
+    # initial challenge.
     #
-    # ==The order is the point.== Minting the token and setting ``phone_verification_required``
-    # before the dispatch would promise the guest a code that may never arrive (no sender
-    # configured, a provider that refuses the number), leaving a page that waits for a code with no
-    # way to ask for another one — while the phone stays unverified and every reminder is skipped.
-    # A challenge that did not go out is not a pending verification.
+    # ==The token is minted EVEN IF the dispatch fails, and that is deliberate.== The token is what
+    # opens the verification panel — the only door to RESEND — and the provider may well recover on
+    # the next attempt. What the page must NOT do is claim a code is on its way when no channel
+    # accepted it: that is what ``phone_verification_delivery_failed`` says, so the guest is told
+    # "we could not reach you, try again" instead of watching an empty phone.
     if params.guest_phone and params.guest_phone_consent:
+        signer = GuestTokenSigner(settings.app_secret)
+        # The token outlives the appointment by a day at least: it has to still work when the guest
+        # opens the page the reminder pointed at, hours or days after booking. It is verified, not
+        # consumed, so resend may use it repeatedly (D-11).
+        token_ttl = max(timedelta(days=1), (as_utc(booking.start_at) - _now()) + timedelta(days=1))
+        res.phone_verification_token = await issue_guest_token(
+            session,
+            signer,
+            booking_id=booking.id,
+            tenant_id=booking.tenant_id,
+            purpose=GuestTokenPurpose.PHONE_VERIFICATION,
+            ttl=token_ttl,
+        )
+        res.phone_verification_required = True
+
         senders_factory = getattr(request.app.state, "senders_factory", None)
         senders = await senders_factory(booking.tenant_id) if senders_factory else None
         branding = await get_branding(session, tenant_id=booking.tenant_id)
@@ -439,9 +454,10 @@ async def create_public_booking(
                 locale=payload.locale or "es",
             )
         except Exception as exc:
-            # The booking is confirmed; the CHALLENGE failed. Say so loudly with the booking it
-            # belongs to: the guest will never get a code, and the phone stays unverified (so no
-            # reminder will be sent) until somebody looks at this line.
+            # The booking is confirmed; the CHALLENGE did not go out. Say so loudly with the booking
+            # it belongs to, and tell the guest the truth through the response flag: until they
+            # verify, no reminder will be sent for this booking.
+            res.phone_verification_delivery_failed = True
             _logger.warning(
                 "Initial phone verification challenge for booking %s (tenant %s) did not go out: "
                 "%s: %s",
@@ -450,21 +466,6 @@ async def create_public_booking(
                 type(exc).__name__,
                 exc,
             )
-        else:
-            signer = GuestTokenSigner(settings.app_secret)
-            token_ttl = max(
-                timedelta(days=1), (as_utc(booking.start_at) - _now()) + timedelta(days=1)
-            )
-            phone_token = await issue_guest_token(
-                session,
-                signer,
-                booking_id=booking.id,
-                tenant_id=booking.tenant_id,
-                purpose=GuestTokenPurpose.PHONE_VERIFICATION,
-                ttl=token_ttl,
-            )
-            res.phone_verification_token = phone_token
-            res.phone_verification_required = True
 
     return res
 

@@ -333,6 +333,16 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     )
     assert response.status_code == 201
 
+    # This test app wires no outbound phone channel, so the dispatch cannot go out — and the
+    # response says so instead of promising a code. The token is still minted: it is what opens the
+    # verification panel, whose RESEND is the guest's only recovery when a provider hiccups.
+    body = response.json()
+    assert body["phone_verification_required"] is True
+    assert body["phone_verification_token"]
+    assert body["phone_verification_delivery_failed"] is True, (
+        "the page would tell the guest to check a phone that never received anything"
+    )
+
     stored = await _stored(owner_maker, response.json()["id"])
     assert stored.guest_phone == "+13054131728"  # normalized to E.164 on the way in
     assert stored.guest_phone_consent_at is not None, (
@@ -398,8 +408,14 @@ async def test_booking_with_no_phone_at_all_still_confirms(
     seeded = await _seed(owner_maker, phone_rule_active=True)
 
     response = await wired_client.post(BOOKINGS, json=_payload(seeded), headers=seeded["headers"])
-
     assert response.status_code == 201
+
+    # No phone: no verification is announced at all (nothing to verify).
+    body = response.json()
+    assert body["phone_verification_required"] is False
+    assert body["phone_verification_token"] is None
+    assert body["phone_verification_delivery_failed"] is False
+
     stored = await _stored(owner_maker, response.json()["id"])
     assert stored.guest_phone is None
     assert stored.guest_phone_consent_at is None

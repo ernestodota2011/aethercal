@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Final
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.server.channels import Channel
@@ -470,6 +470,7 @@ async def verify_phone_code(  # noqa: PLR0913
     matches = hmac.compare_digest(challenge.code_hmac or "", expected_hmac)
 
     if not matches:
+        next_attempt = PhoneVerificationChallenge.attempts + 1
         increment = (
             update(PhoneVerificationChallenge)
             .where(
@@ -480,28 +481,22 @@ async def verify_phone_code(  # noqa: PLR0913
                 PhoneVerificationChallenge.expires_at > current_time,
                 PhoneVerificationChallenge.attempts < MAX_ATTEMPTS,
             )
-            .values(attempts=PhoneVerificationChallenge.attempts + 1)
+            .values(
+                attempts=next_attempt,
+                # The burn rides IN the same statement as the attempt that exhausts the budget:
+                # two statements would leave a window where the counter reads 5 and the secret is
+                # still live.
+                code_hmac=case(
+                    (next_attempt >= MAX_ATTEMPTS, None), else_=PhoneVerificationChallenge.code_hmac
+                ),
+            )
             .returning(PhoneVerificationChallenge.attempts)
             # Bulk statement: the in-session copy is stale afterwards and nothing reads it (the
             # caller returns immediately), while the evaluation strategy would trip over SQLite's
             # naive datetimes against the aware bound parameter.
             .execution_options(synchronize_session=False)
         )
-        attempts = (await session.execute(increment)).scalar_one_or_none()
-        if attempts is None:
-            # The budget was already spent — or the challenge died — under a concurrent guess.
-            return False
-        if attempts >= MAX_ATTEMPTS:
-            # Burn the code in the same breath as the attempt that exhausted the budget, so the
-            # challenge has no live secret left to guess (D-7·bis).
-            await session.execute(
-                update(PhoneVerificationChallenge)
-                .where(
-                    PhoneVerificationChallenge.id == challenge.id,
-                    PhoneVerificationChallenge.consumed_at.is_(None),
-                )
-                .values(code_hmac=None)
-            )
+        await session.execute(increment)
         return False
 
     # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7)

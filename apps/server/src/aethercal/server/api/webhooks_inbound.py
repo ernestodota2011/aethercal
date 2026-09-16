@@ -360,10 +360,11 @@ async def receive_whatsapp_webhook(
         effects=effects,
     )
 
+    # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
+    # provider, and a body that carries what we told a guest is a body that lands in provider logs.
     return {
         "status": result.status,
         "action": result.action.value,
-        "reply_message": result.reply_message or "",
     }
 
 

@@ -1337,6 +1337,7 @@ class _BookingApp:
                 base_url=self._settings.base_url,
                 brand=brand,
                 embed=embed,
+                delivery_failed=booking.phone_verification_delivery_failed,
             )
         return views.confirmation_page(
             locale,
