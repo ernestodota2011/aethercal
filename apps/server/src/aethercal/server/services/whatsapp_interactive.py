@@ -514,7 +514,18 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
     now: datetime,
     effects: BookingEffects | None = None,
 ) -> WhatsAppProcessResult:
-    """Process an inbound WhatsApp text interaction for a specific tenant business."""
+    """Process an inbound WhatsApp text interaction for a specific tenant business.
+
+    .. rubric:: ``reply_message`` is returned, and NOT sent — a declared boundary
+
+    Every result carries the text the GUEST would read, so the caller (or the operator reading a
+    log) knows what the product told them. Sending it back over WhatsApp is deliberately not done
+    here: an outbound chat reply is an outbound message, and every outbound message in this product
+    goes through the belt — consent, the possession seal, the opt-out list, the daily caps and the
+    notification ledger. A reply fired straight off the webhook would bypass all five. When the
+    reply is wired to a sender, it is wired THERE (an outbox effect), not here, and this docstring
+    is where that decision is recorded instead of being rediscovered as a gap.
+    """
     norm_phone = normalize_e164(sender_phone)
     action = parse_reply_action(message_text)
 

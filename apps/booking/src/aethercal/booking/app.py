@@ -1451,11 +1451,14 @@ class _BookingApp:
         except Exception as exc:
             err_msg = t(locale, "phone_verify_error_invalid")
             if isinstance(exc, AetherCalAPIError):
-                msg_lower = exc.message.lower()
-                if "burned" in msg_lower or "attempts" in msg_lower:
+                # ==Por CÓDIGO, no por substring del mensaje.== El endpoint publica un `error`
+                # estructurado (`code_burned`, `invalid_code`, `forbidden`) justamente para que la
+                # página no tenga que adivinar por el texto: adivinar es lo que hacía que
+                # "su código murió por intentos" se mostrara como "revise los dígitos".
+                if exc.error == "code_burned":
                     err_msg = t(locale, "phone_verify_error_attempts")
-                elif "limit" in msg_lower:
-                    err_msg = t(locale, "phone_verify_error_rate_limit_phone")
+                elif exc.error == "forbidden":
+                    err_msg = t(locale, "error_link_invalid")
             return views.phone_verification_page(
                 locale,
                 booking_id=booking_id,
@@ -1518,13 +1521,16 @@ class _BookingApp:
         except Exception as exc:
             err_msg = t(locale, "error_generic")
             if isinstance(exc, AetherCalAPIError):
-                msg_lower = exc.message.lower()
-                if "60 second" in msg_lower or "wait" in msg_lower:
+                # Los códigos del endpoint de reenvío: el enfriamiento de 60 s, el techo diario del
+                # número y el de la red son tres hechos distintos, y ahora tres códigos distintos.
+                if exc.error == "rate_limited_cooldown":
                     err_msg = t(locale, "phone_verify_error_rate_limit_cooldown")
-                elif "ip" in msg_lower or "network" in msg_lower:
+                elif exc.error == "ip_rate_limited":
                     err_msg = t(locale, "phone_verify_error_rate_limit_ip")
-                elif "limit" in msg_lower:
+                elif exc.error == "rate_limited":
                     err_msg = t(locale, "phone_verify_error_rate_limit_phone")
+                elif exc.error in ("forbidden", "verification_error"):
+                    err_msg = t(locale, "error_link_invalid")
             return views.phone_verification_page(
                 locale,
                 booking_id=booking_id,

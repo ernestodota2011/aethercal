@@ -2,6 +2,15 @@
 
 Implements busy queries, event insertion with Microsoft Teams meeting generation,
 and idempotent event deletion (treating 404/410 as already-gone successes).
+
+.. rubric:: What this client does NOT do, and why
+
+* **No token refresh.** The access token arrives from the caller (the stored credential); a 401 is
+  a real error that the outbox retries, and refreshing here would need the tenant's OAuth client
+  secret — a responsibility of the connection layer, not of a per-call transport.
+* **No 429 backoff.** A rate limit is a TRANSIENT failure, and the outbox already owns retry
+  policy (backoff + dead-letter) for every outbound effect. Retrying inside the call would nest
+  one backoff inside another and hide the pressure from the operator.
 """
 
 from __future__ import annotations

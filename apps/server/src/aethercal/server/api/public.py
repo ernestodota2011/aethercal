@@ -93,8 +93,10 @@ from aethercal.server.services.payments import (
 from aethercal.server.services.phone_verification import (
     GENERIC_OTP_FAILURE_DETAIL,
     IPRateLimitError,
+    PhoneVerificationCooldownError,
     PhoneVerificationError,
     PhoneVerificationRateLimitError,
+    VerificationStatus,
     issue_verification_challenge,
     verify_phone_code,
 )
@@ -936,17 +938,22 @@ async def verify_public_phone(
         )
 
     # 2. Verify OTP code atomically
-    verified = await verify_phone_code(
+    outcome = await verify_phone_code(
         session,
         booking_id=booking_id,
         tenant_id=tenant_id,
         code=payload.code,
         app_secret=settings.app_secret,
     )
-    if not verified:
+    if outcome is not VerificationStatus.SUCCESS:
+        # The MESSAGE stays byte-for-byte generic (D-6: "no existe" / "incorrecto" / "expirado" are
+        # indistinguishable), while the machine CODE says which state it was — the booking page
+        # localises off it, and "your code is dead, ask for a new one" is different advice from
+        # "check the digits".
+        code = "code_burned" if outcome is VerificationStatus.BURNED else "invalid_code"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_code", "message": GENERIC_OTP_FAILURE_DETAIL},
+            detail={"error": code, "message": GENERIC_OTP_FAILURE_DETAIL},
         )
 
     return PhoneVerificationResponse(status="verified")
@@ -1006,6 +1013,13 @@ async def resend_public_phone_otp(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={"error": "ip_rate_limited", "message": str(exc)},
+        ) from exc
+    except PhoneVerificationCooldownError as exc:
+        # Subclass FIRST: the 60-second wait is a different fact from the daily ceiling, and the
+        # page carries different copy for each. The machine code says which one.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited_cooldown", "message": str(exc)},
         ) from exc
     except PhoneVerificationRateLimitError as exc:
         raise HTTPException(

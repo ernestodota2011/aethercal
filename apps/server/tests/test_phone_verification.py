@@ -35,6 +35,7 @@ from aethercal.server.services.phone_verification import (
     IPRateLimitError,
     PhoneVerificationError,
     PhoneVerificationRateLimitError,
+    VerificationStatus,
     check_challenge_rate_limits,
     compute_hmac,
     inherit_phone_verification_on_reschedule,
@@ -49,12 +50,17 @@ _SUPPRESSION_KEY = "test-suppression-key-67890-0123456789"
 
 
 class DummySender:
-    def __init__(self, channel: Channel, fail_permanent: bool = False) -> None:
+    def __init__(
+        self, channel: Channel, fail_permanent: bool = False, fail_transient: bool = False
+    ) -> None:
         self.channel = channel
         self.fail_permanent = fail_permanent
+        self.fail_transient = fail_transient
         self.sent_messages: list[dict[str, Any]] = []
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
+        if self.fail_transient:
+            raise RuntimeError(f"provider 500 for {to}: retryable")
         if self.fail_permanent:
             raise PermanentSendError(f"Provider rejected recipient {to}")
         self.sent_messages.append({"to": to, "subject": subject, "body": body})
@@ -153,7 +159,7 @@ async def test_successful_otp_verification_seals_booking_and_destroys_secret(
         app_secret=_APP_SECRET,
         now=now + timedelta(minutes=2),
     )
-    assert verified is True
+    assert verified is VerificationStatus.SUCCESS
 
     expected_time = now + timedelta(minutes=2)
     assert booking.guest_phone_verified_at is not None
@@ -182,7 +188,7 @@ async def test_successful_otp_verification_seals_booking_and_destroys_secret(
         app_secret=_APP_SECRET,
         now=now + timedelta(minutes=3),
     )
-    assert re_verified is False
+    assert re_verified is VerificationStatus.INVALID
 
 
 @pytest.mark.asyncio
@@ -224,7 +230,7 @@ async def test_wrong_code_increments_attempts_and_burns_after_5_attempts(
             app_secret=_APP_SECRET,
             now=now,
         )
-        assert res is False
+        assert res is VerificationStatus.INVALID
         await sqlite_session.refresh(challenge)
         assert challenge.code_hmac is not None
 
@@ -239,7 +245,7 @@ async def test_wrong_code_increments_attempts_and_burns_after_5_attempts(
         app_secret=_APP_SECRET,
         now=now,
     )
-    assert res5 is False
+    assert res5 is VerificationStatus.BURNED
     await sqlite_session.refresh(challenge)
     assert challenge.code_hmac is None  # Burned!
 
@@ -252,7 +258,7 @@ async def test_wrong_code_increments_attempts_and_burns_after_5_attempts(
         app_secret=_APP_SECRET,
         now=now,
     )
-    assert res6 is False
+    assert res6 is VerificationStatus.INVALID
     assert booking.guest_phone_verified_at is None
 
 
@@ -295,7 +301,7 @@ async def test_a_code_that_cannot_be_a_code_is_refused_WITHOUT_spending_an_attem
             app_secret=_APP_SECRET,
             now=now,
         )
-        is False
+        is VerificationStatus.INVALID
     )
 
     await sqlite_session.refresh(challenge)
@@ -468,6 +474,44 @@ async def test_whatsapp_permanent_error_falls_back_to_sms(
     assert channel_used == Channel.SMS
     assert len(working_sms.sent_messages) == 1
     assert challenge.code_hmac is not None
+
+
+@pytest.mark.asyncio
+async def test_a_TRANSIENT_whatsapp_error_does_NOT_fall_back_to_sms(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==El fallback de canal es para rechazos PERMANENTES (D-8·bis), no para cualquier fallo.==
+
+    Un timeout o un 500 del proveedor es un problema de la entrega, no del número: cambiar de canal
+    ahí duplicaría el mensaje cuando WhatsApp sí lo haya aceptado a medias, y el invitado recibiría
+    dos códigos. El error transitorio se propaga para que el reintento sea el normal, y SMS no se
+    toca.
+    """
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+
+    flaky_wa = DummySender(Channel.WHATSAPP, fail_transient=True)
+    untouched_sms = DummySender(Channel.SMS)
+    senders = TenantSenders(
+        tenant_id=tenant.id,
+        email=None,
+        channels={Channel.WHATSAPP: flaky_wa, Channel.SMS: untouched_sms},  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="retryable"):
+        await issue_verification_challenge(
+            sqlite_session,
+            booking=booking,
+            app_secret=_APP_SECRET,
+            business_name="Acme Corp",
+            senders=senders,
+            source_ip="198.51.100.1",
+            suppression_key=_SUPPRESSION_KEY,
+            now=now,
+        )
+
+    assert untouched_sms.sent_messages == [], "un fallo transitorio cambió de canal: mensaje doble"
 
 
 # --------------------------------------------------------------------------------------

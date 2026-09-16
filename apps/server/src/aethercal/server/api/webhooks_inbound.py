@@ -78,10 +78,24 @@ def _now() -> datetime:
 
 
 def _unauthorized() -> HTTPException:
-    """The ONE answer for every way verification can fail — unknown business, no credential, bad
+    """The ONE answer for every way verification can fail - unknown business, no credential, bad
     signature. Deliberately indistinguishable: the endpoint tells a caller who could not sign
     nothing about which businesses exist or how they are set up."""
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="signature verification")
+
+
+def _deny_after_binding() -> HTTPException:
+    """The same 401, plus a RELEASE of the tenant binding opened to read the credential.
+
+    The bind cannot be avoided — ``tenant_credentials`` and ``webhook_secrets`` are RLS-protected,
+    so the very secret being compared is unreadable without the scope — but once the caller has
+    failed to authenticate, nothing may continue under that business's authority. ``get_session``
+    tears the scope down on the way out either way; doing it at every failure point makes the
+    intent explicit instead of incidental, and covers a future handler that runs code after a
+    caught HTTPException.
+    """
+    reset_tenant_binding()
+    return _unauthorized()
 
 
 def _payload_too_large() -> HTTPException:
@@ -209,10 +223,10 @@ async def receive_payment_webhook(
         )
     except CredentialError:
         # No credential, or one that cannot be used to verify: we cannot authorise this event.
-        raise _unauthorized() from None
+        raise _deny_after_binding() from None
     webhook_secret = credential.secrets.get(_WEBHOOK_SECRET_FIELD)
     if not webhook_secret:  # pragma: no cover - required_fields guarantees it, but fail closed
-        raise _unauthorized()
+        raise _deny_after_binding()
 
     # (4) ==verify the provider's signature. Invalid → 401, and NOTHING has been written.==
     # The whole request goes to the adapter — body, headers AND query — because what a provider
@@ -230,8 +244,7 @@ async def receive_payment_webhook(
         # without the scope — but nothing may continue under that authority. ``get_session`` tears
         # the scope down on the way out either way; doing it here makes the intent explicit at the
         # exact point where authentication failed.
-        reset_tenant_binding()
-        raise _unauthorized()
+        raise _deny_after_binding()
 
     # (5) only now: parse, record (idempotent / anti-replay), dispatch.
     # ==Finding 4.== The signature has ALREADY authorised this — it is genuinely from the provider.
@@ -315,14 +328,14 @@ async def receive_whatsapp_webhook(
             instance_default=instance_default,
         )
     except CredentialError:
-        raise _unauthorized() from None
+        raise _deny_after_binding() from None
 
     if credential is None:
-        raise _unauthorized()
+        raise _deny_after_binding()
 
     expected_key = credential.secrets.get("api_key")
     if not expected_key:
-        raise _unauthorized()
+        raise _deny_after_binding()
 
     auth_header = request.headers.get("authorization", "")
     bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
@@ -333,8 +346,7 @@ async def receive_whatsapp_webhook(
         # the scope — but nothing may continue under that authority. ``get_session`` tears the
         # scope down on the way out either way; doing it here makes the intent explicit at the
         # exact point where authentication failed.
-        reset_tenant_binding()
-        raise _unauthorized()
+        raise _deny_after_binding()
 
     try:
         payload = json.loads(raw_body)

@@ -61,6 +61,12 @@ _OTP_CODE_RE = re.compile(r"[0-9]{6}")
 class VerificationStatus(StrEnum):
     SUCCESS = "success"
     INVALID = "invalid"
+    BURNED = "burned"
+    """The code was correct in shape but the 5-attempt budget is spent: the challenge is dead.
+
+    It is its own state because the guest-actionable advice differs ("request a new code" instead of
+    "check the digits"), and because the UI has carried a distinct message for it since the feature
+    landed — a message that nothing could reach while verification answered a bare boolean."""
     RATE_LIMITED = "rate_limited"
     IP_RATE_LIMITED = "ip_rate_limited"
     SUPPRESSED = "suppressed"
@@ -72,6 +78,14 @@ class PhoneVerificationError(Exception):
 
 class PhoneVerificationRateLimitError(PhoneVerificationError):
     """Raised when phone-level challenge rate limit is exceeded."""
+
+
+class PhoneVerificationCooldownError(PhoneVerificationRateLimitError):
+    """The 60-second minimum interval: a DIFFERENT actionable fact from the daily ceiling.
+
+    The guest who must wait a minute is not the guest who is out of codes for the day, and the two
+    cases carry different copy. They used to be one exception whose message the UI had to
+    substring-match; the machine code now says which one it is."""
 
 
 class IPRateLimitError(PhoneVerificationError):
@@ -240,7 +254,7 @@ async def check_challenge_rate_limits(
         )
     )
     if (recent_phone_count or 0) > 0:
-        raise PhoneVerificationRateLimitError(
+        raise PhoneVerificationCooldownError(
             "Please wait at least 60 seconds before requesting another code."
         )
 
@@ -425,14 +439,16 @@ async def verify_phone_code(  # noqa: PLR0913
     code: str,
     app_secret: str,
     now: datetime | None = None,
-) -> bool:
+) -> VerificationStatus:
     """Verify an entered OTP code against the live challenge for booking_id (A-7).
 
     - Atomic compare and consume with UPDATE ... WHERE RETURNING.
     - Rate limits invalid attempts (max 5); burns the code on 5th attempt.
     - Timing-safe verification using compare_digest.
     - If valid, seals booking.guest_phone_verified_at = now and destroys secret (code_hmac=None).
-    - Returns True if verified, False otherwise.
+    - Returns a :class:`VerificationStatus`: ``SUCCESS``, ``INVALID`` or ``BURNED``. It used to
+      return a bare bool, which collapsed "that code is wrong" and "that code is dead, ask for a
+      new one" — two different things to tell a guest — into the same answer.
 
     ==The attempt counter is incremented by ONE atomic statement.== It used to be a
     read-modify-write (``challenge.attempts += 1``): under concurrent guesses every attempt read
@@ -446,7 +462,7 @@ async def verify_phone_code(  # noqa: PLR0913
         # A code that cannot BE a code is refused without spending an attempt: it is not a guess at
         # the secret, it is a caller that never sent one (an empty string, a stray word, a pasted
         # paragraph). Hashing it would only burn budget against the wrong thing.
-        return False
+        return VerificationStatus.INVALID
 
     # Look up the live challenge
     challenge = (
@@ -464,7 +480,7 @@ async def verify_phone_code(  # noqa: PLR0913
     ).first()
 
     if challenge is None:
-        return False
+        return VerificationStatus.INVALID
 
     expected_hmac = compute_hmac(app_secret, clean_code)
     matches = hmac.compare_digest(challenge.code_hmac or "", expected_hmac)
@@ -500,8 +516,14 @@ async def verify_phone_code(  # noqa: PLR0913
             # naive datetimes against the aware bound parameter.
             .execution_options(synchronize_session=False)
         )
-        await session.execute(increment)
-        return False
+        result = await session.execute(increment)
+        attempts = result.scalar_one_or_none()
+        if attempts is None or attempts >= MAX_ATTEMPTS:
+            # The first case is a lost race (the budget was already spent, or the challenge died,
+            # under a concurrent guess); the second is this guess spending the last slot. Either
+            # way the code the caller holds is dead.
+            return VerificationStatus.BURNED
+        return VerificationStatus.INVALID
 
     # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7)
     stmt = (
@@ -521,7 +543,7 @@ async def verify_phone_code(  # noqa: PLR0913
     )
     result = await session.execute(stmt)
     if result.scalar_one_or_none() is None:
-        return False
+        return VerificationStatus.INVALID
 
     # Seal the booking
     booking = (
@@ -533,7 +555,7 @@ async def verify_phone_code(  # noqa: PLR0913
         booking.guest_phone_verified_at = current_time
         await session.flush()
 
-    return True
+    return VerificationStatus.SUCCESS
 
 
 def inherit_phone_verification_on_reschedule(predecessor: Booking, successor: Booking) -> None:
@@ -599,6 +621,7 @@ __all__ = [
     "PHONE_MIN_INTERVAL",
     "TOMBSTONE_WINDOW",
     "IPRateLimitError",
+    "PhoneVerificationCooldownError",
     "PhoneVerificationError",
     "PhoneVerificationRateLimitError",
     "VerificationStatus",
