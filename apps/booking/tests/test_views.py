@@ -1047,3 +1047,49 @@ def test_la_pantalla_que_PIDE_los_datos_lleva_el_texto_del_negocio() -> None:
     assert evento.description and evento.description in html, (
         "la pantalla que recoge los datos no lleva el texto del negocio"
     )
+
+
+def test_phone_verification_page_renders_accessible_form_and_bilingual_copy() -> None:
+    bid = uuid.uuid4()
+    token = "test-token-123"
+
+    # Spanish render
+    html_es = to_xml(
+        views.phone_verification_page(
+            "es",
+            booking_id=bid,
+            token=token,
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+            error_message="Código incorrecto",
+        )
+    )
+    assert "Verifica tu teléfono" in html_es
+    assert "Introduce el código de verificación" in html_es
+    assert 'name="code"' in html_es
+    assert 'inputmode="numeric"' in html_es
+    assert 'maxlength="6"' in html_es
+    assert 'name="token"' in html_es
+    assert f'value="{token}"' in html_es
+    assert f'value="{bid}"' in html_es
+    assert "Código incorrecto" in html_es
+    assert "Reenviar código" in html_es
+    assert 'action="/resend-otp"' in html_es
+
+    # English render
+    html_en = to_xml(
+        views.phone_verification_page(
+            "en",
+            booking_id=bid,
+            token=token,
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+            success_message="Code sent",
+        )
+    )
+    assert "Verify your phone" in html_en
+    assert "Enter verification code" in html_en
+    assert "Code sent" in html_en
+    assert "Resend code" in html_en

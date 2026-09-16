@@ -62,6 +62,9 @@ class GuestTokenPurpose(StrEnum):
     """Resume the paid checkout of a hold (B-05b, r5). Unlike CANCEL/RESCHEDULE it is VERIFIED, not
     consumed — a guest may resume the SAME hold more than once while it lives, so it carries no
     single-use stamp."""
+    PHONE_VERIFICATION = "phone_verification"
+    """Authorize issuing or resending an OTP challenge for phone verification (C-02b, D-11).
+    Like CHECKOUT it is VERIFIED, not consumed — resending uses it multiple times."""
 
 
 @dataclass(frozen=True, slots=True)

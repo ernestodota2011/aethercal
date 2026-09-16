@@ -81,8 +81,26 @@ TENANT_ROOT = "tenants"
 *before*
    any GUC can exist — under a policy that read returns zero rows, and the admin refuses to start.
 
-A ``db`` test asserts the set of unscoped tables is EXACTLY ``{tenants}``, so a new table without a
-``tenant_id`` breaks CI and forces somebody to decide its regime by hand instead of inheriting one.
+A ``db`` test asserts the set of unscoped tables is EXACTLY the declared exceptions
+(:data:`UNSCOPED_INSTANCE_TABLES`), so a new table without a ``tenant_id`` breaks CI and forces
+somebody to decide its regime by hand instead of inheriting one.
+"""
+
+UNSCOPED_INSTANCE_TABLES: tuple[str, ...] = ("phone_suppressions", TENANT_ROOT)
+"""==The tables allowed to carry no ``tenant_id`` — and the reason each one is.==
+
+An empty ``tenant_id`` set is not automatically a mistake, but it is never an accident either:
+the whole point of deriving the scoped set from the metadata is that a table without a
+``tenant_id`` has to be a DECISION somebody wrote down, not a default it slipped into.
+
+1. ``tenants`` — it IS the tenant (:data:`TENANT_ROOT`), and it deliberately carries no policy.
+2. ``phone_suppressions`` — the instance-level opt-out list (D-12). It is deliberately
+   cross-tenant: when an owner of a number replies STOP, every business on this instance must
+   stop messaging that number, and the row has to survive ``guest purge`` so an erasure never
+   reactivates messaging to someone who opted out. The row holds no tenant data — only an HMAC
+   of the phone number under the dedicated suppression key — so there is nothing to scope, and a
+   policy on it would be a lie: the GUC of whichever tenant happened to be stamped would hide
+   other tenants' opt-outs and let them message a number that asked to be left alone.
 """
 
 APP_ROLE = "aethercal_app"
@@ -117,8 +135,8 @@ def tenant_scoped_tables(metadata: MetaData) -> tuple[str, ...]:
 
 
 def unscoped_tables(metadata: MetaData) -> tuple[str, ...]:
-    """Every table WITHOUT a ``tenant_id``. Must be exactly ``("tenants",)`` — a test enforces
-    it."""
+    """Every table WITHOUT a ``tenant_id``. Must be exactly :data:`UNSCOPED_INSTANCE_TABLES` — a
+    test enforces it."""
     return tuple(
         sorted(name for name, table in metadata.tables.items() if "tenant_id" not in table.c)
     )
@@ -256,6 +274,7 @@ __all__ = [
     "TENANT_GUC",
     "TENANT_PREDICATE",
     "TENANT_ROOT",
+    "UNSCOPED_INSTANCE_TABLES",
     "VERSION_TABLE",
     "WORKER_ROLE",
     "default_privileges",

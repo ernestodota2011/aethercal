@@ -10,6 +10,7 @@ from aethercal.server.db.models.integrations import (
     ExternalConnection,
 )
 from aethercal.server.db.models.notifications import SentNotification
+from aethercal.server.db.models.otp import PhoneSuppression, PhoneVerificationChallenge
 from aethercal.server.db.models.outbox import Outbox, OutboxStatus
 from aethercal.server.db.models.payments import (
     Payment,
@@ -45,6 +46,8 @@ __all__ = [
     "PaymentEvent",
     "PaymentEventStatus",
     "PaymentStatus",
+    "PhoneSuppression",
+    "PhoneVerificationChallenge",
     "RefundKind",
     "Schedule",
     "SentNotification",

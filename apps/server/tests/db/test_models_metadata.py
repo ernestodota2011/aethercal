@@ -59,10 +59,15 @@ EXPECTED_TABLES = {
     # not exist yet is retried rather than lost, and the same ``event.id`` can never be replayed.
     "payments",
     "payment_events",
+    # 0018 — OTP phone verification (C-02b, RF-24).
+    "phone_verification_challenges",
+    "phone_suppressions",
 }
 
 # tenants is the tenant root; every other table hangs off it via tenant_id.
 TENANT_ROOT = "tenants"
+# Instance-level tables that have no tenant_id (opt-out list across the instance, D-12).
+INSTANCE_TABLES = frozenset({TENANT_ROOT, "phone_suppressions"})
 
 
 def _unique_column_sets(table_name: str) -> set[tuple[str, ...]]:
@@ -80,8 +85,10 @@ def test_exactly_the_mvp_tables_are_defined() -> None:
 
 def test_every_tenant_scoped_table_has_a_non_null_tenant_id_fk() -> None:
     for name, table in Base.metadata.tables.items():
-        if name == TENANT_ROOT:
-            assert "tenant_id" not in table.c, "the tenant root must not carry its own tenant_id"
+        if name in INSTANCE_TABLES:
+            assert "tenant_id" not in table.c, (
+                f"{name} is an instance-level table and must not carry tenant_id"
+            )
             continue
         assert "tenant_id" in table.c, f"{name} is missing tenant_id"
         column = table.c["tenant_id"]

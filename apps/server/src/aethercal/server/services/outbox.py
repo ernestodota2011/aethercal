@@ -2526,6 +2526,7 @@ async def _record_notify_sent(
 # during an incident — or a regulator reading it afterwards — has to be able to tell them apart.
 _NO_PHONE = "no-phone"
 _NO_CONSENT = "no-phone-consent"
+_PHONE_UNVERIFIED = "phone-unverified"
 _CHANNEL_UNCONFIGURED = "channel-unconfigured"
 _UNKNOWN_OUTCOME = "unknown-outcome"
 """The provider was given the message and the answer was lost. NEVER re-sent blind."""
@@ -2663,6 +2664,11 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
         raise OutboxSkipped(
             f"{_NO_CONSENT}: the guest has not consented to be messaged on their phone, so the "
             f"{channel.value} step must not run (consent is recorded, or it did not happen)"
+        )
+    if booking.guest_phone_verified_at is None:
+        raise OutboxSkipped(
+            f"{_PHONE_UNVERIFIED}: the guest's phone number has not been verified via OTP, so the "
+            f"{channel.value} step must not run"
         )
 
 

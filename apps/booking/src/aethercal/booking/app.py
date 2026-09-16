@@ -261,6 +261,13 @@ def _booking_prefix(embed: bool, tenant: str | None = None) -> str:
     return f"{base}{_EMBED_PATH_PREFIX.rstrip('/')}" if embed else f"{base}{_NORMAL_PATH_PREFIX}"
 
 
+def _sub_path(path: str, *, embed: bool, tenant: str | None = None) -> str:
+    """The route path scoped to embed and optional tenant prefix."""
+    base = f"{_TENANT_PATH_PREFIX}{tenant}" if tenant else ""
+    emb = _EMBED_PATH_PREFIX.rstrip("/") if embed else ""
+    return f"{base}{emb}{path}"
+
+
 def _embed_frame_ancestors(embed_allowed_origins: Sequence[str]) -> str:
     """The CSP ``frame-ancestors`` value for an ``/embed/*`` response: the configured allow-list
     (space-separated origins — the CSP source-list syntax) or ``*`` when none is configured. V1
@@ -1318,6 +1325,19 @@ class _BookingApp:
                 embed=embed,
                 brand=brand,
             )
+        if booking.phone_verification_required and booking.phone_verification_token:
+            route_tenant = self._route_tenant(request)
+            return views.phone_verification_page(
+                locale,
+                booking_id=booking.id,
+                token=booking.phone_verification_token,
+                action=_sub_path("/verify-phone", embed=embed, tenant=route_tenant),
+                resend_action=_sub_path("/resend-otp", embed=embed, tenant=route_tenant),
+                lang_urls=lang_urls,
+                base_url=self._settings.base_url,
+                brand=brand,
+                embed=embed,
+            )
         return views.confirmation_page(
             locale,
             event=event,
@@ -1370,6 +1390,152 @@ class _BookingApp:
         return await self._complete_booking(
             request, form=form, event=found, locale=locale, tz=tz, tenant=tenant, brand=brand
         )
+
+    async def verify_phone_submit(self, request: Request) -> object:
+        form = _form_dict(await request.form())
+        locale = self._locale(request, form.get("lang"))
+        brand = await self._brand(request)
+        embed = _is_embed_request(request)
+        tenant = self._tenant(request)
+        route_tenant = self._route_tenant(request)
+        lang_urls = _lang_links_here(request)
+
+        booking_id = _parse_uuid(form.get("booking_id", ""))
+        token = form.get("token", "").strip()
+        code = form.get("code", "").strip()
+
+        if booking_id is None or not token or tenant is None:
+            return views.message_page(
+                locale,
+                title=t(locale, "phone_verify_title"),
+                message=t(locale, "error_link_invalid"),
+                lang_urls=lang_urls,
+                base_url=self._settings.base_url,
+                brand=brand,
+                is_error=True,
+            )
+
+        action = _sub_path("/verify-phone", embed=embed, tenant=route_tenant)
+        resend_action = _sub_path("/resend-otp", embed=embed, tenant=route_tenant)
+        guest_ip = self._guest_ip(request)
+
+        try:
+            res = await self._call(
+                request,
+                lambda c: c.verify_public_phone(
+                    tenant, booking_id, code=code, token=token, forwarded_for=guest_ip
+                ),
+            )
+            if res.verified:
+                return views.message_page(
+                    locale,
+                    title=t(locale, "phone_verify_title"),
+                    message=res.message or t(locale, "confirmed_heading", title=""),
+                    lang_urls=lang_urls,
+                    base_url=self._settings.base_url,
+                    brand=brand,
+                )
+            return views.phone_verification_page(
+                locale,
+                booking_id=booking_id,
+                token=token,
+                action=action,
+                resend_action=resend_action,
+                lang_urls=lang_urls,
+                error_message=res.message or t(locale, "phone_verify_error_invalid"),
+                base_url=self._settings.base_url,
+                brand=brand,
+                embed=embed,
+            )
+        except Exception as exc:
+            err_msg = t(locale, "phone_verify_error_invalid")
+            if isinstance(exc, AetherCalAPIError):
+                msg_lower = exc.message.lower()
+                if "burned" in msg_lower or "attempts" in msg_lower:
+                    err_msg = t(locale, "phone_verify_error_attempts")
+                elif "limit" in msg_lower:
+                    err_msg = t(locale, "phone_verify_error_rate_limit_phone")
+            return views.phone_verification_page(
+                locale,
+                booking_id=booking_id,
+                token=token,
+                action=action,
+                resend_action=resend_action,
+                lang_urls=lang_urls,
+                error_message=err_msg,
+                base_url=self._settings.base_url,
+                brand=brand,
+                embed=embed,
+            )
+
+    async def resend_otp_submit(self, request: Request) -> object:
+        form = _form_dict(await request.form())
+        locale = self._locale(request, form.get("lang"))
+        brand = await self._brand(request)
+        embed = _is_embed_request(request)
+        tenant = self._tenant(request)
+        route_tenant = self._route_tenant(request)
+        lang_urls = _lang_links_here(request)
+
+        booking_id = _parse_uuid(form.get("booking_id", ""))
+        token = form.get("token", "").strip()
+
+        if booking_id is None or not token or tenant is None:
+            return views.message_page(
+                locale,
+                title=t(locale, "phone_verify_title"),
+                message=t(locale, "error_link_invalid"),
+                lang_urls=lang_urls,
+                base_url=self._settings.base_url,
+                brand=brand,
+                is_error=True,
+            )
+
+        action = _sub_path("/verify-phone", embed=embed, tenant=route_tenant)
+        resend_action = _sub_path("/resend-otp", embed=embed, tenant=route_tenant)
+        guest_ip = self._guest_ip(request)
+
+        try:
+            await self._call(
+                request,
+                lambda c: c.resend_public_phone_otp(
+                    tenant, booking_id, token=token, forwarded_for=guest_ip
+                ),
+            )
+            return views.phone_verification_page(
+                locale,
+                booking_id=booking_id,
+                token=token,
+                action=action,
+                resend_action=resend_action,
+                lang_urls=lang_urls,
+                success_message=t(locale, "phone_verify_resend_sent"),
+                base_url=self._settings.base_url,
+                brand=brand,
+                embed=embed,
+            )
+        except Exception as exc:
+            err_msg = t(locale, "error_generic")
+            if isinstance(exc, AetherCalAPIError):
+                msg_lower = exc.message.lower()
+                if "60 second" in msg_lower or "wait" in msg_lower:
+                    err_msg = t(locale, "phone_verify_error_rate_limit_cooldown")
+                elif "ip" in msg_lower or "network" in msg_lower:
+                    err_msg = t(locale, "phone_verify_error_rate_limit_ip")
+                elif "limit" in msg_lower:
+                    err_msg = t(locale, "phone_verify_error_rate_limit_phone")
+            return views.phone_verification_page(
+                locale,
+                booking_id=booking_id,
+                token=token,
+                action=action,
+                resend_action=resend_action,
+                lang_urls=lang_urls,
+                error_message=err_msg,
+                base_url=self._settings.base_url,
+                brand=brand,
+                embed=embed,
+            )
 
     async def cancel_form(self, request: Request) -> object:
         locale = self._locale(request)
@@ -1663,6 +1829,8 @@ def create_app(
     _register(app, "/cancel", booking.cancel_submit, ["POST"])
     _register(app, "/reschedule", booking.reschedule_form, ["GET"])
     _register(app, "/reschedule", booking.reschedule_submit, ["POST"])
+    _register(app, "/verify-phone", booking.verify_phone_submit, ["POST"])
+    _register(app, "/resend-otp", booking.resend_otp_submit, ["POST"])
     _register(app, "/e/{slug}", booking.event, ["GET"])
     _register(app, "/e/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/e/{slug}/book", booking.book_form, ["GET"])
@@ -1674,6 +1842,8 @@ def create_app(
     _register(app, "/embed/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/embed/{slug}/book", booking.book_form, ["GET"])
     _register(app, "/embed/{slug}/book", booking.book_submit, ["POST"])
+    _register(app, "/embed/verify-phone", booking.verify_phone_submit, ["POST"])
+    _register(app, "/embed/resend-otp", booking.resend_otp_submit, ["POST"])
     # ==THE BUSINESS-SCOPED TWINS — this is what makes ONE page serve N businesses.==
     #
     # The SAME handlers, again, under `/t/{tenant}`. Not a second implementation: each handler asks
@@ -1686,6 +1856,10 @@ def create_app(
     # URLs (and whose guests' bookmarks and e-mailed links) must not break on the day the page
     # learned to serve more than one.
     _register(app, "/t/{tenant}", booking.index, ["GET"])
+    _register(app, "/t/{tenant}/verify-phone", booking.verify_phone_submit, ["POST"])
+    _register(app, "/t/{tenant}/resend-otp", booking.resend_otp_submit, ["POST"])
+    _register(app, "/t/{tenant}/embed/verify-phone", booking.verify_phone_submit, ["POST"])
+    _register(app, "/t/{tenant}/embed/resend-otp", booking.resend_otp_submit, ["POST"])
     _register(app, "/t/{tenant}/e/{slug}", booking.event, ["GET"])
     _register(app, "/t/{tenant}/e/{slug}/slots", booking.slots_partial, ["GET"])
     _register(app, "/t/{tenant}/e/{slug}/book", booking.book_form, ["GET"])

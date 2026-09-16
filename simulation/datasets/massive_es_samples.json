@@ -1,0 +1,153 @@
+{
+  "calendar_set": [
+    {
+      "id": "3201",
+      "label": 50,
+      "text": "recuérdame si algo más pasa",
+      "label_text": "calendar_set",
+      "label_text_es": "conjunto de calendario"
+    },
+    {
+      "id": "3601",
+      "label": 50,
+      "text": "recuérdame a la una de la tarde",
+      "label_text": "calendar_set",
+      "label_text_es": "conjunto de calendario"
+    },
+    {
+      "id": "5945",
+      "label": 50,
+      "text": "recuérdale a mi amigo que consiga la tarea mañana",
+      "label_text": "calendar_set",
+      "label_text_es": "conjunto de calendario"
+    },
+    {
+      "id": "6418",
+      "label": 50,
+      "text": "abierta memo agregar nota sobre mi reunión",
+      "label_text": "calendar_set",
+      "label_text_es": "conjunto de calendario"
+    },
+    {
+      "id": "6511",
+      "label": 50,
+      "text": "recordatorios",
+      "label_text": "calendar_set",
+      "label_text_es": "conjunto de calendario"
+    }
+  ],
+  "calendar_query": [
+    {
+      "id": "33",
+      "label": 32,
+      "text": "mirar cuando empieza el espectáculo",
+      "label_text": "calendar_query",
+      "label_text_es": "consulta de calendario"
+    },
+    {
+      "id": "1137",
+      "label": 32,
+      "text": "dime por favor los eventos actuales para el día",
+      "label_text": "calendar_query",
+      "label_text_es": "consulta de calendario"
+    },
+    {
+      "id": "1274",
+      "label": 32,
+      "text": "puedes confirmar que mi reunión de mañana ha sido cancelada",
+      "label_text": "calendar_query",
+      "label_text_es": "consulta de calendario"
+    },
+    {
+      "id": "3423",
+      "label": 32,
+      "text": "a qué hora es la fiesta de ignacio",
+      "label_text": "calendar_query",
+      "label_text_es": "consulta de calendario"
+    },
+    {
+      "id": "4293",
+      "label": 32,
+      "text": "cuáles son los próximos recordatorios",
+      "label_text": "calendar_query",
+      "label_text_es": "consulta de calendario"
+    }
+  ],
+  "calendar_remove": [
+    {
+      "id": "6714",
+      "label": 30,
+      "text": "olly cancela la reunión de negocios del miércoles",
+      "label_text": "calendar_remove",
+      "label_text_es": "quitar calendario"
+    },
+    {
+      "id": "6715",
+      "label": 30,
+      "text": "elimina el evento boda de ricardo del próximo año",
+      "label_text": "calendar_remove",
+      "label_text_es": "quitar calendario"
+    },
+    {
+      "id": "6716",
+      "label": 30,
+      "text": "eliminar stand-up el viernes a las diez a. m.",
+      "label_text": "calendar_remove",
+      "label_text_es": "quitar calendario"
+    },
+    {
+      "id": "6717",
+      "label": 30,
+      "text": "solo quitar el levantarse el viernes a las diez de la mañana",
+      "label_text": "calendar_remove",
+      "label_text_es": "quitar calendario"
+    },
+    {
+      "id": "6727",
+      "label": 30,
+      "text": "eliminar chat con juan",
+      "label_text": "calendar_remove",
+      "label_text_es": "quitar calendario"
+    }
+  ],
+  "general_affirm": [],
+  "general_negate": [],
+  "general_dontcare": [],
+  "datetime_query": [
+    {
+      "id": "48",
+      "label": 0,
+      "text": "dime la hora en madrid",
+      "label_text": "datetime_query",
+      "label_text_es": "consulta de fecha y hora"
+    },
+    {
+      "id": "195",
+      "label": 0,
+      "text": "que hora es",
+      "label_text": "datetime_query",
+      "label_text_es": "consulta de fecha y hora"
+    },
+    {
+      "id": "196",
+      "label": 0,
+      "text": "dime la hora",
+      "label_text": "datetime_query",
+      "label_text_es": "consulta de fecha y hora"
+    },
+    {
+      "id": "213",
+      "label": 0,
+      "text": "que fecha es hoy",
+      "label_text": "datetime_query",
+      "label_text_es": "consulta de fecha y hora"
+    },
+    {
+      "id": "214",
+      "label": 0,
+      "text": "que dia es hoy",
+      "label_text": "datetime_query",
+      "label_text_es": "consulta de fecha y hora"
+    }
+  ]
+}

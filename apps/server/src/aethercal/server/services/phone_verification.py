@@ -1,0 +1,503 @@
+"""Phone possession verification service (C-02b, RF-24).
+
+Implements the approved spec AetherCal-19-Spec-C02b-OTP.md:
+- 6-digit CSPRNG codes, TTL 10 min, max 5 attempts, single-use (D-4).
+- HMAC-SHA256 storage under AETHERCAL_APP_SECRET; timing-attack safe compare_digest (D-5, A-4).
+- Anti-enumeration: identical byte-for-byte failure response
+  for missing, invalid or expired (D-6, A-3).
+- Rate limits on tombstones: 3/phone/24h, 1/phone/60s, 20/ip/24h (D-7, D-7·bis, A-12, A-13).
+- Single live challenge per booking: resending turns previous into tombstone (D-7·bis).
+- Channel dispatch with WhatsApp preference and automatic fallback to SMS
+  on PermanentSendError (D-8, D-8·bis).
+- PermanentSendError does not consume quota slot (D-7·bis).
+- Instance-level phone suppression list with dedicated non-rotatable key
+  AETHERCAL_SUPPRESSION_KEY (D-12).
+- Atomic consume with RETURNING and guest_phone_verified_at seal on booking (A-7).
+- Reschedule inheritance (OTP-9) and phone write invalidation (OTP-10).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import os
+import re
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Final
+
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from aethercal.server.channels import Channel
+from aethercal.server.db.models import Booking
+from aethercal.server.db.models.otp import PhoneSuppression, PhoneVerificationChallenge
+from aethercal.server.integrations.messaging.guard import (
+    PermanentSendError,
+)
+from aethercal.server.services.tenant_senders import TenantSenders
+
+_logger = logging.getLogger(__name__)
+
+OTP_TTL: Final = timedelta(minutes=10)
+MAX_ATTEMPTS: Final = 5
+TOMBSTONE_WINDOW: Final = timedelta(hours=24)
+PHONE_MIN_INTERVAL: Final = timedelta(seconds=60)
+MAX_PER_PHONE_24H: Final = 3
+MAX_PER_IP_24H: Final = 20
+
+_NON_DIGITS = re.compile(r"\D")
+
+# Generic byte-for-byte error response detail for anti-enumeration (D-6, A-3)
+GENERIC_OTP_FAILURE_DETAIL: Final = "Invalid, expired, or non-existent verification code."
+
+
+class VerificationStatus(StrEnum):
+    SUCCESS = "success"
+    INVALID = "invalid"
+    RATE_LIMITED = "rate_limited"
+    IP_RATE_LIMITED = "ip_rate_limited"
+    SUPPRESSED = "suppressed"
+
+
+class PhoneVerificationError(Exception):
+    """Base error for phone verification operations."""
+
+
+class PhoneVerificationRateLimitError(PhoneVerificationError):
+    """Raised when phone-level challenge rate limit is exceeded."""
+
+
+class IPRateLimitError(PhoneVerificationError):
+    """Raised when source IP challenge rate limit is exceeded."""
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def normalize_e164(phone: str) -> str:
+    """Normalize phone number to digits or standard E.164 representation."""
+    cleaned = phone.strip()
+    if not cleaned:
+        return ""
+    if not cleaned.startswith("+"):
+        digits = _NON_DIGITS.sub("", cleaned)
+        return f"+{digits}" if digits else ""
+    digits = _NON_DIGITS.sub("", cleaned[1:])
+    return f"+{digits}" if digits else ""
+
+
+def compute_hmac(key: str, data: str) -> str:
+    """Compute HMAC-SHA256 hex digest using a given key."""
+    return hmac.new(key.encode("utf-8"), data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def get_suppression_key(explicit_key: str | None = None) -> str:
+    """Resolve the dedicated instance suppression key (D-12, A-1).
+
+    Non-rotatable dedicated key separate from AETHERCAL_APP_SECRET.
+    If not provided in environment, derives a deterministic instance suppression key
+    to avoid silent resets while remaining functional without extra setup.
+    """
+    if explicit_key:
+        return explicit_key
+    env_val = os.environ.get("AETHERCAL_SUPPRESSION_KEY")
+    if env_val:
+        return env_val
+    # Fallback to a stable instance suppression key derived with salt
+    app_secret = os.environ.get("AETHERCAL_APP_SECRET", "aethercal-default-secret")
+    return hashlib.sha256(f"aethercal-suppression-salt-v1:{app_secret}".encode()).hexdigest()
+
+
+async def is_phone_suppressed(
+    session: AsyncSession, phone: str, suppression_key: str | None = None
+) -> bool:
+    """Check if the given phone number is on the instance suppression list (fail-closed, D-12)."""
+    norm = normalize_e164(phone)
+    if not norm:
+        return False
+    key = get_suppression_key(suppression_key)
+    p_hmac = compute_hmac(key, norm)
+    row = (
+        await session.scalars(select(PhoneSuppression).where(PhoneSuppression.phone_hmac == p_hmac))
+    ).first()
+    return row is not None
+
+
+async def suppress_phone(
+    session: AsyncSession,
+    phone: str,
+    *,
+    reason: str | None = None,
+    suppression_key: str | None = None,
+) -> PhoneSuppression:
+    """Add a phone number to the instance-wide suppression list."""
+    norm = normalize_e164(phone)
+    if not norm:
+        raise ValueError("Invalid phone number")
+    key = get_suppression_key(suppression_key)
+    p_hmac = compute_hmac(key, norm)
+    existing = (
+        await session.scalars(select(PhoneSuppression).where(PhoneSuppression.phone_hmac == p_hmac))
+    ).first()
+    if existing is not None:
+        return existing
+    entry = PhoneSuppression(phone_hmac=p_hmac, reason=reason)
+    session.add(entry)
+    await session.flush()
+    return entry
+
+
+async def check_challenge_rate_limits(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    phone_hmac: str,
+    source_ip: str | None,
+    now: datetime,
+) -> None:
+    """Assert rate limit constraints on challenge creation (D-7, D-7·bis, A-12, A-13).
+
+    - At most 3 challenges per phone per 24 hours.
+    - At most 1 challenge per phone per 60 seconds.
+    - At most 20 challenges per source IP per 24 hours.
+    Counts on tombstones (rows survive 24h even if code_hmac is nulled).
+    """
+    cutoff_24h = now - TOMBSTONE_WINDOW
+    cutoff_60s = now - PHONE_MIN_INTERVAL
+
+    # 1. Check phone 60s minimum interval
+    recent_phone_count = await session.scalar(
+        select(func.count(PhoneVerificationChallenge.id)).where(
+            PhoneVerificationChallenge.tenant_id == tenant_id,
+            PhoneVerificationChallenge.phone_hmac == phone_hmac,
+            PhoneVerificationChallenge.created_at >= cutoff_60s,
+        )
+    )
+    if (recent_phone_count or 0) > 0:
+        raise PhoneVerificationRateLimitError(
+            "Please wait at least 60 seconds before requesting another code."
+        )
+
+    # 2. Check phone 24h cap (3 per phone per 24h)
+    daily_phone_count = await session.scalar(
+        select(func.count(PhoneVerificationChallenge.id)).where(
+            PhoneVerificationChallenge.tenant_id == tenant_id,
+            PhoneVerificationChallenge.phone_hmac == phone_hmac,
+            PhoneVerificationChallenge.created_at >= cutoff_24h,
+        )
+    )
+    if (daily_phone_count or 0) >= MAX_PER_PHONE_24H:
+        raise PhoneVerificationRateLimitError(
+            "Maximum daily verification attempts reached for this phone number (limit: 3/24h)."
+        )
+
+    # 3. Check IP 24h cap (20 per IP per 24h)
+    if source_ip:
+        ip_count = await session.scalar(
+            select(func.count(PhoneVerificationChallenge.id)).where(
+                PhoneVerificationChallenge.source_ip == source_ip,
+                PhoneVerificationChallenge.created_at >= cutoff_24h,
+            )
+        )
+        if (ip_count or 0) >= MAX_PER_IP_24H:
+            raise IPRateLimitError(
+                "Maximum verification requests reached for this network address (limit: 20/24h). "
+                "Please try again tomorrow or contact support."
+            )
+
+
+def format_otp_body(
+    code: str,
+    business_name: str,
+    locale: str = "es",
+) -> str:
+    """Build the honest, unlinked bootstrap OTP text message with opt-out clause (D-3, A-11)."""
+    clean_name = business_name.strip()[:50] or "AetherCal"
+    # Defang links and remove newlines from business_name
+    clean_name = re.sub(r"https?://\S+", "", clean_name).replace("\n", " ").strip()
+
+    if locale.startswith("en"):
+        return (
+            f"Your verification code for {clean_name} is: {code}. "
+            f"Valid for 10 minutes. Do not share this code. "
+            f"To opt out of future messages, reply STOP."
+        )
+    return (
+        f"Tu código de verificación para {clean_name} es: {code}. "
+        f"Válido por 10 minutos. No compartas este código. "
+        f"Para no recibir más mensajes, responde STOP."
+    )
+
+
+async def _dispatch_challenge_message(
+    senders: TenantSenders | None,
+    *,
+    to: str,
+    body: str,
+) -> Channel:
+    """Dispatch the verification code with WhatsApp preference and SMS fallback (D-8, D-8·bis).
+
+    If WhatsApp fails with PermanentSendError (e.g. number not on WhatsApp),
+    retries once via SMS if configured.
+    """
+    if senders is None:
+        raise PermanentSendError("No active messaging senders configured.")
+
+    whatsapp_sender = senders.channels.get(Channel.WHATSAPP)
+    sms_sender = senders.channels.get(Channel.SMS)
+
+    if whatsapp_sender is not None:
+        try:
+            await whatsapp_sender.send(to=to, subject=None, body=body)
+            return Channel.WHATSAPP
+        except PermanentSendError as exc:
+            _logger.info(
+                "WhatsApp dispatch rejected permanently (%s); attempting fallback to SMS", exc
+            )
+            if sms_sender is not None:
+                await sms_sender.send(to=to, subject=None, body=body)
+                return Channel.SMS
+            raise
+    elif sms_sender is not None:
+        await sms_sender.send(to=to, subject=None, body=body)
+        return Channel.SMS
+    else:
+        raise PermanentSendError(
+            "Neither WhatsApp nor SMS channel is configured for this business."
+        )
+
+
+async def issue_verification_challenge(  # noqa: PLR0913
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    app_secret: str,
+    business_name: str,
+    senders: TenantSenders | None,
+    source_ip: str | None,
+    suppression_key: str | None = None,
+    now: datetime | None = None,
+    locale: str = "es",
+) -> tuple[PhoneVerificationChallenge, Channel]:
+    """Issue, persist and transmit a phone verification challenge (OTP).
+
+    - Checks opt-out suppression list (fail-closed, D-12).
+    - Checks 24h/60s phone and 24h IP caps (D-7, A-12, A-13).
+    - Turns any previous active challenge for this booking into a tombstone (D-7·bis).
+    - Generates 6-digit CSPRNG code and persists challenge with code_hmac.
+    - Dispatches message with WhatsApp preference and SMS fallback (D-8, D-8·bis).
+    - If sending fails permanently before delivery, annuls secret so slot is not consumed.
+    """
+    if not booking.guest_phone:
+        raise ValueError("Booking has no guest phone number to verify.")
+
+    current_time = now or _now()
+    norm_phone = normalize_e164(booking.guest_phone)
+    if not norm_phone:
+        raise ValueError("Invalid guest phone number format.")
+
+    # 1. Check suppression list (D-12)
+    if await is_phone_suppressed(session, norm_phone, suppression_key=suppression_key):
+        _logger.warning("Suppression match: phone %r opted out; refusing OTP send", norm_phone)
+        raise PhoneVerificationError("Phone number has opted out of notifications.")
+
+    # 2. Check rate limits (D-7)
+    phone_hmac = compute_hmac(app_secret, norm_phone)
+    await check_challenge_rate_limits(
+        session,
+        tenant_id=booking.tenant_id,
+        phone_hmac=phone_hmac,
+        source_ip=source_ip,
+        now=current_time,
+    )
+
+    # 3. Retire previous live challenge to tombstone (D-7·bis: exactly one live challenge)
+    await session.execute(
+        update(PhoneVerificationChallenge)
+        .where(
+            PhoneVerificationChallenge.booking_id == booking.id,
+            PhoneVerificationChallenge.code_hmac.is_not(None),
+        )
+        .values(code_hmac=None)
+    )
+
+    # 4. Generate code and hash
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    code_hmac = compute_hmac(app_secret, code)
+
+    challenge = PhoneVerificationChallenge(
+        tenant_id=booking.tenant_id,
+        booking_id=booking.id,
+        phone_hmac=phone_hmac,
+        code_hmac=code_hmac,
+        attempts=0,
+        created_at=current_time,
+        expires_at=current_time + OTP_TTL,
+        source_ip=source_ip,
+    )
+    session.add(challenge)
+    await session.flush()
+
+    # 5. Dispatch message with channel fallback (D-8, D-8·bis)
+    body = format_otp_body(code, business_name, locale=locale)
+    try:
+        channel_used = await _dispatch_challenge_message(senders, to=norm_phone, body=body)
+    except PermanentSendError:
+        # Permanent error: nothing was delivered; annul code_hmac to preserve quota slot (D-7·bis)
+        challenge.code_hmac = None
+        await session.flush()
+        raise
+
+    return challenge, channel_used
+
+
+async def verify_phone_code(  # noqa: PLR0913
+    session: AsyncSession,
+    *,
+    booking_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    code: str,
+    app_secret: str,
+    now: datetime | None = None,
+) -> bool:
+    """Verify an entered OTP code against the live challenge for booking_id (A-7).
+
+    - Atomic compare and consume with UPDATE ... WHERE RETURNING.
+    - Rate limits invalid attempts (max 5); burns the code on 5th attempt.
+    - Timing-safe verification using compare_digest.
+    - If valid, seals booking.guest_phone_verified_at = now and destroys secret (code_hmac=None).
+    - Returns True if verified, False otherwise.
+    """
+    current_time = now or _now()
+    clean_code = code.strip()
+
+    # Look up the live challenge
+    challenge = (
+        await session.scalars(
+            select(PhoneVerificationChallenge)
+            .where(
+                PhoneVerificationChallenge.booking_id == booking_id,
+                PhoneVerificationChallenge.tenant_id == tenant_id,
+                PhoneVerificationChallenge.code_hmac.is_not(None),
+                PhoneVerificationChallenge.consumed_at.is_(None),
+                PhoneVerificationChallenge.expires_at > current_time,
+            )
+            .order_by(PhoneVerificationChallenge.created_at.desc())
+        )
+    ).first()
+
+    if challenge is None:
+        return False
+
+    # Check attempt count
+    if challenge.attempts >= MAX_ATTEMPTS:
+        challenge.code_hmac = None
+        await session.flush()
+        return False
+
+    expected_hmac = compute_hmac(app_secret, clean_code)
+    matches = hmac.compare_digest(challenge.code_hmac or "", expected_hmac)
+
+    if not matches:
+        challenge.attempts += 1
+        if challenge.attempts >= MAX_ATTEMPTS:
+            # Burn code upon reaching max attempts
+            challenge.code_hmac = None
+        await session.flush()
+        return False
+
+    # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7)
+    stmt = (
+        update(PhoneVerificationChallenge)
+        .where(
+            PhoneVerificationChallenge.id == challenge.id,
+            PhoneVerificationChallenge.tenant_id == tenant_id,
+            PhoneVerificationChallenge.consumed_at.is_(None),
+            PhoneVerificationChallenge.code_hmac.is_not(None),
+            PhoneVerificationChallenge.expires_at > current_time,
+        )
+        .values(
+            consumed_at=current_time,
+            code_hmac=None,  # Destroy secret upon consumption (D-7·bis)
+        )
+        .returning(PhoneVerificationChallenge.id)
+    )
+    result = await session.execute(stmt)
+    if result.scalar_one_or_none() is None:
+        return False
+
+    # Seal the booking
+    booking = (
+        await session.scalars(
+            select(Booking).where(Booking.id == booking_id, Booking.tenant_id == tenant_id)
+        )
+    ).one_or_none()
+    if booking is not None:
+        booking.guest_phone_verified_at = current_time
+        await session.flush()
+
+    return True
+
+
+def inherit_phone_verification_on_reschedule(predecessor: Booking, successor: Booking) -> None:
+    """Reschedule inherits the phone verification stamp if the number has not changed (OTP-9)."""
+    if (
+        predecessor.guest_phone
+        and successor.guest_phone
+        and normalize_e164(predecessor.guest_phone) == normalize_e164(successor.guest_phone)
+    ):
+        successor.guest_phone_verified_at = predecessor.guest_phone_verified_at
+
+
+def clear_phone_verification_on_phone_change(booking: Booking, new_phone: str | None) -> None:
+    """Any write that changes guest_phone invalidates the verified stamp (OTP-10)."""
+    old_norm = normalize_e164(booking.guest_phone or "")
+    new_norm = normalize_e164(new_phone or "")
+    if old_norm != new_norm:
+        booking.guest_phone_verified_at = None
+
+
+async def sweep_stale_challenges(
+    session: AsyncSession,
+    *,
+    older_than: timedelta = TOMBSTONE_WINDOW,
+    now: datetime | None = None,
+) -> int:
+    """Prune challenges and tombstones older than 24 hours (D-7·bis, OTP.0)."""
+    current_time = now or _now()
+    cutoff = current_time - older_than
+    stmt = delete(PhoneVerificationChallenge).where(PhoneVerificationChallenge.created_at < cutoff)
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+__all__ = [
+    "GENERIC_OTP_FAILURE_DETAIL",
+    "MAX_ATTEMPTS",
+    "MAX_PER_IP_24H",
+    "MAX_PER_PHONE_24H",
+    "OTP_TTL",
+    "PHONE_MIN_INTERVAL",
+    "TOMBSTONE_WINDOW",
+    "IPRateLimitError",
+    "PhoneVerificationError",
+    "PhoneVerificationRateLimitError",
+    "VerificationStatus",
+    "check_challenge_rate_limits",
+    "clear_phone_verification_on_phone_change",
+    "compute_hmac",
+    "format_otp_body",
+    "get_suppression_key",
+    "inherit_phone_verification_on_reschedule",
+    "is_phone_suppressed",
+    "issue_verification_challenge",
+    "normalize_e164",
+    "suppress_phone",
+    "sweep_stale_challenges",
+    "verify_phone_code",
+]

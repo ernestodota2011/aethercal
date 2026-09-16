@@ -17,6 +17,8 @@ nothing about which businesses exist or how they are configured to a caller that
 
 from __future__ import annotations
 
+import hmac
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated
@@ -39,12 +41,19 @@ from aethercal.server.services.payment_webhooks import (
     dispatch_payment_event,
     record_payment_event,
 )
+from aethercal.server.services.phone_verification import get_suppression_key
 from aethercal.server.services.tenant_credentials import (
     CredentialError,
     CredentialProvider,
+    resolve_infra_credential,
     resolve_money_credential,
 )
 from aethercal.server.services.tenant_resolution import tenant_by_slug
+from aethercal.server.services.tenant_senders import InstanceSenderDefaults
+from aethercal.server.services.whatsapp_interactive import (
+    extract_evolution_payload,
+    process_inbound_whatsapp,
+)
 from aethercal.server.settings import Settings
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -253,4 +262,98 @@ async def receive_payment_webhook(
     return {"status": "ok"}
 
 
-__all__ = ["receive_payment_webhook", "router"]
+@router.post("/whatsapp/{tenant_slug}", status_code=status.HTTP_200_OK)
+@router.post("/evolution/{tenant_slug}", status_code=status.HTTP_200_OK)
+async def receive_whatsapp_webhook(
+    tenant_slug: TenantSlug,
+    request: Request,
+    session: SessionDep,
+) -> dict[str, str]:
+    """Receive, authenticate, and process an inbound WhatsApp event from Evolution API (Horizon 1).
+
+    Authentication checks the API key sent by Evolution API (via headers `apikey`, `x-api-key`,
+    `Authorization: Bearer <key>`, or query params `apikey`, `token`) against the tenant's
+    configured WhatsApp credential or the instance default.
+    """
+    raw_body = await _read_body_within_limit(request)
+
+    tenant_id = await tenant_by_slug(session, tenant_slug)
+    if tenant_id is None:
+        raise _unauthorized()
+    await bind_tenant(session, tenant_id)
+
+    fernet_keys = request.app.state.fernet_keys
+    defaults: InstanceSenderDefaults | None = getattr(request.app.state, "sender_defaults", None)
+    instance_default = (
+        defaults.secrets_for(CredentialProvider.WHATSAPP) if defaults is not None else None
+    )
+
+    try:
+        credential = await resolve_infra_credential(
+            session,
+            tenant_id=tenant_id,
+            provider=CredentialProvider.WHATSAPP,
+            fernet_key=fernet_keys,
+            instance_default=instance_default,
+        )
+    except CredentialError:
+        raise _unauthorized() from None
+
+    if credential is None:
+        raise _unauthorized()
+
+    expected_key = credential.secrets.get("api_key")
+    if not expected_key:
+        raise _unauthorized()
+
+    auth_header = request.headers.get("authorization", "")
+    bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
+    received_key = (
+        request.headers.get("apikey")
+        or request.headers.get("x-api-key")
+        or bearer_token
+        or request.query_params.get("apikey")
+        or request.query_params.get("token")
+    )
+    if not received_key or not hmac.compare_digest(received_key.strip(), expected_key.strip()):
+        raise _unauthorized()
+
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        return {"status": "ignored"}
+
+    if not isinstance(payload, dict):
+        return {"status": "ignored"}
+
+    extracted = extract_evolution_payload(payload)
+    if extracted is None:
+        return {"status": "ignored"}
+
+    sender_phone, message_text = extracted
+
+    settings: Settings = request.app.state.settings
+    base = settings.booking_base_url or str(request.base_url)
+    effects = BookingEffects(
+        signer=GuestTokenSigner(settings.app_secret),
+        booking_base_url=base.rstrip("/"),
+    )
+
+    result = await process_inbound_whatsapp(
+        session,
+        tenant_id=tenant_id,
+        sender_phone=sender_phone,
+        message_text=message_text,
+        suppression_key=get_suppression_key(),
+        now=_now(),
+        effects=effects,
+    )
+
+    return {
+        "status": result.status,
+        "action": result.action.value,
+        "reply_message": result.reply_message or "",
+    }
+
+
+__all__ = ["receive_payment_webhook", "receive_whatsapp_webhook", "router"]

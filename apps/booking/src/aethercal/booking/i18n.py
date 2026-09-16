@@ -114,6 +114,32 @@ MESSAGES: dict[Locale, dict[str, str]] = {
             "Reserva tu cita en línea con {negocio}, de forma rápida y sencilla."
         ),
         "footer_powered": "Con la tecnología de AetherCal",
+        "phone_verify_title": "Verifica tu teléfono",
+        "phone_verify_heading": "Introduce el código de verificación",
+        "phone_verify_lead": (
+            "Te hemos enviado un código de 6 dígitos por WhatsApp o SMS para "
+            "confirmar que el número te pertenece."
+        ),
+        "phone_verify_code_label": "Código de verificación",
+        "phone_verify_code_hint": "Código numérico de 6 dígitos.",
+        "phone_verify_submit": "Verificar",
+        "phone_verify_resend": "Reenviar código",
+        "phone_verify_resend_sent": "Te hemos enviado un nuevo código.",
+        "phone_verify_error_invalid": (
+            "Código inválido o expirado. Revisa el código o solicita uno nuevo."
+        ),
+        "phone_verify_error_attempts": (
+            "Has superado el límite de intentos para este código. Solicita uno nuevo."
+        ),
+        "phone_verify_error_rate_limit_phone": (
+            "Has alcanzado el límite de solicitudes para este número por hoy. Inténtalo más tarde."
+        ),
+        "phone_verify_error_rate_limit_ip": (
+            "Demasiadas solicitudes desde tu red. Inténtalo de nuevo más tarde."
+        ),
+        "phone_verify_error_rate_limit_cooldown": (
+            "Por favor, espera al menos 60 segundos antes de solicitar otro código."
+        ),
     },
     "en": {
         "app_name": "AetherCal",
@@ -204,6 +230,31 @@ MESSAGES: dict[Locale, dict[str, str]] = {
             "Book your appointment online with {negocio}, quickly and easily."
         ),
         "footer_powered": "Powered by AetherCal",
+        "phone_verify_title": "Verify your phone",
+        "phone_verify_heading": "Enter verification code",
+        "phone_verify_lead": (
+            "We sent a 6-digit code via WhatsApp or SMS to verify you own this phone number."
+        ),
+        "phone_verify_code_label": "Verification code",
+        "phone_verify_code_hint": "6-digit numerical code.",
+        "phone_verify_submit": "Verify",
+        "phone_verify_resend": "Resend code",
+        "phone_verify_resend_sent": "A new code has been sent to your phone.",
+        "phone_verify_error_invalid": (
+            "Invalid or expired code. Please check the code or request a new one."
+        ),
+        "phone_verify_error_attempts": (
+            "Maximum verification attempts reached for this code. Please request a new one."
+        ),
+        "phone_verify_error_rate_limit_phone": (
+            "You have reached the daily code limit for this phone number. Please try again later."
+        ),
+        "phone_verify_error_rate_limit_ip": (
+            "Too many requests from your network. Please try again later."
+        ),
+        "phone_verify_error_rate_limit_cooldown": (
+            "Please wait at least 60 seconds before requesting another code."
+        ),
     },
 }
 

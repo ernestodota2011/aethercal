@@ -567,6 +567,10 @@ async def _booking_with_whatsapp_step(
         )
         booking.guest_phone = phone
         booking.guest_phone_consent_at = consented_at
+        # A phone the guest proved they possess (C-02b). The message gate requires the OTP seal
+        # too, and these scenarios model the ordinary case — a consented, verified guest — so the
+        # helpers advertise one unless a test says otherwise.
+        booking.guest_phone_verified_at = consented_at
         await session.flush()
         return tenant_id, booking.id
 
@@ -800,6 +804,9 @@ async def _booking_with_step_kind(
         )
         booking.guest_phone = phone
         booking.guest_phone_consent_at = _NOW
+        # Consented AND verified: the gate requires both (C-02b), and a step that is skipped for a
+        # missing seal would make these quota/retirement tests pass for the wrong reason.
+        booking.guest_phone_verified_at = _NOW
         await session.flush()
         return tenant_id, booking.id
 

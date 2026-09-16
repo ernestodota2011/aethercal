@@ -138,9 +138,49 @@ class PublicBookingRead(BaseModel):
     #: The signed guest token that authorizes RESUMING this hold's checkout (r5), or ``None`` for a
     #: free booking. A booking-scoped, expiring capability — not PII.
     checkout_token: str | None = None
+    #: The signed guest token that authorizes phone possession verification (C-02b, D-11).
+    phone_verification_token: str | None = None
+    phone_verification_required: bool = False
+
+
+class PhoneVerificationRequest(BaseModel):
+    """Payload for verifying phone possession code (C-02b)."""
+
+    token: Annotated[str, Field(description="Signed guest token with purpose phone_verification")]
+    code: Annotated[
+        str, Field(min_length=4, max_length=10, description="6-digit verification code")
+    ]
+
+
+class PhoneVerificationResponse(BaseModel):
+    """Result of phone verification code entry."""
+
+    status: str = "verified"
+    message: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "verified"
+
+
+class PhoneResendRequest(BaseModel):
+    """Payload for requesting a new OTP challenge code."""
+
+    token: Annotated[str, Field(description="Signed guest token with purpose phone_verification")]
+
+
+class PhoneResendResponse(BaseModel):
+    """Result of requesting a new OTP challenge."""
+
+    status: str = "sent"
+    message: str | None = None
 
 
 __all__ = [
+    "PhoneResendRequest",
+    "PhoneResendResponse",
+    "PhoneVerificationRequest",
+    "PhoneVerificationResponse",
     "PublicBookingCreate",
     "PublicBookingRead",
     "PublicEventTypeRead",

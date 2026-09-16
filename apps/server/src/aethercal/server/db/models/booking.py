@@ -67,6 +67,10 @@ class Booking(UUIDPrimaryKey, TenantScoped, Timestamps, Base):
     # and cannot be evidenced at all. A WhatsApp/SMS step asks this column "was the box ticked?",
     # and that is the honest limit of the answer it gets back.
     guest_phone_consent_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # WHEN THE GUEST'S PHONE NUMBER WAS PROVEN POSSESSED VIA OTP (C-02b, RF-24). NULL = unverified.
+    # Required by the outbox phone gate: a WhatsApp/SMS step skips a booking without this stamp
+    # with skip_reason "phone-unverified".
+    guest_phone_verified_at: Mapped[_dt.datetime | None] = mapped_column(sa.DateTime(timezone=True))
     guest_timezone: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     guest_notes: Mapped[str | None] = mapped_column(sa.Text)
     answers: Mapped[dict[str, Any]] = mapped_column(sa.JSON, default=dict, nullable=False)

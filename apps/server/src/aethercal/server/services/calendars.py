@@ -97,28 +97,41 @@ from aethercal.server.integrations.google.calendar import (
 )
 from aethercal.server.integrations.google.oauth import credentials_from_token_json
 from aethercal.server.integrations.google.parse import MeetEventRequest
+from aethercal.server.integrations.microsoft.client import (
+    build_service as build_microsoft_service,
+)
+from aethercal.server.integrations.microsoft.client import (
+    delete_event as microsoft_delete_event,
+)
+from aethercal.server.integrations.microsoft.client import (
+    insert_event as microsoft_insert_event,
+)
+from aethercal.server.integrations.microsoft.client import (
+    query_busy as microsoft_query_busy,
+)
+from aethercal.server.integrations.microsoft.parse import MicrosoftEventRequest
 
 _logger = logging.getLogger(__name__)
 
 GOOGLE_PROVIDER = "google"
 # CalDAV (C-03): a SECOND freebusy provider, READ-ONLY. It contributes busy time from any standards
 # calendar server (Nextcloud, Radicale, iCloud…) so no core function depends on Google alone
-# (RNF-9). It is NEVER a booking write target — there is no create/delete/reschedule path for it —
-# which is exactly why the WRITE path (``resolve_calendar_target``, ``_retire_other_targets``, the
-# booking sync in ``services/bookings``) keeps ``load_active_connections`` on its Google-only
-# default, and only the READ path (``read_busy``) widens to ``BUSY_PROVIDERS``.
+# (RNF-9). It is NEVER a booking write target — there is no create/delete/reschedule path for it.
 CALDAV_PROVIDER = "caldav"
+# Microsoft 365 / Graph API (Horizon 1): read freebusy and write booking events with Teams meetings.
+MICROSOFT_PROVIDER = "microsoft"
 
 # The providers whose connected calendars contribute to a host's BUSY set (read/union path, RF-30).
-BUSY_PROVIDERS: tuple[str, ...] = (GOOGLE_PROVIDER, CALDAV_PROVIDER)
+BUSY_PROVIDERS: tuple[str, ...] = (GOOGLE_PROVIDER, CALDAV_PROVIDER, MICROSOFT_PROVIDER)
+# The providers that can be targeted for booking event creation (write path).
+WRITE_PROVIDERS: tuple[str, ...] = (GOOGLE_PROVIDER, MICROSOFT_PROVIDER)
 
 # The per-provider freebusy query, dispatched by ``connection.provider`` in ``refresh_busy_cache``.
-# Both have the same signature ``(service, calendar_id, window) -> list[TimeInterval]`` and both run
-# offline against an injected fake; the only difference is which wire protocol shapes the request.
 BusyQueryFn = Callable[[Any, str, TimeInterval], list[TimeInterval]]
 _BUSY_QUERY_BY_PROVIDER: dict[str, BusyQueryFn] = {
     GOOGLE_PROVIDER: google_query_busy,
     CALDAV_PROVIDER: caldav_query_busy,
+    MICROSOFT_PROVIDER: microsoft_query_busy,
 }
 # The calendar a connection uses when the operator has linked NONE explicitly: the account's own
 # default. It is a FALLBACK, not the policy — the calendar is configured per connection through the
@@ -199,6 +212,14 @@ class CaldavCredential:
     username: str
     password: str
     calendar_url: str
+
+
+@dataclass(frozen=True)
+class MicrosoftCredential:
+    """An OAuth connection to Microsoft 365 / Graph API: account email + token JSON (Horizon 1)."""
+
+    account_email: str
+    token_json: str
 
 
 @dataclass(frozen=True)
@@ -356,6 +377,45 @@ async def store_caldav_connection(
     after = await busy_calendar_ids(session, connection=connection)
     if after != before:
         await invalidate_busy_cache(session, connection=connection)
+    return connection
+
+
+async def store_microsoft_connection(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    credential: MicrosoftCredential,
+    fernet: Fernet | MultiFernet,
+) -> ExternalConnection:
+    """Persist (or refresh) a host's Microsoft connection with credentials encrypted at rest.
+
+    Keyed by `(tenant_id, user_id, provider='microsoft', account_email)`.
+    """
+    ciphertext = fernet.encrypt(credential.token_json.encode("utf-8"))
+    connection = (
+        await session.scalars(
+            select(ExternalConnection).where(
+                ExternalConnection.tenant_id == tenant_id,
+                ExternalConnection.user_id == user_id,
+                ExternalConnection.provider == MICROSOFT_PROVIDER,
+                ExternalConnection.account_email == credential.account_email,
+            )
+        )
+    ).one_or_none()
+    if connection is None:
+        connection = ExternalConnection(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            provider=MICROSOFT_PROVIDER,
+            account_email=credential.account_email,
+            encrypted_credentials=ciphertext,
+        )
+        session.add(connection)
+    else:
+        connection.encrypted_credentials = ciphertext
+        connection.revoked_at = None
+    await session.flush()
     return connection
 
 
@@ -561,6 +621,9 @@ def build_live_service(
             username=secrets["username"],
             password=secrets["password"],
         )
+    if connection.provider == MICROSOFT_PROVIDER:
+        token_data = json.loads(token) if token.startswith("{") else {"access_token": token}
+        return build_microsoft_service(access_token=token_data.get("access_token", token))
     return build_service(credentials_from_token_json(token))
 
 
@@ -574,7 +637,7 @@ async def load_active_connections(
     *,
     tenant_id: uuid.UUID,
     user_id: uuid.UUID,
-    providers: Collection[str] = (GOOGLE_PROVIDER,),
+    providers: Collection[str] = WRITE_PROVIDERS,
 ) -> list[ExternalConnection]:
     """ALL of the host's active (not revoked) connections for ``providers``, tenant-scoped, oldest
     first.
@@ -962,8 +1025,9 @@ async def create_event_for_booking(
     calendar_id: str,
     request: MeetEventRequest,
     service: Any,
+    provider: str = GOOGLE_PROVIDER,
 ) -> tuple[str, str | None]:
-    """Create the calendar event (with a Google Meet link) in ``calendar_id``; ``(id, meet_url)``.
+    """Create calendar event (Google Meet or Teams link) in ``calendar_id``; ``(id, meet_url)``.
 
     PRIMITIVES, not a ``CalendarTarget``, and that is load-bearing: this runs with NO session open
     (the outbox releases its connection before any network call, R8), so an ORM object reaching here
@@ -973,24 +1037,34 @@ async def create_event_for_booking(
 
     Does not touch the database -- the caller writes the returned ``external_event_id`` /
     ``meeting_url``, and the calendar they landed in, onto the ``Booking`` row inside its own
-    transaction. A Google failure raises :class:`CalendarSyncError` so the intent retries.
+    transaction. A provider failure raises :class:`CalendarSyncError` so the intent retries.
     """
     try:
+        if provider == MICROSOFT_PROVIDER:
+            ms_req = MicrosoftEventRequest(
+                summary=request.summary,
+                start=request.start,
+                end=request.end,
+                timezone=request.timezone,
+                guest_email=request.guest_email,
+            )
+            event_id, teams_url = await asyncio.to_thread(
+                microsoft_insert_event, service, calendar_id, ms_req
+            )
+            return event_id, teams_url
+
         # Blocking network write, offloaded so a hung insert cannot freeze the worker nor outlive
         # the outbox lease (a re-drain would duplicate the event). See refresh_busy_cache.
         created = await asyncio.to_thread(insert_event_with_meet, service, calendar_id, request)
     except Exception as exc:
-        raise CalendarSyncError(f"failed to create Google event in calendar {calendar_id}") from exc
+        raise CalendarSyncError(
+            f"failed to create {provider} event in calendar {calendar_id}"
+        ) from exc
     return str(created["id"]), _extract_meet_url(created)
 
 
 def _is_already_gone(exc: Exception) -> bool:
-    """True when Google's error says the event is not there any more (404 / 410).
-
-    googleapiclient raises ``HttpError``, whose ``resp.status`` (newer builds also expose
-    ``status_code``) carries the code. Read defensively rather than importing the untyped error
-    class: the seam around the SDK stays intact, and a fake in the tests can model it exactly.
-    """
+    """True when the calendar error says the event is not there any more (404 / 410)."""
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(getattr(exc, "resp", None), "status", None)
@@ -1002,29 +1076,34 @@ async def delete_event_for_booking(
     calendar_id: str,
     external_event_id: str,
     service: Any,
+    provider: str = GOOGLE_PROVIDER,
 ) -> None:
     """Delete a booking's calendar event from ``calendar_id`` (cancel). IDEMPOTENT.
 
-    An event Google no longer has (404 / 410) is a SUCCESS: the desired end state — no event — is
-    exactly what holds, and the outbox retries at-least-once, so a re-drained cancellation (or the
-    delete half of a reschedule that crashed right after it) must not fail forever and dead-letter
-    over an event it already removed. Any other failure raises :class:`CalendarSyncError` and the
-    intent retries.
+    An event the provider no longer has (404 / 410) is a SUCCESS: the desired end state — no event
+    — is exactly what holds, and the outbox retries at-least-once, so a re-drained cancellation (or
+    the delete half of a reschedule that crashed right after it) must not fail forever and
+    dead-letter over an event it already removed. Any other failure raises
+    :class:`CalendarSyncError` and the intent retries.
     """
     try:
+        if provider == MICROSOFT_PROVIDER:
+            await asyncio.to_thread(microsoft_delete_event, service, calendar_id, external_event_id)
+            return
         # Blocking network call, offloaded (see ``refresh_busy_cache``): keeps the loop responsive
         # and the outbox timeout enforceable.
         await asyncio.to_thread(delete_event, service, calendar_id, external_event_id)
     except Exception as exc:
         if _is_already_gone(exc):
             _logger.info(
-                "Google event %s already absent from calendar %s; delete is a no-op",
+                "%s event %s already absent from calendar %s; delete is a no-op",
+                provider,
                 external_event_id,
                 calendar_id,
             )
             return
         raise CalendarSyncError(
-            f"failed to delete Google event {external_event_id} from calendar {calendar_id}"
+            f"failed to delete {provider} event {external_event_id} from calendar {calendar_id}"
         ) from exc
 
 
@@ -1036,35 +1115,22 @@ async def reschedule_event_for_booking(  # noqa: PLR0913 - source/target + their
     target_service: Any,
     external_event_id: str,
     request: MeetEventRequest,
+    source_provider: str = GOOGLE_PROVIDER,
+    target_provider: str = GOOGLE_PROVIDER,
 ) -> tuple[str, str | None]:
-    """Move a booking's event: delete it where it LIVES (``source``), create it where it BELONGS.
-
-    ``source`` is the calendar the event was actually written to (persisted on the booking), which
-    is not necessarily the host's currently-configured ``target`` — a host who re-designates their
-    booking calendar between the confirmation and the reschedule would otherwise leave the old event
-    orphaned in the old calendar. They are usually the same, and the caller then passes the same
-    client twice.
-
-    Delete-and-reinsert (rather than ``events.patch``) keeps the code path identical to create and
-    guarantees a clean conference for the new time. Returns the new ``(id, meet_url)``; a Google
-    failure raises :class:`CalendarSyncError` for the intent to retry (the delete is idempotent, so
-    a retry after a partial move re-deletes harmlessly and re-creates).
-    """
+    """Move a booking's event: delete it where it LIVES (``source``), create it where it BELONGS."""
     await delete_event_for_booking(
         calendar_id=source_calendar_id,
         external_event_id=external_event_id,
         service=source_service,
+        provider=source_provider,
     )
-    try:
-        # Blocking network write, offloaded (see ``refresh_busy_cache``).
-        created = await asyncio.to_thread(
-            insert_event_with_meet, target_service, target_calendar_id, request
-        )
-    except Exception as exc:
-        raise CalendarSyncError(
-            f"failed to re-create Google event {external_event_id} in calendar {target_calendar_id}"
-        ) from exc
-    return str(created["id"]), _extract_meet_url(created)
+    return await create_event_for_booking(
+        calendar_id=target_calendar_id,
+        request=request,
+        service=target_service,
+        provider=target_provider,
+    )
 
 
 def _extract_meet_url(created: dict[str, Any]) -> str | None:
@@ -1086,6 +1152,8 @@ __all__ = [
     "CALDAV_PROVIDER",
     "DEFAULT_CALENDAR_ID",
     "GOOGLE_PROVIDER",
+    "MICROSOFT_PROVIDER",
+    "WRITE_PROVIDERS",
     "AmbiguousCalendarTargetError",
     "BusyQuery",
     "BusyReadResult",
@@ -1095,6 +1163,7 @@ __all__ = [
     "CalendarTarget",
     "CalendarTargetMissingError",
     "GoogleCredential",
+    "MicrosoftCredential",
     "ServiceFactory",
     "build_live_service",
     "busy_calendar_ids",
@@ -1110,4 +1179,5 @@ __all__ = [
     "resolve_calendar_target",
     "store_caldav_connection",
     "store_google_connection",
+    "store_microsoft_connection",
 ]

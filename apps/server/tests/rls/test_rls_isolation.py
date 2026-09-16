@@ -29,7 +29,11 @@ from aethercal.server.db.guc import (
 )
 from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
 from aethercal.server.db.pools import BypassReason, BypassRequiredError, WorkerPools
-from aethercal.server.db.rls import tenant_scoped_tables, unscoped_tables
+from aethercal.server.db.rls import (
+    UNSCOPED_INSTANCE_TABLES,
+    tenant_scoped_tables,
+    unscoped_tables,
+)
 from aethercal.server.db.roles import DbRole
 from aethercal.server.observability import collect_metrics
 from aethercal.server.services.api_keys import parse_key
@@ -494,11 +498,16 @@ class TestCriterion4EveryScopedTableIsForced:
         assert policies == 0
 
 
-class TestCriterion13jTheUnscopedSetIsExactlyTenants:
+class TestCriterion13jTheUnscopedSetIsExactlyTheDeclaredExceptions:
     def test_a_new_table_without_a_tenant_id_breaks_ci(self) -> None:
         """Offline, and deliberately so: it forces somebody to DECIDE a new table's regime by hand,
-        instead of letting it inherit one nobody chose."""
-        assert unscoped_tables(Base.metadata) == ("tenants",)
+        instead of letting it inherit one nobody chose.
+
+        The expected set is the DECLARATION (:data:`UNSCOPED_INSTANCE_TABLES`), not a literal: the
+        tenant root and the instance-level opt-out list, each with its reason written next to it.
+        A new table without a ``tenant_id`` fails here until somebody adds it deliberately — which
+        is the same guard as before, now with the second exception named instead of anonymous."""
+        assert unscoped_tables(Base.metadata) == UNSCOPED_INSTANCE_TABLES
 
 
 class TestCriterion13cTheAppRoleCanActuallyUseEveryTable:

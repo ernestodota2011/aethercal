@@ -20,10 +20,12 @@ def test_purpose_values() -> None:
     assert GuestTokenPurpose.CANCEL.value == "cancel"
     assert GuestTokenPurpose.RESCHEDULE.value == "reschedule"
     assert GuestTokenPurpose.CHECKOUT.value == "checkout"  # r5: resume a paid hold's checkout
+    assert GuestTokenPurpose.PHONE_VERIFICATION.value == "phone_verification"  # C-02b OTP
     assert set(GuestTokenPurpose) == {
         GuestTokenPurpose.CANCEL,
         GuestTokenPurpose.RESCHEDULE,
         GuestTokenPurpose.CHECKOUT,
+        GuestTokenPurpose.PHONE_VERIFICATION,
     }
 
 

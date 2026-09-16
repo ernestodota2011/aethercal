@@ -21,6 +21,10 @@ from aethercal.schemas.bookings import BookingCreate, BookingRead, BookingResche
 from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.event_types import EventTypeRead
 from aethercal.schemas.public import (
+    PhoneResendRequest,
+    PhoneResendResponse,
+    PhoneVerificationRequest,
+    PhoneVerificationResponse,
     PublicBookingCreate,
     PublicBookingRead,
     PublicEventTypeRead,
@@ -334,6 +338,45 @@ class AetherCalClient:
         _raise_for_status(response)
         return _booking_from_api(response.json())
 
+    def verify_public_phone(
+        self,
+        tenant_slug: str,
+        booking_id: uuid.UUID,
+        *,
+        code: str,
+        token: str,
+        forwarded_for: str | None = None,
+    ) -> PhoneVerificationResponse:
+        """Verify phone possession using OTP code and guest verification token (C-02b)."""
+        headers = {_FORWARDED_FOR: forwarded_for} if forwarded_for else None
+        response = self._send(
+            "POST",
+            f"{_PUBLIC_PATH}{tenant_slug}/bookings/{booking_id}/verify-phone",
+            json=PhoneVerificationRequest(code=code, token=token).model_dump(mode="json"),
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return PhoneVerificationResponse.model_validate(response.json())
+
+    def resend_public_phone_otp(
+        self,
+        tenant_slug: str,
+        booking_id: uuid.UUID,
+        *,
+        token: str,
+        forwarded_for: str | None = None,
+    ) -> PhoneResendResponse:
+        """Request a new OTP challenge code using guest verification token (C-02b)."""
+        headers = {_FORWARDED_FOR: forwarded_for} if forwarded_for else None
+        response = self._send(
+            "POST",
+            f"{_PUBLIC_PATH}{tenant_slug}/bookings/{booking_id}/resend-otp",
+            json=PhoneResendRequest(token=token).model_dump(mode="json"),
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return PhoneResendResponse.model_validate(response.json())
+
 
 class AsyncAetherCalClient:
     """Asynchronous client. Use as an async context manager to close the connection pool."""
@@ -388,6 +431,45 @@ class AsyncAetherCalClient:
         except AetherCalError:
             return False
         return True
+
+    async def verify_public_phone(
+        self,
+        tenant_slug: str,
+        booking_id: uuid.UUID,
+        *,
+        code: str,
+        token: str,
+        forwarded_for: str | None = None,
+    ) -> PhoneVerificationResponse:
+        """Verify phone possession using OTP code and guest verification token (C-02b)."""
+        headers = {_FORWARDED_FOR: forwarded_for} if forwarded_for else None
+        response = await self._asend(
+            "POST",
+            f"{_PUBLIC_PATH}{tenant_slug}/bookings/{booking_id}/verify-phone",
+            json=PhoneVerificationRequest(code=code, token=token).model_dump(mode="json"),
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return PhoneVerificationResponse.model_validate(response.json())
+
+    async def resend_public_phone_otp(
+        self,
+        tenant_slug: str,
+        booking_id: uuid.UUID,
+        *,
+        token: str,
+        forwarded_for: str | None = None,
+    ) -> PhoneResendResponse:
+        """Request a new OTP challenge code using guest verification token (C-02b)."""
+        headers = {_FORWARDED_FOR: forwarded_for} if forwarded_for else None
+        response = await self._asend(
+            "POST",
+            f"{_PUBLIC_PATH}{tenant_slug}/bookings/{booking_id}/resend-otp",
+            json=PhoneResendRequest(token=token).model_dump(mode="json"),
+            headers=headers,
+        )
+        _raise_for_status(response)
+        return PhoneResendResponse.model_validate(response.json())
 
 
 __all__ = [

@@ -1390,6 +1390,96 @@ def confirmation_page(
     )
 
 
+def phone_verification_page(
+    locale: Locale,
+    *,
+    booking_id: UUID,
+    token: str,
+    action: str,
+    resend_action: str,
+    lang_urls: Mapping[Locale, str],
+    error_message: str | None = None,
+    success_message: str | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+    embed: bool = False,
+    brand: TenantBrandingRead | None = None,
+) -> Any:
+    """Phone verification page (C-02b): 6-digit OTP entry and resend action."""
+    notices: list[Any] = []
+    if error_message:
+        notices.append(Div(error_message, cls="notice error", role="alert"))
+    if success_message:
+        notices.append(Div(success_message, cls="notice success", role="status"))
+
+    hint_id = "code-hint"
+    form = Form(
+        Input(type="hidden", name="booking_id", value=str(booking_id)),
+        Input(type="hidden", name="token", value=token),
+        Input(type="hidden", name="lang", value=locale),
+        Div(
+            Label(
+                t(locale, "phone_verify_code_label"),
+                Span(f" ({t(locale, 'required_mark')})", cls="req"),
+                fr="code",
+            ),
+            Input(
+                type="text",
+                name="code",
+                id="code",
+                inputmode="numeric",
+                pattern="[0-9]{6}",
+                maxlength="6",
+                required=True,
+                autofocus=True,
+                autocomplete="one-time-code",
+                placeholder="123456",
+                cls="field-input",
+                aria_describedby=hint_id,
+            ),
+            P(t(locale, "phone_verify_code_hint"), id=hint_id, cls="hint"),
+            cls="field",
+        ),
+        Div(
+            Button(t(locale, "phone_verify_submit"), type="submit", cls="btn"),
+            cls="actions",
+        ),
+        method="post",
+        action=action,
+        enctype="application/x-www-form-urlencoded",
+    )
+
+    resend_form = Form(
+        Input(type="hidden", name="booking_id", value=str(booking_id)),
+        Input(type="hidden", name="token", value=token),
+        Input(type="hidden", name="lang", value=locale),
+        Button(
+            t(locale, "phone_verify_resend"),
+            type="submit",
+            cls="btn secondary",
+        ),
+        method="post",
+        action=resend_action,
+        enctype="application/x-www-form-urlencoded",
+    )
+
+    return page(
+        locale,
+        t(locale, "phone_verify_title"),
+        Div(
+            H1(t(locale, "phone_verify_heading")),
+            P(t(locale, "phone_verify_lead"), cls="lead"),
+            *notices,
+            form,
+            Div(resend_form, cls="pager"),
+            cls="stack",
+        ),
+        lang_urls=lang_urls,
+        base_url=base_url,
+        brand=brand,
+        embed=embed,
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Generic message + cancel/reschedule pages.
 # --------------------------------------------------------------------------------------
@@ -1548,6 +1638,7 @@ __all__ = [
     "index_page",
     "message_page",
     "page",
+    "phone_verification_page",
     "render",
     "reschedule_page",
     "reschedule_section",

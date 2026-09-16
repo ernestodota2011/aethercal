@@ -38,11 +38,16 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aethercal.core.model import BookingStatus
 from aethercal.schemas.branding import TenantBrandingRead
 from aethercal.schemas.public import (
+    PhoneResendRequest,
+    PhoneResendResponse,
+    PhoneVerificationRequest,
+    PhoneVerificationResponse,
     PublicBookingCreate,
     PublicBookingRead,
     PublicEventTypeRead,
@@ -84,6 +89,14 @@ from aethercal.server.services.payments import (
     enqueue_expire_hold,
     min_hold_remaining_for_checkout,
     record_checkout_intent,
+)
+from aethercal.server.services.phone_verification import (
+    GENERIC_OTP_FAILURE_DETAIL,
+    IPRateLimitError,
+    PhoneVerificationError,
+    PhoneVerificationRateLimitError,
+    issue_verification_challenge,
+    verify_phone_code,
 )
 from aethercal.server.services.slots import compute_slots
 from aethercal.server.services.tenant_credentials import (
@@ -399,7 +412,41 @@ async def create_public_booking(
         raise _public_booking_error(exc) from exc
 
     await session.refresh(booking)
-    return PublicBookingRead.model_validate(booking)
+    res = PublicBookingRead.model_validate(booking)
+
+    # If phone was provided and consented, issue verification token and initial challenge (C-02b)
+    if params.guest_phone and params.guest_phone_consent:
+        signer = GuestTokenSigner(settings.app_secret)
+        token_ttl = max(timedelta(days=1), (as_utc(booking.start_at) - _now()) + timedelta(days=1))
+        phone_token = await issue_guest_token(
+            session,
+            signer,
+            booking_id=booking.id,
+            tenant_id=booking.tenant_id,
+            purpose=GuestTokenPurpose.PHONE_VERIFICATION,
+            ttl=token_ttl,
+        )
+        res.phone_verification_token = phone_token
+        res.phone_verification_required = True
+
+        senders_factory = getattr(request.app.state, "senders_factory", None)
+        senders = await senders_factory(booking.tenant_id) if senders_factory else None
+        branding = await get_branding(session, tenant_id=booking.tenant_id)
+        business_name = branding.public_name or branding.name or tenant_slug
+        try:
+            await issue_verification_challenge(
+                session,
+                booking=booking,
+                app_secret=settings.app_secret,
+                business_name=business_name,
+                senders=senders,
+                source_ip=client_ip,
+                locale=payload.locale or "es",
+            )
+        except Exception as exc:
+            _logger.info("Initial phone verification challenge dispatch: %s", exc)
+
+    return res
 
 
 @router.post(
@@ -840,6 +887,116 @@ def _public_booking_error(exc: BookingError) -> HTTPException:
     if isinstance(exc, EventTypeNotFoundError | EventTypeInactiveError):
         return _not_found()
     return map_booking_error(exc)
+
+
+@router.post(
+    "/{tenant_slug}/bookings/{booking_id}/verify-phone",
+    response_model=PhoneVerificationResponse,
+)
+async def verify_public_phone(
+    tenant_slug: TenantSlug,
+    booking_id: uuid.UUID,
+    payload: PhoneVerificationRequest,
+    request: Request,
+    session: SessionDep,
+) -> PhoneVerificationResponse:
+    """Verify phone possession via OTP code (C-02b)."""
+    tenant_id = await _bind_business(session, tenant_slug)
+    settings = _settings(request)
+    signer = GuestTokenSigner(settings.app_secret)
+    # 1. Authorize via signed guest token (D-11)
+    token_row = await verify_guest_token(
+        session, signer, payload.token, expected_purpose=GuestTokenPurpose.PHONE_VERIFICATION
+    )
+    if token_row is None or token_row.booking_id != booking_id or token_row.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "forbidden", "message": "Invalid or expired authorization token"},
+        )
+
+    # 2. Verify OTP code atomically
+    verified = await verify_phone_code(
+        session,
+        booking_id=booking_id,
+        tenant_id=tenant_id,
+        code=payload.code,
+        app_secret=settings.app_secret,
+    )
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_code", "message": GENERIC_OTP_FAILURE_DETAIL},
+        )
+
+    return PhoneVerificationResponse(status="verified")
+
+
+@router.post(
+    "/{tenant_slug}/bookings/{booking_id}/resend-otp",
+    response_model=PhoneResendResponse,
+)
+async def resend_public_phone_otp(
+    tenant_slug: TenantSlug,
+    booking_id: uuid.UUID,
+    payload: PhoneResendRequest,
+    request: Request,
+    session: SessionDep,
+) -> PhoneResendResponse:
+    """Resend a phone possession verification code (C-02b)."""
+    tenant_id = await _bind_business(session, tenant_slug)
+    settings = _settings(request)
+    signer = GuestTokenSigner(settings.app_secret)
+    # 1. Authorize via signed guest token (D-11)
+    token_row = await verify_guest_token(
+        session, signer, payload.token, expected_purpose=GuestTokenPurpose.PHONE_VERIFICATION
+    )
+    if token_row is None or token_row.booking_id != booking_id or token_row.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "forbidden", "message": "Invalid or expired authorization token"},
+        )
+
+    booking = (
+        await session.scalars(
+            select(Booking).where(Booking.id == booking_id, Booking.tenant_id == tenant_id)
+        )
+    ).one_or_none()
+    if booking is None or not booking.guest_phone:
+        raise _not_found()
+
+    client_ip = _client_ip(request)
+    branding = await get_branding(session, tenant_id=tenant_id)
+    business_name = branding.public_name or branding.name or tenant_slug
+
+    senders_factory = getattr(request.app.state, "senders_factory", None)
+    senders = await senders_factory(tenant_id) if senders_factory else None
+
+    try:
+        await issue_verification_challenge(
+            session,
+            booking=booking,
+            app_secret=settings.app_secret,
+            business_name=business_name,
+            senders=senders,
+            source_ip=client_ip,
+        )
+    except IPRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "ip_rate_limited", "message": str(exc)},
+        ) from exc
+    except PhoneVerificationRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "message": str(exc)},
+        ) from exc
+    except PhoneVerificationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "verification_error", "message": str(exc)},
+        ) from exc
+
+    return PhoneResendResponse(status="sent")
 
 
 __all__ = ["router"]

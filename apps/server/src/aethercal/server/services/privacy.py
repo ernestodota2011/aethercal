@@ -89,6 +89,7 @@ from aethercal.server.db.models import (
     Payment,
     PaymentEvent,
     PaymentEventStatus,
+    PhoneVerificationChallenge,
     SentNotification,
     WebhookDelivery,
 )
@@ -127,6 +128,8 @@ BOOKING_PII_COLUMNS: dict[str, Any] = {
     # The consent goes with the number it was given for. A standing "yes, you may message me on this
     # phone", attached to a person who no longer exists, is a permission nobody can withdraw.
     "guest_phone_consent_at": None,
+    # The verified stamp goes with the number and booking. An erased guest has no verified phone.
+    "guest_phone_verified_at": None,
     "guest_notes": None,
     "answers": {},
     # Not obviously "identifying", and not in the design's table — but it is a fact ABOUT the person
@@ -183,6 +186,7 @@ _PURGED_BY_BOOKING: dict[str, _PurgedTable] = {
     "outbox": _PurgedTable(Outbox, only=Outbox.effect.in_(PURGEABLE_EFFECTS)),
     "guest_tokens": _PurgedTable(GuestToken),
     "sent_notifications": _PurgedTable(SentNotification),
+    "phone_verification_challenges": _PurgedTable(PhoneVerificationChallenge),
 }
 """Table name → what to delete, for every table hanging off a booking. ==This IS the purge.==
 

@@ -156,7 +156,10 @@ def create_app(settings: Settings) -> FastAPI:
             # operator restarts first. So the check stays and the objects go — `from_env` raises
             # here exactly as before, and what it returns is inert configuration, not a sender.
             # "Sending, but uncapped" must never be a state any process can reach.
-            defaults = build_instance_sender_defaults()
+            defaults = (
+                getattr(app.state, "sender_defaults", None) or build_instance_sender_defaults()
+            )
+            app.state.sender_defaults = defaults
             warn_if_operator_identity_is_lent(defaults)
 
             # ==NO SCHEDULER LIVES HERE ANY MORE.== `AETHERCAL_RUN_SCHEDULER=1` does not start one:
@@ -200,6 +203,7 @@ def create_app(settings: Settings) -> FastAPI:
     # raw body is its whole authority — so it is always mounted: the provider must be able to reach
     # it whenever payments are in use, and an unsigned or wrongly-signed request is a 401.
     app.state.fernet_keys = settings.decryption_fernet_keys()
+    app.state.sender_defaults = build_instance_sender_defaults()
     app.include_router(webhooks_inbound.router)
 
     # ==The payment providers (B-05b, B-06).== The webhook adapters (signature scheme + event

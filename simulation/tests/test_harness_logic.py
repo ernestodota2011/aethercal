@@ -3100,6 +3100,44 @@ def test_reported_total_sigue_leyendo_un_total_valido() -> None:
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 
 
+def _posix_bash() -> str:
+    """Un `bash` que REALMENTE pueda correr estos guiones, o un skip.
+
+    ==`shutil.which("bash")` no comprueba eso en Windows.== El primer resultado suele ser
+    `C:\\Windows\\System32\\bash.exe`, el lanzador de WSL: existe aunque no haya ninguna
+    distribucion instalada, y cuando la hay tampoco puede abrir las rutas de Windows tal como
+    estos guiones lo invocan. Cualquiera de las dos formas convierte una laptop en cinco rojos
+    falsos. El bash para el que estan escritos los guiones es Git for Windows (o Cygwin/MSYS2),
+    asi que esos se prueban primero, y el candidato se verifica POR EFECTO — tiene que devolver la
+    marca que se le pide — antes de confiar en el.
+    """
+    candidates: list[str] = []
+    if os.name == "nt":
+        for variable in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            root = os.environ.get(variable)
+            if root:
+                candidates.append(str(pathlib.Path(root) / "Git" / "bin" / "bash.exe"))
+                candidates.append(str(pathlib.Path(root) / "Git" / "usr" / "bin" / "bash.exe"))
+    found = shutil.which("bash")
+    if found is not None:
+        candidates.append(found)
+    for candidate in candidates:
+        if not pathlib.Path(candidate).is_file():
+            continue
+        try:
+            probe = subprocess.run(  # noqa: PLW1510 - el codigo de salida ES la medida
+                [candidate, "-c", "printf aethercal-bash-ok"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):  # pragma: no cover - host sin bash usable
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == "aethercal-bash-ok":
+            return candidate
+    pytest.skip("no hay un bash POSIX usable en este host")
+
+
 def _arbol_de_teardown(raiz: pathlib.Path, *, con_stack_file: str | None) -> pathlib.Path:
     """Copia los guiones a un arbol desechable y planta un `docker` de mentira.
 
@@ -3140,9 +3178,7 @@ def _arbol_de_teardown(raiz: pathlib.Path, *, con_stack_file: str | None) -> pat
 
 
 def _correr_teardown(raiz: pathlib.Path, guion: pathlib.Path) -> tuple[int, str, str]:
-    bash = shutil.which("bash")
-    if bash is None:  # pragma: no cover - solo en un host sin bash
-        pytest.skip("no hay bash en este host")
+    bash = _posix_bash()
     visto = raiz / "token-visto.txt"
     entorno = {k: v for k, v in os.environ.items() if k != "AETHERCAL_SIM_METRICS_TOKEN"}
     entorno["PATH"] = f"{raiz / 'bin'}{os.pathsep}{entorno.get('PATH', '')}"
@@ -3303,9 +3339,7 @@ def test_run_sh_desmonta_el_stack_con_una_ruta_QUE_LLEVA_ESPACIOS(
     tres argumentos (`-f`, `/ruta`, `con`, `espacios/...`) y `docker compose down` falla: el stack
     desechable — con su base de datos y su `deploy/.env` sustituido — se queda vivo.
     """
-    bash = shutil.which("bash")
-    if bash is None:  # pragma: no cover - solo en un host sin bash
-        pytest.skip("no hay bash en este host")
+    bash = _posix_bash()
     repo, guion = _arbol_run_sh_con_espacios(tmp_path)
     visto = tmp_path / "argv-visto.txt"
 
@@ -3707,9 +3741,7 @@ def _correr_arranque(
     tiempo agotado -- un rojo lento y de motivo equivocado. Negando tambien el `up`, la version
     saboteada muere de inmediato y por la razon correcta: aborto SIN el mensaje del teardown.
     """
-    bash = shutil.which("bash")
-    if bash is None:  # pragma: no cover - solo en un host sin bash
-        pytest.skip("no hay bash en este host")
+    bash = _posix_bash()
     entorno = dict(os.environ)
     entorno["PATH"] = f"{raiz / 'bin'}{os.pathsep}{entorno.get('PATH', '')}"
     entorno["DOCKER_FALLA_EN"] = falla_en
