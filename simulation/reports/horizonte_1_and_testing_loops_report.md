@@ -115,3 +115,15 @@ Hallazgo adicional detectado al auditar el camino del opt-out y corregido: **la 
 no se consultaba antes de enviar un recordatorio** (solo el flujo de OTP la miraba), así que un "STOP"
 no detenía los mensajes siguientes. Ahora el portero del outbox la comprueba con su propia razón de
 salto (`phone-suppressed`).
+
+### Veredicto final
+- **Crisol Gate: GO** sobre el commit `094cbcc` (diez corridas del lazo; cada NO-GO se respondió con
+  su arreglo o con la refutación medida — varias corridas de motor único, `flash`, porque la cuota de
+  `codex` estaba agotada).
+- Cierres posteriores del lazo: barrido de tumbas OTP **cableado** al worker (job
+  `phone-challenge-sweep`, horario, con su `BypassReason`), verificación atada al teléfono **actual**
+  de la reserva, `quitar`/`bloquear` como verbos contextuales del opt-out, cuerpos de webhook leídos
+  **después** de autenticar, y los contratos de error del OTP por código de máquina.
+- Evidencia ejecutable: **3.194 pruebas en verde** (230 omitidas por requerir Postgres/proveedor
+  vivo), `ruff check` y `ruff format --check` limpios, `pyright` 0 errores, `lint-imports` 2/2
+  contratos intactos, y el lazo de intenciones **625/625 con 0% de falsos positivos en `OPT_OUT`**.
