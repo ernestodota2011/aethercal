@@ -757,6 +757,38 @@ async def test_no_phone_at_all_has_its_own_distinct_reason(
     assert not any("no-phone-consent" in message for message in messages)
 
 
+async def test_an_UNVERIFIED_phone_is_never_messaged(
+    migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """==OTP-4: el sello de posesión es ADICIONAL al consentimiento, no sustituto.==
+
+    Un paso telefónico exige las DOS cosas: la casilla tildada y el sello de que quien reservó pudo
+    leer un código en ese número (C-02b, `guest_phone_verified_at`). Este es el sabotaje que OTP-4
+    pide: el fixture es idéntico al del camino feliz salvo UNA variable — el sello — y el paso se
+    salta POR ESA RAZÓN, con su propio motivo distinguible de "sin consentimiento".
+    """
+    _tenant_id, booking_id = await _booking_with_whatsapp_step(
+        migrated, phone="+13055551234", consented_at=_NOW
+    )
+    async with migrated() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.guest_phone_verified_at = None  # el huésped nunca completó el OTP
+
+    whatsapp = _RecordingChannelSender()
+    with caplog.at_level("WARNING"):
+        step = await _drain_whatsapp(migrated, booking_id, whatsapp)
+
+    assert whatsapp.sent == [], "un recordatorio salió hacia un número sin posesión verificada"
+    assert step.attempts == 0
+    assert step.status == "skipped"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("phone-unverified" in message for message in messages), (
+        "el salto tiene que nombrar el sello que falta"
+    )
+    assert not any("no-phone-consent" in message for message in messages)
+
+
 async def test_a_SUPPRESSED_phone_is_never_messaged_even_with_consent_and_verification(
     migrated: Sessionmaker, caplog: pytest.LogCaptureFixture
 ) -> None:

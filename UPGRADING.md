@@ -69,6 +69,40 @@ Full detail: [CHANGELOG.md](CHANGELOG.md) (`[Unreleased]`) and
 
 ---
 
+## Phone steps now wait for verified possession (C-02b)
+
+**What changed.** A booking made through the public form with a phone number and the consent box
+ticked now receives **one verification code** (WhatsApp, falling back to SMS). Until the guest enters
+it, `bookings.guest_phone_verified_at` is NULL, and every phone step on that booking is `skipped`
+with the reason **`phone-unverified`** — an additional gate on top of consent, not a replacement for
+it.
+
+**What breaks.** ==Any booking created BEFORE this release has no seal==, so its phone reminders and
+follow-ups stop sending. So does any booking created outside the public form (the admin, or the API
+key) that carries a phone and consent: there is no code path that mints a verifiable challenge for
+those today. This is the correction the consent design asked for — a box ticked by whoever filled in
+the form is not possession of the number — and it is declared here rather than discovered as silence.
+
+**What to do:**
+
+- Nothing to configure beyond the key below: new public bookings verify themselves through the
+  booking page.
+- For bookings that predate the upgrade: **rebook through the public form** (or ask the guest to) if
+  a phone step matters for them; their e-mail steps are unaffected.
+- **Set `AETHERCAL_SUPPRESSION_KEY`** (≥32 random characters) — ==required whenever
+  `AETHERCAL_PUBLIC_API_ENABLED=true`, and the app refuses to boot without it.== It is the HMAC key
+  behind the instance opt-out list (STOP replies), deliberately not derived from
+  `AETHERCAL_APP_SECRET`; generate it once and keep it stable, because rotating it makes every
+  number already suppressed invisible again.
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> AETHERCAL_SUPPRESSION_KEY
+```
+
+Full detail: [CHANGELOG.md](CHANGELOG.md) and [docs/phone-channels.md](docs/phone-channels.md).
+
+---
+
 ## Not breaking, but new since v0.1.0
 
 - **Payments** (Stripe, Mercado Pago) — additive; an event type with no price keeps working exactly

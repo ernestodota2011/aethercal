@@ -665,11 +665,9 @@ async def test_endpoint_payload_too_large_rejected(
         {"headers": {"apikey": _TEST_API_KEY}},
         {"headers": {"x-api-key": _TEST_API_KEY}},
         {"headers": {"authorization": f"Bearer {_TEST_API_KEY}"}},
-        {"query_params": {"token": _TEST_API_KEY}},
-        {"query_params": {"apikey": _TEST_API_KEY}},
     ],
 )
-async def test_endpoint_authenticates_with_various_headers_and_params(
+async def test_endpoint_authenticates_with_various_headers(
     sqlite_session: AsyncSession,
     seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
     auth_kwargs: dict[str, Any],
@@ -705,6 +703,36 @@ async def test_endpoint_authenticates_with_various_headers_and_params(
     resp = await receive_whatsapp_webhook(tenant.slug, req, sqlite_session)
     assert resp["status"] == "attendance_confirmed"
     assert resp["action"] == "confirm_attendance"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_params", [{"apikey": _TEST_API_KEY}, {"token": _TEST_API_KEY}])
+async def test_endpoint_REFUSES_an_api_key_in_the_query_string(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+    query_params: dict[str, str],
+) -> None:
+    """==Un secreto en la URL es un secreto en cada log del camino.== El proveedor manda el header
+    igual de bien, así que la clave SOLO se acepta por header; los query params se rechazan."""
+    tenant, _, _ = seeded_whatsapp_booking
+    await store_credential(
+        sqlite_session,
+        tenant_id=tenant.id,
+        provider=CredentialProvider.WHATSAPP,
+        secrets={
+            "base_url": "https://evolution.example.com",
+            "instance": "test-instance",
+            "api_key": _TEST_API_KEY,
+        },
+        fernet_key=_FERNET_KEY,
+        current_implementations={},
+    )
+    await sqlite_session.flush()
+
+    req = _build_webhook_request(body=b"{}", query_params=query_params)
+    with pytest.raises(HTTPException) as exc_info:
+        await receive_whatsapp_webhook(tenant.slug, req, sqlite_session)
+    assert exc_info.value.status_code == 401
 
 
 @pytest.mark.asyncio

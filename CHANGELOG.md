@@ -140,6 +140,34 @@ serving requests no longer owns the tables (migration `0008_rls_roles_and_polici
 
 ### Added
 
+**Phone possession verification, and two channels that answer back** — the public booking flow can
+now ask the guest to prove they hold the number they typed, and the phone channels gained an inbound
+side (C-02b, Horizon 1).
+
+- **One verification code per booking** (six CSPRNG digits, 10-minute TTL, five attempts, single
+  use), sent over WhatsApp with automatic fallback to SMS when the number has no WhatsApp account.
+  Stored as an HMAC under `AETHERCAL_APP_SECRET`; consumed, expired or cancelled codes destroy the
+  secret and leave a 24-hour counting tombstone. Emission is bound to the guest's signed token
+  (`PHONE_VERIFICATION` purpose), so verifying or resending is not an open message cannon.
+- ==**A phone step now requires the possession seal too:**== the outbox skips with
+  `phone-unverified` — an additional reason, not a replacement — and **this turns off channels that
+  would send today** (any existing booking with a phone and consent, created before this release,
+  has no seal). That is the correction, not a regression: *see UPGRADING.md.*
+- **Inbound WhatsApp replies**: "1" confirms attendance (stamped on
+  `bookings.attendance_confirmed_at`, first confirmation wins), "2" cancels through the same
+  transactional chain as the guest cancel link, and STOP/BAJA/ALTO/… suppresses the number on the
+  instance-wide opt-out list, which the send path consults before the channel, the template and the
+  caps. Only UPCOMING appointments are eligible: a late or replayed reply never cancels a visit
+  that already happened.
+- **`AETHERCAL_SUPPRESSION_KEY`** (≥32 characters) is the dedicated, non-derivable HMAC key behind
+  that list; ==the app refuses to boot the public router without it==, and the list survives guest
+  erasure so an erasure never reactivates messaging to someone who asked to stop.
+- **Microsoft 365 (Graph) as a busy-calendar provider**: `getSchedule` for availability, events
+  with a Teams join link, idempotent deletion (404/410 are already-gone successes). ==Only an
+  explicit `free` status counts as free:== every other status — including `unknown` and statuses
+  this code has never seen — blocks time, and a non-free item whose instants cannot be read aborts
+  the query rather than guessing.
+
 **The connected calendar** — a booking now creates the event in the host's Google Calendar,
 cancelling deletes it, and rescheduling moves it. ==RF-11/12/13 were ticked and were not true: no
 booking had ever reached a host's calendar.== The integration and the outbox effect were both built

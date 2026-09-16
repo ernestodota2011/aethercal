@@ -317,6 +317,12 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
 
     It is the whole chain in one test: a checkbox ticked on a public form becomes a stamped column
     in Postgres, which unlocks a real WhatsApp send at drain time, to that exact number.
+
+    ==Since C-02b the stamp is NECESSARY and not SUFFICIENT:== the send path also waits for
+    ``guest_phone_verified_at`` (OTP-4, pinned by the ``phone-unverified`` sabotage test in
+    ``apps/server/tests/test_step_materialisation.py``). This test completes that loop the way the
+    guest does — the OTP round trip through the public endpoints has its own unit coverage — and
+    then asserts the send, so what it proves is the CONSENT column unlocking a real message.
     """
     seeded = await _seed(owner_maker, phone_rule_active=True)
 
@@ -335,6 +341,13 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     # PostgreSQL keeps the zone (``DateTime(timezone=True)``): the stamp is a real instant, and it
     # is the SERVER's clock — never a timestamp the client supplied.
     assert stored.guest_phone_consent_at.tzinfo is not None
+
+    # The guest entered the code they received: the possession seal, in the same column the API
+    # endpoint seals when the OTP verifies.
+    async with owner_maker() as session, session.begin():
+        booking = await session.get(Booking, uuid.UUID(response.json()["id"]))
+        assert booking is not None
+        booking.guest_phone_verified_at = datetime.now(UTC)
 
     whatsapp, rows = await _drain(worker_pools, owner_maker, start=seeded["start"])
 

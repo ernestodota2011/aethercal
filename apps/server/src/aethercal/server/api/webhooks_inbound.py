@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aethercal.server.db.guc import bind_tenant
+from aethercal.server.db.guc import bind_tenant, reset_tenant_binding
 from aethercal.server.db.models import Booking
 from aethercal.server.deps import get_session
 from aethercal.server.services.bookings import (
@@ -225,6 +225,12 @@ async def receive_payment_webhook(
         query=request.query_params,
     )
     if not adapter.verify_signature(inbound, secret=webhook_secret):
+        # ==A 401 must not leave the request bound to a business it could not authenticate.== The
+        # bind ABOVE is unavoidable — the signing secret is RLS-protected, so it cannot be read
+        # without the scope — but nothing may continue under that authority. ``get_session`` tears
+        # the scope down on the way out either way; doing it here makes the intent explicit at the
+        # exact point where authentication failed.
+        reset_tenant_binding()
         raise _unauthorized()
 
     # (5) only now: parse, record (idempotent / anti-replay), dispatch.
@@ -271,9 +277,14 @@ async def receive_whatsapp_webhook(
 ) -> dict[str, str]:
     """Receive, authenticate, and process an inbound WhatsApp event from Evolution API (Horizon 1).
 
-    Authentication checks the API key sent by Evolution API (via headers `apikey`, `x-api-key`,
-    `Authorization: Bearer <key>`, or query params `apikey`, `token`) against the tenant's
-    configured WhatsApp credential or the instance default.
+    Authentication checks the API key Evolution API presents in a HEADER (`apikey`, `x-api-key`, or
+    `Authorization: Bearer <key>`) against the tenant's configured WhatsApp credential, or the
+    instance default.
+
+    ==Headers only, deliberately: a credential in the query string is a credential in every access
+    log, proxy log and browser history between the provider and here== — and the provider sends a
+    header just as happily. (An unknown slug, a missing credential and a wrong key all answer the
+    same 401, so the endpoint is no oracle for which businesses exist.)
     """
     raw_body = await _read_body_within_limit(request)
 
@@ -308,14 +319,14 @@ async def receive_whatsapp_webhook(
 
     auth_header = request.headers.get("authorization", "")
     bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
-    received_key = (
-        request.headers.get("apikey")
-        or request.headers.get("x-api-key")
-        or bearer_token
-        or request.query_params.get("apikey")
-        or request.query_params.get("token")
-    )
+    received_key = request.headers.get("apikey") or request.headers.get("x-api-key") or bearer_token
     if not received_key or not hmac.compare_digest(received_key.strip(), expected_key.strip()):
+        # ==A 401 must not leave the request bound to a business it could not authenticate.== The
+        # bind above is unavoidable — the credential is RLS-protected and cannot be read without
+        # the scope — but nothing may continue under that authority. ``get_session`` tears the
+        # scope down on the way out either way; doing it here makes the intent explicit at the
+        # exact point where authentication failed.
+        reset_tenant_binding()
         raise _unauthorized()
 
     try:

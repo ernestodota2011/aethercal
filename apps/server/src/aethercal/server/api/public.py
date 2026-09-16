@@ -414,21 +414,15 @@ async def create_public_booking(
     await session.refresh(booking)
     res = PublicBookingRead.model_validate(booking)
 
-    # If phone was provided and consented, issue verification token and initial challenge (C-02b)
+    # If a phone was provided and consented, dispatch the initial challenge (C-02b) and — ONLY if
+    # it actually went out — hand the page the token it needs to verify or resend.
+    #
+    # ==The order is the point.== Minting the token and setting ``phone_verification_required``
+    # before the dispatch would promise the guest a code that may never arrive (no sender
+    # configured, a provider that refuses the number), leaving a page that waits for a code with no
+    # way to ask for another one — while the phone stays unverified and every reminder is skipped.
+    # A challenge that did not go out is not a pending verification.
     if params.guest_phone and params.guest_phone_consent:
-        signer = GuestTokenSigner(settings.app_secret)
-        token_ttl = max(timedelta(days=1), (as_utc(booking.start_at) - _now()) + timedelta(days=1))
-        phone_token = await issue_guest_token(
-            session,
-            signer,
-            booking_id=booking.id,
-            tenant_id=booking.tenant_id,
-            purpose=GuestTokenPurpose.PHONE_VERIFICATION,
-            ttl=token_ttl,
-        )
-        res.phone_verification_token = phone_token
-        res.phone_verification_required = True
-
         senders_factory = getattr(request.app.state, "senders_factory", None)
         senders = await senders_factory(booking.tenant_id) if senders_factory else None
         branding = await get_branding(session, tenant_id=booking.tenant_id)
@@ -445,7 +439,32 @@ async def create_public_booking(
                 locale=payload.locale or "es",
             )
         except Exception as exc:
-            _logger.info("Initial phone verification challenge dispatch: %s", exc)
+            # The booking is confirmed; the CHALLENGE failed. Say so loudly with the booking it
+            # belongs to: the guest will never get a code, and the phone stays unverified (so no
+            # reminder will be sent) until somebody looks at this line.
+            _logger.warning(
+                "Initial phone verification challenge for booking %s (tenant %s) did not go out: "
+                "%s: %s",
+                booking.id,
+                booking.tenant_id,
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            signer = GuestTokenSigner(settings.app_secret)
+            token_ttl = max(
+                timedelta(days=1), (as_utc(booking.start_at) - _now()) + timedelta(days=1)
+            )
+            phone_token = await issue_guest_token(
+                session,
+                signer,
+                booking_id=booking.id,
+                tenant_id=booking.tenant_id,
+                purpose=GuestTokenPurpose.PHONE_VERIFICATION,
+                ttl=token_ttl,
+            )
+            res.phone_verification_token = phone_token
+            res.phone_verification_required = True
 
     return res
 

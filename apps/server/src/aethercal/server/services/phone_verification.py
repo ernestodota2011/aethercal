@@ -54,6 +54,9 @@ _NON_DIGITS = re.compile(r"\D")
 # Generic byte-for-byte error response detail for anti-enumeration (D-6, A-3)
 GENERIC_OTP_FAILURE_DETAIL: Final = "Invalid, expired, or non-existent verification code."
 
+_OTP_CODE_RE = re.compile(r"[0-9]{6}")
+"""The ONLY shape a code can have (D-4: six digits). Anything else is not a guess at the secret."""
+
 
 class VerificationStatus(StrEnum):
     SUCCESS = "success"
@@ -439,6 +442,11 @@ async def verify_phone_code(  # noqa: PLR0913
     """
     current_time = now or _now()
     clean_code = code.strip()
+    if not _OTP_CODE_RE.fullmatch(clean_code):
+        # A code that cannot BE a code is refused without spending an attempt: it is not a guess at
+        # the secret, it is a caller that never sent one (an empty string, a stray word, a pasted
+        # paragraph). Hashing it would only burn budget against the wrong thing.
+        return False
 
     # Look up the live challenge
     challenge = (

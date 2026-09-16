@@ -256,6 +256,54 @@ async def test_wrong_code_increments_attempts_and_burns_after_5_attempts(
     assert booking.guest_phone_verified_at is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("garbage", ["", "   ", "12345", "1234567", "abcdef", "12 34 56"])
+async def test_a_code_that_cannot_be_a_code_is_refused_WITHOUT_spending_an_attempt(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+    garbage: str,
+) -> None:
+    """==Un intento es una ADIVINANZA del secreto; un texto que no tiene su forma no lo es.==
+
+    D-4 dice que un código son seis dígitos. Cualquier otra cosa (vacío, una palabra, un número de
+    otra longitud, dígitos con espacios) se rechaza antes de calcular el HMAC y **sin consumir
+    intento** — gastar cupo con eso sería gastarlo contra el invitado que se equivocó al pegar, no
+    contra quien intenta adivinar.
+    """
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+
+    sender = DummySender(Channel.WHATSAPP)
+    senders = TenantSenders(tenant_id=tenant.id, email=None, channels={Channel.WHATSAPP: sender})  # type: ignore[arg-type]
+    challenge, _ = await issue_verification_challenge(
+        sqlite_session,
+        booking=booking,
+        app_secret=_APP_SECRET,
+        business_name="Acme Corp",
+        senders=senders,
+        source_ip="198.51.100.1",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+
+    assert (
+        await verify_phone_code(
+            sqlite_session,
+            booking_id=booking.id,
+            tenant_id=tenant.id,
+            code=garbage,
+            app_secret=_APP_SECRET,
+            now=now,
+        )
+        is False
+    )
+
+    await sqlite_session.refresh(challenge)
+    assert challenge.attempts == 0, "un texto que no es un código gastó un intento"
+    assert challenge.code_hmac is not None, "el código vivo se quemó por un texto que no era código"
+    assert booking.guest_phone_verified_at is None
+
+
 # --------------------------------------------------------------------------------------
 # Rate limit & Tombstone tests (D-7, D-7·bis, A-12, A-13)
 # --------------------------------------------------------------------------------------
