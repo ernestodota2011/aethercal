@@ -553,7 +553,29 @@ async def sweep_stale_challenges(
     older_than: timedelta = TOMBSTONE_WINDOW,
     now: datetime | None = None,
 ) -> int:
-    """Prune challenges and tombstones older than 24 hours (D-7·bis, OTP.0)."""
+    """Prune challenges and tombstones older than 24 hours (D-7·bis, OTP.0).
+
+    .. rubric:: ==KNOWN GAP: nothing calls this yet (found by the Crisol gate, 2026-09-16).==
+
+    The 24-hour retention the whole tombstone design rests on is, at this moment, a documented
+    rule and not an enforced one: ``phone_verification_challenges`` only grows. The counting
+    queries filter by ``created_at >= cutoff``, so the ceilings stay CORRECT — this is unbounded
+    storage growth linear in OTP volume, not a wrong answer.
+
+    Wiring it is a change to the worker's boot, and that is why it is a written plan and not a
+    five-line patch:
+
+    1. a new ``BypassReason`` member (the sweep crosses every business) with its rationale, and
+       the pool audit that reason feeds;
+    2. a guarded tick next to ``run_webhook_delivery_once`` (its own session, a failure logs and
+       the scheduler continues);
+    3. the job id + interval in ``scheduler.register_scheduler_jobs``/``start_scheduler``, the
+       ``SchedulerIntervals`` TypedDict, and a default in ``Settings``;
+    4. tests for the tick and the registration, like the other three jobs have.
+
+    It is deferred deliberately, not forgotten: see ``ESTADO-ACTUAL.md`` in the AetherLogik vault
+    (thread "barrido de tombstones OTP").
+    """
     current_time = now or _now()
     cutoff = current_time - older_than
     stmt = delete(PhoneVerificationChallenge).where(PhoneVerificationChallenge.created_at < cutoff)
