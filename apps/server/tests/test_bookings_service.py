@@ -84,6 +84,7 @@ from aethercal.server.services.outbox import (
     OutboxEffect,
     OutboxExecutor,
     OutboxReport,
+    OutboxSkipped,
     OutboxWork,
     backoff_delay,
     drain_outbox,
@@ -1126,13 +1127,18 @@ async def test_confirmation_and_cancellation_drained_together_only_sends_the_can
     seq, uid = _ics_seq_and_uid(sender.sent[0])
     assert seq == 1 and uid == booking.ical_uid
     assert "cancelada" in str(sender.sent[0]["Subject"]).lower()
-    # Both intents are consumed (delivered) — the discarded one is not left retrying.
+    # Both intents are consumed — neither is left retrying — and each row says WHAT it was. The
+    # confirmation is SKIPPED with its reason on the row, not marked delivered: ==a delivered row
+    # claims the guest got a message that was never composed.== Telling those apart is the whole job
+    # of the settle, which used to collapse them into the same word.
     email_rows = [
         r
         for r in await _outbox_rows(sqlite_session, booking_id=booking.id)
         if r.effect == OutboxEffect.EMAIL.value
     ]
-    assert {r.status for r in email_rows} == {"delivered"}
+    assert {r.status for r in email_rows} == {"delivered", "skipped"}
+    skipped = next(r for r in email_rows if r.status == "skipped")
+    assert "booking-chain-moved" in (skipped.skip_reason or "")
 
 
 async def test_a_confirmation_retried_after_cancellation_is_discarded_as_stale(
@@ -1499,8 +1505,11 @@ async def test_reschedule_drained_before_the_original_upsert_never_recreates_the
 
     # RESCHEDULE first: b2 is the chain's current booking → it creates the event.
     await run_google_effect(sqlite_maker, reschedule, _BEFORE, service_factory=factory)
-    # Then the original UPSERT: b1 was replaced → skipped, no second/old event ever created.
-    await run_google_effect(sqlite_maker, upsert, _BEFORE, service_factory=factory)
+    # Then the original UPSERT: b1 was replaced → skipped, no second/old event ever created. The
+    # skip RAISES now: a bare return used to settle the row as delivered, hiding that the event had
+    # never been created — the invariant this test protects is unchanged, but it is now visible.
+    with pytest.raises(OutboxSkipped, match="booking-chain-moved"):
+        await run_google_effect(sqlite_maker, upsert, _BEFORE, service_factory=factory)
 
     await sqlite_session.refresh(b1)
     await sqlite_session.refresh(b2)

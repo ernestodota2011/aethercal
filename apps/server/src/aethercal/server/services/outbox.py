@@ -111,6 +111,7 @@ from aethercal.server.services.phone_verification import (
     is_phone_suppressed,
 )
 from aethercal.server.services.templates import (
+    REPLY_CANCEL_KIND,
     TemplateError,
     build_template_context,
     load_template,
@@ -302,11 +303,20 @@ _STALENESS: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], Staleness]] = {
         else Staleness.SUBJECT
     ),
     OutboxEffect.NOTIFY: lambda payload: trigger_staleness(WorkflowTrigger(payload["trigger"])),
-    # A reply speaks about the appointment the guest just answered about. If a later transition
-    # replaced it (a reschedule opens a NEW booking id), the acknowledgement of the old one is
-    # stale — and the successor carries its own confirmation, so nothing is lost. SUBJECT, and it
-    # reads NO payload key: the trigger lives in the guest's message, not in a rule.
-    OutboxEffect.NOTIFY_REPLY: lambda _payload: Staleness.SUBJECT,
+    # ==Sub-classified BY KIND, because the two acknowledgements answer opposite questions.==
+    #
+    # * ``reply_cancel`` → **EXEMPT**, and this is load-bearing: the guest's "2" CANCELS the booking
+    #   before the intent drains, and ``_is_chain_current`` is False for a cancelled booking BY
+    #   CONSTRUCTION — a SUBJECT cancellation acknowledgement is marked delivered and NEVER SENT, so
+    #   the guest who cancelled hears nothing (the same trap ``REFUND``/``EXPIRE_HOLD`` document).
+    # * ``reply_confirm`` → **SUBJECT**: it speaks about an appointment still meant to happen.
+    #   If the chain moved on (the booking was cancelled or rescheduled before the drain), "thanks,
+    #   your attendance is confirmed" is simply wrong, and the successor booking has its own story.
+    #
+    # Neither reads a trigger key: a reply is queued by the guest's message, not by a rule.
+    OutboxEffect.NOTIFY_REPLY: lambda payload: (
+        Staleness.EXEMPT if payload.get("kind") == REPLY_CANCEL_KIND else Staleness.SUBJECT
+    ),
     # ==Both EXEMPT, and it MUST be a conscious choice.== A refund acts on a booking that is
     # cancelled by definition, and ``_is_chain_current`` is False for a cancelled booking BY
     # CONSTRUCTION — so a SUBJECT refund would be marked ``delivered`` and never sent, and the
@@ -2004,21 +2014,29 @@ async def run_email_effect(
 
 
 async def _prepare_email(session: AsyncSession, work: OutboxWork) -> _EmailPlan | None:
-    """The email's READ phase: decide, then compose. ``None`` = there is nothing to send."""
+    """The email's READ phase: decide, then compose. ``None`` = the ledger already proves the guest
+    got this message (a replay), which is the ONLY honest reading of a delivered row."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return None
+        raise OutboxSkipped(
+            f"{_BOOKING_GONE}: the booking of email intent {work.id} no longer exists"
+        )
     payload = work.payload
     kind = NotificationKind(payload["kind"])
 
     if _should_skip_as_unconfirmed(booking, work):
         # Defence in depth: an intent for a booking that was never confirmed (a hold) must not be
         # sent, even if some path the funnel does not guard managed to queue it. It dies here.
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_UNCONFIRMED}: the {kind.value} email speaks about a booking that was "
+            "never confirmed"
+        )
     if await _should_skip_as_stale(session, booking, work):
         # A later transition superseded this booking: drop the notice (never mail a "confirmed"
         # after a "cancelled", nor a reminder for a slot that was rescheduled away).
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_MOVED}: the {kind.value} email was overtaken by a later transition"
+        )
     if booking.meeting_url is None and await _chain_awaits_meeting_link(session, booking):
         raise OutboxDeferred(f"email for booking {booking.id} awaits its Google Meet link")
     if await notification_already_sent(session, booking=booking, kind=kind, channel=Channel.EMAIL):
@@ -2185,14 +2203,19 @@ async def _prepare_google(
     """
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return None
+        raise OutboxSkipped(
+            f"{_BOOKING_GONE}: the booking of Google intent {work.id} no longer exists"
+        )
     if _should_skip_as_unconfirmed(booking, work):
         # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a booking that was never
         # confirmed must not sync to a calendar — a Google event with the guest as an attendee makes
         # Google mail them the invitation, so this is how a hold would announce itself.
         # Dropped BEFORE the host/target machinery, which is irrelevant for something that will
         # never be sent.
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_UNCONFIRMED}: a calendar event must not announce a booking that was never "
+            "confirmed"
+        )
     payload = work.payload
     host_id = await _payload_host_id(session, payload)
     if host_id is None:
@@ -2240,7 +2263,9 @@ async def _prepare_google(
     # already replaced is skipped even if its own intent drains AFTER the successor's (two workers,
     # inverted order), so it never (re)creates an event the chain has moved on from.
     if await _should_skip_as_stale(session, booking, work):
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_MOVED}: the {operation.value} was overtaken by a later transition"
+        )
     if operation is GoogleOperation.UPSERT and booking.external_event_id is not None:
         # A replay of an upsert whose event was already created (the settle crashed after the
         # write-back committed). Creating again would duplicate the event in the host's calendar.
@@ -2634,6 +2659,20 @@ _BAD_TEMPLATE = "bad-template"
 _RULE_GONE = "workflow-gone"
 _RULE_PAUSED = "workflow-inactive"
 _TOO_LATE = "moment-passed"
+_CHAIN_MOVED = "booking-chain-moved"
+"""A later transition overtook the booking (a cancel, a reschedule): this message speaks about an
+appointment that is no longer the chain's live member, so it is retired instead of sent.
+
+It used to be a bare ``return None`` from the prepare phase — and the drain settles a normal return
+as DELIVERED, so the row claimed a message had gone out that was never composed. ==The staleness
+contract documented on :data:`_STALENESS` says these notices must not be "marked delivered and never
+sent", and the settle was doing exactly that==, one layer below the guard meant to prevent it."""
+_CHAIN_UNCONFIRMED = "booking-never-confirmed"
+"""The booking was never CONFIRMED (an expired hold): the effect requires a confirmation that never
+happened, so it dies here with its reason rather than inheriting a delivered row."""
+_BOOKING_GONE = "booking-gone"
+"""Defensive: the booking vanished under the intent. Nothing can be composed, so it is retired
+LOUDLY — a silent success would hide the one state in which nothing in this module is true."""
 
 
 def message_deadline(trigger: WorkflowTrigger, booking: Booking) -> datetime:
@@ -2884,13 +2923,15 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
     destroyed."""
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return None
+        raise OutboxSkipped(
+            f"{_BOOKING_GONE}: the booking of step intent {work.id} no longer exists"
+        )
 
     if _should_skip_as_unconfirmed(booking, work):
         # Defence in depth (see :func:`_should_skip_as_unconfirmed`): a workflow step — a WhatsApp
         # or SMS to the guest — must not fire for a booking that was never confirmed, whatever path
         # queued it. It dies here rather than reaching a provider.
-        return None
+        raise OutboxSkipped(f"{_CHAIN_UNCONFIRMED}: a workflow step for a booking never confirmed")
 
     payload = work.payload
     channel = Channel(payload["channel"])
@@ -2901,7 +2942,9 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
 
     if await _should_skip_as_stale(session, booking, work):
         # A later transition overtook the booking, and this step's trigger is not a terminal one.
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_MOVED}: the {trigger.value} step was overtaken by a later transition"
+        )
 
     # May this step be sent NOW? The rule that queued it must still be switched on (else the step
     # WAITS — it is not destroyed), and its own moment must not have passed (else it is retired,
@@ -3084,13 +3127,17 @@ async def _prepare_reply(  # noqa: PLR0913 - one keyword per injected sending se
     """
     booking = await session.get(Booking, work.booking_id)
     if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
-        return None
+        raise OutboxSkipped(f"{_BOOKING_GONE}: the booking of an acknowledgement no longer exists")
     if _should_skip_as_unconfirmed(booking, work):
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_UNCONFIRMED}: an acknowledgement speaks about a booking never confirmed"
+        )
     if await _should_skip_as_stale(session, booking, work):
         # A later transition overtook the booking: the acknowledgement of the old appointment would
         # be stale, and the successor carries its own confirmation.
-        return None
+        raise OutboxSkipped(
+            f"{_CHAIN_MOVED}: the {work.payload.get('kind')!s} acknowledgement was overtaken"
+        )
 
     payload = work.payload
     channel = Channel(str(payload["channel"]))

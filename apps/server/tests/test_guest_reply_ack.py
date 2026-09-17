@@ -24,6 +24,7 @@ import pytest_asyncio
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from aethercal.core.model import BookingStatus
 from aethercal.server.channels import Channel
 from aethercal.server.db.migrate import run_migrations
 from aethercal.server.db.models import (
@@ -261,6 +262,59 @@ async def test_the_cancel_acknowledgement_has_its_own_body(migrated: Sessionmake
     assert len(whatsapp.sent) == 1
     body = whatsapp.sent[0][1]
     assert "cancel" in body.lower()
+
+
+async def test_the_CANCELLED_booking_still_gets_its_cancellation_acknowledgement(
+    migrated: Sessionmaker,
+) -> None:
+    """==La trampa que este test existe para atrapar.== En producción el "2" del huésped CANCELA la
+    reserva antes de que el intento se drene, y ``_is_chain_current`` es False para una cancelada
+    *por construcción*. Con una política SUBJECT el acuse quedaba marcado como entregado y NUNCA
+    salía: el huésped que canceló no recibía nada. Por eso ``reply_cancel`` es EXEMPT — y por eso
+    esta prueba reproduce el ORDEN real (cancelar primero, drenar después), que es justo lo que la
+    prueba de cuerpo de arriba no hace."""
+    _tenant_id, booking_id = await _booked_with_phone(migrated)
+    await _enqueue(migrated, booking_id, kind=REPLY_CANCEL_KIND, key="reply:reply_cancel:m1")
+
+    async with migrated() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = _NOW
+
+    whatsapp = _RecordingWhatsApp()
+    report = await _drain(migrated, whatsapp)
+
+    assert len(report.delivered) == 1
+    assert len(whatsapp.sent) == 1, "el huésped canceló y no recibió acuse"
+    assert "cancel" in whatsapp.sent[0][1].lower()
+
+
+async def test_a_confirmation_acknowledgement_is_NOT_sent_after_the_booking_was_cancelled(
+    migrated: Sessionmaker,
+) -> None:
+    """La otra mitad de la clasificación por tipo: el acuse de confirmación HABLA de una cita que
+    debe ocurrir, así que si la cadena se movió, "gracias, tu asistencia está confirmada" sobre una
+    reserva cancelada es sencillamente falso. SUBJECT, y no sale."""
+    _tenant_id, booking_id = await _booked_with_phone(migrated)
+    await _enqueue(migrated, booking_id, kind=REPLY_CONFIRM_KIND, key="reply:reply_confirm:m1")
+
+    async with migrated() as session, session.begin():
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = _NOW
+
+    whatsapp = _RecordingWhatsApp()
+    report = await _drain(migrated, whatsapp)
+
+    assert whatsapp.sent == [], "'asistencia confirmada' sobre una reserva cancelada"
+    assert len(report.skipped) == 1
+    async with migrated() as session:
+        row = (
+            await session.scalars(sa.select(Outbox).where(Outbox.effect == "notify_reply"))
+        ).one()
+    assert row.status == "skipped"
 
 
 def test_every_reply_kind_has_a_body_in_every_locale() -> None:

@@ -654,6 +654,12 @@ async def sweep_stale_challenges(
     The counting queries keep filtering by ``created_at >= cutoff`` regardless, so this job is
     housekeeping, never a correctness dependency: a missed tick delays deletion, it does not
     resurrect a tombstone into a rate-limit slot.
+
+    ==Y por eso ``older_than`` NO puede ser menor que ``TOMBSTONE_WINDOW``.== Son las dos mitades de
+    una misma frontera: los contadores cuentan lo que cae DENTRO de la ventana y este barrido borra
+    lo que cae FUERA. Acortarlo (el default es una invitación a tocarlo) borraría tombstones que los
+    contadores todavía consideran vivos — o sea, le devolvería a un atacante sus intentos. Si alguna
+    vez hay que retener más, se alarga ``TOMBSTONE_WINDOW``; el barrido lo sigue.
     """
     current_time = now or _now()
     cutoff = current_time - older_than
