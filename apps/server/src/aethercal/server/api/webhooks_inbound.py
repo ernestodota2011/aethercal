@@ -237,73 +237,82 @@ async def receive_payment_webhook(
         raise _unauthorized()
     await bind_tenant(session, tenant_id)
 
-    # (3) read THAT business's signing secret (BYOK, under its own RLS).
-    settings: Settings = request.app.state.settings
-    fernet_keys = request.app.state.fernet_keys
+    # ==The same ONE try/finally as the WhatsApp handler, for the same reason.== It starts
+    # right after the bind, so the release is a property of the shape: the 413 out of the size
+    # cap, an adapter that raises while verifying or parsing, and every future edit are covered
+    # without touching a list of exits.
     try:
-        credential = await resolve_money_credential(
+        # (3) read THAT business's signing secret (BYOK, under its own RLS).
+        settings: Settings = request.app.state.settings
+        fernet_keys = request.app.state.fernet_keys
+        try:
+            credential = await resolve_money_credential(
+                session,
+                tenant_id=tenant_id,
+                provider=credential_provider,
+                fernet_key=fernet_keys,
+            )
+        except CredentialError:
+            # No credential, or one that cannot be used to verify: we cannot authorise this event.
+            raise _deny_after_binding() from None
+        webhook_secret = credential.secrets.get(_WEBHOOK_SECRET_FIELD)
+        if not webhook_secret:  # pragma: no cover - required_fields guarantees it, but fail closed
+            raise _deny_after_binding()
+
+        # (4) ==verify the provider's signature. Invalid → 401, and NOTHING has been written.==
+        # The whole request goes to the adapter — body, headers AND query — because what a provider
+        # signs is the provider's business: Stripe HMACs the raw body, Mercado Pago HMACs a manifest
+        # built from the ``data.id`` QUERY parameter and the ``x-request-id`` header. The adapter is
+        # handed the signing secret ALONE, never the credential that can move money.
+        inbound = InboundWebhook(
+            raw_body=raw_body,
+            headers=request.headers,
+            query=request.query_params,
+        )
+        if not adapter.verify_signature(inbound, secret=webhook_secret):
+            # ==A 401 must not leave the request bound to a business it could not authenticate.==
+            # The bind ABOVE is unavoidable — the signing secret is RLS-protected, so it cannot be
+            # read without the scope — but nothing may continue under that authority. The finally
+            # releases it; this call states the intent where authentication failed.
+            raise _deny_after_binding()
+
+        # (5) only now: parse, record (idempotent / anti-replay), dispatch.
+        # ==Finding 4.== The signature has ALREADY authorised this — it is genuinely from the
+        # provider.
+        # An event we do not model (``customer.created``, …) is therefore ACKed 200 and NOT
+        # written, not rejected: any non-2xx makes the provider retry it for ever. 401 (bad
+        # signature) is the only rejection; there is no 400 here, because a verified body we
+        # choose not to act on is not an error, it is an event we are simply not interested in.
+        # ==``parse`` may perform provider I/O, and is given the business's own credential.==
+        # Mercado Pago's notification carries an id and nothing else — no amount, no currency, no
+        # status — and its signature does not cover the body anyway, so the adapter must fetch the
+        # payment (``GET /v1/payments/{id}``) on the business's ``access_token`` to learn what
+        # happened. Stripe's adapter ignores ``secrets`` and does no I/O: its signed body is
+        # self-describing.
+        event = await adapter.parse(inbound, secrets=credential.secrets)
+        if event is None:
+            return {"status": "ignored"}
+
+        row, is_new = await record_payment_event(
+            session, tenant_id=tenant_id, provider=provider, event=event
+        )
+        if not is_new:
+            # A replay of the SAME event id — the UNIQUE already holds the first delivery. Ack it.
+            return {"status": "duplicate"}
+
+        await dispatch_payment_event(
             session,
             tenant_id=tenant_id,
-            provider=credential_provider,
-            fernet_key=fernet_keys,
+            provider=provider,
+            event=event,
+            row=row,
+            now=_now(),
+            confirm_effects=_confirm_effects(request, settings),
+            cancel_effects=_cancel_effects(request, settings),
         )
-    except CredentialError:
-        # No credential, or one that cannot be used to verify: we cannot authorise this event.
-        raise _deny_after_binding() from None
-    webhook_secret = credential.secrets.get(_WEBHOOK_SECRET_FIELD)
-    if not webhook_secret:  # pragma: no cover - required_fields guarantees it, but fail closed
-        raise _deny_after_binding()
+    finally:
+        reset_tenant_binding()
 
-    # (4) ==verify the provider's signature. Invalid → 401, and NOTHING has been written.==
-    # The whole request goes to the adapter — body, headers AND query — because what a provider
-    # signs is the provider's business: Stripe HMACs the raw body, Mercado Pago HMACs a manifest
-    # built from the ``data.id`` QUERY parameter and the ``x-request-id`` header. The adapter is
-    # handed the signing secret ALONE, never the credential that can move money.
-    inbound = InboundWebhook(
-        raw_body=raw_body,
-        headers=request.headers,
-        query=request.query_params,
-    )
-    if not adapter.verify_signature(inbound, secret=webhook_secret):
-        # ==A 401 must not leave the request bound to a business it could not authenticate.== The
-        # bind ABOVE is unavoidable — the signing secret is RLS-protected, so it cannot be read
-        # without the scope — but nothing may continue under that authority. ``get_session`` tears
-        # the scope down on the way out either way; doing it here makes the intent explicit at the
-        # exact point where authentication failed.
-        raise _deny_after_binding()
-
-    # (5) only now: parse, record (idempotent / anti-replay), dispatch.
-    # ==Finding 4.== The signature has ALREADY authorised this — it is genuinely from the provider.
-    # An event we do not model (``customer.created``, …) is therefore ACKed 200 and NOT written, not
-    # rejected: any non-2xx makes the provider retry it for ever. 401 (bad signature) is the only
-    # rejection; there is no 400 here, because a verified body we choose not to act on is not an
-    # error, it is an event we are simply not interested in.
-    # ==``parse`` may perform provider I/O, and is given the business's own credential to do it.==
-    # Mercado Pago's notification carries an id and nothing else — no amount, no currency, no
-    # status — and its signature does not cover the body anyway, so the adapter must fetch the
-    # payment (``GET /v1/payments/{id}``) on the business's ``access_token`` to learn what happened.
-    # Stripe's adapter ignores ``secrets`` and does no I/O: its signed body is self-describing.
-    event = await adapter.parse(inbound, secrets=credential.secrets)
-    if event is None:
-        return {"status": "ignored"}
-
-    row, is_new = await record_payment_event(
-        session, tenant_id=tenant_id, provider=provider, event=event
-    )
-    if not is_new:
-        # A replay of the SAME event id — the UNIQUE already holds the first delivery. Ack it.
-        return {"status": "duplicate"}
-
-    await dispatch_payment_event(
-        session,
-        tenant_id=tenant_id,
-        provider=provider,
-        event=event,
-        row=row,
-        now=_now(),
-        confirm_effects=_confirm_effects(request, settings),
-        cancel_effects=_cancel_effects(request, settings),
-    )
     return {"status": "ok"}
 
 
@@ -336,7 +345,8 @@ async def receive_whatsapp_webhook(
 
     The bind is unavoidable (the credential is RLS-protected) and ``get_session`` tears the request
     scope down either way — but ==a reader should not have to follow two files to know the authority
-    does not outlive the work==: each return calls :func:`reset_tenant_binding` before it leaves.
+    does not outlive the work==: one ``try/finally`` starts right after the bind and releases it on
+    every exit this handler has, including the ones a branch audit forgets.
     """
     # ==The body is read AFTER authenticating.== The size cap is checked from the header first (a
     # declared oversize is still a 413 before any work), but the BYTES are pulled from the stream
@@ -351,88 +361,97 @@ async def receive_whatsapp_webhook(
         raise _unauthorized()
     await bind_tenant(session, tenant_id)
 
-    fernet_keys = request.app.state.fernet_keys
-    defaults: InstanceSenderDefaults | None = getattr(request.app.state, "sender_defaults", None)
-    instance_default = (
-        defaults.secrets_for(CredentialProvider.WHATSAPP) if defaults is not None else None
-    )
-
+    # ==ONE try/finally, right after the bind, so "the authority never outlives the work" is a
+    # property of the SHAPE and not of a handful of scattered calls.== It covers what the explicit
+    # resets did not: the 413 a size cap raises while reading the bytes, an unexpected error out of
+    # the credential read, and anything a future edit adds between here and the exit. A reader no
+    # longer has to audit every branch to know the binding is released.
     try:
-        credential = await resolve_infra_credential(
-            session,
-            tenant_id=tenant_id,
-            provider=CredentialProvider.WHATSAPP,
-            fernet_key=fernet_keys,
-            instance_default=instance_default,
+        fernet_keys = request.app.state.fernet_keys
+        defaults: InstanceSenderDefaults | None = getattr(
+            request.app.state, "sender_defaults", None
         )
-    except CredentialError:
-        raise _deny_after_binding() from None
-
-    if credential is None:
-        raise _deny_after_binding()
-
-    expected_key = credential.secrets.get("api_key")
-    if not expected_key:
-        raise _deny_after_binding()
-
-    auth_header = request.headers.get("authorization", "")
-    bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
-    received_key = request.headers.get("apikey") or request.headers.get("x-api-key") or bearer_token
-    if not received_key or not hmac.compare_digest(received_key.strip(), expected_key.strip()):
-        # ==A 401 must not leave the request bound to a business it could not authenticate.== The
-        # bind above is unavoidable — the credential is RLS-protected and cannot be read without
-        # the scope — but nothing may continue under that authority. ``get_session`` tears the
-        # scope down on the way out either way; doing it here makes the intent explicit at the
-        # exact point where authentication failed.
-        raise _deny_after_binding()
-
-    # Authenticated: NOW the bytes are worth reading (still under the streamed cap).
-    raw_body = await _read_body_within_limit(request)
-
-    try:
-        payload = json.loads(raw_body)
-    except Exception as exc:
-        # Acked as ignored (the provider gets a 200 and stops retrying), but NOT silently: an
-        # operator wondering why a guest's "1" never landed needs this line.
-        _logger.debug("inbound WhatsApp webhook body is not JSON (%s); ignoring", exc)
-        reset_tenant_binding()
-        return {"status": "ignored"}
-
-    if not isinstance(payload, dict):
-        reset_tenant_binding()
-        return {"status": "ignored"}
-
-    extracted = extract_evolution_payload(payload)
-    if extracted is None:
-        # ==A message the parser cannot use still leaves a trace.== An audio note, a sticker, a
-        # group message, an event we do not model: the guest may believe they answered. The API
-        # answer is `ignored` and nobody reads API answers, so the event NAME is logged here (never
-        # the payload: it carries the sender's number and their words).
-        _logger.info(
-            "inbound WhatsApp webhook for tenant %s carried no guest text (event=%s); ignored",
-            tenant_id,
-            str(payload.get("event"))[:64],
+        instance_default = (
+            defaults.secrets_for(CredentialProvider.WHATSAPP) if defaults is not None else None
         )
-        reset_tenant_binding()
-        return {"status": "ignored"}
 
-    sender_phone, message_text = extracted
+        try:
+            credential = await resolve_infra_credential(
+                session,
+                tenant_id=tenant_id,
+                provider=CredentialProvider.WHATSAPP,
+                fernet_key=fernet_keys,
+                instance_default=instance_default,
+            )
+        except CredentialError:
+            raise _deny_after_binding() from None
 
-    settings: Settings = request.app.state.settings
-    base = settings.booking_base_url or str(request.base_url)
-    effects = BookingEffects(
-        signer=GuestTokenSigner(settings.app_secret),
-        booking_base_url=base.rstrip("/"),
-    )
+        if credential is None:
+            raise _deny_after_binding()
 
-    # ==A failure here is a 5xx ON PURPOSE, and the retry it buys is SAFE.== Nothing in this handler
-    # catches an error from the transition: ``get_session`` rolls the transaction back on the way
-    # out, so a failed attempt leaves NO partial write, and every transition this service performs
-    # is replay-tolerant — a second "1" keeps the first stamp, a second "2" finds no CONFIRMED
-    # booking, a second STOP finds the suppression row already there. Answering 200 with an "error"
-    # status would instead LOSE the guest's reply for ever on a transient database hiccup. So let
-    # the provider retry as much as it likes: the worst case is a duplicate that changes nothing.
-    try:
+        expected_key = credential.secrets.get("api_key")
+        if not expected_key:
+            raise _deny_after_binding()
+
+        auth_header = request.headers.get("authorization", "")
+        bearer_token = (
+            auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
+        )
+        received_key = (
+            request.headers.get("apikey") or request.headers.get("x-api-key") or bearer_token
+        )
+        if not received_key or not hmac.compare_digest(received_key.strip(), expected_key.strip()):
+            # ==A 401 must not leave the request bound to a business it could not authenticate.==
+            # The bind above is unavoidable — the credential is RLS-protected and cannot be read
+            # without the scope — but nothing may continue under that authority. The finally below
+            # releases it; this explicit call states the intent at the exact point where
+            # authentication failed.
+            raise _deny_after_binding()
+
+        # Authenticated: NOW the bytes are worth reading (still under the streamed cap).
+        raw_body = await _read_body_within_limit(request)
+
+        try:
+            payload = json.loads(raw_body)
+        except Exception as exc:
+            # Acked as ignored (the provider gets a 200 and stops retrying), but NOT silently: an
+            # operator wondering why a guest's "1" never landed needs this line.
+            _logger.debug("inbound WhatsApp webhook body is not JSON (%s); ignoring", exc)
+            return {"status": "ignored"}
+
+        if not isinstance(payload, dict):
+            return {"status": "ignored"}
+
+        extracted = extract_evolution_payload(payload)
+        if extracted is None:
+            # ==A message the parser cannot use still leaves a trace.== An audio note, a sticker,
+            # a group message, an event we do not model: the guest may believe they answered. The
+            # API answer is `ignored` and nobody reads API answers, so the event NAME is logged
+            # here (never the payload: it carries the sender's number and their words).
+            _logger.info(
+                "inbound WhatsApp webhook for tenant %s carried no guest text (event=%s); ignored",
+                tenant_id,
+                str(payload.get("event"))[:64],
+            )
+            return {"status": "ignored"}
+
+        sender_phone, message_text = extracted
+
+        settings: Settings = request.app.state.settings
+        base = settings.booking_base_url or str(request.base_url)
+        effects = BookingEffects(
+            signer=GuestTokenSigner(settings.app_secret),
+            booking_base_url=base.rstrip("/"),
+        )
+
+        # ==A failure here is a 5xx ON PURPOSE, and the retry it buys is SAFE.== Nothing in this
+        # handler catches an error from the transition: ``get_session`` rolls the transaction
+        # back on the way out, so a failed attempt leaves NO partial write, and every transition
+        # this service performs is replay-tolerant — a second "1" keeps the first stamp, a second
+        # "2" finds no CONFIRMED booking, a second STOP finds the suppression row already there.
+        # Answering 200 with an "error" status would instead LOSE the guest's reply for ever on a
+        # transient database hiccup. So let the provider retry as much as it likes: the worst
+        # case is a duplicate that changes nothing.
         result = await process_inbound_whatsapp(
             session,
             tenant_id=tenant_id,
@@ -445,16 +464,13 @@ async def receive_whatsapp_webhook(
         await _queue_guest_acknowledgement(
             session, payload=payload, result=result, tenant_id=tenant_id
         )
+
     finally:
-        # ==Every exit releases the tenant binding, and a `finally` is why that needs no argument.==
-        # `get_session` rolls back and tears the scope down either way, but this handler DECLARES
-        # that the authority never outlives the work — and a declaration that a reader has to
-        # verify by following another file is one edit away from being false. This covers the
-        # returns, the raises, and the cancellation of a request in flight alike.
+        # The single release, for every exit above: the returns, the raises, and the
+        # cancellation of a request in flight alike. ``reset_tenant_binding`` is idempotent, so
+        # the explicit calls a 401 still makes are an intent statement, not a second release.
         reset_tenant_binding()
 
-    # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
-    # provider, and a body that carries what we told a guest is a body that lands in provider logs.
     return {
         "status": result.status,
         "action": result.action.value,

@@ -590,7 +590,12 @@ async def verify_phone_code(  # noqa: PLR0913, PLR0911 - one early exit per veri
             return VerificationStatus.BURNED
         return VerificationStatus.INVALID
 
-    # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7)
+    # Atomic consume: RETURNING id ensures exactly one winner in case of race (A-7).
+    # The WHERE is the full LIVENESS predicate, and each clause is load-bearing: the tenant scope
+    # (the row is tenant-owned), the phone binding (a re-pointed booking must not consume the old
+    # number's challenge), ``code_hmac IS NOT NULL`` (a burned or annulled code can never match),
+    # and ``expires_at > now`` (an expired code dies even if the sweep has not run yet). Drop any of
+    # them and the successful path stops meaning "this live secret was spent by this guest".
     stmt = (
         update(PhoneVerificationChallenge)
         .where(

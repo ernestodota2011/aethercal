@@ -40,6 +40,7 @@ from aethercal.server.channels import Channel
 from aethercal.server.db.models import (
     Booking,
     EventType,
+    GuestToken,
     Outbox,
     Schedule,
     Tenant,
@@ -348,6 +349,17 @@ async def test_consent_given_seals_the_column_and_the_whatsapp_step_sends(
     assert stored.guest_phone_consent_at is not None, (
         "the guest ticked the box and the column is NULL: the consent was thrown away"
     )
+
+    # ==The token OUTLIVES the appointment, and this is the assertion that keeps it so.== The panel
+    # is what the guest needs when the reminder reaches them, the day before — and the reminder
+    # cannot re-mint the token (it is returned once and never e-mailed), so a TTL shortened to "a
+    # day from now" would leave every long-lead booking holding a dead link. Only a test that reads
+    # both columns catches that, and this is it.
+    async with owner_maker() as session:
+        token_row = (
+            await session.scalars(select(GuestToken).where(GuestToken.booking_id == stored.id))
+        ).one()
+    assert token_row.expires_at > stored.start_at
     # PostgreSQL keeps the zone (``DateTime(timezone=True)``): the stamp is a real instant, and it
     # is the SERVER's clock — never a timestamp the client supplied.
     assert stored.guest_phone_consent_at.tzinfo is not None
