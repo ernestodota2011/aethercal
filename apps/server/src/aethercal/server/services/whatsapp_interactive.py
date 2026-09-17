@@ -457,8 +457,26 @@ def _names_a_cancellation(tokens: tuple[str, ...]) -> bool:
     return False
 
 
+def _carries_a_confirm_expression(normalized: str, tokens: tuple[str, ...]) -> bool:
+    """Whether the message says YES somewhere — the exemption the leading-"no" rule needs.
+
+    ==Un "no" que encabeza el mensaje NO siempre es un no.== "No falto" y "no, ahí estaré" son dos
+    formas corrientes de confirmar (el "no" niega la AUSENCIA, no la cita), y la regla de la palabra
+    inicial las cancelaba antes de que la frase de confirmación pudiera leerse. Cuando el mensaje
+    trae una expresión de confirmación inequívoca, esa expresión gana; el "no" suelto (y todo lo
+    que el corpus etiqueta como cancelación) no trae ninguna, así que sigue cancelando igual.
+    """
+    if any(phrase in normalized for phrase in _CONFIRM_PHRASES):
+        return True
+    return any(token in _CONFIRM_WORDS for token in tokens)
+
+
 def _is_cancel(normalized: str, tokens: tuple[str, ...]) -> bool:
-    if tokens and tokens[0] in _CANCEL_LEADING_WORDS:
+    if (
+        tokens
+        and tokens[0] in _CANCEL_LEADING_WORDS
+        and not _carries_a_confirm_expression(normalized, tokens)
+    ):
         return True
     if _names_a_reschedule(normalized, tokens):
         return True

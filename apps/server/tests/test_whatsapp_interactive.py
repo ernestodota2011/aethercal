@@ -212,11 +212,16 @@ def test_a_leading_no_cancels(text: str) -> None:
         "Seguro, no falto",  # el "no" de una confirmación: negación, no respuesta
         "seguro voy",
         "seguro que sí mi pana",
+        "no falto",  # ==el caso que la regla de "no" inicial cancelaba: niega la ausencia==
+        "no, ahí estaré",
+        "No, allá caigo sin falta",
     ],
 )
 def test_no_mid_sentence_does_not_cancel(text: str) -> None:
     """==Un ``no`` que no encabeza el mensaje es gramática, no una respuesta.== "Seguro, no falto"
-    es un SÍ; leerlo como cancelación borraría una cita por una frase hecha."""
+    es un SÍ; leerlo como cancelación borraría una cita por una frase hecha. Y encabezarlo tampoco
+    lo vuelve un no cuando el resto del mensaje dice "sí" con todas las letras ("no falto", "no,
+    ahí estaré"): la expresión de confirmación gana."""
     assert parse_reply_action(text) == WhatsAppReplyAction.CONFIRM_ATTENDANCE
 
 
