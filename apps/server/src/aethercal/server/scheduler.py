@@ -656,12 +656,19 @@ def build_drain_executor(app: FastAPI) -> OutboxExecutor:
         fernet_keys=fernet_keys,
         implementations=implementations,
     )
+    # ==The opt-out list's key comes from the BOOT's settings, not from a second read of the
+    # environment.== The operator set it once; every process and every path resolves the same value
+    # from the object that validated it at startup. Read defensively like the money runners above:
+    # a harness whose fake app carries no settings falls back to the environment (which the suite
+    # exports), and a production boot always has the real object.
+    settings = getattr(app.state, "settings", None)
     return make_booking_effect_executor(
         sessionmaker=pools.exec_maker,
         resolve_senders=functools.partial(resolve_senders_for, app),
         service_factory=service_factory,
         refund_runner=refund_runner,
         expire_hold_runner=expire_hold_runner,
+        suppression_key=settings.suppression_key if settings is not None else None,
     )
 
 

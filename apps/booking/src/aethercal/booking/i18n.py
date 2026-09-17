@@ -8,7 +8,10 @@ no runtime locale files: the catalog is data in this module so it is type-checke
 
 from __future__ import annotations
 
+import logging
 from typing import Literal, get_args
+
+_logger = logging.getLogger(__name__)
 
 Locale = Literal["es", "en"]
 
@@ -147,6 +150,16 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "phone_verify_error_rate_limit_cooldown": (
             "Por favor, espera al menos 60 segundos antes de solicitar otro código."
         ),
+        "phone_verify_error_booking_inactive": (
+            "Esta reserva ya no está activa, así que no hay nada que verificar."
+        ),
+        "phone_verify_error_already_verified": (
+            "Tu teléfono ya está verificado para esta reserva."
+        ),
+        "phone_verify_optional_note": (
+            "Tu cita ya está confirmada. Verificar el teléfono es opcional: si cierras esta "
+            "página, no vas a poder verificarlo después."
+        ),
     },
     "en": {
         "app_name": "AetherCal",
@@ -269,6 +282,14 @@ MESSAGES: dict[Locale, dict[str, str]] = {
         "phone_verify_error_rate_limit_cooldown": (
             "Please wait at least 60 seconds before requesting another code."
         ),
+        "phone_verify_error_booking_inactive": (
+            "This booking is no longer active, so there is nothing to verify."
+        ),
+        "phone_verify_error_already_verified": ("Your phone is already verified for this booking."),
+        "phone_verify_optional_note": (
+            "Your booking is confirmed. Verifying your phone is optional: if you close this page, "
+            "you will not be able to verify it later."
+        ),
     },
 }
 
@@ -308,8 +329,19 @@ def select_locale(
 
 
 def t(locale: Locale, key: str, /, **kwargs: object) -> str:
-    """Look up ``key`` for ``locale`` and format it with ``kwargs`` (falls back to Spanish)."""
-    template = MESSAGES[locale].get(key) or MESSAGES[DEFAULT_LOCALE].get(key, key)
+    """Look up ``key`` for ``locale`` and format it with ``kwargs`` (falls back to Spanish).
+
+    ==A fallback that nobody can see is how one Spanish sentence ends up inside an English page.==
+    When the active catalog is missing a key, this logs a warning naming it before falling back —
+    and the test suite pins both catalogs key-for-key, so a warning here means a deployment is
+    carrying a catalog the tests never saw.
+    """
+    template = MESSAGES[locale].get(key)
+    if template is None:
+        _logger.warning(
+            "missing %r string for key %r; falling back to the default locale", locale, key
+        )
+        template = MESSAGES[DEFAULT_LOCALE].get(key, key)
     return template.format(**kwargs) if kwargs else template
 
 

@@ -2039,9 +2039,15 @@ class _GooglePlan:
     # Where the event LIVES; a delete/move acts here. ``None`` = the chain has no event yet.
     home_calendar_id: str | None
     home_service: Any
+    # ==WHOSE calendar each end is.== Read off the connection rows while the session is open,
+    # because the plan outlives it — and because the alternative is what shipped: the provider
+    # parameter of the calendar service defaulted to Google, and every dispatch here silently took
+    # that default, so a Microsoft 365 host's event was handed to the Google client.
+    home_provider: str | None
     # Where a NEW event goes; a create/move lands here. ``None`` only for a DELETE.
     target_connection_id: uuid.UUID | None
     target_calendar_id: str | None
+    target_provider: str | None
     target_service: Any
 
 
@@ -2070,35 +2076,48 @@ async def run_google_effect(
         return
 
     if plan.operation is GoogleOperation.DELETE:
-        if plan.home_calendar_id is not None and plan.external_event_id is not None:
+        if (
+            plan.home_calendar_id is not None
+            and plan.home_provider is not None
+            and plan.external_event_id is not None
+        ):
             # Delete where the event LIVES, never where the host is configured now.
             await delete_event_for_booking(
                 calendar_id=plan.home_calendar_id,
                 external_event_id=plan.external_event_id,
                 service=plan.home_service,
+                provider=plan.home_provider,
             )
         return
 
     request = plan.request
     target_calendar_id = plan.target_calendar_id
-    if request is None or target_calendar_id is None:  # pragma: no cover - prepare builds both
-        return
+    provider = plan.target_provider
+    # ``prepare`` builds all three together; the guard is what makes the types line up.
+    if request is None or target_calendar_id is None or provider is None:
+        return  # pragma: no cover - prepare builds both
     if (
         plan.operation is GoogleOperation.RESCHEDULE
         and plan.home_calendar_id is not None
+        and plan.home_provider is not None
         and plan.external_event_id is not None
     ):
         new_id, meeting_url = await reschedule_event_for_booking(
             source_calendar_id=plan.home_calendar_id,
             source_service=plan.home_service,
+            source_provider=plan.home_provider,
             target_calendar_id=target_calendar_id,
             target_service=plan.target_service,
+            target_provider=provider,
             external_event_id=plan.external_event_id,
             request=request,
         )
     else:
         new_id, meeting_url = await create_event_for_booking(
-            calendar_id=target_calendar_id, request=request, service=plan.target_service
+            calendar_id=target_calendar_id,
+            request=request,
+            service=plan.target_service,
+            provider=provider,
         )
 
     async with sessionmaker() as session, session.begin():
@@ -2175,8 +2194,10 @@ async def _prepare_google(
             request=None,
             home_calendar_id=home.calendar_id if home is not None else None,
             home_service=service_factory(home.connection) if home is not None else None,
+            home_provider=home.connection.provider if home is not None else None,
             target_connection_id=None,
             target_calendar_id=None,
+            target_provider=None,
             target_service=None,
         )
 
@@ -2199,8 +2220,10 @@ async def _prepare_google(
         request=_meet_request_from_payload(payload),
         home_calendar_id=home.calendar_id if home is not None else None,
         home_service=service_factory(home.connection) if home is not None else None,
+        home_provider=home.connection.provider if home is not None else None,
         target_connection_id=target.connection.id,
         target_calendar_id=target.calendar_id,
+        target_provider=target.connection.provider,
         target_service=service_factory(target.connection),
     )
 
@@ -2421,6 +2444,7 @@ async def run_notify_effect(  # noqa: PLR0913 - one keyword per injected sending
     sender: EmailSender | None,
     channels: Mapping[Channel, PhoneChannelSender],
     channel_errors: Mapping[Channel, Exception],
+    suppression_key: str | None = None,
 ) -> None:
     """Execute one workflow step: send its message on its channel (RF-24).
 
@@ -2445,7 +2469,13 @@ async def run_notify_effect(  # noqa: PLR0913 - one keyword per injected sending
     """
     async with sessionmaker() as session:
         plan = await _prepare_notify(
-            session, work, now, sender=sender, channels=channels, channel_errors=channel_errors
+            session,
+            work,
+            now,
+            sender=sender,
+            channels=channels,
+            channel_errors=channel_errors,
+            suppression_key=suppression_key,
         )
         await session.rollback()  # a pure read: release the connection before any network call
     if plan is None:
@@ -2688,7 +2718,11 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
 
 
 async def _require_phone_not_suppressed(
-    session: AsyncSession, booking: Booking, channel: Channel
+    session: AsyncSession,
+    booking: Booking,
+    channel: Channel,
+    *,
+    suppression_key: str | None = None,
 ) -> None:
     """Refuse to message a phone the guest asked us to stop messaging (D-12).
 
@@ -2701,6 +2735,11 @@ async def _require_phone_not_suppressed(
 
     Ordering is deliberate: this runs right after the consent gate and BEFORE the channel registry
     or the template, so no send plan can exist for a suppressed number.
+
+    ``suppression_key`` comes from the caller's ``Settings`` when the worker wires the executor
+    (:func:`make_booking_effect_executor`); the environment is only a fallback for harnesses that
+    build an executor directly. ==One source of truth in production, and it is the one the web
+    process already booted with.==
     """
     phone = booking.guest_phone
     if not phone:  # pragma: no cover - the consent gate above already refused the empty one
@@ -2709,13 +2748,13 @@ async def _require_phone_not_suppressed(
             "step cannot run"
         )
     try:
-        suppression_key = get_suppression_key()
+        resolved_key = get_suppression_key(suppression_key)
     except SuppressionKeyNotConfigured as exc:
         raise OutboxSkipped(
             f"{_SUPPRESSION_KEY_MISSING}: {exc} The {channel.value} step is refused rather than "
             "sent unchecked: the opt-out list cannot be read without its key"
         ) from exc
-    if await is_phone_suppressed(session, phone, suppression_key=suppression_key):
+    if await is_phone_suppressed(session, phone, suppression_key=resolved_key):
         raise OutboxSkipped(
             f"{_PHONE_SUPPRESSED}: the guest opted out of messages (D-12), so the {channel.value} "
             "step must not run; the suppression stands until the guest withdraws it"
@@ -2767,6 +2806,7 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
     sender: EmailSender | None,
     channels: Mapping[Channel, PhoneChannelSender],
     channel_errors: Mapping[Channel, Exception],
+    suppression_key: str | None = None,
 ) -> _NotifyPlan | None:
     """The step's READ phase: decide, then compose/render. ``None`` = nothing to send.
 
@@ -2844,7 +2884,7 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
     # template. Not as a nicety of ordering: it must be impossible to reach a send plan for a phone
     # we have no permission to message, however the checks below are later reordered.
     _require_phone_consent(booking, channel)
-    await _require_phone_not_suppressed(session, booking, channel)
+    await _require_phone_not_suppressed(session, booking, channel, suppression_key=suppression_key)
 
     phone_sender = channels.get(channel)
     if phone_sender is None:
@@ -2983,13 +3023,14 @@ async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the k
 # --------------------------------------------------------------------------------------
 
 
-def make_booking_effect_executor(
+def make_booking_effect_executor(  # noqa: PLR0913 - one keyword per injected seam
     *,
     sessionmaker: Sessionmaker,
     resolve_senders: SenderResolver,
     service_factory: ServiceFactory | None,
     refund_runner: OutboxExecutor | None = None,
     expire_hold_runner: OutboxExecutor | None = None,
+    suppression_key: str | None = None,
 ) -> OutboxExecutor:
     """Build the live ``execute`` the drain injects: dispatch each intent to its handler.
 
@@ -3086,6 +3127,7 @@ def make_booking_effect_executor(
                 sender=senders.email,
                 channels=senders.channels,
                 channel_errors=senders.channel_errors,
+                suppression_key=suppression_key,
             )
         elif effect is OutboxEffect.REFUND:
             if refund_runner is None:

@@ -593,6 +593,16 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
             session, tenant_id=tenant_id, phone_e164=norm_phone, now=now
         )
         if booking is None:
+            # ==A guest spoke and nothing happened.== The response tells the PROVIDER, and nobody
+            # reads provider responses: without this line, a guest answering a reminder that no
+            # longer matches any booking leaves no trace anywhere. No phone in the log (it is the
+            # guest's data); the tenant and the outcome are what an operator acts on.
+            _logger.info(
+                "inbound WhatsApp reply for tenant %s matched NO upcoming booking "
+                "(action=%s); nothing was written",
+                tenant_id,
+                action.value,
+            )
             return WhatsAppProcessResult(
                 action=action,
                 status="no_booking_found",
@@ -624,6 +634,11 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
             session, tenant_id=tenant_id, phone_e164=norm_phone, now=now
         )
         if booking is None:
+            _logger.info(
+                "inbound WhatsApp cancel for tenant %s matched NO upcoming booking; "
+                "nothing was cancelled",
+                tenant_id,
+            )
             return WhatsAppProcessResult(
                 action=action,
                 status="no_booking_found",
@@ -651,6 +666,12 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
             reply_message="Tu cita ha sido cancelada con éxito.",
         )
 
+    _logger.info(
+        "inbound WhatsApp reply for tenant %s parsed as %s (no action taken; the guest was asked "
+        "to reply 1 or 2)",
+        tenant_id,
+        action.value,
+    )
     return WhatsAppProcessResult(
         action=action,
         status="ignored",

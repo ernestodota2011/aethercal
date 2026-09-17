@@ -1129,3 +1129,47 @@ def test_phone_verification_page_tells_the_truth_when_the_code_did_not_go_out() 
     )
     assert "We could not send the code" in html_en
     assert "We sent a 6-digit code" not in html_en
+
+
+def test_phone_verification_page_IS_the_confirmation_when_the_details_are_given() -> None:
+    """==El hueco que esto cierra: con un OTP pendiente el huésped no veía su confirmación.==
+
+    El panel reemplazaba a la confirmación entera (que se renderiza en línea, sin ruta propia), así
+    que el invitado miraba una caja de código sin fecha, sin hora y sin saber que su reserva ya
+    estaba hecha — y sin ninguna página a la que volver. Con los detalles de la reserva, la página
+    es la CONFIRMACIÓN que además pide el código, con el texto honesto que OTP-2 exige: la cita está
+    confirmada, verificar es opcional, y cerrar la página cierra esa puerta."""
+    html = to_xml(
+        views.phone_verification_page(
+            "es",
+            booking_id=uuid.uuid4(),
+            token="t",
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+            event=_event(),
+            when_label="martes 14 de julio, 13:00",
+            guest_email="guest@example.com",
+        )
+    )
+
+    assert "Tu cita con" in html or "confirmada" in html  # el H1 de confirmación
+    assert "martes 14 de julio, 13:00" in html  # la fecha y hora, visibles
+    assert "guest@example.com" in html  # el aviso de que salió un correo
+    assert "Introduce el código de verificación" in html  # el H2 del panel
+    assert "verificar el teléfono es opcional" in html.lower()
+    assert "no vas a poder verificarlo después" in html
+
+    # Y sin detalles sigue siendo el panel solo — es el caso del re-render tras un código fallido.
+    panel_only = to_xml(
+        views.phone_verification_page(
+            "es",
+            booking_id=uuid.uuid4(),
+            token="t",
+            action="/verify-phone",
+            resend_action="/resend-otp",
+            lang_urls=LANG_URLS,
+        )
+    )
+    assert "Introduce el código de verificación" in panel_only
+    assert "no vas a poder verificarlo después" in panel_only  # el aviso honesto viaja igual

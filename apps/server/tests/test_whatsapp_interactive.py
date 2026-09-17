@@ -700,43 +700,51 @@ async def test_process_inbound_opt_out_suppression(
 async def test_process_inbound_no_booking_found(
     sqlite_session: AsyncSession,
     seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     tenant, _, _ = seeded_whatsapp_booking
     now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
 
-    result = await process_inbound_whatsapp(
-        sqlite_session,
-        tenant_id=tenant.id,
-        sender_phone="+19999999999",
-        message_text="1",
-        suppression_key=_SUPPRESSION_KEY,
-        now=now,
-    )
+    with caplog.at_level("INFO"):
+        result = await process_inbound_whatsapp(
+            sqlite_session,
+            tenant_id=tenant.id,
+            sender_phone="+19999999999",
+            message_text="1",
+            suppression_key=_SUPPRESSION_KEY,
+            now=now,
+        )
     assert result.action == WhatsAppReplyAction.CONFIRM_ATTENDANCE
     assert result.status == "no_booking_found"
     assert result.booking_id is None
     assert "No encontramos una cita" in (result.reply_message or "")
+    # ==El huésped habló y no pasó nada: eso no puede quedar sin rastro para el operador.== La
+    # respuesta viaja al PROVEEDOR y nadie la lee; la línea de log es lo que se puede ver.
+    assert any("matched NO upcoming booking" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_process_inbound_unknown_action(
     sqlite_session: AsyncSession,
     seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     tenant, _, _ = seeded_whatsapp_booking
     now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
 
-    result = await process_inbound_whatsapp(
-        sqlite_session,
-        tenant_id=tenant.id,
-        sender_phone="+13055551111",
-        message_text="hola buenas tardes",
-        suppression_key=_SUPPRESSION_KEY,
-        now=now,
-    )
+    with caplog.at_level("INFO"):
+        result = await process_inbound_whatsapp(
+            sqlite_session,
+            tenant_id=tenant.id,
+            sender_phone="+13055551111",
+            message_text="hola buenas tardes",
+            suppression_key=_SUPPRESSION_KEY,
+            now=now,
+        )
     assert result.action == WhatsAppReplyAction.UNKNOWN
     assert result.status == "ignored"
     assert "Responde 1" in (result.reply_message or "")
+    assert any("parsed as unknown" in record.getMessage() for record in caplog.records)
 
 
 # --------------------------------------------------------------------------------------
@@ -1004,3 +1012,47 @@ async def test_endpoint_ignores_malformed_json_gracefully(
     )
     resp = await receive_whatsapp_webhook(tenant.slug, req, sqlite_session)
     assert resp == {"status": "ignored"}
+
+
+@pytest.mark.asyncio
+async def test_endpoint_logs_a_message_it_could_not_extract_text_from(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """==Una nota de voz del huésped es un mensaje que nadie ve.== El parser solo entiende texto:
+    el audio, el sticker o el evento no modelado se responden `ignored` al PROVEEDOR — y nadie lee
+    la respuesta del proveedor — así que el nombre del evento queda en el log (nunca el payload, que
+    lleva el número del remitente y sus palabras)."""
+    tenant, _, _ = seeded_whatsapp_booking
+    await store_credential(
+        sqlite_session,
+        tenant_id=tenant.id,
+        provider=CredentialProvider.WHATSAPP,
+        secrets={
+            "base_url": "https://evolution.example.com",
+            "instance": "test-instance",
+            "api_key": _TEST_API_KEY,
+        },
+        fernet_key=_FERNET_KEY,
+        current_implementations={},
+    )
+    await sqlite_session.flush()
+
+    payload = {
+        "event": "messages.upsert",
+        "data": {
+            "key": {"remoteJid": "13055551111@s.whatsapp.net", "fromMe": False},
+            "message": {"audioMessage": {"seconds": 12}},
+        },
+    }
+    req = _build_webhook_request(
+        body=json.dumps(payload).encode("utf-8"),
+        headers={"apikey": _TEST_API_KEY},
+    )
+    with caplog.at_level("INFO"):
+        resp = await receive_whatsapp_webhook(tenant.slug, req, sqlite_session)
+
+    assert resp == {"status": "ignored"}
+    assert any("carried no guest text" in record.getMessage() for record in caplog.records)
+    assert not any("13055551111" in record.getMessage() for record in caplog.records)

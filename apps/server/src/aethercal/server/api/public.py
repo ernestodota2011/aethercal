@@ -929,7 +929,14 @@ async def verify_public_phone(
     request: Request,
     session: SessionDep,
 ) -> PhoneVerificationResponse:
-    """Verify phone possession via OTP code (C-02b)."""
+    """Verify phone possession via OTP code (C-02b).
+
+    ==The booking's STATE shapes the answer, and it is read before the code is touched.== A booking
+    whose phone is already verified answers ``verified`` (success is idempotent: the stamp is what
+    matters, not who pressed the button twice), and one that is no longer CONFIRMED gets its own
+    machine code instead of a code-shaped failure — the page can then say "this booking is no longer
+    active" rather than "check your digits".
+    """
     tenant_id = await _bind_business(session, tenant_slug)
     settings = _settings(request)
     signer = GuestTokenSigner(settings.app_secret)
@@ -943,7 +950,26 @@ async def verify_public_phone(
             detail={"error": "forbidden", "message": "Invalid or expired authorization token"},
         )
 
-    # 2. Verify OTP code atomically
+    # 2. The booking, under this tenant, before anything else: its state decides the answer.
+    booking = (
+        await session.scalars(
+            select(Booking).where(Booking.id == booking_id, Booking.tenant_id == tenant_id)
+        )
+    ).one_or_none()
+    if booking is None:
+        raise _not_found()
+    if booking.guest_phone_verified_at is not None:
+        return PhoneVerificationResponse(status="verified")
+    if booking.status is not BookingStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "booking_not_active",
+                "message": "This booking is no longer active, so there is nothing to verify.",
+            },
+        )
+
+    # 3. Verify OTP code atomically
     outcome = await verify_phone_code(
         session,
         booking_id=booking_id,
@@ -976,7 +1002,17 @@ async def resend_public_phone_otp(
     request: Request,
     session: SessionDep,
 ) -> PhoneResendResponse:
-    """Resend a phone possession verification code (C-02b)."""
+    """Resend a phone possession verification code (C-02b).
+
+    ==Two states make a resend senseless, and neither may keep minting codes.==
+
+    * the phone is ALREADY verified — the token survives verification on purpose (D-11: verified,
+      not consumed, so the page can resend), and that is exactly why the *state* has to close the
+      door: otherwise the capability keeps a message cannon pointed at a number that no longer needs
+      one;
+    * the booking is no longer CONFIRMED — a cancelled booking has no phone step left to unlock, so
+      every further code is a message with no purpose.
+    """
     tenant_id = await _bind_business(session, tenant_slug)
     settings = _settings(request)
     signer = GuestTokenSigner(settings.app_secret)
@@ -997,6 +1033,22 @@ async def resend_public_phone_otp(
     ).one_or_none()
     if booking is None or not booking.guest_phone:
         raise _not_found()
+    if booking.guest_phone_verified_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "already_verified",
+                "message": "This phone number is already verified for this booking.",
+            },
+        )
+    if booking.status is not BookingStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "booking_not_active",
+                "message": "This booking is no longer active, so there is nothing to verify.",
+            },
+        )
 
     client_ip = _client_ip(request)
     branding = await get_branding(session, tenant_id=tenant_id)

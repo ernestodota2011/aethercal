@@ -1346,6 +1346,19 @@ def _add_to_calendar_section(
     )
 
 
+def _confirmation_summary(locale: Locale, event: PublicEventTypeRead, when_label: str) -> list[Any]:
+    """The ``<dt>/<dd>`` pair(s) every "your booking is confirmed" surface shows.
+
+    Extracted so the confirmation page and the phone-verification panel render the SAME facts: the
+    verification panel used to replace the confirmation entirely, which left the guest looking at a
+    code box with no date, no time and no statement that the booking was already theirs.
+    """
+    summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
+    if event.location:
+        summary.append(Dd(event.location, cls="meta"))
+    return summary
+
+
 def confirmation_page(
     locale: Locale,
     *,
@@ -1362,7 +1375,7 @@ def confirmation_page(
 
     ``guest_email`` is passed IN, and it used to be read off the booking. The public API answers
     with
-    four fields and no personal data at all — the guest's own address included — because a response
+    four fields and no personal data at all - the guest's own address included - because a response
     that echoed it back would make a booking id an oracle for a stranger's e-mail on an endpoint
     that
     asked for no credentials. The page does not need the API to tell it: the guest typed the address
@@ -1370,15 +1383,12 @@ def confirmation_page(
 
     The meeting link is gone from this page for the same reason, and reaches the guest by e-mail.
     """
-    summary: list[Any] = [Dt(t(locale, "confirmed_when")), Dd(when_label)]
-    if event.location:
-        summary.append(Dd(event.location, cls="meta"))
     return page(
         locale,
         resolve_title(event, locale),
         Div(
             H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))),
-            Dl(*summary, cls="summary"),
+            Dl(*_confirmation_summary(locale, event, when_label), cls="summary"),
             P(t(locale, "confirmed_email_note", email=guest_email), cls="lead"),
             _add_to_calendar_section(locale, event, booking),
             cls="stack",
@@ -1401,16 +1411,27 @@ def phone_verification_page(
     error_message: str | None = None,
     success_message: str | None = None,
     delivery_failed: bool = False,
+    event: PublicEventTypeRead | None = None,
+    when_label: str | None = None,
+    guest_email: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
     embed: bool = False,
     brand: TenantBrandingRead | None = None,
 ) -> Any:
-    """Phone verification page (C-02b): 6-digit OTP entry and resend action.
+    """Phone verification (C-02b): the confirmation, plus the 6-digit OTP panel when asked for.
 
     ``delivery_failed`` is the server's word that the code did not go out (no phone channel
-    configured, or the provider refused the number). The panel renders either way — RESEND is the
-    guest's only recovery, and it lives here — but the lead must not claim a code is on its way
-    when none was accepted."""
+    configured, or the provider refused the number). The panel renders either way - RESEND is the
+    guest's only recovery, and it lives here - but the lead must not claim a code is on its way
+    when none was accepted.
+
+    ==When ``event``/``when_label`` are given, this page IS the confirmation page plus the panel.==
+    It used to show ONLY the code box: the guest who had just booked saw no date, no time, and no
+    statement that the booking was already confirmed — and with the confirmation content rendered
+    inline (no route of its own), there was no page to go back to. The lead also carries the
+    declared consequence of OTP-2: the booking is confirmed, verifying is optional, and closing the
+    page means not being able to verify later.
+    """
     lead_key = "phone_verify_lead_failed" if delivery_failed else "phone_verify_lead"
     notices: list[Any] = []
     if error_message:
@@ -1469,12 +1490,28 @@ def phone_verification_page(
         enctype="application/x-www-form-urlencoded",
     )
 
+    # ==The heading depends on what this page IS.== With the booking's details in hand it is the
+    # CONFIRMATION page that also carries the verification panel; without them (a re-render after a
+    # failed code, where the panel is the only context the handler still holds) it stays the
+    # panel's own page — and it still says the booking is confirmed and verifying is optional,
+    # which is the half a guest needs even when the summary cannot be re-fetched.
+    heading: list[Any] = []
+    if event is not None and when_label is not None:
+        heading.append(H1(t(locale, "confirmed_heading", title=resolve_title(event, locale))))
+        heading.append(Dl(*_confirmation_summary(locale, event, when_label), cls="summary"))
+        if guest_email:
+            heading.append(P(t(locale, "confirmed_email_note", email=guest_email), cls="lead"))
+        heading.append(H2(t(locale, "phone_verify_heading")))
+    else:
+        heading.append(H1(t(locale, "phone_verify_heading")))
+
     return page(
         locale,
         t(locale, "phone_verify_title"),
         Div(
-            H1(t(locale, "phone_verify_heading")),
+            *heading,
             P(t(locale, lead_key), cls="lead"),
+            P(t(locale, "phone_verify_optional_note"), cls="lead"),
             *notices,
             form,
             Div(resend_form, cls="pager"),

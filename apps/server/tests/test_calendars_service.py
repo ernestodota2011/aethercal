@@ -25,6 +25,7 @@ from aethercal.server.db.models import BusyCache, ExternalConnection, Tenant, Us
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.services.calendars import (
     DEFAULT_CALENDAR_ID,
+    GOOGLE_PROVIDER,
     BusyQuery,
     BusyStatus,
     CalendarSyncError,
@@ -695,7 +696,10 @@ async def test_create_event_for_booking_returns_id_and_meeting_url(
     service = FakeGoogleService(insert_result=_INSERT_RESULT)
 
     event_id, meeting_url = await create_event_for_booking(
-        calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
+        calendar_id=DEFAULT_CALENDAR_ID,
+        request=_event(now),
+        service=service,
+        provider=GOOGLE_PROVIDER,
     )
 
     assert event_id == "evt-123"
@@ -712,7 +716,10 @@ async def test_create_event_for_booking_google_failure_raises_calendar_sync_erro
 
     with pytest.raises(CalendarSyncError):
         await create_event_for_booking(
-            calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
+            calendar_id=DEFAULT_CALENDAR_ID,
+            request=_event(now),
+            service=service,
+            provider=GOOGLE_PROVIDER,
         )
 
 
@@ -748,7 +755,10 @@ async def test_create_event_for_booking_runs_the_blocking_call_off_the_event_loo
     loop_thread = threading.get_ident()
 
     await create_event_for_booking(
-        calendar_id=DEFAULT_CALENDAR_ID, request=_event(now), service=service
+        calendar_id=DEFAULT_CALENDAR_ID,
+        request=_event(now),
+        service=service,
+        provider=GOOGLE_PROVIDER,
     )
 
     assert service.insert_thread is not None
@@ -785,7 +795,10 @@ async def test_delete_event_for_booking_calls_google(
     service = FakeGoogleService()
 
     await delete_event_for_booking(
-        calendar_id=DEFAULT_CALENDAR_ID, external_event_id="evt-123", service=service
+        calendar_id=DEFAULT_CALENDAR_ID,
+        external_event_id="evt-123",
+        service=service,
+        provider=GOOGLE_PROVIDER,
     )
 
     assert service.events().deleted == ["evt-123"]
@@ -800,7 +813,10 @@ async def test_delete_event_for_booking_google_failure_raises_calendar_sync_erro
 
     with pytest.raises(CalendarSyncError):
         await delete_event_for_booking(
-            calendar_id=DEFAULT_CALENDAR_ID, external_event_id="evt-123", service=service
+            calendar_id=DEFAULT_CALENDAR_ID,
+            external_event_id="evt-123",
+            service=service,
+            provider=GOOGLE_PROVIDER,
         )
 
 
@@ -815,8 +831,10 @@ async def test_reschedule_event_for_booking_replaces_the_event(
     event_id, meeting_url = await reschedule_event_for_booking(
         source_calendar_id=DEFAULT_CALENDAR_ID,
         source_service=service,
+        source_provider=GOOGLE_PROVIDER,
         target_calendar_id=DEFAULT_CALENDAR_ID,
         target_service=service,
+        target_provider=GOOGLE_PROVIDER,
         external_event_id="old-evt",
         request=_event(now),
     )
@@ -838,8 +856,10 @@ async def test_reschedule_event_for_booking_google_failure_raises_calendar_sync_
         await reschedule_event_for_booking(
             source_calendar_id=DEFAULT_CALENDAR_ID,
             source_service=service,
+            source_provider=GOOGLE_PROVIDER,
             target_calendar_id=DEFAULT_CALENDAR_ID,
             target_service=service,
+            target_provider=GOOGLE_PROVIDER,
             external_event_id="old-evt",
             request=_event(now),
         )

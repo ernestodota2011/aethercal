@@ -1025,7 +1025,7 @@ async def create_event_for_booking(
     calendar_id: str,
     request: MeetEventRequest,
     service: Any,
-    provider: str = GOOGLE_PROVIDER,
+    provider: str,
 ) -> tuple[str, str | None]:
     """Create calendar event (Google Meet or Teams link) in ``calendar_id``; ``(id, meet_url)``.
 
@@ -1038,6 +1038,12 @@ async def create_event_for_booking(
     Does not touch the database -- the caller writes the returned ``external_event_id`` /
     ``meeting_url``, and the calendar they landed in, onto the ``Booking`` row inside its own
     transaction. A provider failure raises :class:`CalendarSyncError` so the intent retries.
+
+    ==``provider`` is REQUIRED, with no default.== It used to default to Google, and every outbox
+    call site silently took that default: a host connected to Microsoft 365 had their event
+    dispatched to the GOOGLE client with a Graph-shaped service — the wrong API, the wrong token,
+    the wrong account — while the write-back recorded it as synced. A default here is a guess about
+    somebody's calendar; the only safe spelling is the caller saying whose it is.
     """
     try:
         if provider == MICROSOFT_PROVIDER:
@@ -1076,7 +1082,7 @@ async def delete_event_for_booking(
     calendar_id: str,
     external_event_id: str,
     service: Any,
-    provider: str = GOOGLE_PROVIDER,
+    provider: str,
 ) -> None:
     """Delete a booking's calendar event from ``calendar_id`` (cancel). IDEMPOTENT.
 
@@ -1115,8 +1121,8 @@ async def reschedule_event_for_booking(  # noqa: PLR0913 - source/target + their
     target_service: Any,
     external_event_id: str,
     request: MeetEventRequest,
-    source_provider: str = GOOGLE_PROVIDER,
-    target_provider: str = GOOGLE_PROVIDER,
+    source_provider: str,
+    target_provider: str,
 ) -> tuple[str, str | None]:
     """Move a booking's event: delete it where it LIVES (``source``), create it where it BELONGS."""
     await delete_event_for_booking(

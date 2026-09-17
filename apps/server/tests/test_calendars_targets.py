@@ -38,6 +38,7 @@ from aethercal.server.db.models import (
 from aethercal.server.integrations.google.parse import MeetEventRequest
 from aethercal.server.services.calendars import (
     DEFAULT_CALENDAR_ID,
+    GOOGLE_PROVIDER,
     AmbiguousCalendarTargetError,
     BusyQuery,
     BusyStatus,
@@ -478,7 +479,10 @@ async def test_create_writes_into_the_target_calendar(
     target = CalendarTarget(connection=connection, calendar_id="dedicated@cal")
 
     event_id, meeting_url = await create_event_for_booking(
-        calendar_id=target.calendar_id, request=_request(), service=google
+        calendar_id=target.calendar_id,
+        request=_request(),
+        service=google,
+        provider=GOOGLE_PROVIDER,
     )
 
     assert google.created == [("dedicated@cal", event_id)]  # not "primary"
@@ -493,7 +497,10 @@ async def test_delete_removes_the_event_from_the_calendar_it_lives_in(
     google = FakeGoogle()
 
     await delete_event_for_booking(
-        calendar_id="dedicated@cal", external_event_id="evt-1", service=google
+        calendar_id="dedicated@cal",
+        external_event_id="evt-1",
+        service=google,
+        provider=GOOGLE_PROVIDER,
     )
 
     assert google.deleted == [("dedicated@cal", "evt-1")]
@@ -510,7 +517,10 @@ async def test_deleting_an_event_google_no_longer_has_is_a_success_not_a_retry_l
     google = FakeGoogle(delete_error=_GoneError(410))
 
     await delete_event_for_booking(
-        calendar_id="dedicated@cal", external_event_id="evt-gone", service=google
+        calendar_id="dedicated@cal",
+        external_event_id="evt-gone",
+        service=google,
+        provider=GOOGLE_PROVIDER,
     )  # must not raise
 
 
@@ -523,7 +533,10 @@ async def test_a_real_delete_failure_still_raises(
 
     with pytest.raises(CalendarSyncError):
         await delete_event_for_booking(
-            calendar_id="dedicated@cal", external_event_id="evt-1", service=google
+            calendar_id="dedicated@cal",
+            external_event_id="evt-1",
+            service=google,
+            provider=GOOGLE_PROVIDER,
         )
 
 
@@ -541,8 +554,10 @@ async def test_reschedule_deletes_at_the_source_and_creates_at_the_target(
     event_id, _url = await reschedule_event_for_booking(
         source_calendar_id=source.calendar_id,
         source_service=google,
+        source_provider=GOOGLE_PROVIDER,
         target_calendar_id=target.calendar_id,
         target_service=google,
+        target_provider=GOOGLE_PROVIDER,
         external_event_id="evt-old",
         request=_request(),
     )

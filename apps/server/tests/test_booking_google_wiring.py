@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 # The calendar-id-aware fake lives with the calendar-target tests; reused here so "which calendar
 # was actually called" stays observable end to end (pytest's rootdir import mode puts the tests
 # directory on sys.path, the same way the other modules in this suite share helpers).
+from test_calendars_microsoft import FakeMicrosoftService
 from test_calendars_targets import FakeGoogle
 
 from aethercal.core.model import BookingStatus
@@ -55,8 +56,10 @@ from aethercal.server.services.calendars import (
     AmbiguousCalendarTargetError,
     CalendarTargetMissingError,
     GoogleCredential,
+    MicrosoftCredential,
     link_booking_calendar,
     store_google_connection,
+    store_microsoft_connection,
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
 from aethercal.server.services.outbox import (
@@ -148,6 +151,32 @@ async def _connect(
         tenant_id=tenant.id,
         user_id=host.id,
         credential=GoogleCredential(account_email=account_email, token_json='{"token": "at"}'),
+        fernet=fernet,
+    )
+    connection.busy_synced_from = NOW
+    connection.busy_synced_to = NOW + timedelta(days=30)
+    connection.busy_synced_at = NOW
+    await session.flush()
+    return connection
+
+
+async def _connect_microsoft(
+    session: AsyncSession,
+    tenant: Tenant,
+    host: User,
+    *,
+    fernet: Fernet,
+    account_email: str = "graph@agency.test",
+) -> ExternalConnection:
+    """Connect a Microsoft 365 account, with the same fresh EMPTY busy coverage as the Google
+    twin."""
+    connection = await store_microsoft_connection(
+        session,
+        tenant_id=tenant.id,
+        user_id=host.id,
+        credential=MicrosoftCredential(
+            account_email=account_email, token_json='{"access_token": "ms-at"}'
+        ),
         fernet=fernet,
     )
     connection.busy_synced_from = NOW
@@ -267,6 +296,66 @@ async def test_a_booking_creates_the_event_in_the_hosts_calendar(
     # And the booking remembers WHERE the event lives, so a cancel can delete the right one.
     assert booking.external_connection_id == connection.id
     assert booking.external_calendar_id == "primary"
+
+
+async def test_a_MICROSOFT_host_creates_and_deletes_through_the_MICROSOFT_client(
+    sqlite_session: AsyncSession,
+    sqlite_maker: async_sessionmaker[AsyncSession],
+    tenant_factory: Any,
+    fernet: Fernet,
+) -> None:
+    """==El defecto que este test cierra: el proveedor se perdía en el camino.==
+
+    El outbox resolvía la conexión del anfitrión (Microsoft, en este caso) pero despachaba con
+    ``create_event_for_booking(service=...)`` SIN ``provider``, y ese argumento tenía default
+    Google. El evento de un anfitrión de Microsoft 365 se le entregaba al cliente de Google — otra
+    API, otro token, otra cuenta — mientras la reserva quedaba marcada como sincronizada.
+
+    Aquí se recorre el flujo REAL: reserva → ``create_booking`` → intención al outbox → drenaje →
+    el fake de Microsoft registra la llamada. Si el dispatch volviera a asumir Google, el fake de
+    Microsoft no vería ninguna llamada (y el intento fallaría con CalendarSyncError en vez de
+    escribir el id), así que el test no puede pasar por la razón equivocada.
+    """
+    tenant, event_type, host = await _seed(sqlite_session, tenant_factory)
+    connection = await _connect_microsoft(sqlite_session, tenant, host, fernet=fernet)
+    microsoft = FakeMicrosoftService()
+
+    booking = await _book(sqlite_session, tenant, event_type)
+    await _drain(
+        sqlite_session,
+        sqlite_maker,
+        make_booking_effect_executor(
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: microsoft,
+        ),
+    )
+
+    await sqlite_session.refresh(booking)
+    assert microsoft.created_events, "el evento NO se creó con el cliente de Microsoft"
+    assert booking.external_event_id == "ms-evt-999"
+    assert booking.meeting_url == "https://teams.microsoft.com/l/meetup-join/999"
+    assert booking.external_connection_id == connection.id
+    assert booking.external_calendar_id == "primary"
+
+    # La cancelación borra por el MISMO cliente: el proveedor viaja también en el camino de borrado.
+    await cancel_booking(
+        sqlite_session,
+        tenant_id=tenant.id,
+        booking_id=booking.id,
+        effects=_effects(),
+        now=NOW,
+    )
+    await _drain(
+        sqlite_session,
+        sqlite_maker,
+        make_booking_effect_executor(
+            sessionmaker=sqlite_maker,
+            resolve_senders=TenantSenders.for_offline_tests(email=_Sender()),
+            service_factory=lambda _c: microsoft,
+        ),
+    )
+    assert ("primary", "ms-evt-999") in microsoft.deleted_events
 
 
 async def test_the_event_lands_in_the_dedicated_calendar_when_one_is_designated(

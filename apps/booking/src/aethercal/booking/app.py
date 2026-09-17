@@ -1338,6 +1338,13 @@ class _BookingApp:
                 brand=brand,
                 embed=embed,
                 delivery_failed=booking.phone_verification_delivery_failed,
+                # ==La cita ya está confirmada, y el huésped tiene que VERLO.== El panel de
+                # verificación reemplazaba a la confirmación entera (que se renderiza en línea, sin
+                # ruta propia): sin esto el invitado miraba una caja de código sin fecha, sin hora
+                # y sin saber que su reserva ya estaba hecha.
+                event=event,
+                when_label=label,
+                guest_email=booking_create.guest_email,
             )
         return views.confirmation_page(
             locale,
@@ -1460,6 +1467,8 @@ class _BookingApp:
                 # "su código murió por intentos" se mostrara como "revise los dígitos".
                 if exc.error == "code_burned":
                     err_msg = t(locale, "phone_verify_error_attempts")
+                elif exc.error == "booking_not_active":
+                    err_msg = t(locale, "phone_verify_error_booking_inactive")
                 elif exc.error == "forbidden":
                     err_msg = t(locale, "error_link_invalid")
             return views.phone_verification_page(
@@ -1532,6 +1541,10 @@ class _BookingApp:
                     err_msg = t(locale, "phone_verify_error_rate_limit_ip")
                 elif exc.error == "rate_limited":
                     err_msg = t(locale, "phone_verify_error_rate_limit_phone")
+                elif exc.error == "already_verified":
+                    err_msg = t(locale, "phone_verify_error_already_verified")
+                elif exc.error == "booking_not_active":
+                    err_msg = t(locale, "phone_verify_error_booking_inactive")
                 elif exc.error in ("forbidden", "verification_error"):
                     err_msg = t(locale, "error_link_invalid")
             return views.phone_verification_page(

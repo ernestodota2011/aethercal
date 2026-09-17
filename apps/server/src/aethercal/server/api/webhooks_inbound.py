@@ -386,6 +386,15 @@ async def receive_whatsapp_webhook(
 
     extracted = extract_evolution_payload(payload)
     if extracted is None:
+        # ==A message the parser cannot use still leaves a trace.== An audio note, a sticker, a
+        # group message, an event we do not model: the guest may believe they answered. The API
+        # answer is `ignored` and nobody reads API answers, so the event NAME is logged here (never
+        # the payload: it carries the sender's number and their words).
+        _logger.info(
+            "inbound WhatsApp webhook for tenant %s carried no guest text (event=%s); ignored",
+            tenant_id,
+            str(payload.get("event"))[:64],
+        )
         return {"status": "ignored"}
 
     sender_phone, message_text = extracted

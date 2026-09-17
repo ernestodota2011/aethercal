@@ -15,19 +15,30 @@ Covers:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import Request
 
 from aethercal.core.model import BookingStatus
+from aethercal.schemas.public import PhoneResendRequest, PhoneVerificationRequest
+from aethercal.server.api.public import resend_public_phone_otp, verify_public_phone
 from aethercal.server.channels import Channel
+from aethercal.server.client_ip import TrustedProxies
 from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
 from aethercal.server.db.models.otp import PhoneVerificationChallenge
 from aethercal.server.integrations.messaging.guard import (
     PermanentSendError,
+)
+from aethercal.server.services.guest_tokens import (
+    GuestTokenPurpose,
+    GuestTokenSigner,
+    issue_guest_token,
 )
 from aethercal.server.services.outbox import OutboxSkipped, _require_phone_consent
 from aethercal.server.services.phone_verification import (
@@ -46,6 +57,7 @@ from aethercal.server.services.phone_verification import (
     verify_phone_code,
 )
 from aethercal.server.services.tenant_senders import TenantSenders
+from aethercal.server.settings import Settings
 
 _APP_SECRET = "test-app-secret-12345"
 _SUPPRESSION_KEY = "test-suppression-key-67890-0123456789"
@@ -703,3 +715,202 @@ def test_reschedule_does_not_inherit_when_phone_differs() -> None:
 
     inherit_phone_verification_on_reschedule(predecessor, successor)
     assert successor.guest_phone_verified_at is None
+
+
+# --------------------------------------------------------------------------------------
+# The PUBLIC ENDPOINTS' state gates (C-02b), called directly — the HTTP contract had no
+# offline coverage, and these are the paths that SEND messages.
+# --------------------------------------------------------------------------------------
+
+
+def _public_request() -> Request:
+    settings = Settings(
+        app_secret=_APP_SECRET,
+        database_url="sqlite+aiosqlite://",
+        booking_base_url="https://book.test",
+        suppression_key=_SUPPRESSION_KEY,
+    )
+    state = SimpleNamespace(
+        settings=settings,
+        trusted_proxies=TrustedProxies.parse(""),
+        senders_factory=None,
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "query_string": b"",
+        "app": SimpleNamespace(state=state),
+    }
+    return Request(scope)
+
+
+async def _phone_token(sqlite_session: AsyncSession, booking: Booking) -> str:
+    return await issue_guest_token(
+        sqlite_session,
+        GuestTokenSigner(_APP_SECRET),
+        booking_id=booking.id,
+        tenant_id=booking.tenant_id,
+        purpose=GuestTokenPurpose.PHONE_VERIFICATION,
+        ttl=timedelta(days=1),
+    )
+
+
+async def _challenge_rows(sqlite_session: AsyncSession) -> int:
+    return int(
+        await sqlite_session.scalar(
+            sa.select(sa.func.count()).select_from(PhoneVerificationChallenge)
+        )
+        or 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_resend_is_refused_once_the_phone_is_ALREADY_verified(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==La puerta la cierra el ESTADO, no el token:== el token sobrevive a la verificación a
+    propósito (D-11: verificado, no consumido, para poder reenviar), así que sin este gate la
+    capacidad sigue apuntando un cañón de mensajes a un número que ya no lo necesita."""
+    tenant, _, booking = seeded_context
+    booking.guest_phone_verified_at = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    await sqlite_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await resend_public_phone_otp(
+            tenant.slug,
+            booking.id,
+            PhoneResendRequest(token=await _phone_token(sqlite_session, booking)),
+            _public_request(),
+            sqlite_session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "already_verified"
+    assert await _challenge_rows(sqlite_session) == 0
+
+
+@pytest.mark.asyncio
+async def test_resend_is_refused_on_a_booking_that_is_no_longer_ACTIVE(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """Una reserva cancelada no tiene ningún paso telefónico que desbloquear: cada código extra
+    sería un mensaje sin propósito."""
+    tenant, _, booking = seeded_context
+    booking.status = BookingStatus.CANCELLED
+    await sqlite_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await resend_public_phone_otp(
+            tenant.slug,
+            booking.id,
+            PhoneResendRequest(token=await _phone_token(sqlite_session, booking)),
+            _public_request(),
+            sqlite_session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "booking_not_active"
+    assert await _challenge_rows(sqlite_session) == 0
+
+
+@pytest.mark.asyncio
+async def test_verify_on_a_cancelled_booking_is_refused_and_seals_nothing(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    tenant, _, booking = seeded_context
+    booking.status = BookingStatus.CANCELLED
+    await sqlite_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_public_phone(
+            tenant.slug,
+            booking.id,
+            PhoneVerificationRequest(
+                code="123456", token=await _phone_token(sqlite_session, booking)
+            ),
+            _public_request(),
+            sqlite_session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"] == "booking_not_active"
+    assert booking.guest_phone_verified_at is None
+
+
+@pytest.mark.asyncio
+async def test_verify_is_idempotent_once_the_phone_is_verified(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """Un segundo envío del mismo formulario no es un error: el sello es lo que importa."""
+    tenant, _, booking = seeded_context
+    booking.guest_phone_verified_at = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    await sqlite_session.flush()
+
+    response = await verify_public_phone(
+        tenant.slug,
+        booking.id,
+        PhoneVerificationRequest(code="123456", token=await _phone_token(sqlite_session, booking)),
+        _public_request(),
+        sqlite_session,
+    )
+
+    assert response.status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_a_permanently_rejected_send_consumes_NEITHER_the_cooldown_nor_the_daily_quota(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==D-7·bis: la lápida cuenta un desafío ENTREGADO.== Un ``PermanentSendError`` no entregó
+    nada, así que no puede costar cupo: antes anulaba el secreto pero DEJABA LA FILA, y los topes
+    cuentan filas — un número sin WhatsApp quemaba sus 3 del día sin haber recibido un solo
+    código. Ahora la fila se borra y los tres fallos no dejan rastro."""
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    failing = TenantSenders(
+        tenant_id=tenant.id,
+        email=None,
+        channels={Channel.WHATSAPP: DummySender(Channel.WHATSAPP, fail_permanent=True)},
+    )
+
+    for _ in range(4):
+        with pytest.raises(PermanentSendError):
+            await issue_verification_challenge(
+                sqlite_session,
+                booking=booking,
+                app_secret=_APP_SECRET,
+                business_name="Acme Corp",
+                senders=failing,
+                source_ip="198.51.100.1",
+                suppression_key=_SUPPRESSION_KEY,
+                now=now,
+            )
+
+    assert await _challenge_rows(sqlite_session) == 0, "un envío rechazado quedó contando cupo"
+
+    # Y con un canal que sí funciona, el primer intento entra: sin enfriamiento de 60 s ni cupo
+    # consumido por los rechazos.
+    working = TenantSenders(
+        tenant_id=tenant.id,
+        email=None,
+        channels={Channel.WHATSAPP: DummySender(Channel.WHATSAPP)},
+    )
+    challenge, used = await issue_verification_challenge(
+        sqlite_session,
+        booking=booking,
+        app_secret=_APP_SECRET,
+        business_name="Acme Corp",
+        senders=working,
+        source_ip="198.51.100.1",
+        suppression_key=_SUPPRESSION_KEY,
+        now=now,
+    )
+    assert challenge.code_hmac is not None
+    assert used is Channel.WHATSAPP

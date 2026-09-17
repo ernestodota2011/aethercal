@@ -10,7 +10,7 @@ Implements the approved C-02b design package, whose decisions live in this modul
 - Single live challenge per booking: resending turns previous into tombstone (D-7·bis).
 - Channel dispatch with WhatsApp preference and automatic fallback to SMS
   on PermanentSendError (D-8, D-8·bis).
-- PermanentSendError does not consume quota slot (D-7·bis).
+- PermanentSendError does not consume quota slot (D-7·bis): the never-delivered row is deleted.
 - Instance-level phone suppression list with dedicated non-rotatable key
   AETHERCAL_SUPPRESSION_KEY (D-12).
 - Atomic consume with RETURNING and guest_phone_verified_at seal on booking (A-7).
@@ -386,7 +386,8 @@ async def issue_verification_challenge(  # noqa: PLR0913
     - Turns any previous active challenge for this booking into a tombstone (D-7·bis).
     - Generates 6-digit CSPRNG code and persists challenge with code_hmac.
     - Dispatches message with WhatsApp preference and SMS fallback (D-8, D-8·bis).
-    - If sending fails permanently before delivery, annuls secret so slot is not consumed.
+    - If sending fails permanently before delivery, the row is DELETED so the slot and the
+      60-second cooldown are not consumed (D-7·bis: the tombstone counts a DELIVERED challenge).
 
     .. rubric:: A TRANSIENT failure is deliberately different
 
@@ -454,8 +455,13 @@ async def issue_verification_challenge(  # noqa: PLR0913
     try:
         channel_used = await _dispatch_challenge_message(senders, to=norm_phone, body=body)
     except PermanentSendError:
-        # Permanent error: nothing was delivered; annul code_hmac to preserve quota slot (D-7·bis)
-        challenge.code_hmac = None
+        # ==Nothing was delivered, so nothing may count.== Annulling ``code_hmac`` is not enough:
+        # the RATE LIMITS count ROWS (``created_at >= cutoff``), so a lived-but-never-delivered
+        # challenge would still eat one of the phone's 3/24 h and start the 60-second cooldown —
+        # the exact opposite of D-7·bis ("un PermanentSendError no consume slot"), and the reason a
+        # number without WhatsApp could burn its daily budget without ever receiving a code. The row
+        # is DELETED in this transaction; the challenge never existed.
+        await session.delete(challenge)
         await session.flush()
         raise
 
