@@ -35,6 +35,7 @@ from aethercal.server.db.models.otp import PhoneVerificationChallenge
 from aethercal.server.integrations.messaging.guard import (
     PermanentSendError,
 )
+from aethercal.server.integrations.messaging.status import RecipientRejectedError
 from aethercal.server.services.guest_tokens import (
     GuestTokenPurpose,
     GuestTokenSigner,
@@ -65,18 +66,28 @@ _SUPPRESSION_KEY = "test-suppression-key-67890-0123456789"
 
 class DummySender:
     def __init__(
-        self, channel: Channel, fail_permanent: bool = False, fail_transient: bool = False
+        self,
+        channel: Channel,
+        fail_permanent: bool = False,
+        fail_transient: bool = False,
+        fail_provider: bool = False,
     ) -> None:
         self.channel = channel
         self.fail_permanent = fail_permanent
         self.fail_transient = fail_transient
+        self.fail_provider = fail_provider
         self.sent_messages: list[dict[str, Any]] = []
 
     async def send(self, *, to: str, subject: str | None, body: str) -> None:
         if self.fail_transient:
             raise RuntimeError(f"provider 500 for {to}: retryable")
+        if self.fail_provider:
+            # A permanent error about the ACCOUNT (bad credentials, unknown instance): the other
+            # channel would hit the same broken account, so it must NOT be tried.
+            raise PermanentSendError(f"provider-rejected: bad credentials for {to}")
         if self.fail_permanent:
-            raise PermanentSendError(f"Provider rejected recipient {to}")
+            # A permanent error about the RECIPIENT: this number is not on that channel.
+            raise RecipientRejectedError(f"provider-rejected: {to} does not exist on this channel")
         self.sent_messages.append({"to": to, "subject": subject, "body": body})
 
 
@@ -562,7 +573,7 @@ async def test_whatsapp_permanent_error_falls_back_to_sms(
     tenant, _, booking = seeded_context
     now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
 
-    # WhatsApp fails permanently (e.g. not on WhatsApp); SMS succeeds
+    # WhatsApp rejects the RECIPIENT permanently (the number is not on WhatsApp); SMS succeeds.
     failing_wa = DummySender(Channel.WHATSAPP, fail_permanent=True)
     working_sms = DummySender(Channel.SMS, fail_permanent=False)
     senders = TenantSenders(
@@ -584,6 +595,41 @@ async def test_whatsapp_permanent_error_falls_back_to_sms(
     assert channel_used == Channel.SMS
     assert len(working_sms.sent_messages) == 1
     assert challenge.code_hmac is not None
+
+
+@pytest.mark.asyncio
+async def test_a_PROVIDER_permanent_error_does_NOT_fall_back_to_sms(
+    sqlite_session: AsyncSession,
+    seeded_context: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==Solo el rechazo del DESTINATARIO merece el otro canal.== Un error permanente de la CUENTA
+    (credenciales, instancia) no se arregla probando SMS: el mismo proveedor roto contesta lo mismo,
+    y el intento extra solo ensucia el log del operador y suma una llamada. El paso se retira con la
+    razón que sí es accionable."""
+    tenant, _, booking = seeded_context
+    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+
+    broken_wa = DummySender(Channel.WHATSAPP, fail_provider=True)
+    untouched_sms = DummySender(Channel.SMS)
+    senders = TenantSenders(
+        tenant_id=tenant.id,
+        email=None,
+        channels={Channel.WHATSAPP: broken_wa, Channel.SMS: untouched_sms},  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(PermanentSendError, match="bad credentials"):
+        await issue_verification_challenge(
+            sqlite_session,
+            booking=booking,
+            app_secret=_APP_SECRET,
+            business_name="Acme Corp",
+            senders=senders,
+            source_ip="198.51.100.1",
+            suppression_key=_SUPPRESSION_KEY,
+            now=now,
+        )
+
+    assert untouched_sms.sent_messages == [], "un error de la cuenta probó el otro canal"
 
 
 @pytest.mark.asyncio

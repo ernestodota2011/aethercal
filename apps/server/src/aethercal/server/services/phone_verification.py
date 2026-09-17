@@ -8,8 +8,8 @@ Implements the approved C-02b design package, whose decisions live in this modul
   for missing, invalid or expired (D-6, A-3).
 - Rate limits on tombstones: 3/phone/24h, 1/phone/60s, 20/ip/24h (D-7, D-7·bis, A-12, A-13).
 - Single live challenge per booking: resending turns previous into tombstone (D-7·bis).
-- Channel dispatch with WhatsApp preference and automatic fallback to SMS
-  on PermanentSendError (D-8, D-8·bis).
+- Channel dispatch with WhatsApp preference and automatic fallback to SMS on
+  RecipientRejectedError (the number is not on WhatsApp), never on a provider error (D-8, D-8·bis).
 - PermanentSendError does not consume quota slot (D-7·bis): the never-delivered row is deleted.
 - Instance-level phone suppression list with dedicated non-rotatable key
   AETHERCAL_SUPPRESSION_KEY (D-12).
@@ -39,6 +39,7 @@ from aethercal.server.db.models.otp import PhoneSuppression, PhoneVerificationCh
 from aethercal.server.integrations.messaging.guard import (
     PermanentSendError,
 )
+from aethercal.server.integrations.messaging.status import RecipientRejectedError
 from aethercal.server.services.tenant_senders import TenantSenders
 
 _logger = logging.getLogger(__name__)
@@ -337,8 +338,12 @@ async def _dispatch_challenge_message(
 ) -> Channel:
     """Dispatch the verification code with WhatsApp preference and SMS fallback (D-8, D-8·bis).
 
-    If WhatsApp fails with PermanentSendError (e.g. number not on WhatsApp),
-    retries once via SMS if configured.
+    ==The fallback is for the RECIPIENT, not for the provider.== WhatsApp answering "this number is
+    not on WhatsApp" (400/403, classified as
+    :class:`~aethercal.server.integrations.messaging.status.RecipientRejectedError`) is worth one
+    retry over SMS: a different channel may still reach the guest. A permanent PROVIDER error — bad
+    credentials, an unknown instance — is not: SMS would hit the same broken account, so it
+    propagates and the caller retires the step with the operator-actionable reason.
     """
     if senders is None:
         raise PermanentSendError("No active messaging senders configured.")
@@ -350,9 +355,9 @@ async def _dispatch_challenge_message(
         try:
             await whatsapp_sender.send(to=to, subject=None, body=body)
             return Channel.WHATSAPP
-        except PermanentSendError as exc:
+        except RecipientRejectedError as exc:
             _logger.info(
-                "WhatsApp dispatch rejected permanently (%s); attempting fallback to SMS", exc
+                "WhatsApp rejected this RECIPIENT permanently (%s); attempting fallback to SMS", exc
             )
             if sms_sender is not None:
                 await sms_sender.send(to=to, subject=None, body=body)

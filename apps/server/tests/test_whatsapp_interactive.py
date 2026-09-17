@@ -447,7 +447,12 @@ def test_extract_evolution_payload_handles_missing_or_empty_text() -> None:
 async def seeded_whatsapp_booking(
     sqlite_session: AsyncSession,
 ) -> tuple[Tenant, EventType, Booking]:
-    now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+    # ==Relativo al reloj REAL, y es lo que hace que estos tests no venzan.== El webhook usa
+    # ``_now()`` (tiempo real) para elegir la cita objetivo, y la regla es que solo cuentan las que
+    # NO empezaron. Con una fecha fija (era ``2026-09-16``), cada uno de estos tests pasaba hasta
+    # ese instante de pared y después empezaba a responder ``no_booking_found`` — una bomba de
+    # tiempo que revienta un día sin que nadie haya tocado el código.
+    now = datetime.now(UTC)
     tenant = Tenant(name="WhatsApp Clinic", slug=f"wa-{uuid.uuid4().hex[:8]}")
     sqlite_session.add(tenant)
     await sqlite_session.flush()

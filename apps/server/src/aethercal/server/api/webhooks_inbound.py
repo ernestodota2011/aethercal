@@ -445,16 +445,16 @@ async def receive_whatsapp_webhook(
         await _queue_guest_acknowledgement(
             session, payload=payload, result=result, tenant_id=tenant_id
         )
-    except BaseException:
-        # ==The exception path is an exit too.== `get_session` rolls back and tears the scope down
-        # either way, but this handler DECLARES that the authority never outlives the work — so the
-        # declaration is kept literally true here instead of by pointing at another file.
+    finally:
+        # ==Every exit releases the tenant binding, and a `finally` is why that needs no argument.==
+        # `get_session` rolls back and tears the scope down either way, but this handler DECLARES
+        # that the authority never outlives the work — and a declaration that a reader has to
+        # verify by following another file is one edit away from being false. This covers the
+        # returns, the raises, and the cancellation of a request in flight alike.
         reset_tenant_binding()
-        raise
 
     # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
     # provider, and a body that carries what we told a guest is a body that lands in provider logs.
-    reset_tenant_binding()
     return {
         "status": result.status,
         "action": result.action.value,
