@@ -20,13 +20,15 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aethercal.server.channels import Channel
 from aethercal.server.db.guc import bind_tenant, reset_tenant_binding
 from aethercal.server.db.models import Booking
 from aethercal.server.deps import get_session
@@ -36,6 +38,7 @@ from aethercal.server.services.bookings import (
     confirm_paid_booking_effects,
 )
 from aethercal.server.services.guest_tokens import GuestTokenSigner
+from aethercal.server.services.outbox import enqueue_guest_reply
 from aethercal.server.services.payment_webhooks import (
     InboundWebhook,
     PaymentWebhookAdapter,
@@ -43,6 +46,10 @@ from aethercal.server.services.payment_webhooks import (
     record_payment_event,
 )
 from aethercal.server.services.phone_verification import get_suppression_key
+from aethercal.server.services.templates import (
+    REPLY_CANCEL_KIND,
+    REPLY_CONFIRM_KIND,
+)
 from aethercal.server.services.tenant_credentials import (
     CredentialError,
     CredentialProvider,
@@ -52,7 +59,10 @@ from aethercal.server.services.tenant_credentials import (
 from aethercal.server.services.tenant_resolution import tenant_by_slug
 from aethercal.server.services.tenant_senders import InstanceSenderDefaults
 from aethercal.server.services.whatsapp_interactive import (
+    WhatsAppProcessResult,
+    WhatsAppReplyAction,
     extract_evolution_payload,
+    extract_provider_message_id,
     process_inbound_whatsapp,
 )
 from aethercal.server.settings import Settings
@@ -423,12 +433,61 @@ async def receive_whatsapp_webhook(
         effects=effects,
     )
 
+    await _queue_guest_acknowledgement(session, payload=payload, result=result, tenant_id=tenant_id)
+
     # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
     # provider, and a body that carries what we told a guest is a body that lands in provider logs.
     return {
         "status": result.status,
         "action": result.action.value,
     }
+
+
+_REPLY_KIND_BY_ACTION: Mapping[WhatsAppReplyAction, str] = {
+    WhatsAppReplyAction.CONFIRM_ATTENDANCE: REPLY_CONFIRM_KIND,
+    WhatsAppReplyAction.CANCEL: REPLY_CANCEL_KIND,
+}
+"""What the guest gets acknowledged, and ==what they deliberately do not.==
+
+An OPT_OUT is absent, and that is a decision with its own paragraph in
+``services/templates``: the suppression IS the answer, and a "you have been unsubscribed"
+message would be the first message sent to a number that just asked for silence. An UNKNOWN
+gets nothing either — there is no reply the product can honestly give to "hola"."""
+
+
+async def _queue_guest_acknowledgement(
+    session: AsyncSession,
+    *,
+    payload: dict[str, Any],
+    result: WhatsAppProcessResult,
+    tenant_id: uuid.UUID,
+) -> None:
+    """Queue the acknowledgement of the guest's message, under the FULL outbound belt.
+
+    ==It is queued, not sent here, and the difference is the whole point.== An outbound chat message
+    is an outbound message: it has to pass consent, the opt-out list, the daily caps and the ledger.
+    The webhook does not own any of that — the outbox does, for every channel and every effect — so
+    this encodes nothing but WHICH reply, keyed so that a retried webhook (or a replayed drain)
+    cannot send it twice.
+    """
+    kind = _REPLY_KIND_BY_ACTION.get(result.action)
+    if kind is None or result.booking_id is None:
+        return
+    booking = await session.get(Booking, result.booking_id)
+    if booking is None or booking.tenant_id != tenant_id:  # pragma: no cover - defensive
+        return
+    message_id = extract_provider_message_id(payload)
+    # The provider's message id is what makes this exactly-once across BOTH retry layers. Without
+    # one, the key falls back to the kind: at most one acknowledgement of that kind per booking,
+    # which the ledger would enforce anyway.
+    dedupe_key = f"reply:{kind}:{message_id}" if message_id else f"reply:{kind}"
+    await enqueue_guest_reply(
+        session,
+        booking=booking,
+        channel=Channel.WHATSAPP,
+        kind=kind,
+        dedupe_key=dedupe_key[:128],
+    )
 
 
 __all__ = ["receive_payment_webhook", "receive_whatsapp_webhook", "router"]

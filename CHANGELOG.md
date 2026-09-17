@@ -158,9 +158,12 @@ side (C-02b, Horizon 1).
   transactional chain as the guest cancel link, and STOP/BAJA/ALTO/… suppresses the number on the
   instance-wide opt-out list, which the send path consults before the channel, the template and the
   caps. Only UPCOMING appointments are eligible: a late or replayed reply never cancels a visit
-  that already happened. ==The guest does not receive an acknowledgement message yet:== the reply
-  text is returned to the caller and not sent (an outbound chat message has to pass consent, the
-  seal, the opt-out list, the caps and the ledger first — that wiring is a declared follow-up).
+  that already happened. **The guest gets an acknowledgement** — queued as an outbox intent
+  (`notify_reply`) with their message id as the idempotency key, so it passes consent, the opt-out
+  list, the daily caps and the ledger like every other outbound, and a retried webhook or a
+  double "1" sends exactly one. An **OPT_OUT is deliberately not acknowledged**: the suppression IS
+  the answer, and a "you have been unsubscribed" would be the first message sent to a number that
+  just asked for silence.
 - **`AETHERCAL_SUPPRESSION_KEY`** (≥32 characters) is the dedicated, non-derivable HMAC key behind
   that list; ==the app refuses to boot the public router without it==, and the list survives guest
   erasure so an erasure never reactivates messaging to someone who asked to stop.

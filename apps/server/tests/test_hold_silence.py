@@ -161,6 +161,8 @@ def _payload_for(effect: OutboxEffect) -> dict[str, object]:
             return {"provider": "stripe", "provider_ref": "pi_test_NOT_A_REAL_KEY_x"}
         case OutboxEffect.EXPIRE_HOLD:
             return {"booking_id": "00000000-0000-0000-0000-000000000000"}
+        case OutboxEffect.NOTIFY_REPLY:
+            return {"channel": "whatsapp", "kind": "reply_confirm", "locale": "es"}
 
 
 def _dedupe_for(effect: OutboxEffect) -> str:
@@ -175,6 +177,8 @@ def _dedupe_for(effect: OutboxEffect) -> str:
             return "refund:pi_test_NOT_A_REAL_KEY_x"
         case OutboxEffect.EXPIRE_HOLD:
             return "expire_hold:00000000-0000-0000-0000-000000000000"
+        case OutboxEffect.NOTIFY_REPLY:
+            return "reply:reply_confirm:test-message"
 
 
 # --------------------------------------------------------------------------------------

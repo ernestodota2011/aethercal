@@ -219,8 +219,21 @@ class OutboxEffect(StrEnum):
     a cancel that killed a refund in flight is money that never comes back."""
     EXPIRE_HOLD = "expire_hold"
     """Cancel an unpaid hold whose TTL has passed, freeing its slot (B-05b). No external I/O, so any
-    failure is anomalous by definition — a dead EXPIRE_HOLD is a slot blocked for ever. Same exempt,
+    failure is anomalous by definition - a dead EXPIRE_HOLD is a slot blocked for ever. Same exempt,
     non-voidable treatment as REFUND."""
+    NOTIFY_REPLY = "notify_reply"
+    """The acknowledgement of a message the GUEST sent us (Horizon 1 follow-up).
+
+    ==It is its own effect because its belt is its own.== A workflow step is queued by a rule and
+    waits for that rule; a reply is queued by an INBOUND from the guest's own number and has no rule
+    to consult — but it still owes every other gate: consent, the opt-out list, the daily caps, and
+    the ledger. Reusing ``NOTIFY`` would have forced a synthetic step and trigger into a payload
+    whose staleness, rule-pause and identity checks all read them; this effect declares its own
+    answers instead, in the same tables every other effect declares them in.
+
+    One exemption, argued where it lives (:func:`_require_phone_consent`): the possession seal. The
+    guest is answering FROM that phone, which is stronger evidence than a code typed into a browser,
+    and demanding the OTP would leave every guest who never verified unable to be acknowledged."""
 
 
 class GoogleOperation(StrEnum):
@@ -289,6 +302,11 @@ _STALENESS: Mapping[OutboxEffect, Callable[[Mapping[str, Any]], Staleness]] = {
         else Staleness.SUBJECT
     ),
     OutboxEffect.NOTIFY: lambda payload: trigger_staleness(WorkflowTrigger(payload["trigger"])),
+    # A reply speaks about the appointment the guest just answered about. If a later transition
+    # replaced it (a reschedule opens a NEW booking id), the acknowledgement of the old one is
+    # stale — and the successor carries its own confirmation, so nothing is lost. SUBJECT, and it
+    # reads NO payload key: the trigger lives in the guest's message, not in a rule.
+    OutboxEffect.NOTIFY_REPLY: lambda _payload: Staleness.SUBJECT,
     # ==Both EXEMPT, and it MUST be a conscious choice.== A refund acts on a booking that is
     # cancelled by definition, and ``_is_chain_current`` is False for a cancelled booking BY
     # CONSTRUCTION — so a SUBJECT refund would be marked ``delivered`` and never sent, and the
@@ -334,7 +352,12 @@ def confirmation_policy(effect: OutboxEffect) -> Confirmation:
     wrong message.
     """
     match effect:
-        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+        case (
+            OutboxEffect.EMAIL
+            | OutboxEffect.GOOGLE
+            | OutboxEffect.NOTIFY
+            | OutboxEffect.NOTIFY_REPLY
+        ):
             return Confirmation.REQUIRES_CONFIRMATION
         case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
             # They act on bookings that are unpaid or cancelled BY DEFINITION — a refund returns the
@@ -382,6 +405,7 @@ def voidability_policy(effect: OutboxEffect) -> Voidability:
         case (
             OutboxEffect.EMAIL
             | OutboxEffect.GOOGLE
+            | OutboxEffect.NOTIFY_REPLY
             | OutboxEffect.REFUND
             | OutboxEffect.EXPIRE_HOLD
         ):
@@ -425,7 +449,12 @@ def priority_policy(effect: OutboxEffect) -> Priority:
     match effect:
         case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
             return Priority.MONEY_FIRST
-        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+        case (
+            OutboxEffect.EMAIL
+            | OutboxEffect.GOOGLE
+            | OutboxEffect.NOTIFY
+            | OutboxEffect.NOTIFY_REPLY
+        ):
             return Priority.NORMAL
         case _ as unreachable:
             assert_never(unreachable)
@@ -481,7 +510,12 @@ def purge_policy(effect: OutboxEffect) -> Purgeability:
     the first effect whose two answers differ gets one of them wrong, in silence.
     """
     match effect:
-        case OutboxEffect.EMAIL | OutboxEffect.GOOGLE | OutboxEffect.NOTIFY:
+        case (
+            OutboxEffect.EMAIL
+            | OutboxEffect.GOOGLE
+            | OutboxEffect.NOTIFY
+            | OutboxEffect.NOTIFY_REPLY
+        ):
             return Purgeability.PURGEABLE
         case OutboxEffect.REFUND | OutboxEffect.EXPIRE_HOLD:
             return Purgeability.RETAINED
@@ -2384,7 +2418,9 @@ class _NotifyPlan:
     """The ledger key. A ``str``, not a :class:`NotificationKind`: ``workflow_steps.kind`` is
     free-text BY DESIGN, so a tenant may define a ``follow_up`` step and give it a template."""
     channel: Channel
-    step_id: uuid.UUID
+    step_id: uuid.UUID | None
+    """``None`` = not a workflow step: a transactional notice (or a guest REPLY), which the ledger
+    dedupes per (booking, kind, channel) instead of per step."""
     message: Any  # an EmailMessage for the email channel; a rendered plain body for the others.
     recipient: str
 
@@ -2491,11 +2527,27 @@ async def run_notify_effect(  # noqa: PLR0913 - one keyword per injected sending
         await _record_notify_sent(sessionmaker, work, plan, now)
         return
 
-    # A PHONE send. Everything below exists because the window between "the provider accepted" and
-    # "the ledger committed" is not free: a crash inside it means the guest may already have the
-    # message while nothing records it - so a blind retry would send it TWICE and under-count the
-    # daily cap that protects them, because that cap is derived from the very ledger row we failed
-    # to write. The two failures compound. So the intent to call the provider is PERSISTED first.
+    await _send_phone_notify(sessionmaker, work, plan, now, channels=channels)
+
+
+async def _send_phone_notify(
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    plan: _NotifyPlan,
+    now: datetime,
+    *,
+    channels: Mapping[Channel, PhoneChannelSender],
+) -> None:
+    """Hand a phone plan to its provider, under the unknown-outcome protocol.
+
+    ==Extracted so there is ONE place that decides what an ambiguous answer costs.== The workflow
+    step and the guest reply follow the same protocol, and a second copy of it is how one of them
+    quietly loses the marker: the window between "the provider accepted" and "the ledger committed"
+    is where a blind retry sends the guest the message TWICE while under-counting the cap that
+    protects them (the cap is derived from the very ledger row that failed to land). The intent to
+    call the provider is PERSISTED first; a lost answer leaves it standing so the drain PARKS the
+    row instead of guessing.
+    """
     await _mark_provider_call_started(sessionmaker, work, now)
     try:
         await channels[plan.channel].send(to=plan.recipient, subject=None, body=str(plan.message))
@@ -2679,7 +2731,9 @@ async def _gate_on_the_rule(
         )
 
 
-def _require_phone_consent(booking: Booking, channel: Channel) -> None:
+def _require_phone_consent(
+    booking: Booking, channel: Channel, *, require_seal: bool = True
+) -> None:
     """Refuse to message a phone without BOTH a number and a ticked box. Legal, not cosmetic.
 
     ``bookings.guest_phone_consent_at`` records **when the consent box on the booking form was
@@ -2700,7 +2754,19 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
     * consent WITHDRAWN (the stamp set back to NULL) → the same gate closes again, automatically.
       Revocation needs no special code path: it IS the absence of the stamp.
 
-    Each case carries its OWN reason, never merged with "the channel is not configured"."""
+    Each case carries its OWN reason, never merged with "the channel is not configured".
+
+    .. rubric:: ``require_seal=False`` — the ONE caller, and why it is not a hole
+
+    The possession seal (OTP) is demanded of every message this product STARTS. A REPLY is the one
+    case it does not fit: the guest is answering FROM that phone, so the inbound message itself is
+    possession evidence — ==strictly stronger than a six-digit code typed into a browser, because
+    a code can be read by whoever holds the handset while a message proves who sent it==.
+    Demanding the OTP here would leave every guest who skipped or lost the code unable to be
+    acknowledged. The
+    other three gates (number, consent, opt-out list) are unchanged, and the reply still passes the
+    caps and the ledger.
+    """
     if not booking.guest_phone:
         raise OutboxSkipped(
             f"{_NO_PHONE}: the guest gave no phone number, so the {channel.value} step cannot run"
@@ -2710,7 +2776,7 @@ def _require_phone_consent(booking: Booking, channel: Channel) -> None:
             f"{_NO_CONSENT}: the guest has not consented to be messaged on their phone, so the "
             f"{channel.value} step must not run (consent is recorded, or it did not happen)"
         )
-    if booking.guest_phone_verified_at is None:
+    if require_seal and booking.guest_phone_verified_at is None:
         raise OutboxSkipped(
             f"{_PHONE_UNVERIFIED}: the guest's phone number has not been verified via OTP, so the "
             f"{channel.value} step must not run"
@@ -2963,6 +3029,181 @@ async def _prepare_notify(  # noqa: PLR0913 - one keyword per injected sending s
     )
 
 
+async def run_reply_effect(  # noqa: PLR0913 - one keyword per injected sending seam
+    sessionmaker: Sessionmaker,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
+    suppression_key: str | None = None,
+) -> None:
+    """Send the guest the acknowledgement of the message THEY sent us (``NOTIFY_REPLY``).
+
+    The same three phases as every other handler - read, send with NO transaction open, record - and
+    the same unknown-outcome protocol (:func:`_send_phone_notify`). What differs is only the READ:
+    there is no rule to consult (the trigger is the guest's own message), so the gates that remain
+    are the ones that protect the recipient: consent, the opt-out list, the daily caps, and the
+    ledger that makes it exactly-once.
+    """
+    async with sessionmaker() as session:
+        plan = await _prepare_reply(
+            session,
+            work,
+            now,
+            channels=channels,
+            channel_errors=channel_errors,
+            suppression_key=suppression_key,
+        )
+        await session.rollback()  # a pure read: release the connection before any network call
+    if plan is None:
+        return
+
+    await _send_phone_notify(sessionmaker, work, plan, now, channels=channels)
+
+
+async def _prepare_reply(  # noqa: PLR0913 - one keyword per injected sending seam
+    session: AsyncSession,
+    work: OutboxWork,
+    now: datetime,
+    *,
+    channels: Mapping[Channel, PhoneChannelSender],
+    channel_errors: Mapping[Channel, Exception],
+    suppression_key: str | None = None,
+) -> _NotifyPlan | None:
+    """The reply's READ phase: the gates, then the built-in body.
+
+    Deliberately the same ORDER as a workflow step's, because the order is the safety property: the
+    booking must be live, the message must not already be on the ledger, and the recipient gates
+    (consent, opt-out) run before the channel registry, the caps and the render — so no plan can
+    exist for a phone we may not message. What is NOT here, and why:
+
+    * ``_gate_on_the_rule`` — a reply answers the guest, it is not queued by a workflow rule;
+    * the possession seal — see :func:`_require_phone_consent`'s ``require_seal`` rubric: the
+      inbound message proves possession better than the OTP it would demand.
+    """
+    booking = await session.get(Booking, work.booking_id)
+    if booking is None:  # pragma: no cover - defensive: the FK cascade makes this near-impossible
+        return None
+    if _should_skip_as_unconfirmed(booking, work):
+        return None
+    if await _should_skip_as_stale(session, booking, work):
+        # A later transition overtook the booking: the acknowledgement of the old appointment would
+        # be stale, and the successor carries its own confirmation.
+        return None
+
+    payload = work.payload
+    channel = Channel(str(payload["channel"]))
+    kind = str(payload["kind"])
+    locale = str(payload.get("locale", "es"))
+
+    if await notification_already_sent(
+        session, booking=booking, kind=kind, channel=channel, step_id=None
+    ):
+        # The ledger's step-less key is (booking, kind, channel): one acknowledgement of each kind
+        # per booking, ever. A replayed inbound (the provider retries) OR a guest who answers "1"
+        # twice gets ONE message — the second is recorded as already sent, which is what "exactly
+        # once" means here.
+        return None
+
+    if payload.get(PROVIDER_CALL_MARKER):
+        raise OutboxUnknownOutcome(
+            f"{_UNKNOWN_OUTCOME}: a previous attempt handed this {channel.value} reply to the "
+            f"provider at {payload[PROVIDER_CALL_MARKER]} and never recorded the outcome - the "
+            "worker died in the window between the provider accepting and the ledger committing. "
+            "The guest may already have this message, so it is NOT re-sent. A human checks the "
+            "provider, then runs: aethercal-admin outbox resolve-unknown"
+        )
+
+    _require_phone_consent(booking, channel, require_seal=False)
+    await _require_phone_not_suppressed(session, booking, channel, suppression_key=suppression_key)
+
+    phone_sender = channels.get(channel)
+    if phone_sender is None:
+        _refuse_channel(
+            channel,
+            channel_errors,
+            when_off=OutboxSkipped(
+                f"{_CHANNEL_UNCONFIGURED}: the {channel.value} channel has no sender on this "
+                "instance (a channel without credentials is a disabled feature, not an error)"
+            ),
+        )
+
+    try:
+        await enforce_phone_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+        await enforce_ip_cap(
+            session, booking=booking, channel=channel, caps=phone_sender.caps, now=now
+        )
+    except SendRefused as refused:
+        raise OutboxSkipped(str(refused)) from refused
+
+    template = await load_template(
+        session, tenant_id=booking.tenant_id, channel=channel, kind=kind, locale=locale
+    )
+    if template is None:
+        # The reply kinds ship built-in bodies, so this means the payload named a kind nothing
+        # knows — a programming error, and it is retired with that reason instead of sent empty.
+        raise OutboxSkipped(
+            f"{_NO_TEMPLATE}: the {channel.value} reply of kind {kind!r} has no template for "
+            f"locale {locale!r}, and there is no built-in fallback for that kind"
+        )
+
+    context = await build_template_context(session, booking=booking, locale=locale)
+    try:
+        rendered = render_template(
+            template.body, subject=template.subject, context=context, channel=channel
+        )
+    except TemplateError as exc:
+        raise OutboxSkipped(
+            f"{_BAD_TEMPLATE}: the {template.source} {channel.value} reply template for kind "
+            f"{kind!r} cannot be rendered: {exc}"
+        ) from exc
+
+    phone = booking.guest_phone
+    if phone is None:  # pragma: no cover - _require_phone_consent proved this above
+        raise OutboxSkipped(f"{_NO_PHONE}: the booking lost its phone number mid-flight")
+
+    return _NotifyPlan(
+        booking_id=booking.id,
+        kind=kind,
+        channel=channel,
+        step_id=None,
+        message=rendered.body,
+        recipient=phone,
+    )
+
+
+async def enqueue_guest_reply(  # noqa: PLR0913 - one keyword per element of the intent's identity
+    session: AsyncSession,
+    *,
+    booking: Booking,
+    channel: Channel,
+    kind: str,
+    dedupe_key: str,
+    locale: str = "es",
+) -> Outbox | Suppressed | None:
+    """Queue the acknowledgement of an inbound guest message (``NOTIFY_REPLY``).
+
+    ``dedupe_key`` must identify the INBOUND message (the provider's own id): the outbox is drained
+    at-least-once and the provider retries its webhooks, so a key derived from the booking alone
+    would let two different replies collide — and a key derived from nothing would send the same
+    acknowledgement twice.
+
+    The payload carries no text and no phone: only which channel, which kind, and the locale the
+    body should render in. A tenant who wants a different wording writes a ``workflow_templates``
+    row for the reply kind — the same escape hatch every phone step has.
+    """
+    return await enqueue_effect(
+        session,
+        booking=booking,
+        effect=OutboxEffect.NOTIFY_REPLY,
+        dedupe_key=dedupe_key,
+        payload={"channel": channel.value, "kind": kind, "locale": locale},
+    )
+
+
 async def _prepare_notify_email(  # noqa: PLR0913 - the plan's identity IS the keyword contract
     session: AsyncSession,
     *,
@@ -3125,6 +3366,16 @@ def make_booking_effect_executor(  # noqa: PLR0913 - one keyword per injected se
                 work,
                 now,
                 sender=senders.email,
+                channels=senders.channels,
+                channel_errors=senders.channel_errors,
+                suppression_key=suppression_key,
+            )
+        elif effect is OutboxEffect.NOTIFY_REPLY:
+            senders = await _resolve_for(work)
+            await run_reply_effect(
+                sessionmaker,
+                work,
+                now,
                 channels=senders.channels,
                 channel_errors=senders.channel_errors,
                 suppression_key=suppression_key,

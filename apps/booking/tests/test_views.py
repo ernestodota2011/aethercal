@@ -146,6 +146,25 @@ def test_page_shell_self_hosts_htmx_not_a_third_party_cdn() -> None:
     assert "cdn." not in html
 
 
+def test_page_shell_self_hosts_the_submit_feedback_and_the_mobile_theme_colour() -> None:
+    """Dos detalles de la experiencia móvil que tienen que viajar con la página:
+
+    * el script de envío (spinner + botón deshabilitado) se sirve del propio app, igual que htmx —
+      `script-src 'self'` no admite un CDN;
+    * `theme-color` en DOS entradas, porque el producto tiene tema oscuro real y uno claro cálido:
+      un solo valor pintaría mal la barra del navegador en el otro modo.
+    """
+    html = to_xml(views.page("es", "Reserva", views.NotStr("<p/>"), lang_urls=LANG_URLS))
+
+    assert "/static/form-busy.js" in html
+    assert 'name="theme-color"' in html
+    assert "prefers-color-scheme: dark" in html and "prefers-color-scheme: light" in html
+    assert "#0e0e10" in html and "#faf7f2" in html
+    # El feedback del envío está estilado (y sobrevive a `prefers-reduced-motion`, ralentizado).
+    assert 'form[aria-busy="true"]' in html
+    assert "busy-spin" in html
+
+
 def test_page_shell_self_hosts_the_display_font_not_a_font_cdn() -> None:
     # The editorial display face (Bricolage Grotesque) must be served by the app itself — the same
     # strict-CSP reason htmx is vendored: `font-src 'self'` (app.py) allows only same-origin fonts,

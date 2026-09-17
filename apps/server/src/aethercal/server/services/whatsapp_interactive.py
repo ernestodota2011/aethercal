@@ -680,6 +680,27 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
     )
 
 
+def extract_provider_message_id(payload: dict[str, Any]) -> str | None:
+    """The provider's id for an inbound message, or ``None``.
+
+    ==It is what makes the acknowledgement exactly-once.== Provider webhooks are retried, and the
+    outbox is drained at-least-once, so the id is the only piece of an inbound message that is
+    stable across both — the sender's phone and the text are not. Bounded to 120 characters (the
+    ``outbox.dedupe_key`` column is 128 and the key adds a prefix), because it comes from the wire.
+    """
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    key = data.get("key")
+    if not isinstance(key, dict):
+        return None
+    raw = key.get("id")
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    return trimmed[:120] or None
+
+
 def extract_evolution_payload(payload: dict[str, Any]) -> tuple[str, str] | None:
     """Extract `(sender_phone, message_text)` from an Evolution API webhook payload.
 

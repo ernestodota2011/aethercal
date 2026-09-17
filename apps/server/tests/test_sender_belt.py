@@ -374,9 +374,11 @@ class TestAChannelsFaultIsConsultedInExactlyOnePlace:
     def test_every_sender_less_path_goes_through_that_door(self) -> None:
         """==Anti-vacuity.== One reader proves nothing if nobody calls it.
 
-        Three call sites, and each is a place that can find itself without a sender: the booking's
-        confirmation email, a workflow step's email branch, and a workflow step's phone branch.
-        Fewer means a path found no sender and decided for itself — which is the bug.
+        FOUR call sites, and each is a place that can find itself without a sender: the booking's
+        confirmation email, a workflow step's email branch, a workflow step's phone branch, and the
+        guest's own reply being acknowledged (``NOTIFY_REPLY``). Fewer means a path found no sender
+        and decided for itself — which is the bug. ==The count is a lock, so a new sender-less path
+        has to come HERE and say so==, which is how this test earned its fourth line.
         """
         callers = {
             node.lineno
@@ -385,11 +387,11 @@ class TestAChannelsFaultIsConsultedInExactlyOnePlace:
             and isinstance(node.func, ast.Name)
             and node.func.id == "_refuse_channel"
         }
-        assert len(callers) == 3, (
-            f"`_refuse_channel` is called from {len(callers)} places, expected 3 (the confirmation "
-            "email, the workflow step's email branch, the phone branch). A sender-less path that "
-            "does not come through the door decides OFF vs BROKEN on its own — and the email "
-            "branch already proved how that ends."
+        assert len(callers) == 4, (
+            f"`_refuse_channel` is called from {len(callers)} places, expected 4 (the confirmation "
+            "email, the workflow step's email branch, the workflow step's phone branch, the guest "
+            "reply). A sender-less path that does not come through the door decides OFF vs BROKEN "
+            "on its own — and the email branch already proved how that ends."
         )
 
 

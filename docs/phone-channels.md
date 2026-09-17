@@ -46,6 +46,7 @@ is not a footnote, and it is the reason this page exists.
 | Refuses to send | No number, no ticked box, no verified stamp, or a number on the opt-out list → the step is `skipped` with its own reason (`no-phone`, `no-phone-consent`, `phone-unverified`, `phone-suppressed`) and nothing goes out. |
 | Revocation | Setting `guest_phone_consent_at` back to `NULL` closes the gate again. There is no special code path: the absence of the stamp *is* the revocation. |
 | Opt-out | Replying `STOP`, `BAJA`, `ALTO`, `DESUSCRIBIR`, `UNSUBSCRIBE`, `PARAR`, `DETENER`, `QUITAR` or `BLOQUEAR` to a WhatsApp reminder suppresses the number instance-wide, and it stays suppressed even through guest erasure. |
+| Answers back | "1" (confirm attendance) and "2" (cancel) are **acknowledged** over WhatsApp; the acknowledgement is queued like every other outbound, so it passes consent, the opt-out list and the daily caps. An **opt-out is never acknowledged** — the silence is the confirmation. |
 | Bounds the damage | Per-phone and per-IP daily caps, which a channel **refuses to start without**. |
 
 ### What it does NOT do — a declared gap
@@ -143,6 +144,13 @@ A guest can stop the messages at any time by replying to a WhatsApp reminder:
 ```
 STOP · BAJA · ALTO · DESUSCRIBIR · UNSUBSCRIBE · PARAR · DETENER · QUITAR · BLOQUEAR
 ```
+
+> [!important] An opt-out is **never** acknowledged — and that is the feature
+> A "you have been unsubscribed" message would be the first message sent to a number that just
+> asked for silence. The suppression taking effect IS the confirmation, and the send path would
+> refuse the acknowledgement anyway. The other two answers a guest can give — "1" (confirm) and "2"
+> (cancel) — are acknowledged over WhatsApp, through the same belt: consent, the opt-out list, the
+> daily caps and the ledger.
 
 The reply writes the phone into the **instance-level opt-out list** (`phone_suppressions`), keyed by
 `HMAC(AETHERCAL_SUPPRESSION_KEY, phone)`, and the send path checks that list **before** the channel,

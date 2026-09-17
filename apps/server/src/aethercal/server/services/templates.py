@@ -356,6 +356,27 @@ def _cap(value: str, limit: int) -> str:
 # signed guest links (the same shape the retired reminder job had), so those variables render EMPTY,
 # and a built-in that said "Cancel: " followed by nothing would ship a broken message to every guest
 # of every tenant who never wrote a template.
+
+# --------------------------------------------------------------------------------------
+# The guest's OWN replies get an acknowledgement, and these are its built-in bodies.
+#
+# A reply is not a workflow step: no rule queues it, so no tenant authored its wording. The text is
+# therefore built in (like `format_otp_body`), and a tenant who wants different words writes a
+# `workflow_templates` row for the reply kind -- `load_template` prefers it, exactly as it does for
+# the four booking kinds.
+# --------------------------------------------------------------------------------------
+
+REPLY_CONFIRM_KIND = "reply_confirm"
+"""Acknowledgement of a guest who answered "1" (attendance confirmed). One per booking."""
+
+REPLY_CANCEL_KIND = "reply_cancel"
+"""Acknowledgement of a guest who answered "2" (booking cancelled). One per booking."""
+
+#: ==No acknowledgement for an OPT-OUT, and that is the point.== A STOP suppresses the number
+#: instance-wide; a "you have been unsubscribed" message would be the FIRST violation of the list
+#: the guest just asked to join, and the send path would refuse it anyway. The silence IS the
+#: confirmation.
+
 _BUILTIN_PHONE_BODIES: Mapping[tuple[str, str], str] = {
     ("confirmation", "es"): (
         'Hola {{guest_name}}: tu reserva "{{event_title}}" quedó confirmada para el '
@@ -386,6 +407,22 @@ _BUILTIN_PHONE_BODIES: Mapping[tuple[str, str], str] = {
     ),
     ("cancellation", "en"): (
         'Hi {{guest_name}}: your booking "{{event_title}}" on {{start_local}} has been cancelled.'
+    ),
+    (REPLY_CONFIRM_KIND, "es"): (
+        'Gracias {{guest_name}}: confirmamos tu asistencia a "{{event_title}}" del {{start_local}} '
+        "({{timezone}})."
+    ),
+    (REPLY_CONFIRM_KIND, "en"): (
+        'Thank you {{guest_name}}: your attendance to "{{event_title}}" on {{start_local}} '
+        "({{timezone}}) is confirmed."
+    ),
+    (REPLY_CANCEL_KIND, "es"): (
+        'Hemos cancelado tu reserva "{{event_title}}" del {{start_local}}. Si necesitas otra cita, '
+        "puedes reservar de nuevo en cualquier momento."
+    ),
+    (REPLY_CANCEL_KIND, "en"): (
+        'Your booking "{{event_title}}" on {{start_local}} has been cancelled. If you need another '
+        "appointment, you can book again at any time."
     ),
 }
 

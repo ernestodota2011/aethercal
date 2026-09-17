@@ -581,6 +581,9 @@ def test_every_effect_declares_a_staleness_policy() -> None:
         # staleness — both are unconditionally EXEMPT — but the entry has to exist or this fails.
         OutboxEffect.REFUND: {"provider_ref": "pi_test_NOT_A_REAL_KEY_abc"},
         OutboxEffect.EXPIRE_HOLD: {"booking_id": str(uuid.uuid4())},
+        # The 6th: the guest's own reply gets acknowledged. Its staleness reads NO key (the trigger
+        # is the guest's message, not a rule), but the entry has to exist or this loop fails.
+        OutboxEffect.NOTIFY_REPLY: {"channel": "whatsapp", "kind": "reply_confirm", "locale": "es"},
     }
     for effect in OutboxEffect:
         assert staleness_policy(effect, payloads[effect]) in set(Staleness)

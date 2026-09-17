@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+import sqlalchemy as sa
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
@@ -32,7 +33,7 @@ from aethercal.server.api.webhooks_inbound import (
     receive_whatsapp_webhook,
 )
 from aethercal.server.crypto import derive_fernet_key
-from aethercal.server.db.models import Booking, EventType, Schedule, Tenant, User
+from aethercal.server.db.models import Booking, EventType, Outbox, Schedule, Tenant, User
 from aethercal.server.integrations.messaging.guard import DailyCaps
 from aethercal.server.integrations.whatsapp.config import EvolutionConfig
 from aethercal.server.services.phone_verification import (
@@ -912,6 +913,114 @@ async def test_endpoint_authenticates_with_various_headers(
     resp = await receive_whatsapp_webhook(tenant.slug, req, sqlite_session)
     assert resp["status"] == "attendance_confirmed"
     assert resp["action"] == "confirm_attendance"
+
+
+def _inbound_body(text: str, *, message_id: str | None = None) -> bytes:
+    key: dict[str, Any] = {"remoteJid": "13055551111@s.whatsapp.net", "fromMe": False}
+    if message_id is not None:
+        key["id"] = message_id
+    return json.dumps(
+        {
+            "event": "messages.upsert",
+            "data": {"key": key, "message": {"conversation": text}},
+        }
+    ).encode("utf-8")
+
+
+async def _reply_rows(session: AsyncSession) -> list[Outbox]:
+    return list(
+        (await session.scalars(sa.select(Outbox).where(Outbox.effect == "notify_reply"))).all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_endpoint_queues_the_acknowledgement_keyed_on_the_providers_message_id(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+) -> None:
+    """==El acuse se ENCOLA, no se envía desde el webhook.== Así pasa por el cinturón completo
+    (consentimiento, lista de bajas, topes y libro) en el worker, como todo mensaje saliente; y la
+    clave lleva el id del mensaje del proveedor, que es lo único estable entre reintentos."""
+    tenant, _, _ = seeded_whatsapp_booking
+    await store_credential(
+        sqlite_session,
+        tenant_id=tenant.id,
+        provider=CredentialProvider.WHATSAPP,
+        secrets={
+            "base_url": "https://evolution.example.com",
+            "instance": "test-instance",
+            "api_key": _TEST_API_KEY,
+        },
+        fernet_key=_FERNET_KEY,
+        current_implementations={},
+    )
+    await sqlite_session.flush()
+
+    first = _build_webhook_request(
+        body=_inbound_body("1", message_id="MSG-1"), headers={"apikey": _TEST_API_KEY}
+    )
+    resp = await receive_whatsapp_webhook(tenant.slug, first, sqlite_session)
+    assert resp["status"] == "attendance_confirmed"
+
+    rows = await _reply_rows(sqlite_session)
+    assert len(rows) == 1
+    assert rows[0].dedupe_key == "reply:reply_confirm:MSG-1"
+    assert rows[0].payload["kind"] == "reply_confirm"
+    assert rows[0].payload["channel"] == "whatsapp"
+
+    # ==El proveedor REINTENTA el mismo mensaje:== misma clave → ninguna fila nueva. La exactitud
+    # también la sostiene el libro, pero encolar dos veces ya sería ruido en la cola.
+    replay = _build_webhook_request(
+        body=_inbound_body("1", message_id="MSG-1"), headers={"apikey": _TEST_API_KEY}
+    )
+    await receive_whatsapp_webhook(tenant.slug, replay, sqlite_session)
+    assert len(await _reply_rows(sqlite_session)) == 1
+
+    # Un mensaje DISTINTO sí encola el suyo.
+    second = _build_webhook_request(
+        body=_inbound_body("1", message_id="MSG-2"), headers={"apikey": _TEST_API_KEY}
+    )
+    await receive_whatsapp_webhook(tenant.slug, second, sqlite_session)
+    keys = {row.dedupe_key for row in await _reply_rows(sqlite_session)}
+    assert keys == {"reply:reply_confirm:MSG-1", "reply:reply_confirm:MSG-2"}
+
+
+@pytest.mark.asyncio
+async def test_endpoint_queues_the_cancel_acknowledgement_and_NOTHING_for_an_opt_out(
+    sqlite_session: AsyncSession,
+    seeded_whatsapp_booking: tuple[Tenant, EventType, Booking],
+) -> None:
+    """Una baja NO se acusa: el silencio ES la confirmación (y el cinturón lo rechazaría, porque
+    el número acaba de entrar a la lista de supresión)."""
+    tenant, _, _ = seeded_whatsapp_booking
+    await store_credential(
+        sqlite_session,
+        tenant_id=tenant.id,
+        provider=CredentialProvider.WHATSAPP,
+        secrets={
+            "base_url": "https://evolution.example.com",
+            "instance": "test-instance",
+            "api_key": _TEST_API_KEY,
+        },
+        fernet_key=_FERNET_KEY,
+        current_implementations={},
+    )
+    await sqlite_session.flush()
+
+    stop = _build_webhook_request(
+        body=_inbound_body("STOP", message_id="MSG-STOP"), headers={"apikey": _TEST_API_KEY}
+    )
+    resp = await receive_whatsapp_webhook(tenant.slug, stop, sqlite_session)
+    assert resp["status"] == "suppressed"
+    assert await _reply_rows(sqlite_session) == [], "un STOP recibió acuse: la lista ya violada"
+
+    cancel = _build_webhook_request(
+        body=_inbound_body("2", message_id="MSG-2"), headers={"apikey": _TEST_API_KEY}
+    )
+    resp = await receive_whatsapp_webhook(tenant.slug, cancel, sqlite_session)
+    assert resp["status"] == "cancelled"
+    rows = await _reply_rows(sqlite_session)
+    assert [row.dedupe_key for row in rows] == ["reply:reply_cancel:MSG-2"]
 
 
 @pytest.mark.asyncio

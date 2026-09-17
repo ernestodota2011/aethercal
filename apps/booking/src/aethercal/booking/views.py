@@ -89,6 +89,11 @@ from aethercal.schemas.slots import Availability
 # live-swaps the slot list when the guest changes timezone.
 _HTMX_SRC = "/static/htmx-2.0.4.min.js"
 
+#: Envío de formularios planos: marca `aria-busy` y deshabilita los botones mientras el POST viaja,
+#: para que un envío lento se vea y un doble clic no mande el formulario dos veces. Vendado igual
+#: que htmx (sin CDN, `script-src 'self'`), y sin él todo funciona igual.
+_FORM_BUSY_SRC = "/static/form-busy.js"
+
 # Premium-dark, brand-warm (ember accent) — deliberately NOT the lavender/violet/cyan-glow AI-slop
 # palette. Boxless: hairline separators + air + an editorial display face, not stacked cards.
 # ==Character comes from craft, not emptiness== (a self-hosted display font on headings/marks +
@@ -285,6 +290,16 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   color: var(--text); }
 .notice.error { border-left-color: var(--danger); background: transparent; }
 .pager { display: flex; justify-content: space-between; gap: .75rem; margin-top: 1.75rem; }
+/* ==El envío dice que está trabajando.== `form-busy.js` marca `aria-busy` y deshabilita los
+   botones al arrancar un envío plano; esto es lo que se ve (spinner) y lo que se anuncia (el
+   atributo). El doble clic deja de mandar el formulario dos veces, que era el síntoma real. */
+form[aria-busy="true"] .btn { opacity: .88; cursor: progress; }
+form[aria-busy="true"] .btn::after {
+  content: ""; display: inline-block; width: .85em; height: .85em; margin-left: .55rem;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: busy-spin .7s linear infinite;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
 dl.summary { margin: 0; }
 dl.summary dt { color: var(--muted); font-size: .78rem; text-transform: uppercase;
   letter-spacing: .08em; margin-top: 1.1rem; font-weight: 560; }
@@ -293,6 +308,8 @@ body.embed main { padding: 1.5rem 1.15rem 2rem; max-width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   .slot, .btn { transition: border-color 140ms ease, background 140ms ease; }
   .slot:hover, .slot:active, .btn:active { transform: none; box-shadow: none; }
+  /* El spinner NO se quita: es información (el envío está en curso), no adorno. Se ralentiza. */
+  form[aria-busy="true"] .btn::after { animation-duration: 2s; }
 }
 """
 
@@ -633,6 +650,12 @@ def page(
             Meta(charset="utf-8"),
             Meta(name="viewport", content="width=device-width, initial-scale=1"),
             Meta(name="color-scheme", content="dark light"),
+            # Browser chrome (the mobile address bar, the task switcher card) matches the page it
+            # sits on. Two entries on purpose: the product ships a real dark theme AND a warm light
+            # one, so a single value would be wrong in the other mode. The colours are the `--bg`
+            # tokens — not `--accent`, which a tenant replaces.
+            Meta(name="theme-color", content="#0e0e10", media="(prefers-color-scheme: dark)"),
+            Meta(name="theme-color", content="#faf7f2", media="(prefers-color-scheme: light)"),
             # ==Una pagina que no puede decir de quien es tampoco se anuncia.== Los `og:` son
             # metadatos de PREVISUALIZACION: existen para que un enlace pegado en WhatsApp se
             # despliegue con el nombre del negocio. Una pagina de fallo no se comparte, y con
@@ -662,6 +685,7 @@ def page(
             # `:root` — and only ever those two variables.
             *_brand_style(brand),
             Script(src=_HTMX_SRC, defer=True),
+            Script(src=_FORM_BUSY_SRC, defer=True),
         ),
         Body(*body_children, cls="embed" if embed else None),
         lang=locale,
