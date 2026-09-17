@@ -432,17 +432,25 @@ async def receive_whatsapp_webhook(
     # booking, a second STOP finds the suppression row already there. Answering 200 with an "error"
     # status would instead LOSE the guest's reply for ever on a transient database hiccup. So let
     # the provider retry as much as it likes: the worst case is a duplicate that changes nothing.
-    result = await process_inbound_whatsapp(
-        session,
-        tenant_id=tenant_id,
-        sender_phone=sender_phone,
-        message_text=message_text,
-        suppression_key=get_suppression_key(settings.suppression_key),
-        now=_now(),
-        effects=effects,
-    )
-
-    await _queue_guest_acknowledgement(session, payload=payload, result=result, tenant_id=tenant_id)
+    try:
+        result = await process_inbound_whatsapp(
+            session,
+            tenant_id=tenant_id,
+            sender_phone=sender_phone,
+            message_text=message_text,
+            suppression_key=get_suppression_key(settings.suppression_key),
+            now=_now(),
+            effects=effects,
+        )
+        await _queue_guest_acknowledgement(
+            session, payload=payload, result=result, tenant_id=tenant_id
+        )
+    except BaseException:
+        # ==The exception path is an exit too.== `get_session` rolls back and tears the scope down
+        # either way, but this handler DECLARES that the authority never outlives the work — so the
+        # declaration is kept literally true here instead of by pointing at another file.
+        reset_tenant_binding()
+        raise
 
     # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
     # provider, and a body that carries what we told a guest is a body that lands in provider logs.

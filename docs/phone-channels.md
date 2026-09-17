@@ -137,6 +137,23 @@ error, loudly, rather than as "mostly configured".
 
 Silence means "off". Anything else is loud.
 
+## Which provider answers are "permanent", and why it matters
+
+Every phone provider's answer is classified by **one rule** (`integrations/messaging/status.py`):
+
+- **Permanent** — a retry cannot fix it, so the step is retired with its reason instead of burning
+  six backoff attempts: `400` (malformed payload / invalid number), `401`/`403` (credentials, or a
+  recipient the provider refuses), `404` (unknown instance or account), `405`, `406`, `410`, `415`,
+  `422`. A number that is not on WhatsApp answers one of these, which is why the OTP flow can fall
+  back to SMS **once** on it.
+- **Transient** — everything else, *including every status nobody has classified yet*: 429, 5xx,
+  408, 425. The step RETRIES with backoff. The asymmetry is deliberate: a needless retry costs a
+  duplicate message (visible, recoverable); a needless retirement costs **the message** (invisible,
+  unrecoverable).
+- **Unknown outcome** — the request left this machine and the answer was lost (a read timeout after
+  the write, an aborted call). The intent is **parked, never re-sent blind**, because it may already
+  be on the guest's phone. A human resolves it: `aethercal-admin outbox resolve-unknown`.
+
 ## Opting out
 
 A guest can stop the messages at any time by replying to a WhatsApp reminder:
