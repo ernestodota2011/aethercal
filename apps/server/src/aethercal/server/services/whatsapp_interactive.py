@@ -11,6 +11,16 @@ appointment, so a reply that arrives after it has no live appointment to act on 
 as ``no_booking_found`` — a late or replayed reply must never cancel a visit that already
 happened.
 
+.. rubric:: A non-text message is answered with SILENCE, on purpose
+
+The parser reads text. An audio note, an image or a sticker from a guest therefore produces
+``UNKNOWN`` and no state change — and the handler logs that it happened (naming the event, never
+the payload) so the silence is observable instead of invisible. ==What is deliberately NOT done is
+auto-replying "please send text":== a reply is an outbound message and would have to pass the
+whole belt (consent, opt-out, caps, ledger) for a message the product cannot even act on — and the
+copy would be a guess about the guest's language. If an operator ever wants it, the machinery is
+already here: a parsed intent, a built-in body and ``enqueue_guest_reply``.
+
 All transitions and notifications obey RLS, multi-tenant isolation, and the transactional outbox.
 
 .. rubric:: The reply lexicon, and why OPT_OUT is checked FIRST

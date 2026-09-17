@@ -331,6 +331,12 @@ async def receive_whatsapp_webhook(
     compared in constant time. What an authenticated caller can reach is narrow by construction:
     the handler only ever acts on an UPCOMING booking whose phone matches the sender's (the
     intent parser cannot name a booking, and the suppression list has no read surface).
+
+    .. rubric:: Every exit releases the tenant binding, and it says so here
+
+    The bind is unavoidable (the credential is RLS-protected) and ``get_session`` tears the request
+    scope down either way — but ==a reader should not have to follow two files to know the authority
+    does not outlive the work==: each return calls :func:`reset_tenant_binding` before it leaves.
     """
     # ==The body is read AFTER authenticating.== The size cap is checked from the header first (a
     # declared oversize is still a 413 before any work), but the BYTES are pulled from the stream
@@ -389,9 +395,11 @@ async def receive_whatsapp_webhook(
         # Acked as ignored (the provider gets a 200 and stops retrying), but NOT silently: an
         # operator wondering why a guest's "1" never landed needs this line.
         _logger.debug("inbound WhatsApp webhook body is not JSON (%s); ignoring", exc)
+        reset_tenant_binding()
         return {"status": "ignored"}
 
     if not isinstance(payload, dict):
+        reset_tenant_binding()
         return {"status": "ignored"}
 
     extracted = extract_evolution_payload(payload)
@@ -405,6 +413,7 @@ async def receive_whatsapp_webhook(
             tenant_id,
             str(payload.get("event"))[:64],
         )
+        reset_tenant_binding()
         return {"status": "ignored"}
 
     sender_phone, message_text = extracted
@@ -437,6 +446,7 @@ async def receive_whatsapp_webhook(
 
     # The guest-facing reply text is deliberately NOT echoed back: this response goes to the
     # provider, and a body that carries what we told a guest is a body that lands in provider logs.
+    reset_tenant_binding()
     return {
         "status": result.status,
         "action": result.action.value,

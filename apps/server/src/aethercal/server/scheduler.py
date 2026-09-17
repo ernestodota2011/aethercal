@@ -727,7 +727,12 @@ def make_phone_challenge_sweep_tick(app: FastAPI) -> Tick:
     """
 
     async def _tick() -> None:
-        await run_phone_challenge_sweep_once(pools=app.state.pools)
+        deleted = await run_phone_challenge_sweep_once(pools=app.state.pools)
+        if deleted:
+            # ==No silent housekeeping.== A sweep that deletes is a fact about the instance,
+            # (volume, and whether the caps' counting window is behaving); a zero is the boring case
+            # and needs no line. Failures already log from the guarded pass.
+            _logger.info("phone-challenge sweep deleted %d stale challenge(s)", deleted)
 
     return _tick
 

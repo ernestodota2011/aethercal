@@ -16,6 +16,25 @@ Certifica dos propiedades, y la primera es la que manda:
    el orden de sus reglas es una propiedad de seguridad, no de estilo.
 2. La exactitud global se mantiene en o por encima de :data:`MIN_ACCURACY`.
 
+.. rubric:: Qué ES este corpus: un conjunto de REGRESIÓN, no de generalización
+
+El corpus lo escribió el mismo equipo que ajusta el parser, así que medirlo contra sí mismo mide
+CONSISTENCIA, no desempeño en el mundo. Decirlo importa para no leer la cifra de más:
+
+* la prueba de generalización es el tráfico real (mensajes que no se parecen a ninguno de estos
+  625), y por eso el lazo imprime la matriz en vez de solo el número: una matriz perfecta con un
+  corpus estrecho se ve perfecta igual;
+* lo que sí certifica un corpus de regresión, y es mucho, es el **no retroceso**: la suite fija
+  625/625 a propósito, porque cada muestra es una conducta prometida y cualquier caída tiene que
+  ser una decisión revisada, nunca un desliz;
+* :data:`MIN_ACCURACY` (0,98) es el piso del MODO CLI, pensado para correrlo contra un corpus que
+  crezca (muestras nuevas de casos reales): exige no romper lo calibrado sin atarse al 100%.
+  Cuando una muestra nueva entra al corpus, entra como caso de prueba y el ajuste es explícito.
+
+Un ``holdout`` sobre estas 625 muestras sería teatro estadístico: no son datos independientes
+—las mismas reglas las escribieron a la vez— y partirlas solo escondería ese hecho detrás de un
+número.
+
 Uso: ``uv run python simulation/whatsapp_intent_loop.py`` (o con ``--dataset`` explícito). Sale 0
 solo si certifica; cualquier corrida no certificada sale 1, para que el lazo pueda colgarse de un
 job de CI sin que nadie lea la salida.

@@ -40,7 +40,14 @@ def _sample(text: str, expected_action: str) -> IntentSample:
 
 
 def test_the_canonical_corpus_classifies_every_sample() -> None:
-    """La calibración vigente: 625/625. Un rojo aquí es una regresión del parser, no del corpus."""
+    """La calibración vigente: 625/625. Un rojo aquí es una regresión del parser, no del corpus.
+
+    ==Pineado en 1.0 a propósito, y es lo correcto para un corpus de REGRESIÓN.== Cada muestra es
+    una conducta prometida; que una deje de clasificarse bien tiene que ser una decisión revisada,
+    nunca un desliz. El piso más laxo (0.98) vive en el modo CLI, que se corre contra corpus que
+    crezcan con casos reales — la generalización la mide el tráfico, no este conjunto (ver el
+    docstring del lazo: por qué un holdout aquí sería teatro).
+    """
     evaluation = evaluate(load_benchmark(default_dataset_path()), dataset=default_dataset_path())
 
     assert evaluation.total == 625
