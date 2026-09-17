@@ -140,6 +140,17 @@ def get_suppression_key(explicit_key: str | None = None) -> str:
     instance it was a PUBLISHED constant. Anyone holding it can compute the HMAC of a guessed phone
     number, so the list stops being opaque. Missing configuration is now a loud refusal: the caller
     cannot consult the opt-out list, so it must not message anybody.
+
+    .. rubric:: Two callers, one refusal, two shapes — and the difference is deliberate
+
+    * the **OTP path** lets this exception reach the public endpoint, which answers 4xx naming the
+      feature: the guest asked for a code and did not get one, and that must be visible.
+    * the **outbox gate** catches it and raises ``OutboxSkipped("suppression-key-missing")``: a
+      dispatch that keeps failing is retried for ever against a condition only an operator can fix,
+      so the send path reports it as a skip (the row and the metrics carry the reason) instead of
+      looping.
+
+    Both refuse to send. Neither invents a key.
     """
     key = (explicit_key or os.environ.get("AETHERCAL_SUPPRESSION_KEY") or "").strip()
     if not key:

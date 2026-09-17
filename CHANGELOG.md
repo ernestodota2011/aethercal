@@ -158,7 +158,9 @@ side (C-02b, Horizon 1).
   transactional chain as the guest cancel link, and STOP/BAJA/ALTO/… suppresses the number on the
   instance-wide opt-out list, which the send path consults before the channel, the template and the
   caps. Only UPCOMING appointments are eligible: a late or replayed reply never cancels a visit
-  that already happened.
+  that already happened. ==The guest does not receive an acknowledgement message yet:== the reply
+  text is returned to the caller and not sent (an outbound chat message has to pass consent, the
+  seal, the opt-out list, the caps and the ledger first — that wiring is a declared follow-up).
 - **`AETHERCAL_SUPPRESSION_KEY`** (≥32 characters) is the dedicated, non-derivable HMAC key behind
   that list; ==the app refuses to boot the public router without it==, and the list survives guest
   erasure so an erasure never reactivates messaging to someone who asked to stop.

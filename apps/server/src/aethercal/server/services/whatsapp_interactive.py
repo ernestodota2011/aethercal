@@ -522,6 +522,16 @@ async def find_target_booking(
     phone — the message's own origin is the possession evidence — and the seal (OTP-4) gates the
     messages the BUSINESS sends, not the ones the guest starts. Requiring it here would leave every
     guest who skipped or lost the OTP unable to cancel or confirm.
+
+    .. rubric:: Eligibility, stated in full
+
+    * any CONFIRMED booking whose ``start_at`` is still ahead qualifies — there is **no upper
+      window** (a guest may answer a reminder whenever it reaches them, and a booking a year out is
+      as real as tomorrow's);
+    * cancelled, no-show and PENDING/HOLD rows never do: the status filter is ``CONFIRMED``, which
+      is the same set the reminder was sent for;
+    * a booking that already carries ``attendance_confirmed_at`` REMAINS cancellable: confirming
+      once is not a promise to attend, and the guest keeps the right to change their mind.
     """
     return (
         await session.scalars(

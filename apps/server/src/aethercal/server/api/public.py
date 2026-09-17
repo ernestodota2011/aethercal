@@ -424,6 +424,12 @@ async def create_public_booking(
     # the next attempt. What the page must NOT do is claim a code is on its way when no channel
     # accepted it: that is what ``phone_verification_delivery_failed`` says, so the guest is told
     # "we could not reach you, try again" instead of watching an empty phone.
+    #
+    # ==The token is returned HERE and nowhere else:== it travels in this response (and into the
+    # panel that renders it). It is not e-mailed, not logged and not re-mintable by the guest, so a
+    # guest who closes the page cannot verify later — the declared consequence of OTP-2 ("si cierras
+    # esta página no vas a poder verificar después"), and the price of a capability that cannot be
+    # re-obtained by anybody who merely knows the booking id.
     if params.guest_phone and params.guest_phone_consent:
         signer = GuestTokenSigner(settings.app_secret)
         # The token outlives the appointment by a day at least: it has to still work when the guest

@@ -397,6 +397,13 @@ async def receive_whatsapp_webhook(
         booking_base_url=base.rstrip("/"),
     )
 
+    # ==A failure here is a 5xx ON PURPOSE, and the retry it buys is SAFE.== Nothing in this handler
+    # catches an error from the transition: ``get_session`` rolls the transaction back on the way
+    # out, so a failed attempt leaves NO partial write, and every transition this service performs
+    # is replay-tolerant — a second "1" keeps the first stamp, a second "2" finds no CONFIRMED
+    # booking, a second STOP finds the suppression row already there. Answering 200 with an "error"
+    # status would instead LOSE the guest's reply for ever on a transient database hiccup. So let
+    # the provider retry as much as it likes: the worst case is a duplicate that changes nothing.
     result = await process_inbound_whatsapp(
         session,
         tenant_id=tenant_id,
