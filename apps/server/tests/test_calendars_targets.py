@@ -84,6 +84,14 @@ class _GoneError(Exception):
         self.resp = type("Resp", (), {"status": status})()
 
 
+class _GoneHttpError(Exception):
+    """Mimics an httpx-shaped error: the status lives on ``response.status_code``."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.response = type("Response", (), {"status_code": status_code})()
+
+
 class _Freebusy:
     def __init__(self, owner: FakeGoogle) -> None:
         self._owner = owner
@@ -515,6 +523,27 @@ async def test_deleting_an_event_google_no_longer_has_is_a_success_not_a_retry_l
     tenant = await tenant_factory(sqlite_session)
     await _connect(sqlite_session, tenant, fernet=fernet)
     google = FakeGoogle(delete_error=_GoneError(410))
+
+    await delete_event_for_booking(
+        calendar_id="dedicated@cal",
+        external_event_id="evt-gone",
+        service=google,
+        provider=GOOGLE_PROVIDER,
+    )  # must not raise
+
+
+async def test_a_gone_signal_in_the_HTTP_SHAPE_is_also_a_success(
+    sqlite_session: AsyncSession, tenant_factory: Any, fernet: Fernet
+) -> None:
+    """==Tres formas del mismo hecho, y las tres tienen que contar como «ya no está».==
+
+    Google la pone en ``resp.status``; un SDK cualquiera en ``status_code``; ``httpx`` — el cliente
+    con el que habla Microsoft — en ``response.status_code``. Leer solo la primera convierte un
+    borrado idempotente en un bucle de reintentos que termina en la carta muerta, sobre un evento
+    que efectivamente ya no existe."""
+    tenant = await tenant_factory(sqlite_session)
+    await _connect(sqlite_session, tenant, fernet=fernet)
+    google = FakeGoogle(delete_error=_GoneHttpError(404))
 
     await delete_event_for_booking(
         calendar_id="dedicated@cal",

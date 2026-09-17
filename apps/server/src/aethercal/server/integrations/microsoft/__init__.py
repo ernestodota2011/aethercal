@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from .client import (
     MICROSOFT_HTTP_TIMEOUT_SECONDS,
+    build_service,
     delete_event,
     insert_event,
     query_busy,
@@ -24,6 +25,7 @@ __all__ = [
     "MicrosoftEventRequest",
     "build_graph_event_body",
     "build_schedule_request_body",
+    "build_service",
     "delete_event",
     "extract_teams_join_url",
     "insert_event",

@@ -410,7 +410,13 @@ async def issue_verification_challenge(  # noqa: PLR0913
 
     # 1. Check suppression list (D-12)
     if await is_phone_suppressed(session, norm_phone, suppression_key=suppression_key):
-        _logger.warning("Suppression match: phone %r opted out; refusing OTP send", norm_phone)
+        # ==The refusal is logged; the NUMBER is not.== A phone number is the guest's data, and a
+        # log line is the easiest place for it to outlive every erasure path the product has. The
+        # tenant plus the fact of the match is everything an operator can act on.
+        _logger.warning(
+            "suppression match for tenant %s: the guest opted out; refusing the OTP send",
+            booking.tenant_id,
+        )
         raise PhoneVerificationError("Phone number has opted out of notifications.")
 
     # 2. Check rate limits (D-7)
@@ -648,7 +654,9 @@ async def sweep_stale_challenges(
     cutoff = current_time - older_than
     stmt = delete(PhoneVerificationChallenge).where(PhoneVerificationChallenge.created_at < cutoff)
     result = await session.execute(stmt)
-    return int(getattr(result, "rowcount", 0) or 0)
+    # ``rowcount`` is -1 on drivers that do not report it: clamp, so "swept -1 rows" never reaches a
+    # log line or a test that reads the count as a real quantity.
+    return max(0, int(getattr(result, "rowcount", 0) or 0))
 
 
 __all__ = [

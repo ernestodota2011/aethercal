@@ -1070,10 +1070,18 @@ async def create_event_for_booking(
 
 
 def _is_already_gone(exc: Exception) -> bool:
-    """True when the calendar error says the event is not there any more (404 / 410)."""
+    """True when the calendar error says the event is not there any more (404 / 410).
+
+    Three shapes, because two SDK families and one HTTP client pass through here: Google's
+    ``HttpError`` carries ``resp.status``, a generic SDK error may carry ``status_code``, and an
+    ``httpx`` error carries ``response.status_code``. Reading only the first is how a delete for an
+    event that is already gone turns into a retry loop that ends in the dead-letter.
+    """
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     return isinstance(status, int) and status in _ALREADY_GONE_STATUSES
 
 

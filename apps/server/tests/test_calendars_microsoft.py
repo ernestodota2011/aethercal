@@ -30,6 +30,7 @@ from aethercal.server.integrations.microsoft.client import (
 )
 from aethercal.server.integrations.microsoft.parse import (
     MicrosoftEventRequest,
+    _parse_graph_datetime,
     build_graph_event_body,
     build_schedule_request_body,
     extract_teams_join_url,
@@ -240,6 +241,26 @@ def test_build_schedule_request_body() -> None:
     assert body["startTime"]["dateTime"] == "2026-09-16T09:00:00Z"
     assert body["endTime"]["dateTime"] == "2026-09-23T18:00:00Z"
     assert body["availabilityViewInterval"] == 30
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-09-16T14:00:00", datetime(2026, 9, 16, 14, 0, tzinfo=UTC)),
+        ("2026-09-16T14:00:00Z", datetime(2026, 9, 16, 14, 0, tzinfo=UTC)),
+        ("2026-09-16T14:00:00.0000000Z", datetime(2026, 9, 16, 14, 0, tzinfo=UTC)),
+        ("2026-09-16T14:00:00.0000000+02:00", datetime(2026, 9, 16, 12, 0, tzinfo=UTC)),
+        ("2026-09-16T14:00:00+02:00", datetime(2026, 9, 16, 12, 0, tzinfo=UTC)),
+    ],
+)
+def test_graph_datetimes_parse_in_every_shape_graph_actually_sends(
+    raw: str, expected: datetime
+) -> None:
+    """==Graph mezcla formatos, y el parser tiene que aceptarlos todos.== Con y sin fracción
+    (``fromisoformat`` acepta 6 dígitos o ninguno), con ``Z`` o con offset explícito. La única
+    cirugía es el séptimo dígito de la fracción, que Python no acepta y Microsoft emite siempre; el
+    resto se delega al parser estándar, que ya prueba la suite — en vez de una regex propia."""
+    assert _parse_graph_datetime(raw) == expected
 
 
 def test_build_graph_event_body_and_extract_teams_join_url() -> None:

@@ -533,6 +533,12 @@ async def find_target_booking(
     messages the BUSINESS sends, not the ones the guest starts. Requiring it here would leave every
     guest who skipped or lost the OTP unable to cancel or confirm.
 
+    ==Nor is consent: it is enforced where it belongs, at SEND time.== A reply that QUEUES an
+    acknowledgement does so regardless of the consent stamp; the outbox's consent gate then refuses
+    the outbound to a number that never agreed (``no-phone-consent``), which is the one place that
+    decision is allowed to live. Duplicating it here would give the same question two answers that
+    can drift apart.
+
     .. rubric:: Eligibility, stated in full
 
     * any CONFIRMED booking whose ``start_at`` is still ahead qualifies — there is **no upper
@@ -569,15 +575,15 @@ async def process_inbound_whatsapp(  # noqa: PLR0913
 ) -> WhatsAppProcessResult:
     """Process an inbound WhatsApp text interaction for a specific tenant business.
 
-    .. rubric:: ``reply_message`` is returned, and NOT sent — a declared boundary
+    .. rubric:: ``reply_message`` is the CALLER's text; the guest's copy lives in ``templates``
 
-    Every result carries the text the GUEST would read, so the caller (or the operator reading a
-    log) knows what the product told them. Sending it back over WhatsApp is deliberately not done
-    here: an outbound chat reply is an outbound message, and every outbound message in this product
-    goes through the belt — consent, the possession seal, the opt-out list, the daily caps and the
-    notification ledger. A reply fired straight off the webhook would bypass all five. When the
-    reply is wired to a sender, it is wired THERE (an outbox effect), not here, and this docstring
-    is where that decision is recorded instead of being rediscovered as a gap.
+    Each result carries a short human summary of what happened, for the caller (and for tests and
+    telemetry — the webhook answers the provider with only ``status``/``action``, deliberately, so
+    guest text never rides a response that lands in provider logs). The message the GUEST actually
+    receives is a different thing by design: it is rendered from ``templates.py``'s built-in bodies
+    (or the tenant's ``workflow_templates`` row) and sent by the outbox through the whole belt — see
+    :func:`~aethercal.server.services.outbox.enqueue_guest_reply`. Keeping the two apart is what
+    lets a tenant reword their acknowledgement without touching this service's semantics.
     """
     norm_phone = normalize_e164(sender_phone)
     action = parse_reply_action(message_text)
