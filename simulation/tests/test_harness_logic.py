@@ -419,9 +419,14 @@ def test_a_foreign_compose_project_is_refused() -> None:
     "field", ["api_url", "worker_url", "booking_url", "mailpit_url", "sink_url"]
 )
 def test_a_non_loopback_endpoint_is_refused(field: str) -> None:
-    """A LAN address is, by definition, an instance somebody else is using."""
+    """A LAN address is, by definition, an instance somebody else is using.
+
+    ==The address is deliberately generic.== This repo is public: a real LAN address of any of our
+    machines — the client's included — is infrastructure we have no reason to publish, and the
+    refusal does not depend on WHICH LAN address it is.
+    """
     with pytest.raises(NotADisposableStackError, match="not loopback"):
-        assert_disposable_stack(_stack(**{field: "http://192.168.0.250:8000"}))
+        assert_disposable_stack(_stack(**{field: "http://10.10.10.250:8000"}))
 
 
 def test_a_public_hostname_is_refused() -> None:
